@@ -5,6 +5,9 @@ docs/learn/credential-stores.mdx
 internal/hashicorp/sync.go
   s_9edc7552bb187b::t_2807ea17b49122 1-2,7-23,25-190,193-195,203-257
   s_9edc7552bb187b::t_327d6996f7a8db 3-6
+  s_9edc7552bb187b::t_334aa1ff5981bd 24
+  s_9edc7552bb187b::t_7df700186e9649 202
+  s_9edc7552bb187b::t_e9e0e8e1c1dbe1 191-192,196-201
 internal/hashicorp/client_integration_test.go
   s_9edc7552bb187b::t_5fde6603084bc8 1-13,15-161
   s_9edc7552bb187b::t_22482f43c46274 14
@@ -13,6 +16,8 @@ internal/mitm/forward_hashicorp_test.go
   s_9edc7552bb187b::t_ccdf5faf9ca0d4 21-24,26-30
   s_9edc7552bb187b::t_280b31b3575b02 46-51,59-61
   s_9edc7552bb187b::t_d26502712b4d8a 130-134
+  s_9edc7552bb187b::t_54c2dffa1b956c 90-94,97,99-100,102-106
+  s_9edc7552bb187b::t_0ef6073239e675 25
 docs/self-hosting/environment-variables.mdx
   s_9edc7552bb187b::t_a29f275d6819fa 89,92-98
   s_9edc7552bb187b::t_d482a51399d571 77-88,90-91,99-103
@@ -51,6 +56,11 @@ web/src/pages/home/VaultsListTab.tsx
   s_9edc7552bb187b::t_e1be74f8d80532 436
   s_9edc7552bb187b::t_11b7e01b9268c4 494,498-500
   s_9edc7552bb187b::t_e681c3b4fec127 368-372
+  s_9edc7552bb187b::t_7cc7d1d121b233 9-10
+  s_9edc7552bb187b::t_477bc1a81896e2 407-413
+  s_9edc7552bb187b::t_7df700186e9649 469,473
+  s_9edc7552bb187b::t_ae380e346c7c8f 487
+  s_9edc7552bb187b::t_cb12b27eb463eb 470-472
 cmd/vaults.go
   s_9edc7552bb187b::t_4bb7ecd46add66 49-72,74
   s_9edc7552bb187b::t_f0334e3a460019 276,279,284-288,294
@@ -61,6 +71,7 @@ internal/store/store.go
   s_9edc7552bb187b::t_62c430eca65afb 261
 internal/hashicorp/sync_test.go
   s_9edc7552bb187b::t_73468d0e194add 1-62,64-66,68-185
+  s_9edc7552bb187b::t_0a8daa277b2fff 63,67
 .env.example
   s_9edc7552bb187b::t_3bcfa728bc68ee 82-92,94,97
   s_9edc7552bb187b::t_d4635d09e966f8 93,95-96
@@ -72,6 +83,7 @@ internal/server/handle_vaults.go
   s_9edc7552bb187b::t_8df3d7e527f170 304-306
   s_9edc7552bb187b::t_5341b237d51157 783-810,812-867
   s_9edc7552bb187b::t_772de52a2c6cd1 229-244
+  s_9edc7552bb187b::t_4503d031d5ae1c 658-661,663-676
 internal/server/server.go
   s_9edc7552bb187b::t_2b7dae6c89858a 24
   s_9edc7552bb187b::t_a1fd6d003da8c9 1121-1123,1125-1132
@@ -83,6 +95,19 @@ docs/reference/cli.mdx
   s_9edc7552bb187b::t_705e324471c0a6 247,257-259
   s_9edc7552bb187b::t_36b39147b1ab94 339
   s_9edc7552bb187b::t_e423bc5e216d91 72
+  s_9edc7552bb187b::t_340e0f55325ba4 253
+internal/store/20260617143024_hashicorp_credential_store.go
+  s_9edc7552bb187b::t_e03b702d7f4636 1-56
+web/src/components/VaultForm.tsx
+  s_9edc7552bb187b::t_8a41314fa9cc50 13,17-19,29-31
+  s_9edc7552bb187b::t_f233b72924b6c5 54-67
+  s_9edc7552bb187b::t_8989f209347ae5 72,86,98
+  s_9edc7552bb187b::t_cf4ae29696f3fa 174-201
+  s_9edc7552bb187b::t_1580c4e0bd5713 142-144
+web/src/pages/vault/SettingsTab.tsx
+  s_9edc7552bb187b::t_f711953b01793a 254-256
+README.md
+  s_9edc7552bb187b::t_6c2acb431b47de 33
 ---
 {
   "schema_version": "authorship/3.0.0",
