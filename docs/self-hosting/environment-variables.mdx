@@ -8,6 +8,7 @@ description: "Configuration for deploying an instance of Agent Vault."
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `PORT` | Optional (defaults to `14321`) | The TCP port the server listens on. Overridden by `--port`. |
+| `DATABASE_URL` | Optional (defaults to SQLite) | PostgreSQL connection URL for [production deployments](/self-hosting/postgres). When set, Agent Vault uses Postgres instead of the built-in SQLite database. All instances must share the same URL. Supports `sslmode` (e.g. `?sslmode=require`). Example: `postgres://user:password@host:5432/agentvault`. Overridden by `--database-url`. |
 | `AGENT_VAULT_MASTER_PASSWORD` | Recommended (passwordless mode if unset) | The master password used to derive the KEK that wraps the data encryption key. Source via your platform's secret store (e.g., `fly secrets set`, Docker secrets); falls back to `--password-stdin` or an interactive prompt. |
 | `AGENT_VAULT_ADDR` | Optional (auto-derived) | The externally-reachable base URL of the server (e.g., `https://vault.example.com`). Used for invite links, discovery responses, and MITM cert SANs. Falls back to `https://<FLY_APP_NAME>.fly.dev` on Fly.io, then `http://{host}:{port}`. |
 | `FLY_APP_NAME` | Set by Fly.io | The Fly.io app name. Used to derive `AGENT_VAULT_ADDR` when unset. |
@@ -24,6 +25,9 @@ description: "Configuration for deploying an instance of Agent Vault."
 | `AGENT_VAULT_MAX_RESPONSE_BYTES` | Optional (defaults to `0` = unlimited) | Maximum response body bytes the MITM proxy streams back to agents. Responses are streamed with a small buffer so unlimited is safe. When set and exceeded, the proxy returns 502 or aborts the connection. Overridden by `--max-response-bytes`. |
 | `AGENT_VAULT_MAX_REQUEST_BYTES` | Optional (defaults to `1073741824` = 1 GiB) | Maximum request body bytes the MITM proxy forwards to upstreams. Requests exceeding this receive HTTP 413. Overridden by `--max-request-bytes`. |
 | `AGENT_VAULT_ISOLATION` | Optional (defaults to `host`) | Default isolation mode for `agent-vault vault run`. One of: `host`, `container` (see [Container isolation](/guides/container-isolation)). Overridden by `--isolation`. |
+| `DB_MAX_OPEN_CONNS` | Optional (defaults to `25`) | Maximum number of open Postgres connections per instance. Only applies when `DATABASE_URL` is set. See [connection pooling](/self-hosting/postgres#operational-notes). |
+| `DB_MAX_IDLE_CONNS` | Optional (defaults to `10`) | Maximum number of idle Postgres connections kept in the pool per instance. Only applies when `DATABASE_URL` is set. See [connection pooling](/self-hosting/postgres#operational-notes). |
+| `DB_CONN_MAX_LIFETIME` | Optional (defaults to `5m`) | Maximum lifetime of a Postgres connection before it is closed and replaced. Go duration string (e.g. `5m`, `1h`). Only applies when `DATABASE_URL` is set. See [connection pooling](/self-hosting/postgres#operational-notes). |
 
 ## Email SMTP configuration
 
@@ -69,4 +73,39 @@ GCP IAM and GCP ID Token share `INFISICAL_GCP_AUTH_IDENTITY_ID`; setting `INFISI
 <Tip>
   The Infisical machine identity should have **read-only** access. Agent Vault never writes back, and a read-only identity caps blast radius if the broker is compromised.
 </Tip>
+
+## HashiCorp Vault credential store
+
+Setting `VAULT_ADDR` enables HashiCorp-Vault-backed vaults: Agent Vault reads a single KV item from a HashiCorp Vault instance and caches the encrypted snapshot locally. Local mutations are rejected. See [Credential stores](/learn/credential-stores).
+
+Supply env vars for one auth method. Detection picks the first complete group in priority order: AppRole → Token. Agent Vault honors the standard Vault client environment, so `VAULT_CACERT`, `VAULT_SKIP_VERIFY`, and `VAULT_NAMESPACE` work as they do for the `vault` CLI.
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `VAULT_ADDR` | Required to enable | Base URL of the HashiCorp Vault instance (e.g., `http://127.0.0.1:8200`). |
+| `VAULT_TOKEN` | Conditional (Token Auth) | A pre-issued Vault token. |
+| `VAULT_ROLE_ID` | Conditional (AppRole Auth) | AppRole RoleID. Selected over Token when set alongside `VAULT_SECRET_ID`. |
+| `VAULT_SECRET_ID` | Conditional (AppRole Auth) | AppRole SecretID. |
+| `VAULT_APPROLE_MOUNT` | Optional (AppRole Auth) | AppRole auth mount path. Defaults to `approle`; override for non-default Enterprise/HCP mounts (e.g. `prod-approle`). |
+| `VAULT_NAMESPACE` | Optional | Vault Enterprise / HCP namespace. |
+| `VAULT_CACERT` | Optional | Path to a CA cert bundle for TLS verification (standard Vault variable). |
+| `VAULT_SKIP_VERIFY` | Optional | Disable TLS verification (standard Vault variable; not recommended). On startup, Agent Vault logs a warning when this is enabled. |
+
+A `VAULT_TOKEN` is validated at startup (a `lookup-self` probe), so an expired or malformed token fails fast rather than surfacing as a per-vault sync error on the first poll.
+
+<Note>
+  Agent Vault does **not** auto-renew the AppRole-issued token. When it expires, syncs fail (`last_sync_status=error`) and the vault keeps serving its last good snapshot until the server restarts and re-authenticates. Use a token TTL comfortably longer than your restart cadence, or restart to refresh.
+</Note>
+
+<Tip>
+  The Vault token or AppRole should map to a **read-only** policy on the target KV path. Agent Vault never writes back, and a read-only identity caps blast radius if the broker is compromised.
+</Tip>
+
+## Telemetry
+
+Agent Vault collects anonymous usage telemetry to help improve the product. No credential values, request payloads, or secret data are ever included. Events capture command invocations and feature usage with the authenticated user's email for company attribution.
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `AGENT_VAULT_TELEMETRY` | Optional (defaults to `true`) | Set to `false` to disable anonymous usage telemetry. Also overridable with `--telemetry=false` on the CLI. |
 
