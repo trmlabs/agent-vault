@@ -1,0 +1,19 @@
+internal/hashicorp/sync.go
+  s_9edc7552bb187b::t_327d6996f7a8db 3-6
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "1a042fcc0175ab1730ab618d939e541a8ce32511",
+  "prompts": {},
+  "sessions": {
+    "s_9edc7552bb187b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "12c34a39-54d3-44a2-a7e1-35585bd8e822",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Preet Bhinder <preet.bhinder@trmlabs.com>"
+    }
+  }
+}

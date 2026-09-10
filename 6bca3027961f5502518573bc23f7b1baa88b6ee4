@@ -1,0 +1,30 @@
+docs/self-hosting/environment-variables.mdx
+  s_9edc7552bb187b::t_a29f275d6819fa 85,88-94
+docs/reference/cli.mdx
+  s_9edc7552bb187b::t_e423bc5e216d91 69
+internal/mitm/forward_hashicorp_test.go
+  s_9edc7552bb187b::t_280b31b3575b02 46-51,59-61
+.env.example
+  s_9edc7552bb187b::t_d4635d09e966f8 83,85-86
+internal/hashicorp/client.go
+  s_9edc7552bb187b::t_3b7dcb82b4d36c 152-153,158-164,167-173
+  s_9edc7552bb187b::t_bed2c480f7aa3b 11
+internal/hashicorp/auth_test.go
+  s_9edc7552bb187b::t_fe6a60e2f469b7 97-168
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "6bca3027961f5502518573bc23f7b1baa88b6ee4",
+  "prompts": {},
+  "sessions": {
+    "s_9edc7552bb187b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "12c34a39-54d3-44a2-a7e1-35585bd8e822",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Preet Bhinder <preet.bhinder@trmlabs.com>"
+    }
+  }
+}

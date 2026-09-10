@@ -1,0 +1,32 @@
+internal/hashicorp/client.go
+  s_9edc7552bb187b::t_2b5db510ec3393 135-140
+  s_9edc7552bb187b::t_05ac995e238047 10
+  s_9edc7552bb187b::t_7bcbaf2a395d8d 59-64
+internal/hashicorp/auth_test.go
+  s_9edc7552bb187b::t_c5eb70898b7468 1-96
+cmd/vaults.go
+  s_9edc7552bb187b::t_55ad9e9841cad0 193-196,202-206
+internal/hashicorp/auth.go
+  s_9edc7552bb187b::t_ea203725bc5ebd 5-15
+internal/hashicorp/config_test.go
+  s_9edc7552bb187b::t_a48742f62b0d30 58
+  s_9edc7552bb187b::t_41e2410a523373 56-57
+internal/hashicorp/config.go
+  s_9edc7552bb187b::t_b330bea158e351 44-47
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "9c38b36ac2bf5652ce069db392052af0ab46486f",
+  "prompts": {},
+  "sessions": {
+    "s_9edc7552bb187b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "12c34a39-54d3-44a2-a7e1-35585bd8e822",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Preet Bhinder <preet.bhinder@trmlabs.com>"
+    }
+  }
+}
