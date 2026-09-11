@@ -209,6 +209,25 @@ type BrokerConfig struct {
 	UpdatedAt    time.Time
 }
 
+// DatabaseService is one managed upstream Postgres-wire database within a vault
+// that the PostgreSQL broker can front. It carries the network address plus the
+// Vault database secrets-engine mount and role that mint short-lived
+// credentials for it; the broker never stores a database password itself. Name
+// is the per-vault slug an agent selects by (unique within the vault).
+type DatabaseService struct {
+	ID        string
+	VaultID   string
+	Name      string
+	Upstream  string // host:port
+	Database  string // upstream database override; empty honors the client's requested database
+	Mount     string // Vault database secrets-engine mount (e.g. "database")
+	Role      string // Vault role granting scoped SQL privileges
+	SSLMode   string // upstream TLS: disable|prefer|require|verify-full
+	MaxConns  int    // per-database connection budget (0 = broker default)
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
 // Proposal represents a proposed set of changes (services + credential slots)
 // created by an agent, pending human approval.
 type Proposal struct {
@@ -507,6 +526,13 @@ type Store interface {
 	// Broker configs
 	SetBrokerConfig(ctx context.Context, vaultID string, servicesJSON string) (*BrokerConfig, error)
 	GetBrokerConfig(ctx context.Context, vaultID string) (*BrokerConfig, error)
+
+	// Database services (managed PostgreSQL-broker upstreams, per vault)
+	UpsertDatabaseService(ctx context.Context, svc DatabaseService) (*DatabaseService, error)
+	GetDatabaseService(ctx context.Context, vaultID, name string) (*DatabaseService, error)
+	ListDatabaseServices(ctx context.Context, vaultID string) ([]DatabaseService, error)
+	DatabaseUpstreamLimit(ctx context.Context, upstream string) (int, error)
+	DeleteDatabaseService(ctx context.Context, vaultID, name string) (bool, error)
 
 	// Master key
 	GetMasterKeyRecord(ctx context.Context) (*MasterKeyRecord, error)
