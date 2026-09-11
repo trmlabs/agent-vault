@@ -12,10 +12,19 @@ type discoverService struct {
 	Host string `json:"host"`
 }
 
+// discoverDatabase is one managed PostgreSQL-broker database an agent may select
+// by Name. It carries the selector and upstream host only — never the Vault
+// mount/role or any credential.
+type discoverDatabase struct {
+	Name string `json:"name"`
+	Host string `json:"host"`
+}
+
 type discoverResponse struct {
-	Vault                string            `json:"vault"`
-	Services             []discoverService `json:"services"`
-	AvailableCredentials []string          `json:"available_credentials"`
+	Vault                string             `json:"vault"`
+	Services             []discoverService  `json:"services"`
+	Databases            []discoverDatabase `json:"databases"`
+	AvailableCredentials []string           `json:"available_credentials"`
 }
 
 func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
@@ -35,6 +44,17 @@ func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
 
 	credentialKeys := s.listCredentialKeys(ctx, ns.ID)
 
+	// Managed PostgreSQL-broker databases the agent may select by name.
+	databases := []discoverDatabase{}
+	if dbRows, err := s.store.ListDatabaseServices(ctx, ns.ID); err != nil {
+		proxyError(w, http.StatusInternalServerError, "internal", "Failed to list databases")
+		return
+	} else {
+		for _, row := range dbRows {
+			databases = append(databases, discoverDatabase{Name: row.Name, Host: row.Upstream})
+		}
+	}
+
 	// Load broker config for this vault.
 	brokerCfg, err := s.store.GetBrokerConfig(ctx, ns.ID)
 	if err != nil || brokerCfg == nil {
@@ -42,6 +62,7 @@ func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
 		jsonOK(w, discoverResponse{
 			Vault:                ns.Name,
 			Services:             []discoverService{},
+			Databases:            databases,
 			AvailableCredentials: credentialKeys,
 		})
 		return
@@ -73,6 +94,7 @@ func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, discoverResponse{
 		Vault:                ns.Name,
 		Services:             services,
+		Databases:            databases,
 		AvailableCredentials: credentialKeys,
 	})
 }

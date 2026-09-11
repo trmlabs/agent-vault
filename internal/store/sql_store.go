@@ -43,8 +43,6 @@ func utcTimePtr(t *time.Time) *time.Time {
 	return &u
 }
 
-
-
 // nullableString returns nil for empty strings, enabling SQL NULL inserts.
 func nullableString(s string) interface{} {
 	if s == "" {
@@ -1800,6 +1798,112 @@ func (s *SQLStore) GetBrokerConfig(ctx context.Context, vaultID string) (*Broker
 		vaultID,
 	)
 	return s.scanBrokerConfig(row)
+}
+
+// --- Database services ---
+
+const databaseServiceColumns = `id, vault_id, name, upstream, database, mount, role, sslmode, max_conns, created_at, updated_at`
+
+// UpsertDatabaseService creates or replaces a managed database service by
+// (vault_id, name). A re-upsert of an existing name overwrites its upstream and
+// Vault coordinates in place, so re-running an "add" is idempotent.
+func (s *SQLStore) UpsertDatabaseService(ctx context.Context, svc DatabaseService) (*DatabaseService, error) {
+	id := svc.ID
+	if id == "" {
+		id = newUUID()
+	}
+	// Empty sslmode is the documented default ("prefer"); the column's DDL
+	// default never fires because the INSERT always supplies the value, so
+	// normalize here — the single write chokepoint — to satisfy the CHECK and
+	// keep the stored value concrete for both the API and config-seed paths.
+	if svc.SSLMode == "" {
+		svc.SSLMode = "prefer"
+	}
+	now := time.Now().UTC()
+	nowStr := s.dialect.FormatTime(now)
+	_, err := s.db.ExecContext(ctx,
+		s.dialect.Rebind(`INSERT INTO database_services (`+databaseServiceColumns+`)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(vault_id, name) DO UPDATE SET
+		   upstream = excluded.upstream,
+		   database = excluded.database,
+		   mount = excluded.mount,
+		   role = excluded.role,
+		   sslmode = excluded.sslmode,
+		   max_conns = excluded.max_conns,
+		   updated_at = excluded.updated_at`),
+		id, svc.VaultID, svc.Name, svc.Upstream, svc.Database, svc.Mount, svc.Role, svc.SSLMode, svc.MaxConns, nowStr, nowStr,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("upserting database service: %w", err)
+	}
+	return s.GetDatabaseService(ctx, svc.VaultID, svc.Name)
+}
+
+// GetDatabaseService returns the named service in the vault, or sql.ErrNoRows
+// when absent.
+func (s *SQLStore) GetDatabaseService(ctx context.Context, vaultID, name string) (*DatabaseService, error) {
+	row := s.db.QueryRowContext(ctx,
+		s.dialect.Rebind(`SELECT `+databaseServiceColumns+` FROM database_services WHERE vault_id = ? AND name = ?`),
+		vaultID, name,
+	)
+	return s.scanDatabaseService(row)
+}
+
+// ListDatabaseServices returns every service in the vault, ordered by name for
+// stable iteration and discovery.
+func (s *SQLStore) ListDatabaseServices(ctx context.Context, vaultID string) ([]DatabaseService, error) {
+	rows, err := s.db.QueryContext(ctx,
+		s.dialect.Rebind(`SELECT `+databaseServiceColumns+` FROM database_services WHERE vault_id = ? ORDER BY name`),
+		vaultID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("listing database services: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []DatabaseService
+	for rows.Next() {
+		svc, err := s.scanDatabaseService(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *svc)
+	}
+	return out, rows.Err()
+}
+
+// DatabaseUpstreamLimit returns the strictest explicit limit across all
+// services using an endpoint. It exposes no cross-vault service metadata.
+func (s *SQLStore) DatabaseUpstreamLimit(ctx context.Context, upstream string) (int, error) {
+	var limit int
+	err := s.db.QueryRowContext(ctx, s.dialect.Rebind(`SELECT COALESCE(MIN(NULLIF(max_conns, 0)), 0) FROM database_services WHERE upstream = ?`), upstream).Scan(&limit)
+	return limit, err
+}
+
+// DeleteDatabaseService removes the named service and reports whether a row was
+// deleted, so the API can distinguish a delete from a not-found.
+func (s *SQLStore) DeleteDatabaseService(ctx context.Context, vaultID, name string) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		s.dialect.Rebind(`DELETE FROM database_services WHERE vault_id = ? AND name = ?`),
+		vaultID, name,
+	)
+	if err != nil {
+		return false, fmt.Errorf("deleting database service: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+func (s *SQLStore) scanDatabaseService(row rowScanner) (*DatabaseService, error) {
+	var svc DatabaseService
+	var createdAt, updatedAt interface{}
+	if err := row.Scan(&svc.ID, &svc.VaultID, &svc.Name, &svc.Upstream, &svc.Database,
+		&svc.Mount, &svc.Role, &svc.SSLMode, &svc.MaxConns, &createdAt, &updatedAt); err != nil {
+		return nil, err
+	}
+	svc.CreatedAt, _ = s.dialect.ScanTime(createdAt)
+	svc.UpdatedAt, _ = s.dialect.ScanTime(updatedAt)
+	return &svc, nil
 }
 
 // --- Proposals ---

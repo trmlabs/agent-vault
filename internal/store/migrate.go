@@ -32,6 +32,7 @@ func CountSourceTables(src *SQLStore) ([]TableCount, error) {
 		"credential_oauth",
 		"credential_oauth_states",
 		"broker_configs",
+		"database_services",
 		"sessions",
 		"proposals",
 		"proposal_credentials",
@@ -127,6 +128,7 @@ func MigrateData(ctx context.Context, src, dst *SQLStore, progressFn func(table 
 		{"credential_oauth", copyCredentialOAuth},
 		{"credential_oauth_states", copyCredentialOAuthStates},
 		{"broker_configs", copyBrokerConfigs},
+		{"database_services", copyDatabaseServices},
 		{"sessions", copySessions},
 		{"proposals", copyProposals},
 		{"proposal_credentials", copyProposalCredentials},
@@ -664,6 +666,41 @@ func copyBrokerConfigs(ctx context.Context, src *SQLStore, tx *sql.Tx, dstDialec
 			)
 		}
 		if err != nil {
+			return n, err
+		}
+		n++
+	}
+	return n, rows.Err()
+}
+
+func copyDatabaseServices(ctx context.Context, src *SQLStore, tx *sql.Tx, dstDialect Dialect) (int, error) {
+	rows, err := src.db.QueryContext(ctx,
+		"SELECT id, vault_id, name, upstream, database, mount, role, sslmode, max_conns, created_at, updated_at FROM database_services")
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	n := 0
+	for rows.Next() {
+		var id, vaultID, name, upstream, database, mount, role, sslmode string
+		var maxConns int
+		var createdAt, updatedAt interface{}
+		if err := rows.Scan(&id, &vaultID, &name, &upstream, &database, &mount, &role, &sslmode, &maxConns, &createdAt, &updatedAt); err != nil {
+			return n, err
+		}
+		ca, err := convertTime(createdAt, src.dialect, dstDialect)
+		if err != nil {
+			return n, fmt.Errorf("converting created_at: %w", err)
+		}
+		ua, err := convertTime(updatedAt, src.dialect, dstDialect)
+		if err != nil {
+			return n, fmt.Errorf("converting updated_at: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			dstDialect.Rebind("INSERT INTO database_services (id, vault_id, name, upstream, database, mount, role, sslmode, max_conns, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"),
+			id, vaultID, name, upstream, database, mount, role, sslmode, maxConns, ca, ua,
+		); err != nil {
 			return n, err
 		}
 		n++
