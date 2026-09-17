@@ -1,34 +1,47 @@
 # ---- Frontend build ----
-FROM node:26-alpine@sha256:7c6af15abe4e3de859690e7db171d0d711bf37d27528eddfe625b2fe89e097f8 AS frontend
+FROM --platform=$BUILDPLATFORM node:26-alpine@sha256:e88a35be04478413b7c71c455cd9865de9b9360e1f43456be5951032d7ac1a66 AS frontend
 
 WORKDIR /app
 COPY web/package.json web/package-lock.json ./
-RUN npm ci
+# Optional build-only trust for dependency registries behind a private CA.
+RUN --mount=type=secret,id=build_ca \
+    if [ -s /run/secrets/build_ca ]; then \
+      NODE_EXTRA_CA_CERTS=/run/secrets/build_ca npm ci; \
+    else npm ci; fi
 COPY web/ .
 RUN npm run build
 
 # ---- Go build stage ----
-FROM golang:1.26.3-alpine@sha256:91eda9776261207ea25fd06b5b7fed8d397dd2c0a283e77f2ab6e91bfa71079d AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26.8-alpine@sha256:ce864e7223ac17b1775e6fd0b4c0db580c2eb50e7953a427916379e4b92a1628 AS builder
 
+ARG TARGETOS
+ARG TARGETARCH
 ARG VERSION=dev
 ARG COMMIT=unknown
 ARG BUILD_DATE=unknown
+ARG POSTHOG_API_KEY=
 
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=secret,id=build_ca \
+    if [ -s /run/secrets/build_ca ]; then \
+      cat /etc/ssl/certs/ca-certificates.crt /run/secrets/build_ca > /tmp/build-ca.pem \
+      && SSL_CERT_FILE=/tmp/build-ca.pem go mod download \
+      && rm /tmp/build-ca.pem; \
+    else go mod download; fi
 COPY . .
 COPY --from=frontend /internal/server/webdist /src/internal/server/webdist
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w \
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w \
     -X github.com/Infisical/agent-vault/cmd.version=${VERSION} \
     -X github.com/Infisical/agent-vault/cmd.commit=${COMMIT} \
-    -X github.com/Infisical/agent-vault/cmd.date=${BUILD_DATE}" \
+    -X github.com/Infisical/agent-vault/cmd.date=${BUILD_DATE} \
+    -X github.com/Infisical/agent-vault/cmd.posthogAPIKey=${POSTHOG_API_KEY}" \
     -o /agent-vault .
 
 # ---- Runtime stage ----
-FROM alpine:3.23.4@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11
+FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 
-RUN apk add --no-cache ca-certificates \
+RUN apk add --no-cache ca-certificates "libcrypto3>=3.5.8-r0" "libssl3>=3.5.8-r0" \
     && addgroup -S agentvault && adduser -S -G agentvault -u 65532 agentvault \
     && mkdir -p /data/.agent-vault && chown -R agentvault:agentvault /data
 

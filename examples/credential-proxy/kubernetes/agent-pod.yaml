@@ -1,0 +1,52 @@
+# Substitute an approved image digest before applying. Supply the actual task
+# command separately. This example intentionally contains no standing token.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: credential-proxy-agent
+  namespace: credential-proxy-demo
+  labels:
+    app: credential-proxy-agent
+spec:
+  serviceAccountName: credential-proxy-agent
+  automountServiceAccountToken: false
+  hostNetwork: false
+  hostPID: false
+  hostIPC: false
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: agent
+      image: REPLACE_WITH_APPROVED_IMAGE_DIGEST
+      command: [/bin/sh, -c, 'sleep 3600']
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+      resources:
+        requests:
+          cpu: 100m
+          memory: 64Mi
+        limits:
+          cpu: '1'
+          memory: 256Mi
+      volumeMounts:
+        - name: broker-proof
+          mountPath: /var/run/credential-proxy
+          readOnly: true
+  volumes:
+    - name: broker-proof
+      projected:
+        defaultMode: 0440
+        sources:
+          - serviceAccountToken:
+              path: token
+              audience: credential-proxy
+              expirationSeconds: 600

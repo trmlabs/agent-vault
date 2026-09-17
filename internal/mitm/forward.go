@@ -76,16 +76,18 @@ func isAbsoluteForwardProxyRequest(r *http.Request) bool {
 }
 
 // handleForward serves an absolute-form forward-proxy request for an
-// http:// upstream. Compared to the CONNECT path: no hijack (the
-// response is a normal HTTP/1.1 reply over the existing connection),
-// and the scope is resolved per request rather than once
-// per tunnel.
+// http:// upstream without hijacking or a client-side TLS tunnel.
+// Both ingress paths resolve scope per request.
 func (p *Proxy) handleForward(w http.ResponseWriter, r *http.Request) {
 	// Read-only pre-gate: reject if this IP's auth-failure budget is
 	// exhausted. Only auth failures are recorded (below). Shares the
 	// TierAuth budget and key shape with CONNECT. Loopback is exempt.
 	if p.rateLimit != nil && !isLoopbackPeer(r) {
 		if d := p.rateLimit.Check(ratelimit.TierAuth, mitmIPKey(r)); !d.Allow {
+			if p.strictCredentialProxy {
+				p.strictUnauthenticatedDeny(w, r, http.StatusTooManyRequests)
+				return
+			}
 			ratelimit.WriteDenial(w, d, "Too many proxy requests")
 			return
 		}
@@ -107,12 +109,20 @@ func (p *Proxy) handleForward(w http.ResponseWriter, r *http.Request) {
 	}
 	portNum, err := strconv.Atoi(portStr)
 	if err != nil {
+		if p.strictCredentialProxy {
+			p.strictUnauthenticatedDeny(w, r, http.StatusBadRequest)
+			return
+		}
 		http.Error(w, "invalid port", http.StatusBadRequest)
 		return
 	}
 	target := net.JoinHostPort(host, portStr)
 
 	if !isValidHost(host) {
+		if p.strictCredentialProxy {
+			p.strictUnauthenticatedDeny(w, r, http.StatusBadRequest)
+			return
+		}
 		http.Error(w, "invalid host", http.StatusBadRequest)
 		return
 	}
@@ -131,12 +141,20 @@ func (p *Proxy) handleForward(w http.ResponseWriter, r *http.Request) {
 	token, hint, err := brokercore.ParseProxyAuth(r)
 	if err != nil {
 		p.recordAuthFailure(r)
+		if p.strictCredentialProxy {
+			p.strictUnauthenticatedDeny(w, r, http.StatusProxyAuthRequired)
+			return
+		}
 		writeProxyAuthChallenge(w, "Proxy-Authorization required")
 		return
 	}
 	scope, err := p.sessions.ResolveForProxy(r.Context(), token, hint)
 	if err != nil {
 		p.recordAuthFailure(r)
+		if p.strictCredentialProxy {
+			p.strictUnauthenticatedDeny(w, r, http.StatusForbidden)
+			return
+		}
 		writeAuthError(w, err)
 		return
 	}
@@ -194,6 +212,10 @@ func (p *Proxy) forwardRequest(
 	useTLSUpstream bool,
 	scope *brokercore.ProxyScope,
 ) {
+	if p.strictCredentialProxy {
+		p.forwardStrict(w, r, target, host, port, useTLSUpstream, scope)
+		return
+	}
 	start := time.Now()
 	authScheme, authHeader := detectAuthFromHeaders(r.Header)
 	event := brokercore.ProxyEvent{
