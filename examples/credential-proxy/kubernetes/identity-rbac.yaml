@@ -1,0 +1,64 @@
+# Identity permissions only. This does not deploy the broker or permit egress.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: credential-proxy-demo
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: credential-proxy-reviewer
+  namespace: credential-proxy-demo
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: credential-proxy-agent
+  namespace: credential-proxy-demo
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: credential-proxy-demo-tokenreview
+rules:
+  - apiGroups: [authentication.k8s.io]
+    resources: [tokenreviews]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: credential-proxy-demo-tokenreview
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: credential-proxy-demo-tokenreview
+subjects:
+  - kind: ServiceAccount
+    name: credential-proxy-reviewer
+    namespace: credential-proxy-demo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: credential-proxy-demo-pod-check
+  namespace: credential-proxy-demo
+rules:
+  - apiGroups: ['']
+    resources: [pods]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: credential-proxy-demo-pod-check
+  namespace: credential-proxy-demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: credential-proxy-demo-pod-check
+subjects:
+  - kind: ServiceAccount
+    name: credential-proxy-reviewer
+    namespace: credential-proxy-demo

@@ -2,7 +2,21 @@
 
 Agent Vault is an HTTP proxy that attaches credentials to your outbound requests. You never see or handle credentials directly — route authenticated requests through Agent Vault and it authenticates on your behalf.
 
-## When to use
+## Managed credential-proxy profile
+
+When the managed runner selects this profile, use its approved destinations, placeholder mappings, fresh workload proof and verified encrypted connection. The legacy token, discovery and proposal instructions below do not apply. Never request a standing token, invent a mapping or fall back to a direct connection.
+
+HTTP supports approved HTTPS GET/HEAD requests without a query or body, with configured placeholders only in `Authorization` or `X-Api-Key`. The runner supplies proof through `Proxy-Authorization`; PostgreSQL uses proof in its password field. Never log proof or put it in a destination header. Reconnect with fresh proof before expiry.
+
+- `403`: denied identity, mapping, destination or request format. Stop and report it.
+- `429`: rate limited. Pause before retrying the approved request.
+- `503`: required audit recording unavailable; the outcome may be unknown. Report it without bypassing or blindly repeating the request.
+
+## Legacy token workflow
+
+The remaining instructions apply only when the runner uses legacy session tokens.
+
+### When to use
 
 1. Check that `AGENT_VAULT_TOKEN` is set — if not, Agent Vault is not available
 2. Call `/discover` to get the list of brokerable services

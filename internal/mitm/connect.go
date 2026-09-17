@@ -48,12 +48,28 @@ func isLoopbackPeer(r *http.Request) bool {
 // CONNECT request line (r.Host) and captured in a closure so subsequent
 // Host-header rewrites by the client cannot redirect the tunnel.
 func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
+	// Count pending authentication and the whole tunnel lifetime. The actor
+	// request limit inside a tunnel does not bound idle TLS connections.
+	if p.strictCredentialProxy {
+		select {
+		case p.strictTunnels <- struct{}{}:
+			defer func() { <-p.strictTunnels }()
+		default:
+			p.strictUnauthenticatedDeny(w, r, http.StatusTooManyRequests)
+			return
+		}
+	}
+
 	// Read-only pre-gate: if this IP has exhausted its auth-failure
 	// budget, reject immediately. Only auth failures are recorded
 	// (below) so legitimate agents don't burn the budget. Loopback
 	// is exempt — see isLoopbackPeer.
 	if p.rateLimit != nil && !isLoopbackPeer(r) {
 		if d := p.rateLimit.Check(ratelimit.TierAuth, mitmIPKey(r)); !d.Allow {
+			if p.strictCredentialProxy {
+				p.strictUnauthenticatedDeny(w, r, http.StatusTooManyRequests)
+				return
+			}
 			ratelimit.WriteDenial(w, d, "Too many CONNECT attempts")
 			return
 		}
@@ -62,11 +78,23 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	target := r.Host
 	host, portStr, err := net.SplitHostPort(target)
 	if err != nil {
+		if p.strictCredentialProxy {
+			p.strictUnauthenticatedDeny(w, r, http.StatusBadRequest)
+			return
+		}
 		http.Error(w, "CONNECT target must be host:port", http.StatusBadRequest)
 		return
 	}
-	port, _ := strconv.Atoi(portStr)
+	port, portErr := strconv.Atoi(portStr)
+	if p.strictCredentialProxy && (portErr != nil || port < 1 || port > 65535) {
+		p.strictUnauthenticatedDeny(w, r, http.StatusBadRequest)
+		return
+	}
 	if !isValidHost(host) {
+		if p.strictCredentialProxy {
+			p.strictUnauthenticatedDeny(w, r, http.StatusBadRequest)
+			return
+		}
 		http.Error(w, "invalid host", http.StatusBadRequest)
 		return
 	}
@@ -77,12 +105,20 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	token, hint, err := brokercore.ParseProxyAuth(r)
 	if err != nil {
 		p.recordAuthFailure(r)
+		if p.strictCredentialProxy {
+			p.strictUnauthenticatedDeny(w, r, http.StatusProxyAuthRequired)
+			return
+		}
 		writeProxyAuthChallenge(w, "Proxy-Authorization required")
 		return
 	}
-	scope, err := p.sessions.ResolveForProxy(r.Context(), token, hint)
+	_, err = p.sessions.ResolveForProxy(r.Context(), token, hint)
 	if err != nil {
 		p.recordAuthFailure(r)
+		if p.strictCredentialProxy {
+			p.strictUnauthenticatedDeny(w, r, http.StatusForbidden)
+			return
+		}
 		writeAuthError(w, err)
 		return
 	}
@@ -120,7 +156,9 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	_ = tlsConn.SetDeadline(time.Now().Add(10 * time.Second))
 	if err := tlsConn.Handshake(); err != nil {
 		// err may carry TLS alert detail from the client — diagnostic, not secret.
-		p.logger.Warn("mitm TLS handshake failed", "host", host, "err", err.Error())
+		if !p.strictCredentialProxy {
+			p.logger.Warn("mitm TLS handshake failed", "host", host, "err", err.Error())
+		}
 		_ = tlsConn.Close()
 		return
 	}
@@ -133,7 +171,21 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// closes the listener so Serve returns.
 	listener := newOneShotListener(tlsConn)
 	srv := &http.Server{
-		Handler: p.forwardHandler(target, host, port, scope),
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// A tunnel can outlive its token or grant. Recheck each request
+			// against the original proxy identity before injecting credentials.
+			scope, err := p.sessions.ResolveForProxy(r.Context(), token, hint)
+			if err != nil {
+				w.Header().Set("Connection", "close")
+				if p.strictCredentialProxy {
+					p.strictUnauthenticatedDeny(w, r, http.StatusForbidden)
+					return
+				}
+				writeAuthError(w, err)
+				return
+			}
+			p.forwardHandler(target, host, port, scope).ServeHTTP(w, r)
+		}),
 		// ReadHeaderTimeout and ReadTimeout bound the request side
 		// (slow-loris defense). IdleTimeout caps keep-alives between
 		// requests. The upstream transport's ResponseHeaderTimeout
@@ -174,7 +226,7 @@ func writeProxyAuthChallenge(w http.ResponseWriter, msg string) {
 }
 
 // writeAuthError maps a brokercore session-resolution error to an HTTP
-// response. All writes happen before the connection is hijacked.
+// response at tunnel admission or before forwarding a tunneled request.
 func writeAuthError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, brokercore.ErrInvalidSession):

@@ -1,0 +1,4 @@
+.git
+**/node_modules
+internal/server/webdist/*
+!internal/server/webdist/.gitkeep

@@ -28,8 +28,8 @@ package mitm
 
 import (
 	"context"
-	"log/slog"
 	"crypto/tls"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync/atomic"
@@ -45,18 +45,21 @@ import (
 // Proxy is a transparent MITM proxy. It is safe to start at most once;
 // reuse across Shutdown is not supported.
 type Proxy struct {
-	ca               ca.Provider
-	sessions         brokercore.SessionResolver
-	creds            brokercore.CredentialProvider
-	httpServer       *http.Server
-	upstream         *http.Transport
-	isListening      atomic.Bool
-	baseURL          string // externally-reachable control-plane URL for help links
-	logger           *slog.Logger
-	rateLimit        *ratelimit.Registry // shared with the HTTP server; nil = no-op
-	logSink          requestlog.Sink     // never nil (Nop default); shared with the HTTP server
-	maxResponseBytes int64               // 0 = unlimited
-	maxRequestBytes  int64
+	ca                    ca.Provider
+	sessions              brokercore.SessionResolver
+	creds                 brokercore.CredentialProvider
+	httpServer            *http.Server
+	upstream              *http.Transport
+	isListening           atomic.Bool
+	baseURL               string // externally-reachable control-plane URL for help links
+	logger                *slog.Logger
+	rateLimit             *ratelimit.Registry // shared with the HTTP server; nil = no-op
+	logSink               requestlog.Sink     // never nil (Nop default); shared with the HTTP server
+	maxResponseBytes      int64               // 0 = unlimited
+	maxRequestBytes       int64
+	strictCredentialProxy bool
+	durableAudit          requestlog.Durable
+	strictTunnels         chan struct{}
 }
 
 // Options carries the dependencies a Proxy needs. BaseURL is the
@@ -66,15 +69,18 @@ type Proxy struct {
 // server so proxy limits and control-plane limits live in one registry;
 // nil disables rate limiting on the MITM path.
 type Options struct {
-	CA               ca.Provider
-	Sessions         brokercore.SessionResolver
-	Credentials      brokercore.CredentialProvider
-	BaseURL          string
-	Logger           *slog.Logger
-	RateLimit        *ratelimit.Registry
-	LogSink          requestlog.Sink // nil → Nop
-	MaxResponseBytes int64           // 0 = unlimited (default); >0 = cap in bytes
-	MaxRequestBytes  int64           // 0 → DefaultMaxRequestBytes (1 GiB)
+	MaxCredentialProxyTunnels int                // <=0 defaults to 128 pending or active CONNECT tunnels
+	StrictCredentialProxy     bool               // bounded header-placeholder release path
+	DurableAudit              requestlog.Durable // mandatory when strict mode is enabled
+	CA                        ca.Provider
+	Sessions                  brokercore.SessionResolver
+	Credentials               brokercore.CredentialProvider
+	BaseURL                   string
+	Logger                    *slog.Logger
+	RateLimit                 *ratelimit.Registry
+	LogSink                   requestlog.Sink // nil → Nop
+	MaxResponseBytes          int64           // 0 = unlimited (default); >0 = cap in bytes
+	MaxRequestBytes           int64           // 0 → DefaultMaxRequestBytes (1 GiB)
 }
 
 // New builds a Proxy bound to addr. The returned Proxy does not begin
@@ -83,6 +89,8 @@ func New(addr string, opts Options) *Proxy {
 	upstream := &http.Transport{
 		DialContext:           netguard.SafeDialContext(netguard.AllowPrivateFromEnv()),
 		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+		DisableCompression:    opts.StrictCredentialProxy,
+		DisableKeepAlives:     opts.StrictCredentialProxy, // avoid transport retries on reused connections
 		ForceAttemptHTTP2:     false,
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
@@ -100,17 +108,24 @@ func New(addr string, opts Options) *Proxy {
 		maxReq = brokercore.DefaultMaxRequestBytes
 	}
 
+	tunnelLimit := opts.MaxCredentialProxyTunnels
+	if tunnelLimit <= 0 {
+		tunnelLimit = 128
+	}
 	p := &Proxy{
-		ca:               opts.CA,
-		sessions:         opts.Sessions,
-		creds:            opts.Credentials,
-		upstream:         upstream,
-		baseURL:          opts.BaseURL,
-		logger:           opts.Logger,
-		rateLimit:        opts.RateLimit,
-		logSink:          sink,
-		maxResponseBytes: opts.MaxResponseBytes, // 0 = unlimited
-		maxRequestBytes:  maxReq,
+		ca:                    opts.CA,
+		strictCredentialProxy: opts.StrictCredentialProxy,
+		durableAudit:          opts.DurableAudit,
+		strictTunnels:         make(chan struct{}, tunnelLimit),
+		sessions:              opts.Sessions,
+		creds:                 opts.Credentials,
+		upstream:              upstream,
+		baseURL:               opts.BaseURL,
+		logger:                opts.Logger,
+		rateLimit:             opts.RateLimit,
+		logSink:               sink,
+		maxResponseBytes:      opts.MaxResponseBytes, // 0 = unlimited
+		maxRequestBytes:       maxReq,
 	}
 
 	p.httpServer = &http.Server{
@@ -176,6 +191,10 @@ func (p *Proxy) dispatch(w http.ResponseWriter, r *http.Request) {
 	}
 	if isAbsoluteForwardProxyRequest(r) {
 		p.handleForward(w, r)
+		return
+	}
+	if p.strictCredentialProxy {
+		p.strictUnauthenticatedDeny(w, r, http.StatusBadRequest)
 		return
 	}
 	// Origin-form (no scheme/host), https://, ws://, file://, gopher://,
