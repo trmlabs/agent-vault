@@ -39,7 +39,7 @@ jobs:
               run: npm ci
 
             - name: Set NPM version
-              run: npm version ${GITHUB_REF_NAME#node-sdk/v} --allow-same-version --no-git-tag-version
+              run: npm version "${GITHUB_REF_NAME#node-sdk/v}" --allow-same-version --no-git-tag-version
 
             - name: Publish NPM
               run: npm publish --access public --provenance
