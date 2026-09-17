@@ -495,7 +495,7 @@ func TestMITMForwardEmitsRequestLogRow(t *testing.T) {
 		}},
 	}}
 	sink := &recordingSink{}
-	proxyURL, clientRoots, _ := setupProxy(t, sr, cp, func(o *Options) { o.LogSink = sink })
+	proxyURL, clientRoots, proxy := setupProxy(t, sr, cp, func(o *Options) { o.LogSink = sink })
 
 	client := newTrustingClient(proxyURL, url.User("av_sess_ok"), clientRoots)
 	req, err := http.NewRequest("POST", upstream.URL+"/v1/things", strings.NewReader("payload"))
@@ -506,7 +506,19 @@ func TestMITMForwardEmitsRequestLogRow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client.Do: %v", err)
 	}
+	_, readErr := io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
+	if readErr != nil {
+		t.Fatalf("read response: %v", readErr)
+	}
+
+	// Response bytes can be flushed before the handler records its log row.
+	// Drain active handlers before inspecting all records, including duplicates.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := proxy.Shutdown(ctx); err != nil {
+		t.Fatalf("drain proxy handlers: %v", err)
+	}
 
 	rows := sink.snapshot()
 	if len(rows) != 1 {
@@ -571,7 +583,7 @@ func TestMITMForwardKeepalivePersistsAcrossRequests(t *testing.T) {
 		upstreamHost: {result: &brokercore.InjectResult{Passthrough: true}},
 	}}
 	sink := &recordingSink{}
-	proxyURL, clientRoots, _ := setupProxy(t, sr, cp, func(o *Options) { o.LogSink = sink })
+	proxyURL, clientRoots, proxy := setupProxy(t, sr, cp, func(o *Options) { o.LogSink = sink })
 
 	client := newTrustingClient(proxyURL, url.User("av_sess_ok"), clientRoots)
 
@@ -589,6 +601,12 @@ func TestMITMForwardKeepalivePersistsAcrossRequests(t *testing.T) {
 
 	if got := hits.Load(); got != 2 {
 		t.Fatalf("upstream hits = %d, want 2", got)
+	}
+	// Even a fully read response may precede the handler's final log emission.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := proxy.Shutdown(ctx); err != nil {
+		t.Fatalf("drain proxy handlers: %v", err)
 	}
 	if rows := sink.snapshot(); len(rows) != 2 {
 		t.Fatalf("got %d log rows, want 2", len(rows))
