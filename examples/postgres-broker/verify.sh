@@ -86,3 +86,6 @@ go test -p 1 -tags 'realpg realvault loadpg' ./internal/pgproxy ./internal/hashi
 if [[ ${AV_VERIFY_COMBINED:-false} == true ]]; then
   go test -tags realcombined ./internal/mitm -run '^TestRealCombinedWorkloadProofVaultAndPostgres$' -count=1 -v -timeout 2m
 fi
+
+# Parent authentication expiry crosses HTTP and PostgreSQL boundaries.
+go test -tags realvault ./internal/mitm -run '^TestRealVault_BrokerParentExpiry$' -count=1 -v -timeout 2m

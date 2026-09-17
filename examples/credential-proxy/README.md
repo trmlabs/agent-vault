@@ -119,8 +119,11 @@ python3 examples/credential-proxy/verify-bootstrap.py --docker-host unix:///path
 This check creates a fresh store and disposable Vault, then observes a short
 Vault login expire and a controlled restart obtain a fresh login. The current
 broker does not renew that login automatically. No caller is admitted in this
-check; validate request denial, active database cleanup and recovery during
-login expiry before accepting the deployment's restart strategy.
+check. The default real-service demo separately checks HTTP denial, failed new
+database credential issuance, active database cleanup and recovery with fresh
+clients after parent authorization expires. Its caller identity is synthetic
+and its database connections are direct. Verify the selected deployment's
+expiry timing and restart procedure before activation.
 
 Startup database entries are applied once per vault and name. Seed history and binding deletion are committed durably, so restarting with unchanged configuration does not restore a removed binding. Explicit CLI/API additions can restore access intentionally. New names in bootstrap configuration can still be created; runtime edits are preserved.
 
