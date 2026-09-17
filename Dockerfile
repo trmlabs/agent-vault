@@ -3,7 +3,11 @@ FROM node:26-alpine@sha256:e88a35be04478413b7c71c455cd9865de9b9360e1f43456be5951
 
 WORKDIR /app
 COPY web/package.json web/package-lock.json ./
-RUN npm ci
+# Optional build-only trust for dependency registries behind a private CA.
+RUN --mount=type=secret,id=build_ca \
+    if [ -s /run/secrets/build_ca ]; then \
+      NODE_EXTRA_CA_CERTS=/run/secrets/build_ca npm ci; \
+    else npm ci; fi
 COPY web/ .
 RUN npm run build
 
@@ -17,7 +21,12 @@ ARG POSTHOG_API_KEY=
 
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=secret,id=build_ca \
+    if [ -s /run/secrets/build_ca ]; then \
+      cat /etc/ssl/certs/ca-certificates.crt /run/secrets/build_ca > /tmp/build-ca.pem \
+      && SSL_CERT_FILE=/tmp/build-ca.pem go mod download \
+      && rm /tmp/build-ca.pem; \
+    else go mod download; fi
 COPY . .
 COPY --from=frontend /internal/server/webdist /src/internal/server/webdist
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w \
