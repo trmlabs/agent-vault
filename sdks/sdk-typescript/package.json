@@ -39,10 +39,10 @@
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {
-    "@types/node": "^22.20.2",
+    "@types/node": "^20.0.0",
     "tsup": "^8.0.0",
     "typescript": "^5.8.0",
-    "vitest": "^5.0.1"
+    "vitest": "^4.1.11"
   },
   "keywords": [
     "agent-vault",
