@@ -529,6 +529,7 @@ type Store interface {
 
 	// Database services (managed PostgreSQL-broker upstreams, per vault)
 	UpsertDatabaseService(ctx context.Context, svc DatabaseService) (*DatabaseService, error)
+	SeedDatabaseService(ctx context.Context, svc DatabaseService) (bool, error)
 	GetDatabaseService(ctx context.Context, vaultID, name string) (*DatabaseService, error)
 	ListDatabaseServices(ctx context.Context, vaultID string) ([]DatabaseService, error)
 	DatabaseUpstreamLimit(ctx context.Context, upstream string) (int, error)

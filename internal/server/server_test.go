@@ -553,6 +553,14 @@ func (m *mockStore) SetBrokerConfig(_ context.Context, vaultID, servicesJSON str
 	return bc, nil
 }
 
+func (m *mockStore) SeedDatabaseService(ctx context.Context, svc store.DatabaseService) (bool, error) {
+	if _, err := m.GetDatabaseService(ctx, svc.VaultID, svc.Name); err == nil {
+		return false, nil
+	}
+	_, err := m.UpsertDatabaseService(ctx, svc)
+	return err == nil, err
+}
+
 func (m *mockStore) UpsertDatabaseService(_ context.Context, svc store.DatabaseService) (*store.DatabaseService, error) {
 	if svc.ID == "" {
 		svc.ID = "dbs-" + svc.VaultID + "-" + svc.Name

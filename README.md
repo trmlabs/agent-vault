@@ -1,3 +1,5 @@
+> This is TRM's maintained fork of [Infisical Agent Vault](https://github.com/Infisical/agent-vault). The credential-proxy profile and its verification commands are documented in [examples/credential-proxy](examples/credential-proxy/README.md). Upstream installation commands and package names below refer to Infisical releases, not a published TRM release. Downstream release publishing is disabled until its destinations and approval controls are configured.
+
 <p align="center">
   <img src="assets/banner.png" alt="Agent Vault" />
 </p>
@@ -6,7 +8,7 @@
 
 <p align="center">
 An open-source credential broker by <a href="https://infisical.com">Infisical</a> that sits between your agents and the APIs they call.<br>
-Agents should not possess credentials. Agent Vault eliminates credential exfiltration risk with brokered access.
+Agents should not possess destination credentials. Agent Vault brokers access on their behalf; protecting credentials also requires trusted destinations, isolated deployment and controls against bypass.
 </p>
 
 <p align="center">
@@ -25,7 +27,7 @@ Agents should not possess credentials. Agent Vault eliminates credential exfiltr
 
 Traditional secrets management involves returning credentials back to you applications and services. This breaks down with AI agents which can be tricked via [prompt injection](https://en.wikipedia.org/wiki/Prompt_injection) into leaking secrets. This is the problem of **credential exfiltration**.
 
-Agent Vault was created to solve credential exfiltration for all AI agents. Instead of giving AI agents credentals directly, you store them in Agent Vault (e.g. `ANTHROPIC_API_KEY`, `GITHUB_PAT`, etc.) and force your agents to route HTTP requests through it. Agent Vault intercepts every request and attaches credentials onto it before forwarding the request to the target outbound API.
+Agent Vault brokers credentials for agents using supported proxy protocols. Instead of giving AI agents credentals directly, you store them in Agent Vault (e.g. `ANTHROPIC_API_KEY`, `GITHUB_PAT`, etc.) and force your agents to route HTTP requests through it. Agent Vault intercepts every request and attaches credentials onto it before forwarding the request to the target outbound API.
 
 Features:
 
@@ -200,7 +202,7 @@ The disposable verification image runs real Vault and PostgreSQL with synthetic 
 
 ## PostgreSQL (Production)
 
-By default Agent Vault stores all state in a local SQLite database, which requires no setup. For production deployments, or when running multiple instances, set the `DATABASE_URL` environment variable (or `--database-url` flag) to a PostgreSQL connection string and Agent Vault switches to Postgres as its backend. All instances share the same database, so state is consistent across replicas.
+By default Agent Vault stores all state in a local SQLite database, which requires no setup. For production deployments, or when running multiple instances, set the `DATABASE_URL` environment variable (or `--database-url` flag) to a PostgreSQL connection string and Agent Vault switches to Postgres as its backend. Legacy instances can share that database. The strict credential-proxy profile currently requires a single active broker: its durable database cleanup owner is exclusive, so do not enable multiple replicas or overlapping rollouts.
 
 Migrate existing data with `agent-vault migrate-db --to postgres://...` before switching. See the [PostgreSQL guide](https://docs.agent-vault.dev/self-hosting/postgres) for deployment examples (Kubernetes, Docker Compose), architecture notes, and operational details.
 
@@ -252,7 +254,7 @@ make docker     # Build Docker image
 
 ## Open-source vs. paid
 
-This repo available under the [MIT expat license](https://github.com/Infisical/infisical/blob/main/LICENSE), with the exception of the `ee` directory which will contain premium enterprise features requiring a Infisical license.
+This repo available under the [MIT expat license](LICENSE), with the exception of the `ee` directory which will contain premium enterprise features requiring a Infisical license.
 
 If you are interested in Infisical or exploring a more commercial path for Agent Vault, take a look at [our website](https://infisical.com/) or [book a meeting with us](https://infisical.cal.com/vlad/infisical-demo).
 

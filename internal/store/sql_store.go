@@ -1883,15 +1883,26 @@ func (s *SQLStore) DatabaseUpstreamLimit(ctx context.Context, upstream string) (
 // DeleteDatabaseService removes the named service and reports whether a row was
 // deleted, so the API can distinguish a delete from a not-found.
 func (s *SQLStore) DeleteDatabaseService(ctx context.Context, vaultID, name string) (bool, error) {
-	res, err := s.db.ExecContext(ctx,
-		s.dialect.Rebind(`DELETE FROM database_services WHERE vault_id = ? AND name = ?`),
-		vaultID, name,
-	)
+	var removed bool
+	err := s.auditWrite(ctx, func(tx *sql.Tx) error {
+		// Serialize deletion with a first seed and remember removals even when
+		// the service was originally added through the API rather than config.
+		if _, err := tx.ExecContext(ctx, s.dialect.Rebind(`INSERT INTO database_service_seed_history (vault_id, name)
+			SELECT id, ? FROM vaults WHERE id = ? ON CONFLICT(vault_id, name) DO NOTHING`), name, vaultID); err != nil {
+			return err
+		}
+		res, err := tx.ExecContext(ctx, s.dialect.Rebind(`DELETE FROM database_services WHERE vault_id = ? AND name = ?`), vaultID, name)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		removed = n > 0
+		return err
+	})
 	if err != nil {
 		return false, fmt.Errorf("deleting database service: %w", err)
 	}
-	n, _ := res.RowsAffected()
-	return n > 0, nil
+	return removed, nil
 }
 
 func (s *SQLStore) scanDatabaseService(row rowScanner) (*DatabaseService, error) {

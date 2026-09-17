@@ -93,3 +93,9 @@ managed-database behavior or production operational checks.
 When the required deployed checks pass, the approved workload can perform its
 HTTP and PostgreSQL tasks without receiving destination credentials, and access
 ends when its identity or permission is withdrawn.
+
+### Database bootstrap and removals
+
+Startup database entries are applied once per vault and name. Seed history and binding deletion are committed durably, so restarting with unchanged configuration does not restore a removed binding. Explicit CLI/API additions can restore access intentionally. New names in bootstrap configuration can still be created; runtime edits are preserved.
+
+Before upgrading a store created without seed history, remove previously deleted bindings from startup configuration. The migration cannot infer old deletions from absent rows. Keep the broker disabled until that configuration is reviewed.
