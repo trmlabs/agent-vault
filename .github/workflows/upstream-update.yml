@@ -1,0 +1,32 @@
+name: Review upstream updates
+
+on:
+  schedule:
+    - cron: '17 9 * * 1'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-update
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.repository != 'Infisical/agent-vault' && vars.UPSTREAM_UPDATES_ENABLED == 'true' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Propose merge without executing upstream code
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/upstream-update.py

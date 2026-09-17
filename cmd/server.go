@@ -18,15 +18,22 @@ import (
 	"time"
 
 	"github.com/Infisical/agent-vault/internal/auth"
+	"github.com/Infisical/agent-vault/internal/brokercore"
 	"github.com/Infisical/agent-vault/internal/ca"
 	"github.com/Infisical/agent-vault/internal/crypto"
+	"github.com/Infisical/agent-vault/internal/hashicorp"
 	"github.com/Infisical/agent-vault/internal/infisical"
 	"github.com/Infisical/agent-vault/internal/mitm"
+	"github.com/Infisical/agent-vault/internal/netguard"
 	"github.com/Infisical/agent-vault/internal/notify"
+	"github.com/Infisical/agent-vault/internal/pgproxy"
 	"github.com/Infisical/agent-vault/internal/pidfile"
 	"github.com/Infisical/agent-vault/internal/requestlog"
 	"github.com/Infisical/agent-vault/internal/server"
+	"github.com/Infisical/agent-vault/internal/session"
 	"github.com/Infisical/agent-vault/internal/store"
+	"github.com/Infisical/agent-vault/internal/telemetry"
+	"github.com/Infisical/agent-vault/internal/workloadidentity"
 	"github.com/spf13/cobra"
 )
 
@@ -79,6 +86,7 @@ var serverCmd = &cobra.Command{
 		host, _ := cmd.Flags().GetString("host")
 		detach, _ := cmd.Flags().GetBool("detach")
 		mitmPort, _ := cmd.Flags().GetInt("mitm-port")
+		postgresPort, _ := cmd.Flags().GetInt("postgres-port")
 		logLevelFlag, _ := cmd.Flags().GetString("log-level")
 		logLevelChanged := cmd.Flags().Changed("log-level")
 		maxRespBytes, _ := cmd.Flags().GetInt64("max-response-bytes")
@@ -93,7 +101,7 @@ var serverCmd = &cobra.Command{
 
 		// --- Detached child path: read master key + initialized flag from stdin pipe ---
 		if os.Getenv("_AGENT_VAULT_DETACHED") == "1" {
-			return runDetachedChild(host, addr, mitmPort, logger, maxRespBytes, maxReqBytes)
+			return runDetachedChild(host, addr, mitmPort, postgresPort, logger, maxRespBytes, maxReqBytes)
 		}
 
 		// Pre-flight before unlocking the vault: don't make the user type a
@@ -105,16 +113,36 @@ var serverCmd = &cobra.Command{
 			_ = pidfile.Remove()
 		}
 
+		dbURL := os.Getenv("DATABASE_URL")
+		if flagURL, _ := cmd.Flags().GetString("database-url"); flagURL != "" {
+			dbURL = flagURL
+		}
 		dbPath, err := store.DefaultDBPath()
-		if err != nil {
+		if err != nil && dbURL == "" {
 			return fmt.Errorf("resolving db path: %w", err)
 		}
 
-		db, err := store.Open(dbPath)
+		db, err := store.OpenStore(store.StoreConfig{
+			DatabaseURL: dbURL,
+			SQLitePath:  dbPath,
+		})
 		if err != nil {
 			return fmt.Errorf("opening store: %w", err)
 		}
 		defer func() { _ = db.Close() }()
+
+		if dbURL != "" {
+			if n, _ := db.CountUsers(context.Background()); n == 0 {
+				if sqlitePath, err2 := store.DefaultDBPath(); err2 == nil {
+					if _, err2 := os.Stat(sqlitePath); err2 == nil {
+						fmt.Fprintln(cmd.OutOrStderr(),
+							"warning: DATABASE_URL is set but the Postgres database has no users.",
+							"If you have existing data in SQLite, run 'agent-vault migrate-db --to <url>' first.",
+						)
+					}
+				}
+			}
+		}
 
 		passwordStdin, _ := cmd.Flags().GetBool("password-stdin")
 		interactive := !passwordStdin && os.Getenv("AGENT_VAULT_MASTER_PASSWORD") == ""
@@ -146,7 +174,7 @@ var serverCmd = &cobra.Command{
 			if logLevelChanged {
 				explicitLogLevel = &logLevelFlag
 			}
-			return spawnDetached(cmd, masterKey, initialized, host, port, mitmPort, addr, explicitLogLevel, maxRespBytes, maxReqBytes)
+			return spawnDetached(cmd, masterKey, initialized, host, port, mitmPort, postgresPort, addr, explicitLogLevel, maxRespBytes, maxReqBytes)
 		}
 
 		// --- Foreground path ---
@@ -157,11 +185,13 @@ var serverCmd = &cobra.Command{
 		notifier := notify.New(smtpCfg)
 		srv := server.New(addr, db, masterKey.Key(), notifier, initialized, baseURL, logger)
 		srv.SetSkills(skillCLI)
+		srv.AttachTelemetry(tel)
 		shutdownLogs := attachLogSink(srv, db, logger)
 		defer shutdownLogs()
-		if err := attachServerExtensions(srv, host, mitmPort, masterKey.Key(), logger, maxRespBytes, maxReqBytes); err != nil {
+		if err := attachServerExtensions(srv, host, mitmPort, postgresPort, masterKey.Key(), db, logger, maxRespBytes, maxReqBytes); err != nil {
 			return err
 		}
+		captureServerStart(mitmPort, db.DialectName())
 		return srv.Start()
 	},
 }
@@ -174,9 +204,13 @@ var serverCmd = &cobra.Command{
 // in server.Start: since the MITM proxy is default-on, environments that
 // cannot create ~/.agent-vault/ca/ (read-only FS, containers without HOME,
 // corrupted state) must still be able to run the core HTTP server.
-func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKey []byte, maxRespBytes, maxReqBytes int64) error {
+func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKey []byte, db store.Store, maxRespBytes, maxReqBytes int64, resolver ...brokercore.SessionResolver) error {
 	if mitmPort <= 0 {
 		return nil
+	}
+	sessions := srv.SessionResolver()
+	if len(resolver) > 0 {
+		sessions = resolver[0]
 	}
 	var extraSANs []string
 	if u, err := url.Parse(srv.BaseURL()); err == nil {
@@ -184,23 +218,32 @@ func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKe
 			extraSANs = []string{h}
 		}
 	}
-	caProv, err := ca.New(masterKey, ca.Options{ExtraSANs: extraSANs})
+	caOpts := ca.Options{ExtraSANs: extraSANs}
+	if db.DialectName() == "postgres" {
+		caOpts.Store = &caStoreAdapter{db: db}
+	}
+	caProv, err := ca.New(masterKey, caOpts)
 	if err != nil {
+		if srv.CredentialProxyEnabled() {
+			return fmt.Errorf("credential proxy CA initialization failed")
+		}
 		fmt.Fprintf(os.Stderr, "warning: transparent proxy disabled (CA init failed: %v); pass --mitm-port 0 to suppress\n", err)
 		return nil
 	}
 	srv.AttachMITM(mitm.New(
 		net.JoinHostPort(host, strconv.Itoa(mitmPort)),
 		mitm.Options{
-			CA:               caProv,
-			Sessions:         srv.SessionResolver(),
-			Credentials:      srv.CredentialProvider(),
-			BaseURL:          srv.BaseURL(),
-			Logger:           srv.Logger(),
-			RateLimit:        srv.RateLimit(),
-			LogSink:          srv.LogSink(),
-			MaxResponseBytes: maxRespBytes,
-			MaxRequestBytes:  maxReqBytes,
+			CA:                    caProv,
+			StrictCredentialProxy: srv.CredentialProxyEnabled(),
+			DurableAudit:          requestlog.NewDurable(db),
+			Sessions:              sessions,
+			Credentials:           srv.CredentialProvider(),
+			BaseURL:               srv.BaseURL(),
+			Logger:                srv.Logger(),
+			RateLimit:             srv.RateLimit(),
+			LogSink:               srv.LogSink(),
+			MaxResponseBytes:      maxRespBytes,
+			MaxRequestBytes:       maxReqBytes,
 		},
 	))
 	return nil
@@ -208,12 +251,173 @@ func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKe
 
 // attachServerExtensions wires optional subsystems (MITM, Infisical) onto srv.
 // Both bootstrap paths (foreground and detached child) call this.
-func attachServerExtensions(srv *server.Server, host string, mitmPort int, masterKey []byte, logger *slog.Logger, maxRespBytes, maxReqBytes int64) error {
-	if err := attachMITMIfEnabled(srv, host, mitmPort, masterKey, maxRespBytes, maxReqBytes); err != nil {
+func attachServerExtensions(srv *server.Server, host string, mitmPort, postgresPort int, masterKey []byte, db store.Store, logger *slog.Logger, maxRespBytes, maxReqBytes int64) error {
+	strictMode := false
+	if raw := os.Getenv("AGENT_VAULT_CREDENTIAL_PROXY"); raw != "" {
+		var err error
+		strictMode, err = strconv.ParseBool(raw)
+		if err != nil {
+			return fmt.Errorf("AGENT_VAULT_CREDENTIAL_PROXY must be true or false")
+		}
+	}
+	if strictMode {
+		listenHost := host
+		if listenHost == "localhost" {
+			listenHost = "127.0.0.1"
+		}
+		listenIP := net.ParseIP(listenHost)
+		if listenIP == nil || !listenIP.IsLoopback() {
+			return fmt.Errorf("credential proxy requires loopback listeners behind a verified TLS transport")
+		}
+		if os.Getenv("AGENT_VAULT_WORKLOAD_IDENTITY_FILE") == "" {
+			return fmt.Errorf("credential proxy requires workload identity configuration")
+		}
+		if boolEnvValue("VAULT_SKIP_VERIFY") {
+			return fmt.Errorf("credential proxy forbids VAULT_SKIP_VERIFY")
+		}
+		if mitmPort <= 0 {
+			return fmt.Errorf("credential proxy requires its HTTP proxy listener")
+		}
+		vaultURL, err := url.Parse(os.Getenv("VAULT_ADDR"))
+		if err != nil || vaultURL.Host == "" || vaultURL.User != nil {
+			return fmt.Errorf("credential proxy requires a valid Vault address")
+		}
+		ip := net.ParseIP(vaultURL.Hostname())
+		if vaultURL.Scheme != "https" && (vaultURL.Scheme != "http" || ip == nil || !ip.IsLoopback()) {
+			return fmt.Errorf("credential proxy requires Vault TLS; HTTP is allowed only on a loopback IP for local fixtures")
+		}
+		srv.EnableCredentialProxy()
+	}
+	sessions := srv.SessionResolver()
+	if path := os.Getenv("AGENT_VAULT_WORKLOAD_IDENTITY_FILE"); path != "" {
+		config, err := workloadidentity.LoadConfig(path)
+		if err != nil {
+			return err
+		}
+		resolver, err := workloadidentity.New(config, db)
+		if err != nil {
+			return err
+		}
+		sessions = resolver
+	}
+	if err := attachMITMIfEnabled(srv, host, mitmPort, masterKey, db, maxRespBytes, maxReqBytes, sessions); err != nil {
 		return err
 	}
 	attachInfisicalIfConfigured(srv, logger)
+	attachHashicorpIfConfigured(srv, logger)
+	if srv.CredentialProxyEnabled() && srv.HashicorpClient() == nil {
+		return fmt.Errorf("credential proxy requires a working HashiCorp Vault client")
+	}
+	// The postgres broker depends on the HashiCorp client, so attach it after
+	// attachHashicorpIfConfigured has run.
+	if err := attachPostgresBrokerIfEnabled(srv, host, postgresPort, logger, sessions); err != nil {
+		return err
+	}
 	return nil
+}
+
+// attachPostgresBrokerIfEnabled wires the PostgreSQL credential-brokering TCP
+// listener when --postgres-port > 0, a HashiCorp Vault client is available
+// (VAULT_ADDR set), and the broker is enabled — either explicitly via
+// AGENT_VAULT_DB_BROKER, or implicitly because bootstrap database services are
+// configured via AGENT_VAULT_DB_SERVICES(_FILE). Database services are resolved
+// live from the store, so they can be added or removed at runtime through the
+// management API; configured services seed an empty store on startup without
+// clobbering runtime edits. It disables quietly otherwise so deployments that
+// do not use it are unaffected. The upstream dial goes through netguard for
+// SSRF parity with the HTTP proxy; database upstreams on private networks
+// require AGENT_VAULT_ALLOW_PRIVATE_RANGES or an allowlist.
+func attachPostgresBrokerIfEnabled(srv *server.Server, host string, postgresPort int, logger *slog.Logger, resolver ...brokercore.SessionResolver) error {
+	if postgresPort <= 0 {
+		return nil
+	}
+	client := srv.HashicorpClient()
+	if client == nil {
+		logger.Debug("postgres broker disabled: no HashiCorp Vault client (set VAULT_ADDR)")
+		return nil
+	}
+	services, err := server.LoadDatabaseServices(os.Getenv)
+	if err != nil {
+		return fmt.Errorf("postgres broker: %w", err)
+	}
+	// Managed mode: the broker runs whenever explicitly enabled or when bootstrap
+	// services are configured (which implies intent). Explicit enablement lets an
+	// operator start with an empty store and add the first database at runtime.
+	if !boolEnvValue("AGENT_VAULT_DB_BROKER") && len(services) == 0 {
+		logger.Debug("postgres broker disabled: set AGENT_VAULT_DB_BROKER=1 or configure AGENT_VAULT_DB_SERVICES")
+		return nil
+	}
+	if host == "localhost" {
+		host = "127.0.0.1"
+	}
+	if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+		return fmt.Errorf("postgres broker requires --host to be a loopback IP; use a local sidecar or authenticated tunnel")
+	}
+	if seeded, err := srv.SeedDatabaseServices(context.Background(), services); err != nil {
+		return fmt.Errorf("postgres broker: %w", err)
+	} else if seeded > 0 {
+		logger.Info("postgres broker: seeded database services from config", slog.Int("count", seeded))
+	}
+	sessions := srv.SessionResolver()
+	if len(resolver) > 0 {
+		sessions = resolver[0]
+	}
+	opts := pgproxy.Options{
+		Auth:      server.NewAgentAuthAdapter(sessions),
+		Databases: srv.DatabaseResolver(),
+		Leases:    server.NewVaultLeaseMinter(client),
+		Dialer:    netguard.SafeDialContext(netguard.AllowPrivateFromEnv()),
+		Logger:    logger,
+	}
+	if srv.CredentialProxyEnabled() {
+		minter, err := server.NewDurableVaultLeaseMinter(context.Background(), client, srv.CleanupStore())
+		if err != nil {
+			return fmt.Errorf("postgres durable cleanup initialization failed: %w", err)
+		}
+		opts.Leases = minter
+		srv.AttachDatabaseCleanup(minter)
+	}
+	// Each brokered connection is one real upstream DB connection, so MaxConns
+	// must be tuned below the database's max_connections. Operators set it (and
+	// the per-actor cap) via env; unset keeps the conservative defaults.
+	if v := intEnvValue("AGENT_VAULT_DB_MAX_CONNS"); v > 0 {
+		opts.MaxConns = v
+	}
+	if v := intEnvValue("AGENT_VAULT_DB_MAX_LEASES_PER_ACTOR"); v > 0 {
+		opts.MaxLeasesPerActor = v
+	}
+	// MaxPendingConns bounds accepted-but-not-yet-serving connections. The
+	// half-open mitigation protects the serving cap, not the accept cap: a
+	// sustained flood above this bound is refused at accept until stalled
+	// sockets are reclaimed at StartupTimeout. Operators facing hostile clients
+	// raise it (or front the listener with a connection limiter).
+	if v := intEnvValue("AGENT_VAULT_DB_MAX_PENDING_CONNS"); v > 0 {
+		opts.MaxPendingConns = v
+	}
+	srv.AttachPostgresBroker(pgproxy.New(net.JoinHostPort(host, strconv.Itoa(postgresPort)), opts))
+	return nil
+}
+
+// boolEnvValue reports whether the named environment variable is set to a
+// truthy value (per strconv.ParseBool). Unset or unparseable is false.
+func boolEnvValue(key string) bool {
+	if raw := os.Getenv(key); raw != "" {
+		if b, err := strconv.ParseBool(raw); err == nil {
+			return b
+		}
+	}
+	return false
+}
+
+// intEnvValue reads a positive integer from the named environment variable,
+// returning 0 when unset or invalid.
+func intEnvValue(key string) int {
+	if raw := os.Getenv(key); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
 }
 
 // attachInfisicalIfConfigured wires the Infisical client when INFISICAL_URL
@@ -246,15 +450,45 @@ func attachInfisicalIfConfigured(srv *server.Server, logger *slog.Logger) {
 	}
 }
 
-// attachLogSink wires the request-log pipeline: a SQLiteSink with async
+// attachHashicorpIfConfigured wires the HashiCorp Vault client when VAULT_ADDR
+// is set. The 10s deadline bounds an AppRole login (token auth is instant); on
+// timeout we proceed without a client so external vaults serve-stale until next
+// restart.
+func attachHashicorpIfConfigured(srv *server.Server, logger *slog.Logger) {
+	if os.Getenv("VAULT_ADDR") == "" {
+		return
+	}
+	type result struct {
+		c   *hashicorp.Client
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		c, err := hashicorp.NewClient(context.Background(), logger)
+		done <- result{c, err}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil {
+			logger.Warn("hashicorp client unavailable; external-store vaults will not refresh",
+				slog.String("err", r.err.Error()))
+			return
+		}
+		srv.AttachHashicorp(r.c)
+	case <-time.After(10 * time.Second):
+		logger.Warn("hashicorp client login exceeded 10s deadline; continuing without external store")
+	}
+}
+
+// attachLogSink wires the request-log pipeline: a BatchSink with async
 // batching feeds persistent storage, and a retention goroutine trims old
 // rows. Returns a shutdown function the caller runs after Start()
 // returns to flush pending records and stop retention.
-func attachLogSink(srv *server.Server, db *store.SQLiteStore, logger *slog.Logger) func() {
-	sink := requestlog.NewSQLiteSink(db, logger, requestlog.SQLiteSinkConfig{})
+func attachLogSink(srv *server.Server, db store.Store, logger *slog.Logger) func() {
+	sink := requestlog.NewBatchSink(db, logger, requestlog.BatchSinkConfig{})
 	srv.AttachLogSink(sink)
 
-	retentionCtx, cancelRetention := context.WithCancel(context.Background())
+	retentionCtx, cancelRetention := context.WithCancel(context.Background()) // #nosec G118 -- returned shutdown closure owns cancellation.
 	go requestlog.RunRetention(retentionCtx, db, logger)
 
 	return func() {
@@ -269,7 +503,7 @@ func attachLogSink(srv *server.Server, db *store.SQLiteStore, logger *slog.Logge
 
 // promptOwnerSetup interactively creates the owner account.
 // masterPassword is optional — if provided, the admin password is checked against it.
-func promptOwnerSetup(cmd *cobra.Command, db *store.SQLiteStore, masterPassword []byte) error {
+func promptOwnerSetup(cmd *cobra.Command, db store.Store, masterPassword []byte) error {
 	fmt.Fprintln(cmd.OutOrStderr(), boldText("Create owner account:"))
 
 	email, err := auth.PromptEmail("  Admin email: ")
@@ -313,7 +547,7 @@ func promptOwnerSetup(cmd *cobra.Command, db *store.SQLiteStore, masterPassword 
 // unlockOrSetup resolves the master password and returns the DEK.
 // Priority: AGENT_VAULT_MASTER_PASSWORD envvar > --password-stdin > interactive prompt.
 // When no password is provided (envvar empty, no --password-stdin), sets up in passwordless mode.
-func unlockOrSetup(cmd *cobra.Command, db *store.SQLiteStore, passwordStdin bool) (*auth.MasterKey, error) {
+func unlockOrSetup(cmd *cobra.Command, db store.Store, passwordStdin bool) (*auth.MasterKey, error) {
 	// 1. AGENT_VAULT_MASTER_PASSWORD envvar (highest priority, for containerized/cloud deployments)
 	if envPw := os.Getenv("AGENT_VAULT_MASTER_PASSWORD"); envPw != "" {
 		_ = os.Unsetenv("AGENT_VAULT_MASTER_PASSWORD")
@@ -387,7 +621,7 @@ func unlockOrSetup(cmd *cobra.Command, db *store.SQLiteStore, passwordStdin bool
 
 // unlockOrSetupWithPassword resolves the DEK using a known password (no prompting, no retry).
 // Used by the AGENT_VAULT_MASTER_PASSWORD envvar and --password-stdin code paths.
-func unlockOrSetupWithPassword(db *store.SQLiteStore, password []byte) (*auth.MasterKey, error) {
+func unlockOrSetupWithPassword(db store.Store, password []byte) (*auth.MasterKey, error) {
 	ctx := context.Background()
 	record, err := db.GetMasterKeyRecord(ctx)
 	if err != nil {
@@ -421,7 +655,12 @@ func unlockOrSetupWithPassword(db *store.SQLiteStore, password []byte) (*auth.Ma
 
 // setupMasterKey runs first-time DEK generation and KEK wrapping.
 // If password is empty, sets up in passwordless mode.
-func setupMasterKey(db *store.SQLiteStore, password []byte) (*auth.MasterKey, error) {
+//
+// In HA (Postgres), another pod may have already created the master key
+// record. SetMasterKeyRecord uses ON CONFLICT DO NOTHING, so if the
+// record already exists, we re-read it and unlock using the existing
+// record instead of the locally-generated one.
+func setupMasterKey(db store.Store, password []byte) (*auth.MasterKey, error) {
 	var mk *auth.MasterKey
 	var rec *auth.VerificationRecord
 	var err error
@@ -430,18 +669,60 @@ func setupMasterKey(db *store.SQLiteStore, password []byte) (*auth.MasterKey, er
 		mk, rec, err = auth.SetupPasswordless()
 	} else {
 		mk, rec, err = auth.SetupWithPassword(password)
-		crypto.WipeBytes(password)
 	}
 	if err != nil {
+		if len(password) > 0 {
+			crypto.WipeBytes(password)
+		}
 		return nil, fmt.Errorf("setting up master key: %w", err)
 	}
 
+	ctx := context.Background()
 	storeRec := verificationToStoreRecord(rec)
-	if err := db.SetMasterKeyRecord(context.Background(), storeRec); err != nil {
+	if err := db.SetMasterKeyRecord(ctx, storeRec); err != nil {
 		mk.Wipe()
+		if len(password) > 0 {
+			crypto.WipeBytes(password)
+		}
 		return nil, fmt.Errorf("persisting master key record: %w", err)
 	}
-	return mk, nil
+
+	// Re-read the record: if another pod won the race (ON CONFLICT DO
+	// NOTHING), the DB has THEIR record, not ours. We need to unlock
+	// using whatever is actually stored.
+	existing, err := db.GetMasterKeyRecord(ctx)
+	if err != nil {
+		mk.Wipe()
+		if len(password) > 0 {
+			crypto.WipeBytes(password)
+		}
+		return nil, fmt.Errorf("re-reading master key after setup: %w", err)
+	}
+
+	verRec := buildVerificationRecord(existing)
+	if existing.DEKPlaintext != nil {
+		mk.Wipe()
+		if len(password) > 0 {
+			crypto.WipeBytes(password)
+		}
+		return auth.UnlockPasswordless(verRec)
+	}
+
+	if len(password) > 0 {
+		mk.Wipe()
+		unlocked, err := auth.Unlock(password, verRec)
+		crypto.WipeBytes(password)
+		if err != nil {
+			return nil, fmt.Errorf("unlocking with password after race: %w", err)
+		}
+		return unlocked, nil
+	}
+
+	// If we reach here, len(password) == 0 and existing.DEKPlaintext
+	// was handled above (passwordless unlock). The only remaining case
+	// is a password-protected DB record with no local password.
+	mk.Wipe()
+	return nil, fmt.Errorf("master key in database is password-protected but AGENT_VAULT_MASTER_PASSWORD is not set; all pods must use the same master password")
 }
 
 // verificationToStoreRecord converts an auth VerificationRecord to a store MasterKeyRecord.
@@ -496,7 +777,7 @@ func readPasswordFromStdin() ([]byte, error) {
 
 // runDetachedChild is the entry point for the detached child process.
 // It reads 33 bytes from stdin: 32-byte master key + 1-byte initialized flag.
-func runDetachedChild(host, addr string, mitmPort int, logger *slog.Logger, maxRespBytes, maxReqBytes int64) error {
+func runDetachedChild(host, addr string, mitmPort, postgresPort int, logger *slog.Logger, maxRespBytes, maxReqBytes int64) error {
 	buf := make([]byte, 33)
 	if _, err := io.ReadFull(os.Stdin, buf); err != nil {
 		return fmt.Errorf("reading master key from pipe: %w", err)
@@ -504,12 +785,16 @@ func runDetachedChild(host, addr string, mitmPort int, logger *slog.Logger, maxR
 	key := buf[:32]
 	initialized := buf[32] == 1
 
+	dbURL := os.Getenv("DATABASE_URL")
 	dbPath, err := store.DefaultDBPath()
-	if err != nil {
+	if err != nil && dbURL == "" {
 		return fmt.Errorf("resolving db path: %w", err)
 	}
 
-	db, err := store.Open(dbPath)
+	db, err := store.OpenStore(store.StoreConfig{
+		DatabaseURL: dbURL,
+		SQLitePath:  dbPath,
+	})
 	if err != nil {
 		return fmt.Errorf("opening store: %w", err)
 	}
@@ -521,18 +806,20 @@ func runDetachedChild(host, addr string, mitmPort int, logger *slog.Logger, maxR
 	notifier := notify.New(smtpCfg)
 	srv := server.New(addr, db, key, notifier, initialized, baseURL, logger)
 	srv.SetSkills(skillCLI)
+	srv.AttachTelemetry(tel)
 	shutdownLogs := attachLogSink(srv, db, logger)
 	defer shutdownLogs()
-	if err := attachServerExtensions(srv, host, mitmPort, key, logger, maxRespBytes, maxReqBytes); err != nil {
+	if err := attachServerExtensions(srv, host, mitmPort, postgresPort, key, db, logger, maxRespBytes, maxReqBytes); err != nil {
 		return err
 	}
+	captureServerStart(mitmPort, db.DialectName())
 	return srv.Start()
 }
 
 // spawnDetached re-execs the server as a background process, passing the master key + initialized flag via a pipe.
 // explicitLogLevel, when non-nil, forwards the parent's --log-level flag to the child so a flag-only
 // invocation (no env var) still takes effect after re-exec.
-func spawnDetached(cmd *cobra.Command, masterKey *auth.MasterKey, initialized bool, host string, port, mitmPort int, addr string, explicitLogLevel *string, maxRespBytes, maxReqBytes int64) error {
+func spawnDetached(cmd *cobra.Command, masterKey *auth.MasterKey, initialized bool, host string, port, mitmPort, postgresPort int, addr string, explicitLogLevel *string, maxRespBytes, maxReqBytes int64) error {
 	defer masterKey.Wipe()
 
 	exe, err := os.Executable()
@@ -556,7 +843,7 @@ func spawnDetached(cmd *cobra.Command, masterKey *auth.MasterKey, initialized bo
 		return fmt.Errorf("opening log file: %w", err)
 	}
 
-	childArgs := []string{"server", "--port", strconv.Itoa(port), "--host", host, "--mitm-port", strconv.Itoa(mitmPort)}
+	childArgs := []string{"server", "--port", strconv.Itoa(port), "--host", host, "--mitm-port", strconv.Itoa(mitmPort), "--postgres-port", strconv.Itoa(postgresPort)}
 	if explicitLogLevel != nil {
 		childArgs = append(childArgs, "--log-level", *explicitLogLevel)
 	}
@@ -566,7 +853,19 @@ func spawnDetached(cmd *cobra.Command, masterKey *auth.MasterKey, initialized bo
 	child.Stdin = pr
 	child.Stdout = logFile
 	child.Stderr = logFile
-	child.Env = append(os.Environ(), "_AGENT_VAULT_DETACHED=1")
+	flagURL, _ := cmd.Flags().GetString("database-url")
+	childEnv := make([]string, 0, len(os.Environ())+2)
+	for _, kv := range os.Environ() {
+		if flagURL != "" && strings.HasPrefix(kv, "DATABASE_URL=") {
+			continue
+		}
+		childEnv = append(childEnv, kv)
+	}
+	childEnv = append(childEnv, "_AGENT_VAULT_DETACHED=1")
+	if flagURL != "" {
+		childEnv = append(childEnv, "DATABASE_URL="+flagURL)
+	}
+	child.Env = childEnv
 	child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
 	if err := child.Start(); err != nil {
@@ -662,15 +961,60 @@ var stopCmd = &cobra.Command{
 	},
 }
 
+func captureServerStart(mitmPort int, dbBackend string) {
+	distinctID := telemetry.MachineID()
+	if sess, _ := session.Load(); sess != nil && sess.Email != "" {
+		distinctID = sess.Email
+	}
+	if distinctID == "" {
+		distinctID = "anonymous_server"
+	}
+	tel.CaptureEvent(distinctID, "av.server-start", map[string]string{
+		"mitm_enabled":     strconv.FormatBool(mitmPort > 0),
+		"database_backend": dbBackend,
+	})
+}
+
 func init() {
 	serverCmd.Flags().IntP("port", "p", defaultPort(), "port to listen on (also respects PORT env var)")
 	serverCmd.Flags().String("host", DefaultHost, "host to bind to")
+	serverCmd.Flags().String("database-url", "", "PostgreSQL connection URL (also respects DATABASE_URL env var)")
 	serverCmd.Flags().BoolP("detach", "d", false, "run server in background after unlocking")
 	serverCmd.Flags().Bool("password-stdin", false, "read master password from stdin (for non-interactive use)")
 	serverCmd.Flags().Int("mitm-port", DefaultMITMPort, "port for the transparent MITM proxy (0 = disabled)")
+	serverCmd.Flags().Int("postgres-port", DefaultPostgresPort, "port for the loopback PostgreSQL broker (0 = disabled; requires VAULT_ADDR and AGENT_VAULT_DB_BROKER or DB_SERVICES)")
 	serverCmd.Flags().String("log-level", "info", "log level: info (default) or debug (per-request proxy logs)")
 	serverCmd.Flags().Int64("max-response-bytes", defaultMaxResponseBytes(), "max response body bytes streamed to agents (default: unlimited; also respects AGENT_VAULT_MAX_RESPONSE_BYTES)")
 	serverCmd.Flags().Int64("max-request-bytes", defaultMaxRequestBytes(), "max request body bytes forwarded to upstreams (default: 1 GiB; also respects AGENT_VAULT_MAX_REQUEST_BYTES)")
 	serverCmd.AddCommand(stopCmd)
 	rootCmd.AddCommand(serverCmd)
+}
+
+// caStoreAdapter bridges store.Store to the ca.CAStore interface.
+type caStoreAdapter struct {
+	db store.Store
+}
+
+func (a *caStoreAdapter) GetCAState(ctx context.Context) (*ca.CAStateRecord, error) {
+	state, err := a.db.GetCAState(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if state == nil {
+		return nil, nil
+	}
+	return &ca.CAStateRecord{
+		RootCert:     state.RootCert,
+		RootKeyCT:    state.RootKeyCT,
+		RootKeyNonce: state.RootKeyNonce,
+	}, nil
+}
+
+func (a *caStoreAdapter) SetCAState(ctx context.Context, rec *ca.CAStateRecord) error {
+	return a.db.SetCAState(ctx, &store.CAState{
+		RootCert:     rec.RootCert,
+		RootKeyCT:    rec.RootKeyCT,
+		RootKeyNonce: rec.RootKeyNonce,
+		Source:       "auto",
+	})
 }

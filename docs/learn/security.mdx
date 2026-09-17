@@ -3,6 +3,10 @@ title: "Security"
 description: "How Agent Vault protects credentials at rest, in transit, and across the network."
 ---
 
+import EnterpriseCTA from "/snippets/enterprise-cta.mdx";
+
+<EnterpriseCTA />
+
 Agent Vault is designed around a single principle: **Agent Vault never reveals vault-stored credentials to agents**. Credentials are encrypted at rest, decrypted only in memory at proxy time, and injected into outbound requests server-side. No credential value stored in the vault is ever returned in an API response or written to a log.
 
 This page covers the cryptographic primitives, token model, network protections, and operational safeguards that make this possible.
@@ -40,7 +44,7 @@ Agent Vault uses a **KEK/DEK key-wrapping architecture**:
 
 Each encryption operation uses a fresh random nonce generated from `crypto/rand`. Credential values are decrypted in memory only at proxy time to resolve auth headers, then discarded.
 
-**Password changes are lightweight**: changing the master password re-wraps the DEK under a new KEK — a single database update with zero credential re-encryption. You can also add a password to a passwordless instance or remove a password entirely using `agent-vault master-password set|change|remove`.
+**Password changes are lightweight**: changing the master password re-wraps the DEK under a new KEK — a single database update with zero credential re-encryption. For single-instance (SQLite) deployments, you can add, change, or remove the password using `agent-vault master-password set|change|remove`. When using PostgreSQL with multiple instances, these CLI commands require `--force` after stopping all instances. See the [PostgreSQL guide](/self-hosting/postgres) for detailed rotation steps.
 
 <Note>
   The master password is **never stored on disk**. If set via the
@@ -72,6 +76,10 @@ All tokens are generated from `crypto/rand` (256 bits of entropy) and hashed bef
 | Vault invite | `av_uinv_` | SHA-256 | 48 hours | For onboarding human users |
 
 All tokens use SHA-256 for fast lookup.
+
+The proxy revalidates the original session before every forwarded HTTP request, including requests on an existing HTTPS CONNECT tunnel. An agent token's revocation, expiry or removed vault grant blocks the next request. This check does not stop an already-running request or upgraded WebSocket. Scoped sessions still use their stored vault role; this is not a replacement for live task authorization.
+
+The local `internal/actionref` acceptance handler demonstrates fixed read operations, output filtering and cancellation through the proxy. It is not mounted in the server, and its test identity and policy callbacks do not validate real workload identity. The real-Vault fixture tests policy loss, policy lookup failure and deadlines against slow HTTP and HTTPS upstreams. Deployments still need a trusted identity verifier, persistent policy, audit records and enforced isolation.
 
 ## Network security
 
@@ -163,12 +171,20 @@ Hard caps prevent unbounded growth in vault state:
 
 ## Database security
 
-Agent Vault uses SQLite with the following hardening:
+**SQLite** (default, single-instance):
 
 - **File permissions**: Database file is created with mode `0600` (owner read/write only).
 - **Parameterized queries**: All queries use prepared statements, preventing SQL injection.
 - **WAL mode**: Write-ahead logging for crash resilience.
 - **Foreign key cascades**: Deleting a vault automatically cleans up all associated credentials, proposals, agents, and sessions.
+
+**PostgreSQL** (production, multi-instance):
+
+- **Parameterized queries**: Same prepared-statement approach as SQLite, preventing SQL injection.
+- **Foreign key cascades**: Same cascade behavior as SQLite.
+- **TLS**: Use `?sslmode=require` or `?sslmode=verify-full` in your connection URL for encrypted connections to the database.
+- **Access controls**: The database user should have access only to the Agent Vault database. Credentials are encrypted at rest by the DEK regardless of database-level access, but limiting access reduces attack surface.
+- **Advisory locks**: Service-config writes use `pg_advisory_lock` to prevent concurrent conflicting updates across instances.
 
 ## Sensitive data handling
 

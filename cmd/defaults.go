@@ -6,10 +6,11 @@ import (
 )
 
 const (
-	DefaultPort     = 14321
-	DefaultHost     = "127.0.0.1"
-	DefaultAddress  = "http://127.0.0.1:14321"
-	DefaultMITMPort = 14322
+	DefaultPort         = 14321
+	DefaultHost         = "127.0.0.1"
+	DefaultAddress      = "http://127.0.0.1:14321"
+	DefaultMITMPort     = 14322
+	DefaultPostgresPort = 14323
 )
 
 // defaultPort returns the PORT env var (if set and valid), otherwise DefaultPort.

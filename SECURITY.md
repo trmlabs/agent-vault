@@ -1,13 +1,11 @@
-# Security Policy
-
-## Supported versions
-
-We always recommend using the latest version of Agent Vault to ensure you get all security updates.
+# Security policy
 
 ## Reporting vulnerabilities
 
-Please do not file GitHub issues or post on our public forum for security vulnerabilities, as they are public!
+For this TRM-maintained fork, report suspected vulnerabilities privately to security@trmlabs.com. Include the revision, affected configuration, impact and reproduction steps. Do not include real credentials or open a public issue containing exploit details.
 
-Infisical takes security issues very seriously. If you have any concerns about Agent Vault or believe you have uncovered a vulnerability, please get in touch via the e-mail address security@infisical.com. In the message, try to provide a description of the issue and ideally a way of reproducing it. The security team will get back to you as soon as possible.
+For the original Infisical project, follow its upstream security policy. If a finding affects both projects, coordinate disclosure with both maintainers.
 
-Note that this security address should be used only for undisclosed vulnerabilities. Please report any security problems to us before disclosing it publicly.
+## Supported releases
+
+A supported TRM release has not yet been designated. Local verification and a passing pull request do not establish production readiness. Until a release is designated, evaluate a pinned revision against the documented deployment acceptance checks.
