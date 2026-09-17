@@ -27,7 +27,7 @@ func (b *Broker) authorizationLoop(ctx context.Context, token, hint, requested s
 		// simply by returning late. A fired watchdog cannot revive the session.
 		watchdog := time.AfterFunc(b.opts.AuthorizationTimeout, terminate)
 		current, err := b.opts.Auth.Authenticate(checkCtx, token, hint)
-		valid := err == nil && current != nil && current.ActorID == scope.ActorID && current.VaultID == scope.VaultID
+		valid := err == nil && current != nil && current.ActorID == scope.ActorID && current.VaultID == scope.VaultID && current.WorkloadID == scope.WorkloadID
 		if valid {
 			next, resolveErr := b.opts.Databases.ResolveDatabase(checkCtx, *current, requested)
 			valid = resolveErr == nil && next != nil && sameBinding(svc, *next)

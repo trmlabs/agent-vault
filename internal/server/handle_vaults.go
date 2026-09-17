@@ -174,6 +174,10 @@ func (s *Server) handleVaultSyncNow(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	case store.CredentialStoreHashicorp:
+		if s.credentialProxy {
+			jsonError(w, http.StatusConflict, "Request-time Vault reads are enabled; synchronization is disabled")
+			return
+		}
 		if s.hashicorpSyncer == nil {
 			jsonCodedError(w, http.StatusServiceUnavailable, "hashicorp_not_configured",
 				"HashiCorp Vault is not configured on this server. Set VAULT_ADDR to enable external-store vaults.")
@@ -806,25 +810,29 @@ func (s *Server) createHashicorpVault(w http.ResponseWriter, ctx context.Context
 		return
 	}
 
-	secs, err := s.hashicorpClient.FetchSecrets(ctx, cfg)
-	if err != nil {
-		// The vault/api error embeds VAULT_ADDR + upstream rejection body; scrub it.
-		s.logger.Warn("hashicorp fetch failed during vault create",
-			slog.String("vault_name", req.Name),
-			slog.String("err", err.Error()))
-		jsonCodedError(w, http.StatusBadGateway, "hashicorp_fetch_failed",
-			"Failed to fetch secrets from HashiCorp Vault. See server logs for details.")
-		return
-	}
-
-	items, err := hashicorp.EncryptSecrets(secs, s.encKey)
-	if err != nil {
-		if errors.Is(err, hashicorp.ErrInvalidKey) {
-			jsonCodedError(w, http.StatusBadRequest, "external_store_invalid_key", err.Error())
+	var items []store.EncryptedKV
+	if !s.credentialProxy {
+		secs, err := s.hashicorpClient.FetchSecrets(ctx, cfg)
+		if err != nil {
+			// The vault/api error embeds VAULT_ADDR + upstream rejection body; scrub it.
+			s.logger.Warn("hashicorp fetch failed during vault create",
+				slog.String("vault_name", req.Name),
+				slog.String("err", err.Error()))
+			jsonCodedError(w, http.StatusBadGateway, "hashicorp_fetch_failed",
+				"Failed to fetch secrets from HashiCorp Vault. See server logs for details.")
 			return
 		}
-		jsonError(w, http.StatusInternalServerError, "Failed to encrypt fetched secrets")
-		return
+
+		items, err = hashicorp.EncryptSecrets(secs, s.encKey)
+		if err != nil {
+			if errors.Is(err, hashicorp.ErrInvalidKey) {
+				jsonCodedError(w, http.StatusBadRequest, "external_store_invalid_key", err.Error())
+				return
+			}
+			jsonError(w, http.StatusInternalServerError, "Failed to encrypt fetched secrets")
+			return
+		}
+
 	}
 
 	configJSON, err := hashicorp.MarshalConfigJSON(cfg)

@@ -18,6 +18,8 @@ defaults:
 jobs:
     npm:
         name: Publish NPM
+        # Downstream copies must configure their own reviewed publication destinations.
+        if: github.repository == 'Infisical/agent-vault'
         runs-on: ubuntu-22.04
         steps:
             - name: Checkout repo
@@ -37,7 +39,7 @@ jobs:
               run: npm ci
 
             - name: Set NPM version
-              run: npm version ${GITHUB_REF_NAME#node-sdk/v} --allow-same-version --no-git-tag-version
+              run: npm version "${GITHUB_REF_NAME#node-sdk/v}" --allow-same-version --no-git-tag-version
 
             - name: Publish NPM
               run: npm publish --access public --provenance

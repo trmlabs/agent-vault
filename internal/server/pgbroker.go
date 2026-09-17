@@ -26,8 +26,8 @@ import (
 // upstream databases from declarative configuration.
 
 // agentAuthAdapter bridges the shared session resolver to pgproxy's
-// AgentAuthenticator. A database connection is authorized by the agent's Agent
-// Vault token exactly as an HTTP request is.
+// AgentAuthenticator. Both entry points verify the same identity proof, using
+// projected workload tokens when that resolver is configured.
 type agentAuthAdapter struct{ resolver brokercore.SessionResolver }
 
 // NewAgentAuthAdapter wraps the session resolver for the PostgreSQL broker.
@@ -40,7 +40,7 @@ func (a agentAuthAdapter) Authenticate(ctx context.Context, token, vaultHint str
 	if err != nil {
 		return nil, err
 	}
-	return &pgproxy.AgentScope{VaultID: scope.VaultID, VaultName: scope.VaultName, ActorID: scope.ActorID()}, nil
+	return &pgproxy.AgentScope{VaultID: scope.VaultID, VaultName: scope.VaultName, ActorID: scope.ActorID(), WorkloadID: scope.WorkloadID}, nil
 }
 
 // DatabaseServiceConfig is one configured upstream database within a vault, as
@@ -169,8 +169,9 @@ func (s *Server) DatabaseResolver() pgproxy.DatabaseResolver {
 }
 
 // SeedDatabaseServices bootstraps the store from configuration (the
-// AGENT_VAULT_DB_SERVICES map, keyed by vault name) on startup. It is
-// insert-if-absent: a service already present in the store — including one
+// AGENT_VAULT_DB_SERVICES map, keyed by vault name) on startup. Each entry is
+// applied once and durably remembered, including after deletion.
+// On first use, a service already present in the store — including one
 // edited through the management API — is left untouched, so config seeds an
 // empty store without clobbering runtime changes on every restart. It returns
 // the number of services newly seeded. A configured vault name that does not
@@ -194,13 +195,7 @@ func (s *Server) SeedDatabaseServices(ctx context.Context, byVault map[string][]
 			defer unlock()
 			added := 0
 			for _, svc := range services {
-				switch _, err := s.store.GetDatabaseService(ctx, vault.ID, svc.Name); {
-				case err == nil:
-					continue // already present (config or runtime); do not clobber
-				case !errors.Is(err, sql.ErrNoRows):
-					return added, fmt.Errorf("checking database service %q in vault %q: %w", svc.Name, vaultName, err)
-				}
-				if _, err := s.store.UpsertDatabaseService(ctx, store.DatabaseService{
+				if inserted, err := s.store.SeedDatabaseService(ctx, store.DatabaseService{
 					VaultID:  vault.ID,
 					Name:     svc.Name,
 					Upstream: svc.Addr,
@@ -211,8 +206,9 @@ func (s *Server) SeedDatabaseServices(ctx context.Context, byVault map[string][]
 					MaxConns: svc.MaxConns,
 				}); err != nil {
 					return added, fmt.Errorf("seeding database service %q in vault %q: %w", svc.Name, vaultName, err)
+				} else if inserted {
+					added++
 				}
-				added++
 			}
 			return added, nil
 		}()

@@ -1,0 +1,15 @@
+{
+  "issuer": "REPLACE_WITH_CLUSTER_SERVICE_ACCOUNT_ISSUER",
+  "audience": "credential-proxy",
+  "timeoutSeconds": 5,
+  "maxTokenLifetimeSeconds": 600,
+  "bindings": [
+    {
+      "namespace": "credential-proxy-demo",
+      "serviceAccount": "credential-proxy-agent",
+      "serviceAccountUID": "REPLACE_WITH_LIVE_SERVICE_ACCOUNT_UID",
+      "agentID": "REPLACE_WITH_EXISTING_BROKER_AGENT_ID",
+      "vaultID": "REPLACE_WITH_EXISTING_BROKER_VAULT_ID"
+    }
+  ]
+}
