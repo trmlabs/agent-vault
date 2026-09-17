@@ -27,6 +27,7 @@ import (
 	"github.com/Infisical/agent-vault/internal/netguard"
 	"github.com/Infisical/agent-vault/internal/notify"
 	"github.com/Infisical/agent-vault/internal/oauth"
+	"github.com/Infisical/agent-vault/internal/pgproxy"
 	"github.com/Infisical/agent-vault/internal/pidfile"
 	"github.com/Infisical/agent-vault/internal/ratelimit"
 	"github.com/Infisical/agent-vault/internal/requestlog"
@@ -95,6 +96,9 @@ type Server struct {
 	hashicorpSyncer *hashicorp.Syncer
 	oauthRefresher  *oauth.Refresher
 	telemetry       *telemetry.Telemetry
+	// pgBroker is the PostgreSQL credential-brokering TCP listener; nil when
+	// --postgres-port is 0 or no database services are configured.
+	pgBroker *pgproxy.Broker
 }
 
 // lockVaultServices acquires the per-vault mutation lock via the store's
@@ -122,6 +126,17 @@ func (s *Server) AttachInfisicalSyncer(syncer *infisical.Syncer) { s.infisicalSy
 
 // AttachHashicorp registers the HashiCorp Vault client. Must be called before Start.
 func (s *Server) AttachHashicorp(c *hashicorp.Client) { s.hashicorpClient = c }
+
+// HashicorpClient returns the attached HashiCorp Vault client, or nil when
+// VAULT_ADDR is unset. The PostgreSQL broker uses it to mint dynamic database
+// credentials.
+func (s *Server) HashicorpClient() *hashicorp.Client { return s.hashicorpClient }
+
+// AttachPostgresBroker registers the optional PostgreSQL credential-brokering
+// TCP listener whose lifecycle is bound to this Server: Start launches it, and
+// SIGINT/SIGTERM/Shutdown stops it alongside the HTTP server. Must be called
+// before Start.
+func (s *Server) AttachPostgresBroker(b *pgproxy.Broker) { s.pgBroker = b }
 
 // AttachHashicorpSyncer pre-wires a syncer instead of letting Start build one
 // from the attached client. Used by tests to inject a fake fetcher; in prod
@@ -331,6 +346,13 @@ type Store interface {
 	// Broker configs
 	GetBrokerConfig(ctx context.Context, vaultID string) (*store.BrokerConfig, error)
 	SetBrokerConfig(ctx context.Context, vaultID, servicesJSON string) (*store.BrokerConfig, error)
+
+	// Database services (managed PostgreSQL-broker upstreams, per vault)
+	UpsertDatabaseService(ctx context.Context, svc store.DatabaseService) (*store.DatabaseService, error)
+	GetDatabaseService(ctx context.Context, vaultID, name string) (*store.DatabaseService, error)
+	ListDatabaseServices(ctx context.Context, vaultID string) ([]store.DatabaseService, error)
+	DatabaseUpstreamLimit(ctx context.Context, upstream string) (int, error)
+	DeleteDatabaseService(ctx context.Context, vaultID, name string) (bool, error)
 
 	// Proposals
 	CreateProposal(ctx context.Context, vaultID, sessionID, servicesJSON, credentialsJSON, message, userMessage string, credentials map[string]store.EncryptedCredential) (*store.Proposal, error)
@@ -909,6 +931,10 @@ func New(addr string, store Store, encKey []byte, notifier *notify.Notifier, ini
 	mux.HandleFunc("DELETE /v1/vaults/{name}/services/{host}", s.requireInitialized(s.requireAuth(actorAuthed(s.handleServiceRemove))))
 	mux.HandleFunc("DELETE /v1/vaults/{name}/services", s.requireInitialized(s.requireAuth(actorAuthed(s.handleServicesClear))))
 	mux.HandleFunc("GET /v1/vaults/{name}/services/credential-usage", s.requireInitialized(s.requireAuth(actorAuthed(s.handleServicesCredentialUsage))))
+	mux.HandleFunc("GET /v1/vaults/{name}/databases", s.requireInitialized(s.requireAuth(actorAuthed(s.handleDatabasesList))))
+	mux.HandleFunc("POST /v1/vaults/{name}/databases", s.requireInitialized(s.requireAuth(actorAuthed(limitBody(s.handleDatabaseUpsert)))))
+	mux.HandleFunc("GET /v1/vaults/{name}/databases/{db}", s.requireInitialized(s.requireAuth(actorAuthed(s.handleDatabaseGet))))
+	mux.HandleFunc("DELETE /v1/vaults/{name}/databases/{db}", s.requireInitialized(s.requireAuth(actorAuthed(s.handleDatabaseRemove))))
 	mux.HandleFunc("GET /v1/vaults/{name}/logs", s.requireInitialized(s.requireAuth(actorAuthed(s.handleVaultLogsList))))
 	mux.HandleFunc("GET /v1/vaults/{name}/discovered-hosts", s.requireInitialized(s.requireAuth(actorAuthed(s.handleDiscoveredHosts))))
 	// Public static reads — immutable payloads with no credentials on
@@ -1019,8 +1045,23 @@ func (s *Server) Start() error {
 		return fmt.Errorf("listen %s: %w", s.httpServer.Addr, err)
 	}
 
+	defer func() { _ = httpLn.Close() }()
+	var pgLn net.Listener
+	if s.pgBroker != nil {
+		pgLn, err = net.Listen("tcp", s.pgBroker.Addr())
+		if err != nil {
+			return fmt.Errorf("listen postgres broker: %w", err)
+		}
+		defer func() { _ = pgLn.Close() }()
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = s.pgBroker.Shutdown(ctx)
+		}()
+	}
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(stop)
 
 	pruneCtx, stopWorkers := context.WithCancel(context.Background())
 	defer stopWorkers()
@@ -1062,7 +1103,7 @@ func (s *Server) Start() error {
 		go s.infisicalDynamic.SweepOrphans(pruneCtx)
 	}
 
-	errCh := make(chan error, 1)
+	errCh := make(chan error, 2)
 	go func() {
 		fmt.Printf("Agent Vault server listening on %s\n", s.baseURL)
 		if !s.initialized {
@@ -1089,6 +1130,15 @@ func (s *Server) Start() error {
 		}()
 	}
 
+	if s.pgBroker != nil {
+		go func() {
+			fmt.Printf("Agent Vault postgres broker listening on %s\n", pgLn.Addr())
+			if err := s.pgBroker.Serve(pgLn); err != nil && !errors.Is(err, net.ErrClosed) {
+				errCh <- fmt.Errorf("postgres broker stopped: %w", err)
+			}
+		}()
+	}
+
 	if err := pidfile.WriteIfFree(os.Getpid()); err != nil {
 		if errors.Is(err, pidfile.ErrAlreadyRunning) {
 			s.logger.Warn("pidfile owned by another process; not claiming or removing it")
@@ -1109,13 +1159,28 @@ func (s *Server) Start() error {
 	defer cancel()
 
 	fmt.Println("shutting down server...")
-	if s.mitm != nil {
-		if err := s.mitm.Shutdown(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: mitm proxy shutdown: %v\n", err)
-		}
+	// Start every shutdown together so one slow subsystem cannot consume the
+	// database broker's entire revoke budget before it even closes sessions.
+	var shutdownWG sync.WaitGroup
+	shutdown := func(name string, fn func(context.Context) error) {
+		shutdownWG.Add(1)
+		go func() {
+			defer shutdownWG.Done()
+			if err := fn(ctx); err != nil {
+				s.logger.Warn("shutdown incomplete", "component", name, "error", err)
+			}
+		}()
 	}
-	if err := s.httpServer.Shutdown(ctx); err != nil {
-		return fmt.Errorf("server shutdown: %w", err)
+	if s.pgBroker != nil {
+		shutdown("postgres broker", s.pgBroker.Shutdown)
+	}
+	if s.mitm != nil {
+		shutdown("HTTP proxy", s.mitm.Shutdown)
+	}
+	httpErr := s.httpServer.Shutdown(ctx)
+	shutdownWG.Wait()
+	if httpErr != nil {
+		return fmt.Errorf("server shutdown: %w", httpErr)
 	}
 
 	// Stop background workers (syncers + touch-cache pruner) and wait for every

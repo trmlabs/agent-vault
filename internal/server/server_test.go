@@ -33,12 +33,13 @@ type mockStore struct {
 	masterKeyRecord    *store.MasterKeyRecord
 	sessions           map[string]*store.Session
 	vaults             map[string]*store.Vault
-	credentials        map[string]*store.Credential   // keyed by "vaultID:key"
-	brokerConfigs      map[string]*store.BrokerConfig // keyed by vaultID
-	proposals          map[string][]store.Proposal    // keyed by vaultID
-	users              map[string]*store.User         // keyed by email
-	grants             map[string]map[string]string   // keyed by userID -> vaultID -> role
-	userInvites        map[string]*store.UserInvite   // keyed by token
+	credentials        map[string]*store.Credential       // keyed by "vaultID:key"
+	brokerConfigs      map[string]*store.BrokerConfig     // keyed by vaultID
+	databaseServices   map[string][]store.DatabaseService // keyed by vaultID
+	proposals          map[string][]store.Proposal        // keyed by vaultID
+	users              map[string]*store.User             // keyed by email
+	grants             map[string]map[string]string       // keyed by userID -> vaultID -> role
+	userInvites        map[string]*store.UserInvite       // keyed by token
 	emailVerifications []*store.EmailVerification
 	passwordResets     []*store.PasswordReset
 	agents             map[string]*store.Agent                // keyed by name
@@ -52,16 +53,17 @@ type mockStore struct {
 
 func newMockStore() *mockStore {
 	ms := &mockStore{
-		sessions:      make(map[string]*store.Session),
-		vaults:        make(map[string]*store.Vault),
-		credentials:   make(map[string]*store.Credential),
-		brokerConfigs: make(map[string]*store.BrokerConfig),
-		users:         make(map[string]*store.User),
-		userInvites:   make(map[string]*store.UserInvite),
-		agents:        make(map[string]*store.Agent),
-		settings:      make(map[string]string),
-		vaultSettings: make(map[string]map[string]string),
-		credStores:    make(map[string]*store.VaultCredentialStore),
+		sessions:         make(map[string]*store.Session),
+		vaults:           make(map[string]*store.Vault),
+		credentials:      make(map[string]*store.Credential),
+		brokerConfigs:    make(map[string]*store.BrokerConfig),
+		databaseServices: make(map[string][]store.DatabaseService),
+		users:            make(map[string]*store.User),
+		userInvites:      make(map[string]*store.UserInvite),
+		agents:           make(map[string]*store.Agent),
+		settings:         make(map[string]string),
+		vaultSettings:    make(map[string]map[string]string),
+		credStores:       make(map[string]*store.VaultCredentialStore),
 	}
 	// Seed root vault
 	ms.vaults["default"] = &store.Vault{ID: "root-ns-id", Name: "default"}
@@ -389,9 +391,9 @@ func (m *mockStore) ExpirePendingProposals(_ context.Context, before time.Time) 
 	return 0, nil
 }
 
-func (m *mockStore) Close() error                                     { return nil }
-func (m *mockStore) Ping(_ context.Context) error                      { return nil }
-func (m *mockStore) DialectName() string                               { return "sqlite" }
+func (m *mockStore) Close() error                                         { return nil }
+func (m *mockStore) Ping(_ context.Context) error                         { return nil }
+func (m *mockStore) DialectName() string                                  { return "sqlite" }
 func (m *mockStore) GetCAState(_ context.Context) (*store.CAState, error) { return nil, nil }
 func (m *mockStore) SetCAState(_ context.Context, _ *store.CAState) error { return nil }
 
@@ -549,6 +551,71 @@ func (m *mockStore) SetBrokerConfig(_ context.Context, vaultID, servicesJSON str
 	}
 	m.brokerConfigs[vaultID] = bc
 	return bc, nil
+}
+
+func (m *mockStore) UpsertDatabaseService(_ context.Context, svc store.DatabaseService) (*store.DatabaseService, error) {
+	if svc.ID == "" {
+		svc.ID = "dbs-" + svc.VaultID + "-" + svc.Name
+	}
+	// Mirror the SQLStore's empty-sslmode normalization so the mock stays
+	// faithful to production (the real store's CHECK rejects an empty sslmode).
+	if svc.SSLMode == "" {
+		svc.SSLMode = "prefer"
+	}
+	now := time.Now()
+	svc.CreatedAt, svc.UpdatedAt = now, now
+	existing := m.databaseServices[svc.VaultID]
+	for i := range existing {
+		if existing[i].Name == svc.Name {
+			svc.ID = existing[i].ID
+			svc.CreatedAt = existing[i].CreatedAt
+			existing[i] = svc
+			return &svc, nil
+		}
+	}
+	m.databaseServices[svc.VaultID] = append(existing, svc)
+	return &svc, nil
+}
+
+func (m *mockStore) GetDatabaseService(_ context.Context, vaultID, name string) (*store.DatabaseService, error) {
+	for i := range m.databaseServices[vaultID] {
+		if m.databaseServices[vaultID][i].Name == name {
+			svc := m.databaseServices[vaultID][i]
+			return &svc, nil
+		}
+	}
+	return nil, sql.ErrNoRows
+}
+
+func (m *mockStore) DatabaseUpstreamLimit(_ context.Context, upstream string) (int, error) {
+	limit := 0
+	for _, services := range m.databaseServices {
+		for _, svc := range services {
+			if svc.Upstream == upstream && svc.MaxConns > 0 && (limit == 0 || svc.MaxConns < limit) {
+				limit = svc.MaxConns
+			}
+		}
+	}
+	return limit, nil
+}
+
+func (m *mockStore) ListDatabaseServices(_ context.Context, vaultID string) ([]store.DatabaseService, error) {
+	src := m.databaseServices[vaultID]
+	out := make([]store.DatabaseService, len(src))
+	copy(out, src)
+	slices.SortFunc(out, func(a, b store.DatabaseService) int { return strings.Compare(a.Name, b.Name) })
+	return out, nil
+}
+
+func (m *mockStore) DeleteDatabaseService(_ context.Context, vaultID, name string) (bool, error) {
+	existing := m.databaseServices[vaultID]
+	for i := range existing {
+		if existing[i].Name == name {
+			m.databaseServices[vaultID] = append(existing[:i], existing[i+1:]...)
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (m *mockStore) GrantVaultRole(_ context.Context, actorID, actorType, vaultID, role string) error {
