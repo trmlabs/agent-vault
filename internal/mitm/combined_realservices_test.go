@@ -131,6 +131,10 @@ func combinedTunnel(t *testing.T, target string, cert tls.Certificate, publicPor
 }
 
 func TestRealCombinedWorkloadProofVaultAndPostgres(t *testing.T) {
+	runCombinedServices(t, false)
+}
+
+func runCombinedServices(t *testing.T, parentExpiry bool) {
 	for _, name := range []string{"AV_TEST_WORKLOAD_CONFIG", "AV_TEST_WORKLOAD_PROOF", "AV_TEST_WORKLOAD_WRONG_PROOF", "VAULT_ADDR", "VAULT_TOKEN", "AV_TEST_PG_UPSTREAM", "AV_TEST_PG_ADMIN"} {
 		if os.Getenv(name) == "" {
 			t.Fatalf("combined fixture requires %s", name)
@@ -148,7 +152,8 @@ func TestRealCombinedWorkloadProofVaultAndPostgres(t *testing.T) {
 		return strings.TrimSpace(string(data))
 	}
 	proof, wrongProof := readProof("AV_TEST_WORKLOAD_PROOF"), readProof("AV_TEST_WORKLOAD_WRONG_PROOF")
-	st, err := store.Open(filepath.Join(t.TempDir(), "combined.db"))
+	storePath := filepath.Join(t.TempDir(), "combined.db")
+	st, err := store.Open(storePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +204,26 @@ func TestRealCombinedWorkloadProofVaultAndPostgres(t *testing.T) {
 	if err := admin.Sys().PutPolicyWithContext(ctx, path, policy); err != nil {
 		t.Fatal("fixture policy creation failed")
 	}
-	parent, err := admin.Auth().Token().CreateWithContext(ctx, &vaultapi.TokenCreateRequest{Policies: []string{path, "agent-vault-database-parent", hashicorp.DatabaseCredentialPolicyName("database", "readonly")}, TTL: "5m"})
+	parentTTL := "5m"
+	if parentExpiry {
+		parentTTL = "15s"
+		role, err := admin.Logical().ReadWithContext(ctx, "database/roles/readonly")
+		if err != nil || role == nil {
+			t.Fatal("cannot read fixture database role")
+		}
+		extended := make(map[string]any, len(role.Data))
+		for key, value := range role.Data {
+			extended[key] = value
+		}
+		extended["default_ttl"] = "90s"
+		if _, err := admin.Logical().WriteWithContext(ctx, "database/roles/readonly", extended); err != nil {
+			t.Fatal("cannot extend fixture lease")
+		}
+		t.Cleanup(func() {
+			_, _ = admin.Logical().WriteWithContext(context.Background(), "database/roles/readonly", role.Data)
+		})
+	}
+	parent, err := admin.Auth().Token().CreateWithContext(ctx, &vaultapi.TokenCreateRequest{Policies: []string{path, "agent-vault-database-parent", hashicorp.DatabaseCredentialPolicyName("database", "readonly")}, TTL: parentTTL, ExplicitMaxTTL: parentTTL})
 	if err != nil {
 		t.Fatal("scoped fixture token creation failed")
 	}
@@ -364,7 +388,7 @@ func TestRealCombinedWorkloadProofVaultAndPostgres(t *testing.T) {
 	}
 	defer func() { _ = dbAdmin.Close(context.Background()) }()
 	queryDone := make(chan error, 1)
-	go func() { _, err := a.Exec(ctx, "SELECT pg_sleep(20)"); queryDone <- err }()
+	go func() { _, err := a.Exec(ctx, "SELECT pg_sleep(60)"); queryDone <- err }()
 	startDeadline := time.Now().Add(3 * time.Second)
 	for {
 		var active bool
@@ -378,6 +402,15 @@ func TestRealCombinedWorkloadProofVaultAndPostgres(t *testing.T) {
 			t.Fatal("combined running query did not start")
 		}
 		time.Sleep(25 * time.Millisecond)
+	}
+	if parentExpiry {
+		verifyCombinedParentRecovery(t, combinedRecovery{
+			ctx: ctx, store: st, storePath: storePath, identityConfig: identityConfig, vaultAdmin: admin,
+			accessor: parent.Auth.Accessor, policy: path, role: role, proof: proof,
+			vaultID: v.ID, proxy: proxy, pg: pg, minter: durable, dbAdmin: dbAdmin,
+			queryDone: queryDone, destination: destination, request: request, connect: connect,
+		})
+		return
 	}
 	// A real broker grant change must withdraw the same runtime proof on both paths.
 	if err := st.RevokeAgent(ctx, agent.ID); err != nil {

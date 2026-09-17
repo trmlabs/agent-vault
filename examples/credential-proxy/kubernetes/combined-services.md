@@ -20,6 +20,7 @@ Allow 10 minutes for image preparation and execution. If the build network requi
 - Revoking the broker agent denies new HTTP and PostgreSQL work and removes its existing database role and session.
 - Two live PostgreSQL sessions reject mixed cancellation capabilities. Canceling one query leaves the other intact; replay after closing the first session has no effect.
 - The persistent database seed regression runs against real PostgreSQL.
+- With the caller still authorized, broker Vault login expiry denies new HTTP and PostgreSQL work and ends the active proxied query. Cleanup records survive closing and reopening the store; fresh Vault authentication and recreated brokers restore the same caller's access. This is broker lifecycle recovery with local clients, not an executable process restart or the separate caller-pod fixture.
 
 Any missing prerequisite or failed assertion fails the run. Record the source revision, command, sanitized output, reviewer decision and remaining deployment work in the release review.
 
