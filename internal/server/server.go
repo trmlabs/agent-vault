@@ -94,11 +94,13 @@ type Server struct {
 	hashicorpClient *hashicorp.Client
 	// hashicorpSyncer is built in Run; exposed for manual-refresh RefreshOnce.
 	hashicorpSyncer *hashicorp.Syncer
+	credentialProxy bool
 	oauthRefresher  *oauth.Refresher
 	telemetry       *telemetry.Telemetry
 	// pgBroker is the PostgreSQL credential-brokering TCP listener; nil when
 	// --postgres-port is 0 or no database services are configured.
-	pgBroker *pgproxy.Broker
+	pgBroker      *pgproxy.Broker
+	pgLeaseCloser interface{ Close(context.Context) error }
 }
 
 // lockVaultServices acquires the per-vault mutation lock via the store's
@@ -221,6 +223,7 @@ func (s *Server) CredentialProvider() brokercore.CredentialProvider {
 	// time, before Start() builds s.infisicalDynamic. The adapter reads the
 	// field per request, so resolution works regardless of init order.
 	p.Dynamic = lateDynamicResolver{s}
+	p.RequestSecrets = requestSecrets{s}
 	return p
 }
 
@@ -965,6 +968,8 @@ func New(addr string, store Store, encKey []byte, notifier *notify.Notifier, ini
 	mux.HandleFunc("GET /v1/proposals/approve-details", s.requireInitialized(ipApprovalToken(s.handleProposalApproveDetails)))
 
 	// Admin proposal management
+	mux.HandleFunc("GET /v1/database-cleanup", s.requireInitialized(s.requireAuth(actorAuthed(s.handleDatabaseCleanupList))))
+	mux.HandleFunc("POST /v1/database-cleanup/{accessor}/confirm", s.requireInitialized(s.requireAuth(actorAuthed(limitBody(s.handleDatabaseCleanupConfirm)))))
 	mux.HandleFunc("GET /v1/admin/proposals", s.requireInitialized(s.requireAuth(actorAuthed(s.handleAdminProposalList))))
 	mux.HandleFunc("GET /v1/admin/proposals/{id}", s.requireInitialized(s.requireAuth(actorAuthed(s.handleAdminProposalGet))))
 
@@ -1030,6 +1035,31 @@ func (s *Server) requireInitialized(next http.HandlerFunc) http.HandlerFunc {
 // Start starts the server and blocks until shutdown.
 // It listens for SIGINT/SIGTERM to shut down gracefully.
 func (s *Server) Start() error {
+	// Release journal ownership on every exit, including startup failures.
+	if s.pgLeaseCloser != nil {
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := s.pgLeaseCloser.Close(ctx); err != nil {
+				s.logger.Warn("database cleanup shutdown incomplete")
+			}
+		}()
+	}
+	if err := s.prepareCredentialProxy(context.Background()); err != nil {
+		return err
+	}
+	var strictMITMLn net.Listener
+	if s.credentialProxy {
+		if s.mitm == nil {
+			return fmt.Errorf("credential proxy requires its HTTP proxy listener")
+		}
+		var err error
+		strictMITMLn, err = net.Listen("tcp", s.mitm.Addr())
+		if err != nil {
+			return fmt.Errorf("listen credential proxy: %w", err)
+		}
+		defer func() { _ = strictMITMLn.Close() }()
+	}
 	// Non-fatal: registry already holds env-based config from New().
 	if s.initialized {
 		if _, err := s.applyRateLimitSettingToRegistry(context.Background()); err != nil {
@@ -1087,10 +1117,10 @@ func (s *Server) Start() error {
 	if s.infisicalSyncer != nil {
 		runSyncer(s.infisicalSyncer.Run)
 	}
-	if s.hashicorpSyncer == nil && s.hashicorpClient != nil {
+	if !s.credentialProxy && s.hashicorpSyncer == nil && s.hashicorpClient != nil {
 		s.hashicorpSyncer = hashicorp.NewSyncer(s.store, s.hashicorpClient, s.encKey, s.logger)
 	}
-	if s.hashicorpSyncer != nil {
+	if !s.credentialProxy && s.hashicorpSyncer != nil {
 		runSyncer(s.hashicorpSyncer.Run)
 	}
 
@@ -1103,7 +1133,7 @@ func (s *Server) Start() error {
 		go s.infisicalDynamic.SweepOrphans(pruneCtx)
 	}
 
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
 	go func() {
 		fmt.Printf("Agent Vault server listening on %s\n", s.baseURL)
 		if !s.initialized {
@@ -1116,7 +1146,11 @@ func (s *Server) Start() error {
 
 	if s.mitm != nil {
 		go func() {
-			l, err := net.Listen("tcp", s.mitm.Addr())
+			l := strictMITMLn
+			var err error
+			if l == nil {
+				l, err = net.Listen("tcp", s.mitm.Addr())
+			}
 			if err != nil {
 				// MITM is best-effort (e.g. default-on port conflict shouldn't
 				// kill the core HTTP server). Log and let the goroutine exit.
@@ -1125,6 +1159,10 @@ func (s *Server) Start() error {
 			}
 			fmt.Printf("Agent Vault transparent proxy listening on %s\n", s.mitm.Addr())
 			if err := s.mitm.Serve(l); err != nil && err != http.ErrServerClosed {
+				if s.credentialProxy {
+					errCh <- fmt.Errorf("credential proxy stopped: %w", err)
+					return
+				}
 				fmt.Fprintf(os.Stderr, "warning: transparent proxy stopped: %v\n", err)
 			}
 		}()
@@ -1151,6 +1189,12 @@ func (s *Server) Start() error {
 
 	select {
 	case err := <-errCh:
+		_ = s.httpServer.Close()
+		if s.mitm != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = s.mitm.Shutdown(ctx)
+			cancel()
+		}
 		return err
 	case <-stop:
 	}

@@ -96,7 +96,7 @@ func Open(dbPath string) (*SQLStore, error) {
 	syscall.Umask(oldUmask)
 
 	// Ensure permissions are correct even for pre-existing files.
-	if err := os.Chmod(dbPath, 0600); err != nil {
+	if err := os.Chmod(dbPath, 0600); err != nil { // #nosec G703 -- operator-configured database path, already opened above; not request input.
 		fmt.Fprintf(os.Stderr, "[agent-vault] warning: failed to set database permissions: %v\n", err)
 	}
 

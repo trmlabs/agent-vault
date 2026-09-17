@@ -190,6 +190,14 @@ Want a full deployment walkthrough? See [Run Hermes on a VPS](https://docs.agent
 
 3. Tokens: You should create an [agent](https://docs.agent-vault.dev/agents/overview) in Agent Vault to represent a long-lived agent. For ephemeral sandboxes, you may prefer to mint short-lived, vault-scoped tokens for sandboxed agents to use to proxy requests through Agent Vault.
 
+HTTP forwarding and requests inside an existing HTTPS CONNECT tunnel revalidate the original proxy session before each request. Revoking an agent token, reaching its expiry, or removing its vault grant prevents the next request from reaching upstream. This does not terminate a request or WebSocket already in progress, and scoped sessions retain their separate stored-role semantics.
+
+The [credential proxy release profile](examples/credential-proxy/README.md) uses request-time Vault reads, durable audit admission and [Kubernetes workload identity](examples/credential-proxy/kubernetes/README.md) shared by HTTP and PostgreSQL. Enable it with `AGENT_VAULT_CREDENTIAL_PROXY=true` and `AGENT_VAULT_WORKLOAD_IDENTITY_FILE`. Direct pod proof does not establish an individual Daytona or ToolHive session identity; deployed ingress and network isolation still require verification.
+
+The disposable verification image runs real Vault and PostgreSQL with synthetic destinations and credentials. Build and run it using the [verification commands](examples/credential-proxy/README.md#run-the-local-demonstration). Its output identifies local checks separately from required deployed validation.
+
+`internal/actionref` adds a fixed-read handler for acceptance testing. It permits only `POST /actions/read` without parameters, uses a configured upstream through the proxy, returns selected JSON fields and cancels requests on permission loss or deadline. The real-Vault fixture observes cancellation at both plain and TLS upstreams. Its identity and policy callbacks are synthetic; the handler is not mounted in the deployed server. Production wiring must provide verified workload identity, persistent current policy, audit records and runtime isolation. To run locally with Go and Vault installed, use `bash examples/credential-proxy/verify.sh`.
+
 ## PostgreSQL (Production)
 
 By default Agent Vault stores all state in a local SQLite database, which requires no setup. For production deployments, or when running multiple instances, set the `DATABASE_URL` environment variable (or `--database-url` flag) to a PostgreSQL connection string and Agent Vault switches to Postgres as its backend. All instances share the same database, so state is consistent across replicas.

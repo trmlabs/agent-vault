@@ -49,9 +49,37 @@ vault write database/config/appdb plugin_name=postgresql-database-plugin allowed
 vault write database/roles/readonly db_name=appdb creation_statements="CREATE ROLE \"{{name}}\" WITH LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}' IN ROLE pg_read_all_data;" revocation_statements="SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = '{{name}}'; DROP ROLE IF EXISTS \"{{name}}\";" default_ttl=8s max_ttl=90s >/dev/null
 vault write database/config/appdb2 plugin_name=postgresql-database-plugin allowed_roles=readonly2 connection_url="postgresql://{{username}}:{{password}}@127.0.0.1:$pg_port/appdb2?sslmode=disable" username=review_admin password="$admin_pw" >/dev/null
 vault write database/roles/readonly2 db_name=appdb2 creation_statements="CREATE ROLE \"{{name}}\" WITH LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}' IN ROLE pg_read_all_data;" revocation_statements="SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = '{{name}}'; DROP ROLE IF EXISTS \"{{name}}\";" default_ttl=8s max_ttl=90s >/dev/null
+# Each child token can read only its selected role. The parent needs these
+# policies plus token creation/revocation and lease-renewal permissions.
+for db_role in readonly readonly2; do
+  db_policy_hash=$(printf '%s' "database/creds/$db_role" | openssl dgst -sha256 | awk '{print $NF}')
+  printf 'path "database/creds/%s" { capabilities = ["read"] }\n' "$db_role" | vault policy write "agent-vault-db-$db_policy_hash" - >/dev/null
+done
+vault policy write agent-vault-database-parent - >/dev/null <<'POLICY'
+path "auth/token/create" { capabilities = ["update"] }
+path "auth/token/revoke-accessor" { capabilities = ["update"] }
+path "sys/leases/renew" {
+  capabilities = ["update"]
+  required_parameters = ["lease_id"]
+  allowed_parameters = {
+    "lease_id" = ["database/creds/readonly/*", "database/creds/readonly2/*"]
+    "increment" = []
+  }
+}
+path "sys/leases/revoke/database/creds/readonly/*" { capabilities = ["update"] }
+path "sys/leases/revoke/database/creds/readonly2/*" { capabilities = ["update"] }
+path "sys/leases/lookup" {
+  capabilities = ["update"]
+  required_parameters = ["lease_id"]
+  allowed_parameters = {
+    "lease_id" = ["database/creds/readonly/*", "database/creds/readonly2/*"]
+  }
+}
+POLICY
 export AV_TEST_PG_SECOND_DB=appdb2 AV_TEST_VAULT_SECOND_ROLE=readonly2
 export AV_TEST_PG_UPSTREAM="[::1]:$pg_port" AV_TEST_PG_DENIED_UPSTREAM="127.0.0.1:$pg_port" AV_TEST_PG_DB=appdb
 export AV_TEST_PG_ADMIN="postgres://review_admin:$admin_pw@127.0.0.1:$pg_port/appdb?sslmode=disable"
 export AV_TEST_STORE_PG_URL="postgres://review_admin:$admin_pw@127.0.0.1:$pg_port/brokerstore?sslmode=disable"
 # Serial packages: generated-role baseline measurements must not overlap.
-go test -p 1 -tags 'realpg realvault loadpg' ./internal/pgproxy ./internal/hashicorp ./internal/server ./internal/store -run 'RealPostgres|RealVault|TestLoadPG_' -count=1 -v -timeout 5m
+# An optional first argument narrows test names for an affected-boundary rerun.
+go test -p 1 -tags 'realpg realvault loadpg' ./internal/pgproxy ./internal/hashicorp ./internal/server ./internal/store -run "${1:-RealPostgres|RealVault|TestLoadPG_}" -count=1 -v -timeout 5m

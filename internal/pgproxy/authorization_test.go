@@ -43,7 +43,7 @@ func TestAuthorizationRevocationClosesAndRevokesSession(t *testing.T) {
 func TestAuthorizationRecheckFailuresAndCapacityChange(t *testing.T) {
 	scope := AgentScope{VaultID: "v", ActorID: "a"}
 	svc := DatabaseService{Name: "db", Addr: "host:5432", Role: "readonly"}
-	for _, mode := range []string{"deleted", "role-change", "identity-change", "stall", "capacity-only"} {
+	for _, mode := range []string{"deleted", "role-change", "identity-change", "workload-change", "stall", "capacity-only"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
@@ -58,6 +58,9 @@ func TestAuthorizationRecheckFailuresAndCapacityChange(t *testing.T) {
 					copy := scope
 					if mode == "identity-change" {
 						copy.ActorID = "other"
+					}
+					if mode == "workload-change" {
+						copy.WorkloadID = "replacement-pod"
 					}
 					return &copy, nil
 				}),

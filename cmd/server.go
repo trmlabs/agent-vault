@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Infisical/agent-vault/internal/auth"
+	"github.com/Infisical/agent-vault/internal/brokercore"
 	"github.com/Infisical/agent-vault/internal/ca"
 	"github.com/Infisical/agent-vault/internal/crypto"
 	"github.com/Infisical/agent-vault/internal/hashicorp"
@@ -32,6 +33,7 @@ import (
 	"github.com/Infisical/agent-vault/internal/session"
 	"github.com/Infisical/agent-vault/internal/store"
 	"github.com/Infisical/agent-vault/internal/telemetry"
+	"github.com/Infisical/agent-vault/internal/workloadidentity"
 	"github.com/spf13/cobra"
 )
 
@@ -202,9 +204,13 @@ var serverCmd = &cobra.Command{
 // in server.Start: since the MITM proxy is default-on, environments that
 // cannot create ~/.agent-vault/ca/ (read-only FS, containers without HOME,
 // corrupted state) must still be able to run the core HTTP server.
-func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKey []byte, db store.Store, maxRespBytes, maxReqBytes int64) error {
+func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKey []byte, db store.Store, maxRespBytes, maxReqBytes int64, resolver ...brokercore.SessionResolver) error {
 	if mitmPort <= 0 {
 		return nil
+	}
+	sessions := srv.SessionResolver()
+	if len(resolver) > 0 {
+		sessions = resolver[0]
 	}
 	var extraSANs []string
 	if u, err := url.Parse(srv.BaseURL()); err == nil {
@@ -218,21 +224,26 @@ func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKe
 	}
 	caProv, err := ca.New(masterKey, caOpts)
 	if err != nil {
+		if srv.CredentialProxyEnabled() {
+			return fmt.Errorf("credential proxy CA initialization failed")
+		}
 		fmt.Fprintf(os.Stderr, "warning: transparent proxy disabled (CA init failed: %v); pass --mitm-port 0 to suppress\n", err)
 		return nil
 	}
 	srv.AttachMITM(mitm.New(
 		net.JoinHostPort(host, strconv.Itoa(mitmPort)),
 		mitm.Options{
-			CA:               caProv,
-			Sessions:         srv.SessionResolver(),
-			Credentials:      srv.CredentialProvider(),
-			BaseURL:          srv.BaseURL(),
-			Logger:           srv.Logger(),
-			RateLimit:        srv.RateLimit(),
-			LogSink:          srv.LogSink(),
-			MaxResponseBytes: maxRespBytes,
-			MaxRequestBytes:  maxReqBytes,
+			CA:                    caProv,
+			StrictCredentialProxy: srv.CredentialProxyEnabled(),
+			DurableAudit:          requestlog.NewDurable(db),
+			Sessions:              sessions,
+			Credentials:           srv.CredentialProvider(),
+			BaseURL:               srv.BaseURL(),
+			Logger:                srv.Logger(),
+			RateLimit:             srv.RateLimit(),
+			LogSink:               srv.LogSink(),
+			MaxResponseBytes:      maxRespBytes,
+			MaxRequestBytes:       maxReqBytes,
 		},
 	))
 	return nil
@@ -241,14 +252,65 @@ func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKe
 // attachServerExtensions wires optional subsystems (MITM, Infisical) onto srv.
 // Both bootstrap paths (foreground and detached child) call this.
 func attachServerExtensions(srv *server.Server, host string, mitmPort, postgresPort int, masterKey []byte, db store.Store, logger *slog.Logger, maxRespBytes, maxReqBytes int64) error {
-	if err := attachMITMIfEnabled(srv, host, mitmPort, masterKey, db, maxRespBytes, maxReqBytes); err != nil {
+	strictMode := false
+	if raw := os.Getenv("AGENT_VAULT_CREDENTIAL_PROXY"); raw != "" {
+		var err error
+		strictMode, err = strconv.ParseBool(raw)
+		if err != nil {
+			return fmt.Errorf("AGENT_VAULT_CREDENTIAL_PROXY must be true or false")
+		}
+	}
+	if strictMode {
+		listenHost := host
+		if listenHost == "localhost" {
+			listenHost = "127.0.0.1"
+		}
+		listenIP := net.ParseIP(listenHost)
+		if listenIP == nil || !listenIP.IsLoopback() {
+			return fmt.Errorf("credential proxy requires loopback listeners behind a verified TLS transport")
+		}
+		if os.Getenv("AGENT_VAULT_WORKLOAD_IDENTITY_FILE") == "" {
+			return fmt.Errorf("credential proxy requires workload identity configuration")
+		}
+		if boolEnvValue("VAULT_SKIP_VERIFY") {
+			return fmt.Errorf("credential proxy forbids VAULT_SKIP_VERIFY")
+		}
+		if mitmPort <= 0 {
+			return fmt.Errorf("credential proxy requires its HTTP proxy listener")
+		}
+		vaultURL, err := url.Parse(os.Getenv("VAULT_ADDR"))
+		if err != nil || vaultURL.Host == "" || vaultURL.User != nil {
+			return fmt.Errorf("credential proxy requires a valid Vault address")
+		}
+		ip := net.ParseIP(vaultURL.Hostname())
+		if vaultURL.Scheme != "https" && (vaultURL.Scheme != "http" || ip == nil || !ip.IsLoopback()) {
+			return fmt.Errorf("credential proxy requires Vault TLS; HTTP is allowed only on a loopback IP for local fixtures")
+		}
+		srv.EnableCredentialProxy()
+	}
+	sessions := srv.SessionResolver()
+	if path := os.Getenv("AGENT_VAULT_WORKLOAD_IDENTITY_FILE"); path != "" {
+		config, err := workloadidentity.LoadConfig(path)
+		if err != nil {
+			return err
+		}
+		resolver, err := workloadidentity.New(config, db)
+		if err != nil {
+			return err
+		}
+		sessions = resolver
+	}
+	if err := attachMITMIfEnabled(srv, host, mitmPort, masterKey, db, maxRespBytes, maxReqBytes, sessions); err != nil {
 		return err
 	}
 	attachInfisicalIfConfigured(srv, logger)
 	attachHashicorpIfConfigured(srv, logger)
+	if srv.CredentialProxyEnabled() && srv.HashicorpClient() == nil {
+		return fmt.Errorf("credential proxy requires a working HashiCorp Vault client")
+	}
 	// The postgres broker depends on the HashiCorp client, so attach it after
 	// attachHashicorpIfConfigured has run.
-	if err := attachPostgresBrokerIfEnabled(srv, host, postgresPort, logger); err != nil {
+	if err := attachPostgresBrokerIfEnabled(srv, host, postgresPort, logger, sessions); err != nil {
 		return err
 	}
 	return nil
@@ -265,7 +327,7 @@ func attachServerExtensions(srv *server.Server, host string, mitmPort, postgresP
 // do not use it are unaffected. The upstream dial goes through netguard for
 // SSRF parity with the HTTP proxy; database upstreams on private networks
 // require AGENT_VAULT_ALLOW_PRIVATE_RANGES or an allowlist.
-func attachPostgresBrokerIfEnabled(srv *server.Server, host string, postgresPort int, logger *slog.Logger) error {
+func attachPostgresBrokerIfEnabled(srv *server.Server, host string, postgresPort int, logger *slog.Logger, resolver ...brokercore.SessionResolver) error {
 	if postgresPort <= 0 {
 		return nil
 	}
@@ -296,12 +358,24 @@ func attachPostgresBrokerIfEnabled(srv *server.Server, host string, postgresPort
 	} else if seeded > 0 {
 		logger.Info("postgres broker: seeded database services from config", slog.Int("count", seeded))
 	}
+	sessions := srv.SessionResolver()
+	if len(resolver) > 0 {
+		sessions = resolver[0]
+	}
 	opts := pgproxy.Options{
-		Auth:      server.NewAgentAuthAdapter(srv.SessionResolver()),
+		Auth:      server.NewAgentAuthAdapter(sessions),
 		Databases: srv.DatabaseResolver(),
 		Leases:    server.NewVaultLeaseMinter(client),
 		Dialer:    netguard.SafeDialContext(netguard.AllowPrivateFromEnv()),
 		Logger:    logger,
+	}
+	if srv.CredentialProxyEnabled() {
+		minter, err := server.NewDurableVaultLeaseMinter(context.Background(), client, srv.CleanupStore())
+		if err != nil {
+			return fmt.Errorf("postgres durable cleanup initialization failed: %w", err)
+		}
+		opts.Leases = minter
+		srv.AttachDatabaseCleanup(minter)
 	}
 	// Each brokered connection is one real upstream DB connection, so MaxConns
 	// must be tuned below the database's max_connections. Operators set it (and

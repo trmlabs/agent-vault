@@ -77,6 +77,10 @@ All tokens are generated from `crypto/rand` (256 bits of entropy) and hashed bef
 
 All tokens use SHA-256 for fast lookup.
 
+The proxy revalidates the original session before every forwarded HTTP request, including requests on an existing HTTPS CONNECT tunnel. An agent token's revocation, expiry or removed vault grant blocks the next request. This check does not stop an already-running request or upgraded WebSocket. Scoped sessions still use their stored vault role; this is not a replacement for live task authorization.
+
+The local `internal/actionref` acceptance handler demonstrates fixed read operations, output filtering and cancellation through the proxy. It is not mounted in the server, and its test identity and policy callbacks do not validate real workload identity. The real-Vault fixture tests policy loss, policy lookup failure and deadlines against slow HTTP and HTTPS upstreams. Deployments still need a trusted identity verifier, persistent policy, audit records and enforced isolation.
+
 ## Network security
 
 Agent Vault includes a network guard that validates every outbound proxy connection at the IP level, preventing agents from using the proxy to reach internal infrastructure.

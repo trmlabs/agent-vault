@@ -1,6 +1,9 @@
 ---
 name: agent-vault-cli
 description: >-
+  Managed credential-proxy users follow the strict profile below,
+  using runner-supplied mappings and workload proof without a standing token.
+  The following proposal workflow applies only to legacy token mode.
   Your outbound requests go through a proxy that injects real
   credentials (API keys, tokens, secrets) on the wire — in headers,
   paths, query strings, bodies, and WebSocket frames. If you have
@@ -12,13 +15,25 @@ description: >-
   and HTTP_PROXY from the environment so requests route through
   the proxy. Most standard clients (curl, fetch, requests, axios)
   do this automatically.
-compatibility: Requires the agent-vault binary on $PATH and AGENT_VAULT_TOKEN environment variable
+compatibility: Legacy mode requires agent-vault on $PATH and AGENT_VAULT_TOKEN; the managed credential-proxy profile uses runner-supplied workload proof.
 metadata:
   author: dangtony98
   version: "0.5.0"
 ---
 
-# Requesting API Access
+# Agent Vault access
+
+## Managed credential-proxy profile
+
+When the managed runner selects this profile, use its approved destinations, placeholder mappings, fresh workload proof and verified encrypted connection. The legacy token, discovery and proposal instructions below do not apply. Never request a standing token, invent a mapping or fall back to a direct connection.
+
+HTTP supports approved HTTPS GET/HEAD requests without a query or body, with configured placeholders only in `Authorization` or `X-Api-Key`. The runner supplies proof through `Proxy-Authorization`; PostgreSQL uses proof in its password field. Never log proof or put it in a destination header. Reconnect with fresh proof before expiry.
+
+- `403`: denied identity, mapping, destination or request format. Stop and report it.
+- `429`: rate limited. Pause before retrying the approved request.
+- `503`: required audit recording unavailable; the outcome may be unknown. Report it without bypassing or blindly repeating the request.
+
+## Legacy token access
 
 `HTTPS_PROXY` and `HTTP_PROXY` in your environment route all outbound HTTP traffic through an Agent Vault proxy. The proxy matches each request's host against configured services, injects the real credential, and forwards to the upstream. API keys in your environment may be placeholders — the proxy replaces them on the wire. Just make requests normally.
 

@@ -90,14 +90,21 @@ type DynamicCredentialResolver interface {
 	Resolve(ctx context.Context, vaultID, key string) (value string, ok bool, err error)
 }
 
+// RequestSecretResolver reads external values for this request only. handled=true
+// forbids fallback to persisted credentials, including when resolution fails.
+type RequestSecretResolver interface {
+	ReadForRequest(context.Context, string) (values map[string]string, handled bool, err error)
+}
+
 // StoreCredentialProvider injects credentials using a CredentialStore and a
 // 32-byte AES-256-GCM key held in memory for the lifetime of the process.
 type StoreCredentialProvider struct {
-	Store      CredentialStore
-	OAuthStore OAuthStore // nil = no OAuth refresh
-	EncKey     []byte
-	Refresher  *oauth.Refresher          // nil = no OAuth refresh
-	Dynamic    DynamicCredentialResolver // nil = no dynamic-secret resolution
+	RequestSecrets RequestSecretResolver
+	Store          CredentialStore
+	OAuthStore     OAuthStore // nil = no OAuth refresh
+	EncKey         []byte
+	Refresher      *oauth.Refresher          // nil = no OAuth refresh
+	Dynamic        DynamicCredentialResolver // nil = no dynamic-secret resolution
 }
 
 // NewStoreCredentialProvider constructs a provider. encKey must be 32 bytes.
@@ -165,11 +172,38 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 		slog.Int("decl_order", score.DeclOrder),
 	)
 
+	// Capture non-secret metadata up front so a downstream credential-missing
+	// error still carries it for diagnostic logging.
+	result := &InjectResult{
+		MatchedName:    matched.Name,
+		MatchedHost:    matched.Host,
+		MatchedPath:    matched.Path,
+		MatchedPort:    matched.Port,
+		CredentialKeys: matched.CredentialKeys(),
+	}
+
+	var fresh map[string]string
+	var external bool
+	if p.RequestSecrets != nil {
+		var err error
+		fresh, external, err = p.RequestSecrets.ReadForRequest(ctx, vaultID)
+		if err != nil {
+			return result, ErrCredentialMissing
+		}
+	}
+
 	// Memoize per-key lookups so a credential shared by auth and a
 	// substitution decrypts only once.
 	cache := make(map[string]string)
 	getCredential := func(key string) (string, error) {
 		if v, ok := cache[key]; ok {
+			return v, nil
+		}
+		if external {
+			v, ok := fresh[key]
+			if !ok || v == "" {
+				return "", ErrCredentialMissing
+			}
 			return v, nil
 		}
 		cred, err := p.Store.GetCredential(ctx, vaultID, key)
@@ -205,16 +239,6 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 
 		cache[key] = s
 		return s, nil
-	}
-
-	// Capture non-secret metadata up front so a downstream credential-missing
-	// error still carries it for diagnostic logging.
-	result := &InjectResult{
-		MatchedName:    matched.Name,
-		MatchedHost:    matched.Host,
-		MatchedPath:    matched.Path,
-		MatchedPort:    matched.Port,
-		CredentialKeys: matched.CredentialKeys(),
 	}
 
 	// Resolve substitutions before auth so passthrough services (which

@@ -69,7 +69,7 @@ func (c *Client) ReadDatabaseCredential(ctx context.Context, mount, role string)
 	mintAPI.SetMaxRetries(0)
 	secret, err := mintAPI.Logical().ReadWithContext(ctx, path)
 	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", path, err)
+		return nil, fmt.Errorf("database credential read failed")
 	}
 	if secret == nil {
 		return nil, fmt.Errorf("no credential at %s (is the database role configured?)", path)
@@ -81,7 +81,7 @@ func (c *Client) ReadDatabaseCredential(ctx context.Context, mount, role string)
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 4*time.Second)
 		defer cancel()
 		if err := c.RevokeLease(cleanupCtx, secret.LeaseID); err != nil {
-			return nil, fmt.Errorf("invalid database credential; cleanup failed: %w", err)
+			return nil, fmt.Errorf("invalid database credential; cleanup failed")
 		}
 		return nil, fmt.Errorf("credential at %s is missing username or password, lease ID, or a positive TTL", path)
 	}
@@ -107,7 +107,7 @@ func (c *Client) RenewLease(ctx context.Context, leaseID string, increment time.
 		"increment": int(math.Ceil(increment.Seconds())),
 	})
 	if err != nil {
-		return 0, fmt.Errorf("renew lease: %w", err)
+		return 0, fmt.Errorf("renew database lease failed")
 	}
 	if secret == nil || secret.LeaseDuration <= 0 || int64(secret.LeaseDuration) > math.MaxInt64/int64(time.Second) {
 		return 0, fmt.Errorf("renew lease: missing positive TTL")
@@ -120,15 +120,17 @@ func (c *Client) RenewLease(ctx context.Context, leaseID string, increment time.
 // disconnected or compromised session's credential stops working at once rather
 // than lingering until its TTL. An empty leaseID is a no-op (nothing was
 // minted). A revoke that Vault rejects returns an error; callers on the
-// shutdown/cleanup path log it and rely on the lease's max TTL as the backstop.
+// shutdown/cleanup path must retain failed cleanup for retry. Production's
+// durable minter also confirms lease absence before clearing its journal.
 func (c *Client) RevokeLease(ctx context.Context, leaseID string) error {
 	if leaseID == "" {
 		return nil
 	}
 	if _, err := c.api.Logical().WriteWithContext(ctx, "sys/leases/revoke", map[string]interface{}{
 		"lease_id": leaseID,
+		"sync":     true,
 	}); err != nil {
-		return fmt.Errorf("revoke lease: %w", err)
+		return fmt.Errorf("revoke database lease failed")
 	}
 	return nil
 }

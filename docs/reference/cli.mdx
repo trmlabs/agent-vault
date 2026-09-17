@@ -35,6 +35,8 @@ description: "Complete reference for all Agent Vault CLI commands."
     | `PORT` | Server listen port (default `14321`). The `--port` flag takes precedence. |
     | `DATABASE_URL` | PostgreSQL connection URL (e.g. `postgres://user:pass@host:5432/agentvault`). When set, Agent Vault uses Postgres instead of SQLite. The `--database-url` flag takes precedence. See [PostgreSQL](/self-hosting/postgres). |
     | `AGENT_VAULT_MASTER_PASSWORD` | Derives a KEK that wraps the data encryption key. Omit for passwordless mode. |
+    | `AGENT_VAULT_CREDENTIAL_PROXY` | Optional boolean, default `false`. Enables the restricted release profile with request-time Vault reads, fail-closed forwarding and durable audit admission. Requires workload identity, verified Vault TLS (loopback HTTP is allowed for local fixtures), and loopback listeners behind protected ingress. See [Credential proxy profile](/self-hosting/environment-variables#credential-proxy-profile). |
+    | `AGENT_VAULT_WORKLOAD_IDENTITY_FILE` | Path to a JSON Kubernetes workload policy. Enables the same exclusive projected-token verifier on HTTP and PostgreSQL proxy admission, without a standing-token fallback. Required by `AGENT_VAULT_CREDENTIAL_PROXY=true`; management authentication stays separate. |
     | `AGENT_VAULT_LOG_LEVEL` | Fallback for `--log-level` when the flag is not set. Accepts `info` or `debug`. |
     | `AGENT_VAULT_MAX_RESPONSE_BYTES` | Maximum response body bytes streamed to agents (default `0` = unlimited). The `--max-response-bytes` flag takes precedence. |
     | `AGENT_VAULT_MAX_REQUEST_BYTES` | Maximum request body bytes forwarded to upstreams (default `1073741824` = 1 GiB). The `--max-request-bytes` flag takes precedence. |
@@ -65,7 +67,7 @@ description: "Complete reference for all Agent Vault CLI commands."
     | `INFISICAL_LDAP_AUTH_IDENTITY_ID` | LDAP Auth identity ID. All three LDAP vars are required together. |
     | `INFISICAL_LDAP_AUTH_USERNAME` | LDAP bind username. |
     | `INFISICAL_LDAP_AUTH_PASSWORD` | LDAP bind password. |
-    | `VAULT_ADDR` | Base URL of a HashiCorp Vault instance. When set, the server constructs a client from one of the auth-method groups below and enables `--credential-store=hashicorp` on `vault create`. Honors the standard Vault client env (`VAULT_CACERT`, `VAULT_SKIP_VERIFY`, `VAULT_NAMESPACE`). See [Environment variables: HashiCorp Vault credential store](/self-hosting/environment-variables#hashicorp-vault-credential-store). |
+    | `VAULT_ADDR` | Base URL of a HashiCorp Vault instance. When set, the server constructs a client from one of the auth-method groups below and enables `--credential-store=hashicorp` on `vault create`. Honors the standard Vault client env (`VAULT_CACERT`, `VAULT_SKIP_VERIFY`, `VAULT_NAMESPACE`). The credential-proxy profile rejects `VAULT_SKIP_VERIFY` and reads destination values at request time without the legacy synchronized snapshot. See [Environment variables: HashiCorp Vault credential store](/self-hosting/environment-variables#hashicorp-vault-credential-store). |
     | `VAULT_TOKEN` | HashiCorp Vault token auth. Used when set and no AppRole pair is present. |
     | `VAULT_ROLE_ID` | HashiCorp Vault AppRole RoleID. Set together with `VAULT_SECRET_ID`; selected over `VAULT_TOKEN` when both are present. |
     | `VAULT_SECRET_ID` | HashiCorp Vault AppRole SecretID. Set together with `VAULT_ROLE_ID`. |

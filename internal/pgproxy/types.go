@@ -17,9 +17,10 @@ import (
 // AgentScope is the authorization result for an agent connection: the vault the
 // agent's token is scoped to, plus a stable actor id for auditing.
 type AgentScope struct {
-	VaultID   string
-	VaultName string
-	ActorID   string
+	VaultID    string
+	VaultName  string
+	ActorID    string
+	WorkloadID string
 }
 
 // AgentAuthenticator validates the agent's Agent Vault token (presented in the
@@ -65,8 +66,8 @@ type Lease struct {
 
 // LeaseMinter mints, renews, and revokes dynamic database credentials. The
 // concrete implementation backs onto Vault's database secrets engine. Calls
-// must honor context cancellation. Leases are not persisted across restarts;
-// Vault's expiry/revocation machinery is the crash-recovery backstop.
+// must honor context cancellation. Production uses DurableLeaseMinter to retain
+// revocation accessors across restarts; passwords remain memory-only.
 type LeaseMinter interface {
 	// Mint issues a fresh credential for svc within vaultID.
 	Mint(ctx context.Context, vaultID string, svc *DatabaseService) (*Lease, error)
@@ -75,7 +76,8 @@ type LeaseMinter interface {
 	Renew(ctx context.Context, leaseID string, minRemaining time.Duration) (time.Time, error)
 	// Revoke invalidates a lease immediately. It is called once per lease when
 	// the connection ends (and on shutdown); an empty lease id is a no-op and a
-	// returned error is logged, bounded by the lease TTL as a backstop.
+	// returned error is logged. The durable implementation retains the cleanup
+	// record and prevents the binding from reopening until it is reconciled.
 	Revoke(ctx context.Context, leaseID string) error
 }
 

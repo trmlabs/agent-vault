@@ -26,8 +26,8 @@ import (
 // upstream databases from declarative configuration.
 
 // agentAuthAdapter bridges the shared session resolver to pgproxy's
-// AgentAuthenticator. A database connection is authorized by the agent's Agent
-// Vault token exactly as an HTTP request is.
+// AgentAuthenticator. Both entry points verify the same identity proof, using
+// projected workload tokens when that resolver is configured.
 type agentAuthAdapter struct{ resolver brokercore.SessionResolver }
 
 // NewAgentAuthAdapter wraps the session resolver for the PostgreSQL broker.
@@ -40,7 +40,7 @@ func (a agentAuthAdapter) Authenticate(ctx context.Context, token, vaultHint str
 	if err != nil {
 		return nil, err
 	}
-	return &pgproxy.AgentScope{VaultID: scope.VaultID, VaultName: scope.VaultName, ActorID: scope.ActorID()}, nil
+	return &pgproxy.AgentScope{VaultID: scope.VaultID, VaultName: scope.VaultName, ActorID: scope.ActorID(), WorkloadID: scope.WorkloadID}, nil
 }
 
 // DatabaseServiceConfig is one configured upstream database within a vault, as

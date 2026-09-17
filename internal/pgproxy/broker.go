@@ -149,6 +149,21 @@ func (b *Broker) Serve(l net.Listener) error {
 
 	b.isListening.Store(true)
 	defer b.isListening.Store(false)
+	if leases, ok := b.opts.Leases.(interface{ AuthorityDone() <-chan struct{} }); ok {
+		go func() {
+			select {
+			case <-leases.AuthorityDone():
+				if b.ctx.Err() != nil {
+					return
+				}
+				b.logger.Error("pgproxy: durable cleanup authority unavailable; stopping broker")
+				ctx, cancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
+				defer cancel()
+				_ = b.Shutdown(ctx)
+			case <-b.ctx.Done():
+			}
+		}()
+	}
 
 	for {
 		conn, err := l.Accept()
@@ -462,16 +477,24 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	b.logger.Info("pgproxy: session established",
 		slog.String("vault", scope.VaultID),
 		slog.String("actor", scope.ActorID),
+		slog.String("workload", scope.WorkloadID),
 		slog.String("service", svc.Name),
 		slog.String("upstream", svc.Addr),
 		slog.String("lease", lease.ID))
 
 	relayCtx, relayCancel := context.WithCancel(b.ctx)
 	defer relayCancel()
-	terminate := func() {
+	terminate := sync.OnceFunc(func() {
 		_ = conn.Close()
+		// Closing a PostgreSQL socket does not necessarily interrupt a running
+		// query. Send the session's private cancellation capability first.
+		if upstream.backendKey != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
+			b.cancelQuery(ctx, &pgproto3.CancelRequest{ProcessID: upstream.backendKey.ProcessID, SecretKey: upstream.backendKey.SecretKey})
+			cancel()
+		}
 		_ = upstream.conn.Close()
-	}
+	})
 	authorizationDone := make(chan struct{})
 	go func() {
 		defer close(authorizationDone)

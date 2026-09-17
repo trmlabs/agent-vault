@@ -15,6 +15,8 @@ description: "Configuration for deploying an instance of Agent Vault."
 | `AGENT_VAULT_ALLOW_PRIVATE_RANGES` | Optional (defaults to `false`) | Whether the proxy may dial private/reserved IP ranges (RFC-1918, loopback, link-local, IPv6 ULA, CGN). Cloud metadata endpoints stay blocked either way. |
 | `AGENT_VAULT_NETWORK_ALLOWLIST` | Optional | Comma-separated CIDRs or bare IPs the proxy may dial when `AGENT_VAULT_ALLOW_PRIVATE_RANGES=false` (e.g., `10.163.0.0/16,192.168.1.1`). |
 | `AGENT_VAULT_TRUSTED_PROXIES` | Optional | Comma-separated CIDRs of reverse proxies whose `X-Forwarded-For` headers are honored (e.g., `10.0.0.0/8,172.16.0.0/12`). |
+| `AGENT_VAULT_CREDENTIAL_PROXY` | Optional (defaults to `false`) | Enables the [credential proxy profile](#credential-proxy-profile): request-time Vault reads, restricted HTTP forwarding and durable audit admission. Requires workload identity, a working Vault client and loopback listeners behind protected ingress. |
+| `AGENT_VAULT_WORKLOAD_IDENTITY_FILE` | Required for the credential proxy profile | Path to JSON trust and workload bindings. Replaces session-token authentication at both HTTP and PostgreSQL proxy entry points with live Kubernetes projected-token verification. No standing-token fallback. |
 | `AGENT_VAULT_LOG_LEVEL` | Optional (defaults to `info`) | Log verbosity. One of: `info`, `debug`. `debug` adds one structured line per proxied request (no credential values). Overridden by `--log-level`. |
 | `AGENT_VAULT_RATELIMIT_PROFILE` | Optional (defaults to `default`) | Rate-limit preset. One of: `default`, `strict` (≈0.5× the defaults), `loose` (≈2×), `off`. |
 | `AGENT_VAULT_RATELIMIT_LOCK` | Optional (defaults to `false`) | Whether to make the rate-limit UI read-only and ignore UI overrides. |
@@ -28,6 +30,18 @@ description: "Configuration for deploying an instance of Agent Vault."
 | `DB_MAX_OPEN_CONNS` | Optional (defaults to `25`) | Maximum number of open Postgres connections per instance. Only applies when `DATABASE_URL` is set. See [connection pooling](/self-hosting/postgres#operational-notes). |
 | `DB_MAX_IDLE_CONNS` | Optional (defaults to `10`) | Maximum number of idle Postgres connections kept in the pool per instance. Only applies when `DATABASE_URL` is set. See [connection pooling](/self-hosting/postgres#operational-notes). |
 | `DB_CONN_MAX_LIFETIME` | Optional (defaults to `5m`) | Maximum lifetime of a Postgres connection before it is closed and replaced. Go duration string (e.g. `5m`, `1h`). Only applies when `DATABASE_URL` is set. See [connection pooling](/self-hosting/postgres#operational-notes). |
+
+## Credential proxy profile
+
+Set `AGENT_VAULT_CREDENTIAL_PROXY=true` to enable the restricted release workflow. The server requires an active HTTP proxy listener, workload identity configuration and a working HashiCorp Vault client. All listeners must be loopback addresses behind a verified encrypted transport. Vault must use HTTPS with certificate verification; HTTP is permitted only on a loopback IP for local fixtures. Unsupported requests, unresolved placeholders and unavailable audit storage deny admission.
+
+`AGENT_VAULT_WORKLOAD_IDENTITY_FILE` identifies a JSON file containing `issuer`, `audience` and `bindings`. Each binding requires `namespace`, `serviceAccount`, `serviceAccountUID`, `agentID` and `vaultID`; optional `podUID` pins one pod. Broker agents must be active and retain current access to the configured vault. One account maps to one agent/vault binding. Proof must have exactly one audience matching the configured value; multi-audience tokens are intentionally excluded from this release profile.
+
+Optional trust fields are `apiServer`, `caFile` and `reviewerTokenFile`. Defaults use `https://kubernetes.default.svc` and the standard service-account CA/token mount. The reviewer needs `create` on TokenReviews and `get` on pods in permitted namespaces. Every authorization verifies the proof and reads the current pod. API failure, deletion, UID mismatch or expired proof denies access. `timeoutSeconds` defaults to `5` (range `1` to `30`); `maxTokenLifetimeSeconds` defaults to `3600` (range `600` to `3600`). The example requests a 600-second projected lifetime.
+
+Agents read fresh proof from the projected file into `Proxy-Authorization` or the PostgreSQL password field. They do not use `AGENT_VAULT_TOKEN` or the legacy `vault run` token workflow. The existing administrator authentication remains separate. These proofs are bearer credentials and remain replayable while valid; protect their file and transport. This adapter identifies direct Kubernetes pods, not individual Daytona or ToolHive sessions inside a shared runner. It does not enforce network isolation or choose a managed runtime.
+
+The repository's `examples/credential-proxy/README.md` documents supported requests and deployment requirements. `examples/credential-proxy/kubernetes/README.md` supplies the identity schema, permissions, projected-volume example and disposable runtime test.
 
 ## Email SMTP configuration
 
@@ -76,7 +90,7 @@ GCP IAM and GCP ID Token share `INFISICAL_GCP_AUTH_IDENTITY_ID`; setting `INFISI
 
 ## HashiCorp Vault credential store
 
-Setting `VAULT_ADDR` enables HashiCorp-Vault-backed vaults: Agent Vault reads a single KV item from a HashiCorp Vault instance and caches the encrypted snapshot locally. Local mutations are rejected. See [Credential stores](/learn/credential-stores).
+Setting `VAULT_ADDR` enables HashiCorp-Vault-backed vaults. The legacy profile synchronizes a KV item into an encrypted local snapshot. The credential-proxy profile reads destination values at request time and denies failed lookups without local-value fallback. Local mutations are rejected. See [Credential stores](/learn/credential-stores).
 
 Supply env vars for one auth method. Detection picks the first complete group in priority order: AppRole → Token. Agent Vault honors the standard Vault client environment, so `VAULT_CACERT`, `VAULT_SKIP_VERIFY`, and `VAULT_NAMESPACE` work as they do for the `vault` CLI.
 
@@ -89,12 +103,12 @@ Supply env vars for one auth method. Detection picks the first complete group in
 | `VAULT_APPROLE_MOUNT` | Optional (AppRole Auth) | AppRole auth mount path. Defaults to `approle`; override for non-default Enterprise/HCP mounts (e.g. `prod-approle`). |
 | `VAULT_NAMESPACE` | Optional | Vault Enterprise / HCP namespace. |
 | `VAULT_CACERT` | Optional | Path to a CA cert bundle for TLS verification (standard Vault variable). |
-| `VAULT_SKIP_VERIFY` | Optional | Disable TLS verification (standard Vault variable; not recommended). On startup, Agent Vault logs a warning when this is enabled. |
+| `VAULT_SKIP_VERIFY` | Optional | Disable TLS verification for the legacy profile (not recommended). The credential-proxy profile rejects this setting; legacy startup logs a warning when it is enabled. |
 
 A `VAULT_TOKEN` is validated at startup (a `lookup-self` probe), so an expired or malformed token fails fast rather than surfacing as a per-vault sync error on the first poll.
 
 <Note>
-  Agent Vault does **not** auto-renew the AppRole-issued token. When it expires, syncs fail (`last_sync_status=error`) and the vault keeps serving its last good snapshot until the server restarts and re-authenticates. Use a token TTL comfortably longer than your restart cadence, or restart to refresh.
+  Agent Vault does **not** auto-renew the AppRole-issued token. When it expires, the legacy profile records failed syncs (`last_sync_status=error`) and keeps its last good snapshot until restart and re-authentication. The credential-proxy profile denies failed reads without using that snapshot. Use a token TTL comfortably longer than your restart cadence, or restart to refresh.
 </Note>
 
 <Tip>
