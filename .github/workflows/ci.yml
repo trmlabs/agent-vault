@@ -95,6 +95,9 @@ jobs:
           mkdir -p internal/server/webdist
           printf '<!doctype html><title>ci-stub</title>' > internal/server/webdist/index.html
 
+      - name: Test upstream merge automation
+        run: python3 scripts/upstream-update-test.py
+
       - name: Run tests
         run: go test -race -count=1 ./...
 
@@ -119,10 +122,13 @@ jobs:
           mkdir -p internal/server/webdist
           printf '<!doctype html><title>ci-stub</title>' > internal/server/webdist/index.html
 
+      - name: Validate GitHub workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/*.yml
+
       - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee # v6.5.0
+        uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee
         with:
-          version: v2.11
+          version: v2.11.0
 
   go-mod-tidy:
     needs: changes

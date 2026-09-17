@@ -28,6 +28,11 @@ That separate test exercises projected tokens, pod deletion, renewal and expiry.
 It does not prove production network isolation. Unit fixtures using a synthetic
 identity verifier or destination are labeled in their source.
 
+For real proof with live Vault and PostgreSQL, including a separate caller pod
+and enforced network policies, follow the [combined service fixtures](kubernetes/combined-services.md).
+These disposable tests establish the exercised paths; deployed storage,
+rollback and managed destinations still require acceptance.
+
 ## Supported release profile
 
 Set `AGENT_VAULT_CREDENTIAL_PROXY=true` and
@@ -91,10 +96,31 @@ private test-run or review link. Local fixtures do not close deployed routing,
 managed-database behavior or production operational checks.
 
 When the required deployed checks pass, the approved workload can perform its
-HTTP and PostgreSQL tasks without receiving destination credentials, and access
-ends when its identity or permission is withdrawn.
+HTTP and PostgreSQL tasks without receiving destination credentials. Withdrawal
+denies new HTTP requests and ends database sessions; stopping an HTTP request
+already in progress remains outside this release.
 
 ### Database bootstrap and removals
+
+Workload bindings require the stable agent ID, not its display name. After
+creating the agent, an authenticated instance owner can read `id` from
+`GET /v1/agents/{name}` through the protected management connection. This read
+does not return an agent token. Keep caller admission disabled until the agent,
+vault grant and reviewed workload binding exist; never give the caller an owner
+session or a standing agent token.
+
+Verify that sequence against the actual executable with Python 3, Go, OpenSSL and an
+explicitly selected disposable Docker daemon:
+
+```sh
+python3 examples/credential-proxy/verify-bootstrap.py --docker-host unix:///path/to/disposable/docker.sock
+```
+
+This check creates a fresh store and disposable Vault, then observes a short
+Vault login expire and a controlled restart obtain a fresh login. The current
+broker does not renew that login automatically. No caller is admitted in this
+check; validate request denial, active database cleanup and recovery during
+login expiry before accepting the deployment's restart strategy.
 
 Startup database entries are applied once per vault and name. Seed history and binding deletion are committed durably, so restarting with unchanged configuration does not restore a removed binding. Explicit CLI/API additions can restore access intentionally. New names in bootstrap configuration can still be created; runtime edits are preserved.
 

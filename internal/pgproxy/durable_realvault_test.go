@@ -212,13 +212,13 @@ func TestRealVault_DurableInterruptedIssuance(t *testing.T) {
 		request.URL.Host = upstream.Host
 		response, err := http.DefaultTransport.RoundTrip(request)
 		if err != nil {
-			http.Error(w, "upstream unavailable", 502)
+			http.Error(w, "upstream unavailable", http.StatusBadGateway)
 			return
 		}
 		defer response.Body.Close()
 		body, err := io.ReadAll(response.Body)
 		if err != nil {
-			http.Error(w, "response unavailable", 502)
+			http.Error(w, "response unavailable", http.StatusBadGateway)
 			return
 		}
 		if r.URL.Path == "/v1/"+svc.Mount+"/creds/"+svc.Role && response.StatusCode == 200 && interrupted.CompareAndSwap(false, true) {
@@ -308,6 +308,8 @@ func TestRealVault_DurableCrashHelper(t *testing.T) {
 		t.Fatal(err)
 	}
 	conn := connectDurableLease(t, svc, lease)
+	// The parent test supplies this path inside its private temporary directory.
+	// #nosec G703
 	if err = os.WriteFile(os.Getenv("AV_DURABLE_READY"), []byte(lease.Username), 0600); err != nil {
 		t.Fatal(err)
 	}

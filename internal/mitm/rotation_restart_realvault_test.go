@@ -137,7 +137,7 @@ func runVaultFreshnessFixture(t *testing.T, strict bool, profile ...bool) {
 			upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				calls.Add(1)
 				if r.Header.Get("Authorization") != "Bearer "+expected.Load().(string) {
-					http.Error(w, "stale credential", 401)
+					http.Error(w, "stale credential", http.StatusUnauthorized)
 					return
 				}
 				_, _ = io.WriteString(w, "approved")

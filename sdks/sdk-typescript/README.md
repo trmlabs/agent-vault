@@ -1,3 +1,5 @@
+> This directory retains the upstream SDK and its published package name. Installing `@infisical/agent-vault` installs the upstream package, not a TRM release. Its legacy session-token examples do not establish support for the strict workload-identity profile. See the repository's credential-proxy examples for that profile.
+
 # Agent Vault TypeScript SDK
 
 The official TypeScript SDK for [Agent Vault](https://github.com/Infisical/agent-vault), an open-source credential brokerage layer for AI agents. Agent Vault sits between development agents and target services, proxying requests and injecting credentials so agents never see raw keys or tokens.
