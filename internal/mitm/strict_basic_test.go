@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"html"
 	"io"
 	"net/http"
 	"strings"
@@ -35,6 +36,8 @@ func TestStrictBasicPlaceholder(t *testing.T) {
 	c := &basicFreshCredentials{value: strictCanary}
 	f.proxy.creds = c
 	f.upstream.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		f.calls.Add(1)
 		user, password, ok := r.BasicAuth()
 		if !ok || user != c.value || password != "" || r.Header.Get("Proxy-Authorization") != "" {
@@ -43,7 +46,7 @@ func TestStrictBasicPlaceholder(t *testing.T) {
 		}
 		switch r.URL.Path {
 		case "/echo-basic":
-			io.WriteString(w, r.Header.Get("Authorization"))
+			io.WriteString(w, html.EscapeString(r.Header.Get("Authorization")))
 		case "/echo-basic-header":
 			w.Header().Set("X-Echo", strings.TrimPrefix(r.Header.Get("Authorization"), "Basic "))
 		case "/echo-basic-trailer":
