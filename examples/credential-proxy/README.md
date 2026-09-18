@@ -112,6 +112,14 @@ saturation returns 429, or 503 if its denial cannot be durably recorded.
 PostgreSQL uses a separate temporary database credential per connection,
 continues checking authorization, and journals cleanup before issuing a
 credential. Cleanup uncertainty refuses new access to the affected binding.
+Caller startup parameters are forwarded only from a fixed allowlist and only
+with bounded values: `statement_timeout` must be a positive millisecond count,
+`application_name` printable ASCII of at most 63 bytes, `client_encoding`
+exactly `UTF8`, and the remaining client GUCs free of control characters. A
+value outside those bounds is dropped, so the upstream default or the Vault
+role's setting applies. This closes the startup packet as a way to clear or
+extend a role-level limit such as `statement_timeout`; an in-session `SET`
+remains governed by the role's SQL permissions.
 Follow [database recovery](database-recovery.md) before clearing a quarantine.
 
 ## Deployment requirements

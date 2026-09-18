@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"slices"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -65,7 +66,7 @@ func connectUpstream(ctx context.Context, dial DialFunc, svc *DatabaseService, l
 		params["database"] = database
 	}
 	for key, value := range clientParams {
-		if forwardableStartupParam(key) {
+		if forwardableStartupParam(key) && validStartupValue(key, value) {
 			params[key] = value
 		}
 	}
@@ -276,12 +277,20 @@ func negotiateUpstreamTLS(ctx context.Context, conn net.Conn, svc *DatabaseServi
 	return tlsConn, true, nil
 }
 
-// forwardableStartupParam reports whether an agent-supplied startup parameter is
-// safe to forward to the upstream. user/database are set from the resolved
-// service and Vault credential; only well-known single-value client runtime
-// GUCs are passed through. "options" is deliberately excluded: PostgreSQL
-// interprets it as backend command-line arguments, letting the agent set
-// arbitrary session GUCs the operator's Vault role may have meant to fix.
+// forwardableStartupParam reports whether an agent-supplied startup parameter
+// key is safe to forward to the upstream. user/database are set from the
+// resolved service and Vault credential; only well-known single-value client
+// runtime GUCs are passed through. "options" is deliberately excluded:
+// PostgreSQL interprets it as backend command-line arguments, letting the agent
+// set arbitrary session GUCs the operator's Vault role may have meant to fix.
+//
+// The key gate alone is not enough. A startup parameter overrides a role-level
+// "ALTER ROLE ... SET", so a permitted key with an unbounded value (for example
+// statement_timeout=0) reaches the same outcome "options" is excluded for.
+// connectUpstream therefore also requires validStartupValue to accept the
+// value; a parameter that fails either gate is dropped, never forwarded.
+// internal/taskrelay/postgres.go applies the same bounds for its stricter
+// allowlist. Keep the two in step when changing either.
 func forwardableStartupParam(key string) bool {
 	switch key {
 	case "application_name",
@@ -295,5 +304,60 @@ func forwardableStartupParam(key string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// validStartupValue reports whether the value of a forwardable startup
+// parameter is within the bounds the broker will pass upstream. Bounding here
+// (not only at the relay) means an agent that reaches the broker's PostgreSQL
+// listener directly cannot use the startup packet to clear or extend a
+// role-level limit such as statement_timeout. It closes that path only: once the
+// session is up, bytes are relayed verbatim and an in-session SET is governed
+// by the role's SQL permissions, as at the relay. A value that fails is dropped
+// silently, matching how a non-forwardable key is dropped: the upstream then
+// applies its own default.
+//   - statement_timeout: 1 to 10 ASCII digits parsing to 1..2147483647. This
+//     refuses "0" (no timeout), signs, units and any embedded options.
+//   - application_name: at most 63 bytes of printable ASCII, so log lines
+//     cannot carry control characters or oversized names.
+//   - client_encoding: exactly UTF8, the only encoding the relay accepts.
+//   - every other forwardable key: no control characters and at most 256
+//     bytes. These GUCs are bounded in effect but free-form in syntax; the
+//     upstream parser decides validity, this only refuses injection shapes.
+func validStartupValue(key, value string) bool {
+	switch key {
+	case "statement_timeout":
+		if value == "" || len(value) > 10 {
+			return false
+		}
+		for i := 0; i < len(value); i++ {
+			if value[i] < '0' || value[i] > '9' {
+				return false
+			}
+		}
+		n, err := strconv.ParseUint(value, 10, 31)
+		return err == nil && n > 0
+	case "application_name":
+		if len(value) > 63 {
+			return false
+		}
+		for i := 0; i < len(value); i++ {
+			if value[i] < 0x20 || value[i] > 0x7e {
+				return false
+			}
+		}
+		return true
+	case "client_encoding":
+		return value == "UTF8"
+	default:
+		if len(value) > 256 {
+			return false
+		}
+		for i := 0; i < len(value); i++ {
+			if value[i] < 0x20 || value[i] == 0x7f {
+				return false
+			}
+		}
+		return true
 	}
 }
