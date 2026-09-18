@@ -1,5 +1,9 @@
 # Kubernetes workload identity reference
 
+These direct-proof fixtures exercise broker identity and service behavior. For a
+sandbox without identity credentials, use the [separate task relay](../task-relay/README.md)
+and complete its deployed network acceptance checks.
+
 The agent presents a short-lived proof of the running pod instead of a standing Agent Vault token. The broker verifies that proof and the current pod, then checks the agent's existing access to the selected vault before either proxy admits work.
 
 These files prepare identity configuration only. They do not deploy a complete protected service. Kubernetes is a supported adapter protocol; GKE remains a proposed deployment until Infra confirms the runtime. A sandbox inside a shared runner is not a Kubernetes pod identity. Do not distribute a runner's service-account token to its sandboxes.

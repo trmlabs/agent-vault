@@ -54,6 +54,10 @@ func (r *relay) connect(w http.ResponseWriter, req *http.Request) {
 	stop := context.AfterFunc(r.ctx, func() { _ = up.Close() })
 	defer stop()
 	_ = up.SetDeadline(minTime(expiry, time.Now().Add(handshakeTimeout)))
+	if !time.Now().Before(expiry) || r.pair.check(req.Context(), req.RemoteAddr) != nil {
+		http.Error(w, "denied", http.StatusForbidden)
+		return
+	}
 	if _, e = fmt.Fprintf(up, "CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Authorization: Bearer %s\r\n\r\n", req.Host, req.Host, proof); e != nil {
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 		return

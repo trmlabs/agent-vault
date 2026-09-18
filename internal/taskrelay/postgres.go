@@ -84,6 +84,9 @@ func (r *relay) postgres(conn net.Conn) {
 	if e != nil || typ != 'R' || len(body) != 4 || binary.BigEndian.Uint32(body) != 3 {
 		return
 	}
+	if !time.Now().Before(expiry) || r.pair.check(r.ctx, conn.RemoteAddr().String()) != nil {
+		return
+	}
 	authPacket, e := (&pgproto3.PasswordMessage{Password: proof}).Encode(nil)
 	if e != nil {
 		return
@@ -256,6 +259,9 @@ func (r *relay) cancelPostgres(peer string, packet []byte) {
 	defer func() { _ = up.Close() }()
 	stop := context.AfterFunc(ctx, func() { _ = up.Close() })
 	defer stop()
+	if !time.Now().Before(target.expiry) || r.pair.check(ctx, peer) != nil {
+		return
+	}
 	if _, e = up.Write(target.packet); e == nil {
 		_, _ = io.Copy(io.Discard, up)
 	}

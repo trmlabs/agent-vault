@@ -577,3 +577,128 @@ func TestSupervisorCanCloseBrowserAfterTaskDeadline(t *testing.T) {
 		})
 	}
 }
+
+func TestWithdrawalBeforeProofForwarding(t *testing.T) {
+	for _, protocol := range []string{"connect", "postgres"} {
+		t.Run(protocol, func(t *testing.T) {
+			f := newRelayFixture(t)
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			forwarded := make(chan bool, 1)
+			config := &tls.Config{Certificates: []tls.Certificate{f.cert}, MinVersion: tls.VersionTLS12}
+			if protocol == "connect" {
+				config.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) { close(entered); <-release; return nil, nil }
+			}
+			listener, e := tls.Listen("tcp", "127.0.0.1:0", config)
+			if e != nil {
+				t.Fatal(e)
+			}
+			defer listener.Close()
+			go func() {
+				conn, e := listener.Accept()
+				if e != nil {
+					forwarded <- false
+					return
+				}
+				defer conn.Close()
+				conn.SetDeadline(time.Now().Add(3 * time.Second))
+				if protocol == "connect" {
+					req, e := http.ReadRequest(bufio.NewReader(conn))
+					if e != nil {
+						forwarded <- false
+						return
+					}
+					defer req.Body.Close()
+					forwarded <- req.Header.Get("Proxy-Authorization") != ""
+					return
+				}
+				if _, e = readStartupPacket(conn); e != nil {
+					forwarded <- false
+					return
+				}
+				close(entered)
+				<-release
+				conn.Write(encodePGFrame('R', []byte{0, 0, 0, 3}))
+				typ, _, e := readPGFrame(conn, 32768)
+				forwarded <- e == nil && typ == 'p'
+			}()
+			address := freeAddress(t)
+			upstream := f.upstream(t, listener.Addr().String())
+			if protocol == "connect" {
+				f.c.Connect = &ConnectConfig{Listen: address, Upstream: upstream, AllowedTargets: []string{"approved.test:443"}}
+			} else {
+				f.c.Postgres = &PostgresConfig{Listen: address, Upstream: upstream, User: "workload", Database: "canary", Placeholder: "public-placeholder"}
+			}
+			f.start(t)
+			agent := f.dial(t, address)
+			if protocol == "connect" {
+				io.WriteString(agent, "CONNECT approved.test:443 HTTP/1.1\r\nHost: approved.test:443\r\n\r\n")
+			} else {
+				packet, _ := (&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber, Parameters: map[string]string{"user": "workload", "database": "canary"}}).Encode(nil)
+				agent.Write(packet)
+				if _, _, e = readPGFrame(agent, 1024); e != nil {
+					t.Fatal(e)
+				}
+				agent.Write(encodePGFrame('p', []byte("public-placeholder\x00")))
+			}
+			select {
+			case <-entered:
+			case <-time.After(time.Second):
+				t.Fatal("broker barrier not reached")
+			}
+			f.state.Store(1)
+			close(release)
+			select {
+			case leaked := <-forwarded:
+				if leaked {
+					t.Fatal("proof forwarded after pairing withdrawal")
+				}
+			case <-time.After(4 * time.Second):
+				t.Fatal("broker connection did not terminate")
+			}
+		})
+	}
+}
+
+func TestAuditDirectorySyncFailureRefusesStartup(t *testing.T) {
+	f := newRelayFixture(t)
+	called := false
+	journal, e := openAudit(f.c, func(directory string) error {
+		called = true
+		if directory != filepath.Dir(f.c.AuditFile) {
+			t.Fatal("wrong audit directory")
+		}
+		return io.ErrClosedPipe
+	})
+	if e != errDenied || journal != nil || !called {
+		t.Fatal("directory sync failure did not refuse startup")
+	}
+	contents, e := os.ReadFile(f.c.AuditFile)
+	if e != nil || len(contents) != 0 {
+		t.Fatal("mapping acknowledged before directory sync")
+	}
+	if syncAuditDirectory(filepath.Join(t.TempDir(), "absent")) != errDenied {
+		t.Fatal("missing directory accepted")
+	}
+}
+
+func TestOperatorConfigExampleMatchesSchema(t *testing.T) {
+	b, e := os.ReadFile("../../examples/credential-proxy/task-relay/config.example.json")
+	if e != nil {
+		t.Fatal(e)
+	}
+	var fields map[string]any
+	if json.Unmarshal(b, &fields) != nil {
+		t.Fatal("invalid example JSON")
+	}
+	fields["deadline"] = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	b, e = json.Marshal(fields)
+	if e != nil {
+		t.Fatal(e)
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	writeTestFile(t, path, b)
+	if _, e = LoadConfig(path); e != nil {
+		t.Fatal(e)
+	}
+}

@@ -1,12 +1,18 @@
 # Credential proxy verification
 
 Run an approved HTTPS request and PostgreSQL query without putting their
-credentials in the agent. The broker verifies the agent's workload identity,
+credentials in the agent. The broker verifies workload identity,
 reads or issues credentials through Vault, and refuses requests it cannot
 safely authorize or record.
 
 This directory supplies local verification and a proposed deployment profile.
 It does not establish that a TRM production deployment has passed acceptance.
+
+For a managed Kubernetes sandbox that must hold **no identity credential**, use
+[the separate task relay](task-relay/README.md). Its operator-owned pairing maps
+the actual socket IP to the live sandbox Pod UID and a fixed policy; projected
+proofs remain in the trusted relay. The direct-proof fixtures below test broker
+identity and protocol behavior and are not the secretless sandbox deployment.
 
 ## Run the local demonstration
 
