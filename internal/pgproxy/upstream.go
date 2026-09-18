@@ -285,6 +285,7 @@ func negotiateUpstreamTLS(ctx context.Context, conn net.Conn, svc *DatabaseServi
 func forwardableStartupParam(key string) bool {
 	switch key {
 	case "application_name",
+		"statement_timeout",
 		"client_encoding",
 		"DateStyle",
 		"TimeZone",

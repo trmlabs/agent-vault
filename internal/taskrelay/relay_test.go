@@ -276,6 +276,7 @@ func TestPostgresCustodyAndCancellation(t *testing.T) {
 	}
 	defer l.Close()
 	proofs := make(chan string, 4)
+	startups := make(chan map[string]string, 4)
 	cancels := make(chan []byte, 4)
 	coreKey := []byte{0, 0, 0, 7, 0, 0, 0, 9}
 	go func() {
@@ -295,6 +296,11 @@ func TestPostgresCustodyAndCancellation(t *testing.T) {
 					cancels <- packet
 					return
 				}
+				var message pgproto3.StartupMessage
+				if message.Decode(packet[4:]) != nil {
+					return
+				}
+				startups <- message.Parameters
 				c.Write(encodePGFrame('R', []byte{0, 0, 0, 3}))
 				typ, p, e := readPGFrame(c, 32768)
 				if e != nil || typ != 'p' {
@@ -311,7 +317,7 @@ func TestPostgresCustodyAndCancellation(t *testing.T) {
 	f.c.Postgres = &PostgresConfig{Listen: freeAddress(t), Upstream: f.upstream(t, l.Addr().String()), Database: "canary", User: "workload", Placeholder: "public-placeholder"}
 	f.start(t)
 	c := f.dial(t, f.c.Postgres.Listen)
-	startup, _ := (&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber, Parameters: map[string]string{"user": "workload", "database": "canary"}}).Encode(nil)
+	startup, _ := (&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber, Parameters: map[string]string{"user": "workload", "database": "canary", "application_name": "service-client", "statement_timeout": "30000", "client_encoding": "UTF8"}}).Encode(nil)
 	c.Write(startup)
 	typ, b, e := readPGFrame(c, 1024)
 	if e != nil || typ != 'R' || binary.BigEndian.Uint32(b) != 3 {
@@ -333,6 +339,10 @@ func TestPostgresCustodyAndCancellation(t *testing.T) {
 	}
 	if string(localKey) == string(coreKey) || len(localKey) != 8 {
 		t.Fatal("broker cancel key disclosed")
+	}
+	gotStartup := <-startups
+	if gotStartup["application_name"] != "service-client" || gotStartup["statement_timeout"] != "30000" || gotStartup["client_encoding"] != "UTF8" || gotStartup["user"] != "workload" || gotStartup["database"] != "canary" || len(gotStartup) != 5 {
+		t.Fatalf("unexpected upstream startup: %v", gotStartup)
 	}
 	expected, _ := os.ReadFile(f.c.Postgres.Upstream.ProofFile)
 	if got := <-proofs; got != string(expected) {
@@ -427,7 +437,16 @@ func TestPostgresDeniesAuthorityAndMalformedFramesBeforeUpstream(t *testing.T) {
 	}()
 	f.c.Postgres = &PostgresConfig{Listen: freeAddress(t), Upstream: f.upstream(t, l.Addr().String()), Database: "canary", User: "workload", Placeholder: "public-placeholder"}
 	f.start(t)
-	for _, parameters := range []map[string]string{{"user": "workload", "database": "other"}, {"user": "workload", "database": "canary", "replication": "true"}, {"user": "workload", "database": "canary", "agent_vault_vault": "other"}, {"user": "workload", "database": "canary", "options": "-c role=admin"}} {
+	invalid := []map[string]string{{"user": "workload", "database": "other"}, {"user": "workload", "database": "canary", "replication": "true"}, {"user": "workload", "database": "canary", "agent_vault_vault": "other"}, {"user": "workload", "database": "canary", "options": "-c role=admin"}}
+	for key, values := range map[string][]string{
+		"application_name":  {strings.Repeat("a", 64), "injected\nlog", "client\x01", "客户端"},
+		"statement_timeout": {"", "0", "-1", "+1", "30s", " 30000", "2147483648", "99999999999", "30000 -c role=admin"},
+	} {
+		for _, value := range values {
+			invalid = append(invalid, map[string]string{"user": "workload", "database": "canary", key: value})
+		}
+	}
+	for _, parameters := range invalid {
 		c := f.dial(t, f.c.Postgres.Listen)
 		b, _ := (&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber, Parameters: parameters}).Encode(nil)
 		c.Write(b)

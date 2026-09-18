@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -47,9 +48,15 @@ func (r *relay) postgres(conn net.Conn) {
 	if !validStartup(startup.Parameters, c) {
 		return
 	}
-	// The public client encoding setting carries no authority and is normalized
-	// away; the trusted broker constructs the actual database connection.
-	packet, e = (&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber, Parameters: map[string]string{"user": c.User, "database": c.Database}}).Encode(nil)
+	// Preserve validated client behavior while fixing connection authority to the
+	// operator's database/user. Never forward arbitrary backend options.
+	parameters := map[string]string{"user": c.User, "database": c.Database}
+	for _, key := range []string{"application_name", "statement_timeout", "client_encoding"} {
+		if value, ok := startup.Parameters[key]; ok {
+			parameters[key] = value
+		}
+	}
+	packet, e = (&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber, Parameters: parameters}).Encode(nil)
 	if e != nil {
 		return
 	}
@@ -159,6 +166,30 @@ func validStartup(parameters map[string]string, c *PostgresConfig) bool {
 	for key, value := range parameters {
 		switch key {
 		case "database", "user":
+		case "application_name":
+			if len(value) > 63 {
+				return false
+			}
+			for _, char := range value {
+				if char < 32 || char > 126 {
+					return false
+				}
+			}
+		case "statement_timeout":
+			// Accept a positive millisecond value, not units, options or a request
+			// to disable the timeout. SQL permissions remain the access boundary.
+			if value == "" || len(value) > 10 {
+				return false
+			}
+			for _, char := range value {
+				if char < '0' || char > '9' {
+					return false
+				}
+			}
+			n, err := strconv.ParseUint(value, 10, 31)
+			if err != nil || n == 0 {
+				return false
+			}
 		case "client_encoding":
 			if value != "UTF8" {
 				return false

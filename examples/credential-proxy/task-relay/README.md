@@ -79,7 +79,7 @@ sections must have usable trust files when present; omit a section until ready.
 | Surface | Sandbox sends | Relay behavior |
 |---|---|---|
 | HTTP | CONNECT to an exact approved host:port, without proxy credentials | Injects fresh proof into the fixed broker connection; returns no broker headers. The inner HTTPS request still follows the broker's approved placeholder and read-only policy. |
-| PostgreSQL | Fixed database/user and the configured public placeholder password | Replaces the password with proof; keeps actual database credentials at the broker. Only optional `client_encoding=UTF8` is accepted and removed from startup. |
+| PostgreSQL | Fixed database/user and the configured public placeholder password | Replaces the password with proof; keeps actual database credentials at the broker. Preserves optional `client_encoding=UTF8`, a printable ASCII `application_name` of at most 63 bytes, and a positive decimal `statement_timeout` in milliseconds (at most 2147483647). Other startup fields are denied. |
 | Browser | POST `{}` with `Content-Type: application/json` to the fixed relay route | Uses one fixed task and a private broker session handle; returns only readiness, a boolean check or closure. |
 
 All relay listeners use native TLS so the actual peer address survives. A
@@ -88,6 +88,9 @@ loopback while verifying the relay certificate and server name. PostgreSQL uses
 this **outer TLS** transport; do not request a second PostgreSQL SSL negotiation
 inside it. Unsupported startup options, replication, caller identity headers and
 caller-selected destinations are refused.
+
+The statement timeout preserves client behavior; it is not an authorization control.
+Database permissions still govern queries, including any permitted session changes.
 
 PostgreSQL cancellation uses a random relay-local key scoped to the active
 session. The relay checks the pairing again and maps that key to the established
