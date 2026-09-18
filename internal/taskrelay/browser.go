@@ -9,11 +9,13 @@ import (
 	"errors"
 	"io"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -39,9 +41,11 @@ type BrowserRelay struct {
 	mu        sync.Mutex
 	handle    string
 	expiresAt int64
-	closed    bool
+	closed    atomic.Bool
 	uncertain bool
 }
+
+type browserPeerKey struct{}
 
 var browserTaskName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$`)
 var browserProof = regexp.MustCompile(`^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$`)
@@ -58,12 +62,31 @@ func NewBrowserRelay(options BrowserOptions) (*BrowserRelay, error) {
 		return nil, errBrowserUnavailable
 	}
 	options.Endpoint = strings.TrimSuffix(options.Endpoint, "/")
-	transport := &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots}, DisableKeepAlives: true, DisableCompression: true, Proxy: nil}
-	return &BrowserRelay{options: options, client: &http.Client{Transport: transport, Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
+	relay := &BrowserRelay{options: options}
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots, ServerName: endpoint.Hostname()}
+	transport := &http.Transport{TLSClientConfig: tlsConfig, DisableKeepAlives: true, DisableCompression: true, Proxy: nil}
+	transport.DialTLSContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		dialer := &tls.Dialer{NetDialer: &net.Dialer{Timeout: 10 * time.Second}, Config: tlsConfig}
+		connection, err := dialer.DialContext(ctx, network, address)
+		if err != nil {
+			return nil, errBrowserUnavailable
+		}
+		// A delayed TLS handshake must not admit a proof after pair withdrawal.
+		// Cleanup has no peer in its context and remains possible after withdrawal.
+		if peer, _ := ctx.Value(browserPeerKey{}).(string); peer != "" {
+			if relay.allowed(ctx, peer) != nil {
+				_ = connection.Close()
+				return nil, errBrowserUnavailable
+			}
+		}
+		return connection, nil
+	}
+	relay.client = &http.Client{Transport: transport, Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	return relay, nil
 }
 
 func (b *BrowserRelay) allowed(ctx context.Context, peer string) error {
-	if b.closed || !time.Now().Before(b.options.Deadline) {
+	if b.closed.Load() || !time.Now().Before(b.options.Deadline) {
 		return errBrowserUnavailable
 	}
 	return b.options.Authorize(ctx, peer)
@@ -113,7 +136,8 @@ func (b *BrowserRelay) call(ctx context.Context, path string, input any, expecte
 	if err != nil {
 		return nil, errBrowserUnavailable
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.options.Endpoint+path, bytes.NewReader(body))
+	requestCtx := context.WithValue(ctx, browserPeerKey{}, peer)
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, b.options.Endpoint+path, bytes.NewReader(body))
 	if err != nil {
 		return nil, errBrowserUnavailable
 	}
@@ -183,7 +207,7 @@ func (b *BrowserRelay) cleanup(ctx context.Context) error {
 func (b *BrowserRelay) refuseAndClose() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	b.closed = true
+	b.closed.Store(true)
 	_ = b.cleanup(ctx)
 }
 
@@ -297,6 +321,6 @@ func (b *BrowserRelay) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (b *BrowserRelay) Close(ctx context.Context) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.closed = true
+	b.closed.Store(true)
 	return b.cleanup(ctx)
 }

@@ -2,6 +2,7 @@ package taskrelay
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -328,5 +330,33 @@ func TestBrowserRelayIgnoresClientAcceptEncoding(t *testing.T) {
 				t.Fatalf("standard client refused: %d", got.Code)
 			}
 		})
+	}
+}
+
+func TestBrowserRelayWithdrawalDuringTLSHandshakeSendsNoProof(t *testing.T) {
+	f := newBrowserFixture(t)
+	entered, release := make(chan struct{}), make(chan struct{})
+	var active atomic.Bool
+	active.Store(true)
+	f.relay.options.Authorize = func(context.Context, string) error {
+		if !active.Load() {
+			return errors.New("withdrawn")
+		}
+		return nil
+	}
+	var requests atomic.Int32
+	broker := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { requests.Add(1); w.WriteHeader(403) }))
+	broker.TLS = &tls.Config{Certificates: f.upstream.TLS.Certificates, MinVersion: tls.VersionTLS12, GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) { close(entered); <-release; return nil, nil }}
+	broker.StartTLS()
+	defer broker.Close()
+	f.relay.options.Endpoint = broker.URL
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- f.request("/v1/browser/tasks", "{}", nil) }()
+	<-entered
+	active.Store(false)
+	close(release)
+	got := <-done
+	if got.Code != 502 || requests.Load() != 0 {
+		t.Fatalf("proof crossed withdrawn pair: status=%d requests=%d", got.Code, requests.Load())
 	}
 }
