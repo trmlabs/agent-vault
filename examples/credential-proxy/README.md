@@ -46,7 +46,12 @@ The initial HTTP workflow is HTTPS GET or HEAD with no query or body. Put a
 configured `__vault_KEY__` placeholder in `Authorization` or `X-Api-Key`.
 Configure an exact destination, a passthrough service authentication strategy,
 and a header substitution mapping that marker to a field of the authorized
-Vault path. All configured markers must appear in allowed headers. Other
+Vault path. All configured markers must appear in allowed headers. For HTTP
+Basic authentication, send the placeholder as the username with an empty
+password, for example `curl --user "__vault_API_KEY__:"`. The proxy substitutes
+the request-time value and encodes the Basic header. The secret must not contain
+a colon. Keep the service configured as passthrough plus header substitution;
+the legacy `basic` service authentication strategy is not this profile. Other
 formats are rejected, not passed through. This is not general browser or API
 coverage.
 

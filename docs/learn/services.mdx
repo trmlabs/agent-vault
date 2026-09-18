@@ -66,6 +66,8 @@ Common services: Stripe, GitHub, OpenAI.
 
 Attaches an `Authorization: Basic <base64>` header using HTTP Basic authentication. The `username` field is required; `password` is optional (defaults to empty).
 
+The strict credential-proxy profile uses a different configuration: a passthrough service with a header substitution. The client sends the configured placeholder as the Basic username and an empty password. The proxy reads the value for that request and constructs the Basic header. General username/password injection remains outside that profile.
+
 ```yaml
 services:
   - name: api-ashbyhq-com

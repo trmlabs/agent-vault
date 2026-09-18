@@ -6,7 +6,7 @@ Agent Vault is an HTTP proxy that attaches credentials to your outbound requests
 
 When the managed runner selects this profile, use its approved destinations, placeholder mappings, fresh workload proof and verified encrypted connection. The legacy token, discovery and proposal instructions below do not apply. Never request a standing token, invent a mapping or fall back to a direct connection.
 
-HTTP supports approved HTTPS GET/HEAD requests without a query or body, with configured placeholders only in `Authorization` or `X-Api-Key`. The runner supplies proof through `Proxy-Authorization`; PostgreSQL uses proof in its password field. Never log proof or put it in a destination header. Reconnect with fresh proof before expiry.
+HTTP supports approved HTTPS GET/HEAD requests without a query or body, with configured placeholders only in `Authorization` or `X-Api-Key`. HTTP Basic supports a configured placeholder as the username with an empty password; never supply a real username or password. The runner supplies proof through `Proxy-Authorization`; PostgreSQL uses proof in its password field. Never log proof or put it in a destination header. Reconnect with fresh proof before expiry.
 
 - `403`: denied identity, mapping, destination or request format. Stop and report it.
 - `429`: rate limited. Pause before retrying the approved request.

@@ -171,6 +171,10 @@ func (p *Proxy) forwardStrict(w http.ResponseWriter, r *http.Request, target, ho
 	}
 	brokercore.ApplyInjection(r.Header, out.Header, inject)
 	used := map[string]bool{}
+	responseSecrets := map[string]string{}
+	for marker, value := range values {
+		responseSecrets[marker] = value
+	}
 	for name, vals := range out.Header {
 		if name == "Authorization" || name == "X-Api-Key" {
 			if len(vals) != 1 {
@@ -179,7 +183,19 @@ func (p *Proxy) forwardStrict(w http.ResponseWriter, r *http.Request, target, ho
 			}
 			marker := vals[0]
 			prefix := ""
-			if name == "Authorization" && strings.HasPrefix(marker, "Bearer ") {
+			basic := name == "Authorization" && strings.HasPrefix(marker, "Basic ")
+			if basic {
+				encoded := strings.TrimPrefix(marker, "Basic ")
+				decoded, err := base64.StdEncoding.Strict().DecodeString(encoded)
+				// Only an exact placeholder username and empty password are supported.
+				// Canonical encoding also excludes whitespace and ambiguous encodings.
+				if err != nil || base64.StdEncoding.EncodeToString(decoded) != encoded || !strings.HasSuffix(string(decoded), ":") {
+					deny(http.StatusBadRequest)
+					return
+				}
+				marker = strings.TrimSuffix(string(decoded), ":")
+			}
+			if !basic && name == "Authorization" && strings.HasPrefix(marker, "Bearer ") {
 				prefix = "Bearer "
 				marker = strings.TrimPrefix(marker, prefix)
 			}
@@ -188,7 +204,18 @@ func (p *Proxy) forwardStrict(w http.ResponseWriter, r *http.Request, target, ho
 				deny(http.StatusBadRequest)
 				return
 			}
-			out.Header.Set(name, prefix+secret)
+			if basic {
+				if strings.ContainsRune(secret, ':') {
+					deny(http.StatusBadRequest)
+					return
+				}
+				out.SetBasicAuth(secret, "")
+				// Base64(secret + ":") is not necessarily an encoding of secret
+				// alone. Include the actual Basic payload in response screening.
+				responseSecrets["basic:"+marker] = secret + ":"
+			} else {
+				out.Header.Set(name, prefix+secret)
+			}
 			used[marker] = true
 		}
 	}
@@ -233,7 +260,7 @@ func (p *Proxy) forwardStrict(w http.ResponseWriter, r *http.Request, target, ho
 		finishFailure(http.StatusBadGateway)
 		return
 	}
-	needles := secretRepresentations(values)
+	needles := secretRepresentations(responseSecrets)
 	if containsSecret(data, needles) {
 		finishFailure(http.StatusBadGateway)
 		return
