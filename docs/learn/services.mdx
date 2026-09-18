@@ -430,3 +430,11 @@ Removes all services. Agents scoped to this [vault](/learn/vaults) will get `403
 
   </Accordion>
 </AccordionGroup>
+
+## Fixed read queries in the strict profile
+
+The strict credential-proxy profile accepts an optional operator-owned
+`fixed_query` object on an exact GET service. Callers send no query or body;
+the proxy adds the configured non-secret string parameters after authorization.
+Legacy forwarding refuses these services. See the repository's
+`examples/credential-proxy/README.md` for the complete configuration and limits.

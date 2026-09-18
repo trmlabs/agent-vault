@@ -282,6 +282,13 @@ func (p *Proxy) forwardRequest(
 		return
 	}
 
+	// Fixed-query services require the strict no-parameters request boundary.
+	if inject.FixedQuery != nil {
+		http.Error(w, "strict credential proxy required", http.StatusForbidden)
+		emit(http.StatusForbidden, "strict_profile_required")
+		return
+	}
+
 	var body io.ReadCloser
 	var contentLength int64
 
@@ -376,7 +383,7 @@ func (p *Proxy) forwardRequest(
 		(r.Method == http.MethodGet || r.Method == http.MethodHead) {
 		_ = resp.Body.Close()
 		retryInject, retryErr := p.creds.Inject(r.Context(), scope.VaultID, host, port, r.URL.Path)
-		if retryErr == nil && retryInject != nil && retryInject.Headers != nil {
+		if retryErr == nil && retryInject != nil && retryInject.Headers != nil && retryInject.FixedQuery == nil {
 			retryReq := outReq.Clone(outReq.Context())
 			for k, v := range retryInject.Headers {
 				retryReq.Header.Set(k, v)

@@ -99,6 +99,7 @@ func TestRealVault_HTTPAuthorization(t *testing.T) {
 		t.Fatal("production Vault client failed against disposable service")
 	}
 
+	t.Run("strict-fixed-query", func(t *testing.T) { testRealVaultFixedQuery(t, hc, admin) })
 	for _, secure := range []bool{false, true} {
 		mode := "forward"
 		if secure {

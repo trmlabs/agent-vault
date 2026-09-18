@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Infisical/agent-vault/internal/broker"
 	"github.com/Infisical/agent-vault/internal/brokercore"
 	"github.com/Infisical/agent-vault/internal/requestlog"
 )
@@ -134,6 +135,17 @@ func (p *Proxy) forwardStrict(w http.ResponseWriter, r *http.Request, target, ho
 		deny(http.StatusForbidden)
 		return
 	}
+	// Fixed parameters come only from the matched operator configuration. Incoming
+	// query strings and bodies remain forbidden above, including exact copies.
+	fixed := broker.Service{Host: inject.MatchedHost, Path: inject.MatchedPath, FixedQuery: inject.FixedQuery}
+	if fixed.ValidateFixedQuery() != nil || (inject.FixedQuery != nil && (r.Method != http.MethodGet || inject.MatchedPath != r.URL.Path || r.URL.RawPath != "" || (inject.MatchedPort == nil && port != 443))) {
+		deny(http.StatusForbidden)
+		return
+	}
+	query := url.Values{}
+	for key, value := range inject.FixedQuery {
+		query.Set(key, value)
+	}
 	values := map[string]string{}
 	for _, sub := range inject.Substitutions {
 		if !strictPlaceholder.MatchString(sub.Placeholder) || len(sub.In) != 1 || sub.In[0] != "header" || sub.Value == "" || strings.ContainsAny(sub.Value, "\r\n") {
@@ -146,7 +158,7 @@ func (p *Proxy) forwardStrict(w http.ResponseWriter, r *http.Request, target, ho
 		}
 		values[sub.Placeholder] = sub.Value
 	}
-	outURL := &url.URL{Scheme: "https", Host: target, Path: r.URL.Path, RawPath: r.URL.RawPath}
+	outURL := &url.URL{Scheme: "https", Host: target, Path: r.URL.Path, RawPath: r.URL.RawPath, RawQuery: query.Encode()}
 	out, err := http.NewRequestWithContext(r.Context(), r.Method, outURL.String(), nil)
 	if err != nil {
 		deny(http.StatusBadRequest)

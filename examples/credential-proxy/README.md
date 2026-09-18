@@ -42,7 +42,7 @@ an unavailable proxy listener and disabled TLS verification. Listeners must be
 loopback addresses; remote clients require a verified TLS transport terminating
 inside the trusted broker pod.
 
-The initial HTTP workflow is HTTPS GET or HEAD with no query or body. Put a
+The initial HTTP workflow is HTTPS GET or HEAD with no caller query or body. Put a
 configured `__vault_KEY__` placeholder in `Authorization` or `X-Api-Key`.
 Configure an exact destination, a passthrough service authentication strategy,
 and a header substitution mapping that marker to a field of the authorized
@@ -54,6 +54,34 @@ a colon. Keep the service configured as passthrough plus header substitution;
 the legacy `basic` service authentication strategy is not this profile. Other
 formats are rejected, not passed through. This is not general browser or API
 coverage.
+
+### Fixed read parameters
+
+For a GET operation with a fixed scope, the operator can add `fixed_query` to
+an exact service. The caller sends the URL without parameters. The proxy adds
+only the configured values and retains request-time credential reads and audit.
+Do not put secrets here; credentials belong in Vault and header substitutions.
+
+```json
+{
+  "name": "catalog-search",
+  "host": "api.example.test/v1/search",
+  "auth": {"type": "passthrough"},
+  "fixed_query": {"keyword": "synthetic", "limit": "1"},
+  "substitutions": [{"key": "API_KEY", "placeholder": "__vault_API_KEY__", "in": ["header"]}]
+}
+```
+
+Submit this service through the existing vault administrator service endpoint.
+The default destination port is 443; configure an explicit port in `host` for
+any other TLS listener. Encoded path variants are denied.
+Wildcard hosts/paths, ambiguous bindings, duplicate JSON parameter names and
+placeholder values are rejected. Parameters are scalar strings: at most 16,
+keys up to 64 characters, values up to 512 bytes, encoded query up to 4096 bytes.
+HEAD, POST, caller query strings and bodies remain denied for this mapping.
+Legacy forwarding refuses it. Missing or invalid configuration never falls
+back to an unrestricted request. Test the destination with synthetic data
+before approving real scope; this does not provide arbitrary API or browser access.
 
 Vault-backed destination values are fetched once for each admitted request.
 There is no local-value fallback or periodic synchronization in this profile.
