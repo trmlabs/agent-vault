@@ -1,0 +1,102 @@
+internal/hashicorp/config.go
+  s_9edc7552bb187b::t_b2c3ea82f6cdda 1-43,48-71,73-80
+  s_9edc7552bb187b::t_1b1576cf818fa7 72
+  s_9edc7552bb187b::t_b330bea158e351 44-47
+cmd/server.go
+  s_9edc7552bb187b::t_071a35b59a64ba 251-280
+  s_9edc7552bb187b::t_18d58bd001579f 217
+  s_9edc7552bb187b::t_61322555ece3fc 23
+internal/hashicorp/auth_test.go
+  s_9edc7552bb187b::t_c5eb70898b7468 1-96
+internal/hashicorp/sync_test.go
+  s_9edc7552bb187b::t_73468d0e194add 1-185
+docs/reference/cli.mdx
+  s_9edc7552bb187b::t_705e324471c0a6 206,212,216-218
+  s_9edc7552bb187b::t_36b39147b1ab94 279
+  s_9edc7552bb187b::t_c3d871a021996a 65-68
+internal/hashicorp/auth.go
+  s_9edc7552bb187b::t_ea203725bc5ebd 5-15
+  s_9edc7552bb187b::t_536e56b7069a93 1-4,16-82
+docs/learn/credential-stores.mdx
+  s_9edc7552bb187b::t_a3492941959849 8,12
+  s_9edc7552bb187b::t_3d577824430d66 31-38,41
+  s_9edc7552bb187b::t_edc4708508b633 74-75
+internal/server/server.go
+  s_9edc7552bb187b::t_a1fd6d003da8c9 1006-1008,1010-1017
+  s_9edc7552bb187b::t_9033fd9979ce59 91-95
+  s_9edc7552bb187b::t_8c324b857a9ab1 125-132
+  s_9edc7552bb187b::t_1030955ee2f6ad 923-936,941-947
+  s_9edc7552bb187b::t_2b7dae6c89858a 23
+docs/self-hosting/environment-variables.mdx
+  s_9edc7552bb187b::t_d482a51399d571 73-92
+internal/hashicorp/sync.go
+  s_9edc7552bb187b::t_2807ea17b49122 1-2,7-249
+  s_9edc7552bb187b::t_327d6996f7a8db 3-6
+internal/store/store.go
+  s_9edc7552bb187b::t_62c430eca65afb 261
+  s_9edc7552bb187b::t_e70554cdb48cf5 249
+internal/server/handle_vaults.go
+  s_9edc7552bb187b::t_8df3d7e527f170 298-300
+  s_9edc7552bb187b::t_be2e0025ac3b55 17
+  s_9edc7552bb187b::t_772de52a2c6cd1 223-238
+  s_9edc7552bb187b::t_9ca9583fd302f2 581-584,586-596
+  s_9edc7552bb187b::t_5341b237d51157 681-765
+  s_9edc7552bb187b::t_4db26e36dea544 147-149,151-168,171-172,174-180,182-205
+README.md
+  s_9edc7552bb187b::t_013d1fdbc2db46 33
+internal/hashicorp/config_test.go
+  s_9edc7552bb187b::t_41e2410a523373 56-57
+  s_9edc7552bb187b::t_a48742f62b0d30 58
+  s_9edc7552bb187b::t_8e961a9001bf6e 1-55,59-65
+.env.example
+  s_9edc7552bb187b::t_3bcfa728bc68ee 72-84
+go.mod
+  s_9edc7552bb187b::t_e521eaebde772f 42,54,63-70,72,79,81,90
+  s_9edc7552bb187b::t_0789f514f565f5 9
+internal/hashicorp/client.go
+  s_9edc7552bb187b::t_cb8df1543e0909 1-9,11-58,65-134,141-174
+  s_9edc7552bb187b::t_05ac995e238047 10
+  s_9edc7552bb187b::t_2b5db510ec3393 135-140
+  s_9edc7552bb187b::t_7bcbaf2a395d8d 59-64
+cmd/vaults.go
+  s_9edc7552bb187b::t_55ad9e9841cad0 193-196,202-206
+  s_9edc7552bb187b::t_acb30029b0e76d 521,525-527
+  s_9edc7552bb187b::t_4bb7ecd46add66 67-90,92
+  s_9edc7552bb187b::t_f0334e3a460019 189,192,197-201,207
+web/src/pages/home/VaultsListTab.tsx
+  s_9edc7552bb187b::t_11b7e01b9268c4 462,466-468,480-481
+  s_9edc7552bb187b::t_ce6143765c5a62 512-540
+  s_9edc7552bb187b::t_6688982c247ab5 429-430
+  s_9edc7552bb187b::t_63a4fad4026682 328-330
+  s_9edc7552bb187b::t_e681c3b4fec127 306-310
+  s_9edc7552bb187b::t_cbcc1f7a03ec35 360-373
+  s_9edc7552bb187b::t_e1be74f8d80532 394
+internal/store/migrations/049_hashicorp_credential_store.sql
+  s_9edc7552bb187b::t_e6fe3fc9c951b9 3-5
+  s_9edc7552bb187b::t_93e42758a20cd2 1-2,6-27
+internal/store/sqlite_test.go
+  s_9edc7552bb187b::t_cb79c26de5702f 32-33
+internal/hashicorp/client_integration_test.go
+  s_9edc7552bb187b::t_22482f43c46274 14
+  s_9edc7552bb187b::t_5fde6603084bc8 1-13,15-161
+internal/mitm/forward_hashicorp_test.go
+  s_9edc7552bb187b::t_65e910039764ff 1-20,31-114,120-146
+  s_9edc7552bb187b::t_ccdf5faf9ca0d4 21-30
+  s_9edc7552bb187b::t_d26502712b4d8a 115-119
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "8a66909a969fa943cdcee99ebb860c3e4406ac66",
+  "prompts": {},
+  "sessions": {
+    "s_9edc7552bb187b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "12c34a39-54d3-44a2-a7e1-35585bd8e822",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Preet Bhinder <preet.bhinder@trmlabs.com>"
+    }
+  }
+}
