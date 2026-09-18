@@ -25,12 +25,13 @@ import (
 )
 
 type relayFixture struct {
-	c        FixedConfig
-	cert     tls.Certificate
-	state    atomic.Int32
-	kube     *httptest.Server
-	done     chan struct{}
-	runError error
+	c         FixedConfig
+	cert      tls.Certificate
+	state     atomic.Int32
+	kubeCalls atomic.Int32 // every request the synthetic API server received
+	kube      *httptest.Server
+	done      chan struct{}
+	runError  error
 }
 
 func newRelayFixture(t *testing.T) *relayFixture {
@@ -38,6 +39,7 @@ func newRelayFixture(t *testing.T) *relayFixture {
 	f := &relayFixture{}
 	dir := t.TempDir()
 	f.kube = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.kubeCalls.Add(1)
 		if r.URL.Path != "/api/v1/namespaces/sandboxes/pods/agent" || r.Header.Get("Authorization") != "Bearer synthetic-reviewer" {
 			w.WriteHeader(403)
 			return
@@ -380,6 +382,14 @@ func TestPostgresCustodyAndCancellation(t *testing.T) {
 	case <-cancels:
 		t.Fatal("accepted stale cancellation key")
 	default:
+	}
+	// The accepted cancel and both rejected ones are journaled, so the audit
+	// separates a forwarded cancellation from a guessed or stale key.
+	if n := countAuditOutcome(t, f.c.AuditFile, "cancel"); n != 1 {
+		t.Fatalf("forwarded cancel produced %d cancel rows, want 1", n)
+	}
+	if n := countAuditOutcome(t, f.c.AuditFile, "denied:cancel"); n != 2 {
+		t.Fatalf("rejected cancels produced %d denied:cancel rows, want 2", n)
 	}
 }
 

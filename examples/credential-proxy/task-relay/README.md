@@ -79,7 +79,7 @@ sections must have usable trust files when present; omit a section until ready.
 | Surface | Sandbox sends | Relay behavior |
 |---|---|---|
 | HTTP | CONNECT to an exact approved host:port, without proxy credentials | Injects fresh proof into the fixed broker connection; returns no broker headers. The inner HTTPS request still follows the broker's approved placeholder and read-only policy. |
-| PostgreSQL | Fixed database/user and the configured public placeholder password | Replaces the password with proof; keeps actual database credentials at the broker. Preserves optional `client_encoding=UTF8`, a printable ASCII `application_name` of at most 63 bytes, and a positive decimal `statement_timeout` in milliseconds (at most 2147483647). Other startup fields are denied. |
+| PostgreSQL | Fixed database/user and the configured public placeholder password | Replaces the password with proof; keeps actual database credentials at the broker. Preserves optional `client_encoding=UTF8`, a printable ASCII `application_name` of at most 63 bytes, and a positive decimal `statement_timeout` in milliseconds (at most 2147483647). Other startup fields are denied. The broker applies these three bounds too, plus a control-character and length bound on the other client settings it forwards, and drops a value that fails, so a caller reaching the broker directly cannot use the startup packet to clear or extend a role-level limit such as `statement_timeout` either. In-session `SET` remains governed by the role's SQL permissions. |
 | Browser | POST `{}` with `Content-Type: application/json` to the fixed relay route | Uses one fixed task and a private broker session handle; returns only readiness, a boolean check or closure. |
 
 All relay listeners use native TLS so the actual peer address survives. A
@@ -114,7 +114,14 @@ returns a failed relay exit. Broker session expiry remains the crash fallback.
 The relay admits at most 32 concurrent operations and caps each listener at 32
 connections. Handshakes have a ten-second bound. Every admission checks the live
 pair; a one-second watcher with a three-second API timeout stops active streams
-on pair loss or API failure. HTTP/PostgreSQL streams also expire no later than
+on pair loss or API failure. A PostgreSQL connection is admitted (live pair check
+plus a durable `admitted` row) only after its peer address, TLS handshake,
+startup message and placeholder password have been validated. A connection
+refused before that point writes a `denied:bad-startup`, `denied:placeholder`
+or `denied:cancel` row; one that closes before sending a startup packet writes
+nothing and costs no API request. The first connection from an address other
+than the paired sandbox writes one `denied:peer` row; later ones are dropped
+without a row so a network neighbour cannot fill the journal. HTTP/PostgreSQL streams also expire no later than
 their admitted proof or task deadline. Reconnect to use a rotated proof.
 
 ## Verify and record acceptance

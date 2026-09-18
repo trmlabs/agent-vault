@@ -31,6 +31,15 @@ func newPairVerifier(c FixedConfig) (*pairVerifier, error) {
 	return &pairVerifier{c, &http.Client{Timeout: apiTimeout, Transport: &http.Transport{TLSClientConfig: t, Proxy: nil, MaxResponseHeaderBytes: 8192}, CheckRedirect: func(*http.Request, []*http.Request) error { return errDenied }}}, nil
 }
 
+// peerMatches reports whether a socket address belongs to the immutable
+// pairing's sandbox Pod IP. It consults nothing live, so a handler can drop a
+// foreign peer before spending a TLS handshake, a Kubernetes request or an
+// audit write on it. It is not admission: check still performs the live test.
+func (v *pairVerifier) peerMatches(peer string) bool {
+	host, _, e := net.SplitHostPort(peer)
+	return e == nil && net.ParseIP(host).Equal(net.ParseIP(v.config.Sandbox.PodIP))
+}
+
 // check never consults caller headers. With a nonempty peer it requires the
 // socket address to equal the immutable pairing and the current live Pod IP.
 func (v *pairVerifier) check(ctx context.Context, peer string) error {
@@ -38,11 +47,8 @@ func (v *pairVerifier) check(ctx context.Context, peer string) error {
 	if !time.Now().Before(c.Deadline) {
 		return errDenied
 	}
-	if peer != "" {
-		host, _, e := net.SplitHostPort(peer)
-		if e != nil || !net.ParseIP(host).Equal(net.ParseIP(c.Sandbox.PodIP)) {
-			return errDenied
-		}
+	if peer != "" && !v.peerMatches(peer) {
+		return errDenied
 	}
 	token, e := readBoundedFile(c.Kubernetes.ReviewerTokenFile, 32<<10)
 	if e != nil || strings.TrimSpace(string(token)) == "" {

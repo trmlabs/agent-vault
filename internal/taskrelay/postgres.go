@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"strconv"
@@ -26,26 +27,42 @@ type cancelTarget struct {
 // PostgreSQL uses outer TLS (the sandbox's public-CA stunnel can provide it).
 // Only the fixed database/user and a public placeholder are accepted. The relay
 // substitutes proof and replaces the broker cancellation key with a local one.
+//
+// Admission (the live Kubernetes check plus the durable "admitted" row) happens
+// only after the peer, the TLS handshake, the startup message and the
+// placeholder have all been validated. Before that point a connection costs no
+// API request. The paired sandbox can make the relay write a "denied:<reason>"
+// row by sending a rejected startup or placeholder; a peer that closes without
+// sending a startup packet leaves nothing.
 func (r *relay) postgres(conn net.Conn) {
 	_ = conn.SetDeadline(minTime(r.config.Deadline, time.Now().Add(handshakeTimeout)))
-	if r.admit(r.ctx, conn.RemoteAddr().String(), "postgres") != nil {
+	peer := conn.RemoteAddr().String()
+	// The listener hands over the connection before the TLS handshake, so a
+	// foreign address is refused before the relay reads a byte from it. Only
+	// the first foreign address is journaled: an unauthenticated network
+	// neighbour must not be able to drive one fsync per connect, and one row
+	// is enough to show the network isolation the operator attested to failed.
+	if !r.pair.peerMatches(peer) {
+		if r.foreignPeer.CompareAndSwap(false, true) {
+			_ = r.record("postgres", "denied:peer")
+		}
 		return
 	}
-	defer func() { _ = r.record("postgres", "terminal") }()
 	packet, e := readStartupPacket(conn)
 	if e != nil {
+		if !errors.Is(e, io.EOF) {
+			_ = r.record("postgres", "denied:bad-startup")
+		}
 		return
 	}
 	if binary.BigEndian.Uint32(packet[4:8]) == cancelCode {
-		r.cancelPostgres(conn.RemoteAddr().String(), packet)
+		r.cancelPostgres(peer, packet)
 		return
 	}
 	var startup pgproto3.StartupMessage
-	if startup.Decode(packet[4:]) != nil || startup.ProtocolVersion != pgproto3.ProtocolVersionNumber {
-		return
-	}
 	c := r.config.Postgres
-	if !validStartup(startup.Parameters, c) {
+	if startup.Decode(packet[4:]) != nil || startup.ProtocolVersion != pgproto3.ProtocolVersionNumber || !validStartup(startup.Parameters, c) {
+		_ = r.record("postgres", "denied:bad-startup")
 		return
 	}
 	// Preserve validated client behavior while fixing connection authority to the
@@ -66,14 +83,27 @@ func (r *relay) postgres(conn net.Conn) {
 		return
 	}
 	typ, password, e := readPGFrame(conn, 1024)
-	if e != nil || typ != 'p' || string(password) != c.Placeholder+"\x00" {
+	if e != nil {
+		if !errors.Is(e, io.EOF) {
+			_ = r.record("postgres", "denied:bad-startup")
+		}
 		return
 	}
+	if typ != 'p' || string(password) != c.Placeholder+"\x00" {
+		_ = r.record("postgres", "denied:placeholder")
+		return
+	}
+	// Everything the sandbox can influence has been validated. Admit: live pair
+	// check, then the durable "admitted" row, before any proof is read or used.
+	if r.admit(r.ctx, peer, "postgres") != nil {
+		return
+	}
+	defer func() { _ = r.record("postgres", "terminal") }()
 	proof, expiry, e := readProof(c.Upstream, r.config.Deadline)
 	if e != nil {
 		return
 	}
-	if r.pair.check(r.ctx, conn.RemoteAddr().String()) != nil {
+	if r.pair.check(r.ctx, peer) != nil {
 		return
 	}
 	up, e := dialUpstream(r.ctx, c.Upstream)
@@ -91,7 +121,7 @@ func (r *relay) postgres(conn net.Conn) {
 	if e != nil || typ != 'R' || len(body) != 4 || binary.BigEndian.Uint32(body) != 3 {
 		return
 	}
-	if !time.Now().Before(expiry) || r.pair.check(r.ctx, conn.RemoteAddr().String()) != nil {
+	if !time.Now().Before(expiry) || r.pair.check(r.ctx, peer) != nil {
 		return
 	}
 	authPacket, e := (&pgproto3.PasswordMessage{Password: proof}).Encode(nil)
@@ -148,7 +178,7 @@ func (r *relay) postgres(conn net.Conn) {
 			break
 		}
 	}
-	if typ != 'Z' || r.pair.check(r.ctx, conn.RemoteAddr().String()) != nil || r.record("postgres", "established") != nil {
+	if typ != 'Z' || r.pair.check(r.ctx, peer) != nil || r.record("postgres", "established") != nil {
 		return
 	}
 	_ = conn.SetDeadline(expiry)
@@ -159,6 +189,9 @@ func (r *relay) postgres(conn net.Conn) {
 	copyTunnel(r.ctx, conn, conn, up, up, expiry)
 }
 
+// validStartup is the relay's stricter allowlist. internal/pgproxy/upstream.go
+// (validStartupValue) applies the same per-key bounds at the broker; keep both
+// in step when changing either.
 func validStartup(parameters map[string]string, c *PostgresConfig) bool {
 	if parameters["database"] != c.Database || parameters["user"] != c.User {
 		return false
@@ -264,18 +297,28 @@ func (r *relay) registerCancel(coreKey []byte, address string, expiry time.Time)
 		}, nil
 	}
 }
+
+// cancelPostgres is reached without admission: a cancel carries no session to
+// admit, only a key that must match an established one. It journals its own
+// outcome so a rejected key is as visible as a rejected startup.
 func (r *relay) cancelPostgres(peer string, packet []byte) {
 	if len(packet) != 16 {
+		_ = r.record("postgres", "denied:cancel")
 		return
 	}
 	r.cancelMu.Lock()
 	target := r.cancellations[string(packet[8:])]
 	r.cancelMu.Unlock()
 	if target == nil || !target.mu.TryLock() {
+		_ = r.record("postgres", "denied:cancel")
 		return
 	}
 	defer target.mu.Unlock()
 	if !target.active || !time.Now().Before(target.expiry) || r.pair.check(r.ctx, peer) != nil {
+		_ = r.record("postgres", "denied:cancel")
+		return
+	}
+	if r.record("postgres", "cancel") != nil {
 		return
 	}
 	// Pin to the established broker socket, not a newly selected service replica.

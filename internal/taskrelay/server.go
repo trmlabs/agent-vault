@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -27,6 +28,7 @@ type relay struct {
 	cancellations map[string]*cancelTarget
 	workMu        sync.Mutex
 	stopping      bool
+	foreignPeer   atomic.Bool // set once a non-paired address has connected
 }
 
 // Run serves native TLS only. Failure of any listener, pairing, deadline or
