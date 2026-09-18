@@ -1,12 +1,18 @@
 # Credential proxy verification
 
 Run an approved HTTPS request and PostgreSQL query without putting their
-credentials in the agent. The broker verifies the agent's workload identity,
+credentials in the agent. The broker verifies workload identity,
 reads or issues credentials through Vault, and refuses requests it cannot
 safely authorize or record.
 
 This directory supplies local verification and a proposed deployment profile.
 It does not establish that a TRM production deployment has passed acceptance.
+
+For a managed Kubernetes sandbox that must hold **no identity credential**, use
+[the separate task relay](task-relay/README.md). Its operator-owned pairing maps
+the actual socket IP to the live sandbox Pod UID and a fixed policy; projected
+proofs remain in the trusted relay. The direct-proof fixtures below test broker
+identity and protocol behavior and are not the secretless sandbox deployment.
 
 ## Run the local demonstration
 
@@ -42,13 +48,52 @@ an unavailable proxy listener and disabled TLS verification. Listeners must be
 loopback addresses; remote clients require a verified TLS transport terminating
 inside the trusted broker pod.
 
-The initial HTTP workflow is HTTPS GET or HEAD with no query or body. Put a
+The initial HTTP workflow is HTTPS GET or HEAD with no caller query or body. Put a
 configured `__vault_KEY__` placeholder in `Authorization` or `X-Api-Key`.
 Configure an exact destination, a passthrough service authentication strategy,
 and a header substitution mapping that marker to a field of the authorized
-Vault path. All configured markers must appear in allowed headers. Other
+Vault path. All configured markers must appear in allowed headers. Only caller
+`Authorization` and `X-Api-Key` headers are forwarded after substitution. Other
+caller headers, including cookies and routing/method overrides, are discarded
+for every strict request. For HTTP
+Basic authentication, send the placeholder as the username with an empty
+password, for example `curl --user "__vault_API_KEY__:"`. The proxy substitutes
+the request-time value and encodes the Basic header. The secret must not contain
+a colon. Keep the service configured as passthrough plus header substitution;
+the legacy `basic` service authentication strategy is not this profile. Other
 formats are rejected, not passed through. This is not general browser or API
 coverage.
+
+### Fixed read parameters
+
+A fixed-query binding must not overlap another service's host, path pattern and
+port. Configuration rejects overlaps rather than selecting by declaration order.
+
+For a GET operation with a fixed scope, the operator can add `fixed_query` to
+an exact service. The caller sends the URL without parameters. The proxy adds
+only the configured values and retains request-time credential reads and audit.
+Do not put secrets here; credentials belong in Vault and header substitutions.
+
+```json
+{
+  "name": "catalog-search",
+  "host": "api.example.test/v1/search",
+  "auth": {"type": "passthrough"},
+  "fixed_query": {"keyword": "synthetic", "limit": "1"},
+  "substitutions": [{"key": "API_KEY", "placeholder": "__vault_API_KEY__", "in": ["header"]}]
+}
+```
+
+Submit this service through the existing vault administrator service endpoint.
+The default destination port is 443; configure an explicit port in `host` for
+any other TLS listener. Encoded path variants are denied.
+Wildcard hosts/paths, ambiguous bindings, duplicate JSON parameter names and
+placeholder values are rejected. Parameters are scalar strings: at most 16,
+keys up to 64 characters, values up to 512 bytes, encoded query up to 4096 bytes.
+HEAD, POST, caller query strings and bodies remain denied for this mapping.
+Legacy forwarding refuses it. Missing or invalid configuration never falls
+back to an unrestricted request. Test the destination with synthetic data
+before approving real scope; this does not provide arbitrary API or browser access.
 
 Vault-backed destination values are fetched once for each admitted request.
 There is no local-value fallback or periodic synchronization in this profile.
@@ -67,6 +112,14 @@ saturation returns 429, or 503 if its denial cannot be durably recorded.
 PostgreSQL uses a separate temporary database credential per connection,
 continues checking authorization, and journals cleanup before issuing a
 credential. Cleanup uncertainty refuses new access to the affected binding.
+Caller startup parameters are forwarded only from a fixed allowlist and only
+with bounded values: `statement_timeout` must be a positive millisecond count,
+`application_name` printable ASCII of at most 63 bytes, `client_encoding`
+exactly `UTF8`, and the remaining client GUCs free of control characters. A
+value outside those bounds is dropped, so the upstream default or the Vault
+role's setting applies. This closes the startup packet as a way to clear or
+extend a role-level limit such as `statement_timeout`; an in-session `SET`
+remains governed by the role's SQL permissions.
 Follow [database recovery](database-recovery.md) before clearing a quarantine.
 
 ## Deployment requirements

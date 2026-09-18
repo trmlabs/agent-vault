@@ -2,7 +2,7 @@
 name: agent-vault-cli
 description: >-
   Managed credential-proxy users follow the strict profile below,
-  using runner-supplied mappings and workload proof without a standing token.
+  using approved mappings through a trusted task relay without holding identity credentials.
   The following proposal workflow applies only to legacy token mode.
   Your outbound requests go through a proxy that injects real
   credentials (API keys, tokens, secrets) on the wire — in headers,
@@ -15,7 +15,7 @@ description: >-
   and HTTP_PROXY from the environment so requests route through
   the proxy. Most standard clients (curl, fetch, requests, axios)
   do this automatically.
-compatibility: Legacy mode requires agent-vault on $PATH and AGENT_VAULT_TOKEN; the managed credential-proxy profile uses runner-supplied workload proof.
+compatibility: Legacy mode requires agent-vault on $PATH and AGENT_VAULT_TOKEN; the managed task-relay profile uses public settings only; proof stays in a separate trusted Pod.
 metadata:
   author: dangtony98
   version: "0.5.0"
@@ -25,9 +25,9 @@ metadata:
 
 ## Managed credential-proxy profile
 
-When the managed runner selects this profile, use its approved destinations, placeholder mappings, fresh workload proof and verified encrypted connection. The legacy token, discovery and proposal instructions below do not apply. Never request a standing token, invent a mapping or fall back to a direct connection.
+When the managed runner selects this profile, use its approved destinations, public placeholder mappings and verified encrypted connection to the assigned task relay. The sandbox must not hold an identity token or projected proof; the separate trusted relay authenticates to the broker. The legacy token, discovery and proposal instructions below do not apply. Never request a standing token, invent a mapping or fall back to a direct connection.
 
-HTTP supports approved HTTPS GET/HEAD requests without a query or body, with configured placeholders only in `Authorization` or `X-Api-Key`. The runner supplies proof through `Proxy-Authorization`; PostgreSQL uses proof in its password field. Never log proof or put it in a destination header. Reconnect with fresh proof before expiry.
+HTTP supports approved HTTPS GET/HEAD requests without a caller query or body, with configured placeholders only in `Authorization` or `X-Api-Key`. HTTP Basic supports a configured placeholder as the username with an empty password; never supply a real username or password. An operator may configure a fixed non-secret query for an exact GET destination; send its URL without parameters and let the proxy add them. HEAD is denied for that mapping. Send no `Proxy-Authorization` or other identity header. PostgreSQL uses only the operator-provided public placeholder password and fixed database/user. The relay also preserves supported application-name, positive statement-timeout and UTF8 encoding settings; see the task relay guide for bounds. Reconnect when a connection expires; never retrieve a proof or bypass the relay. Browser access, when configured, uses only the assigned create/check/close routes with an empty JSON object; no login credentials or session handles belong in the sandbox.
 
 - `403`: denied identity, mapping, destination or request format. Stop and report it.
 - `429`: rate limited. Pause before retrying the approved request.
