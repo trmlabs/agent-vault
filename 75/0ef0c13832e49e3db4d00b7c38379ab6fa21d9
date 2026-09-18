@@ -1,0 +1,135 @@
+internal/hashicorp/auth.go
+  s_9edc7552bb187b::t_96cb01beaa27f1 24
+  s_9edc7552bb187b::t_536e56b7069a93 1-4,16-23,25-82
+  s_9edc7552bb187b::t_ea203725bc5ebd 5-15
+cmd/server.go
+  s_9edc7552bb187b::t_61322555ece3fc 23
+  s_9edc7552bb187b::t_18d58bd001579f 245
+  s_9edc7552bb187b::t_071a35b59a64ba 279-308
+.env.example
+  s_9edc7552bb187b::t_3bcfa728bc68ee 82-92,94,97
+  s_9edc7552bb187b::t_d4635d09e966f8 93,95-96
+internal/server/handle_vaults.go
+  s_9edc7552bb187b::t_4503d031d5ae1c 658-661,663-676
+  s_9edc7552bb187b::t_a1f730f941daa7 811
+  s_9edc7552bb187b::t_5341b237d51157 783-810,812-867
+  s_9edc7552bb187b::t_8df3d7e527f170 304-306
+  s_9edc7552bb187b::t_be2e0025ac3b55 17
+  s_9edc7552bb187b::t_4db26e36dea544 147-149,151-168,171-172,174-180,182-205
+  s_9edc7552bb187b::t_772de52a2c6cd1 229-244
+docs/reference/cli.mdx
+  s_9edc7552bb187b::t_c3d871a021996a 68-71
+  s_9edc7552bb187b::t_705e324471c0a6 247,257-259
+  s_9edc7552bb187b::t_e423bc5e216d91 72
+  s_9edc7552bb187b::t_340e0f55325ba4 253
+  s_9edc7552bb187b::t_36b39147b1ab94 339
+go.mod
+  s_9edc7552bb187b::t_0789f514f565f5 10
+  s_9edc7552bb187b::t_e521eaebde772f 48,60,70-77,79,92,94,103
+docs/learn/credential-stores.mdx
+  s_9edc7552bb187b::t_3d577824430d66 35-42,45
+  s_9edc7552bb187b::t_edc4708508b633 131-132
+  s_9edc7552bb187b::t_a3492941959849 12,16
+web/src/pages/vault/SettingsTab.tsx
+  s_9edc7552bb187b::t_e8329cd41f7c7d 270-275
+  s_9edc7552bb187b::t_996f3de5421059 188-198,207,215-227,230
+  s_9edc7552bb187b::t_9a5a95142bb66f 421-422,424
+  s_9edc7552bb187b::t_32ba84632f8297 439
+  s_9edc7552bb187b::t_74f093b988b229 25-31
+  s_9edc7552bb187b::t_f711953b01793a 284-286
+README.md
+  s_9edc7552bb187b::t_6c2acb431b47de 33
+web/src/pages/home/VaultsListTab.tsx
+  s_9edc7552bb187b::t_11b7e01b9268c4 489,493-495
+  s_9edc7552bb187b::t_477bc1a81896e2 402-408
+  s_9edc7552bb187b::t_7df700186e9649 464,468
+  s_9edc7552bb187b::t_7cc7d1d121b233 9-10
+  s_9edc7552bb187b::t_e1be74f8d80532 431
+  s_9edc7552bb187b::t_ae380e346c7c8f 482
+  s_9edc7552bb187b::t_cb12b27eb463eb 465-467
+go.sum
+  s_9edc7552bb187b::t_9f0404c90ebc93 45-46,101-102,110-111,131-149,152-155,191-192,195-196,228-229
+internal/server/server.go
+  s_9edc7552bb187b::t_2b7dae6c89858a 24
+  s_9edc7552bb187b::t_a1fd6d003da8c9 1121-1123,1125-1132
+  s_9edc7552bb187b::t_942367e344892c 63-74,96-97
+  s_9edc7552bb187b::t_9033fd9979ce59 91-95
+  s_9edc7552bb187b::t_8c324b857a9ab1 123-130
+  s_9edc7552bb187b::t_1030955ee2f6ad 1029-1042,1047-1053
+internal/hashicorp/config.go
+  s_9edc7552bb187b::t_b2c3ea82f6cdda 1-43,48-71,73-80
+  s_9edc7552bb187b::t_b330bea158e351 44-47
+  s_9edc7552bb187b::t_1b1576cf818fa7 72
+web/src/components/VaultForm.tsx
+  s_9edc7552bb187b::t_4d28acfc476e1e 73,88-90,102
+  s_9edc7552bb187b::t_1580c4e0bd5713 146-148
+  s_9edc7552bb187b::t_cf4ae29696f3fa 178-205
+  s_9edc7552bb187b::t_8989f209347ae5 72,87
+  s_9edc7552bb187b::t_8a41314fa9cc50 13,17-19,29-31
+  s_9edc7552bb187b::t_f233b72924b6c5 54-67
+internal/hashicorp/sync_test.go
+  s_9edc7552bb187b::t_0a8daa277b2fff 64,73
+  s_9edc7552bb187b::t_35e05d55146810 38-42
+  s_9edc7552bb187b::t_73468d0e194add 1-37,43-63,65-66,72,74-134,160-215
+  s_9edc7552bb187b::t_f225342117a90e 67-71
+  s_9edc7552bb187b::t_6f77c919fb171c 136-159
+internal/store/store.go
+  s_9edc7552bb187b::t_e70554cdb48cf5 249
+  s_9edc7552bb187b::t_62c430eca65afb 261
+internal/hashicorp/sync.go
+  s_9edc7552bb187b::t_e9e0e8e1c1dbe1 191-192,196-201
+  s_9edc7552bb187b::t_7df700186e9649 202
+  s_9edc7552bb187b::t_327d6996f7a8db 3-6
+  s_9edc7552bb187b::t_2807ea17b49122 1-2,7-23,25-190,193-195,203-257
+  s_9edc7552bb187b::t_334aa1ff5981bd 24
+internal/hashicorp/client.go
+  s_9edc7552bb187b::t_7bcbaf2a395d8d 60-65
+  s_9edc7552bb187b::t_bed2c480f7aa3b 11
+  s_9edc7552bb187b::t_3b7dcb82b4d36c 152-153,158-164,167-173
+  s_9edc7552bb187b::t_cb8df1543e0909 1-9,12-59,66-135,142-151,154-157,165-166,174-188
+  s_9edc7552bb187b::t_2b5db510ec3393 136-141
+  s_9edc7552bb187b::t_05ac995e238047 10
+internal/mitm/forward_hashicorp_test.go
+  s_9edc7552bb187b::t_ccdf5faf9ca0d4 21-24,26-30
+  s_9edc7552bb187b::t_54c2dffa1b956c 90-94,97,99-100,102-106
+  s_9edc7552bb187b::t_0ef6073239e675 25
+  s_9edc7552bb187b::t_d26502712b4d8a 130-134
+  s_9edc7552bb187b::t_65e910039764ff 1-20,31-45,52-58,62-89,95-96,98,101,107-129,135-161
+  s_9edc7552bb187b::t_280b31b3575b02 46-51,59-61
+internal/hashicorp/config_test.go
+  s_9edc7552bb187b::t_8e961a9001bf6e 1-55,59-65
+  s_9edc7552bb187b::t_41e2410a523373 56-57
+  s_9edc7552bb187b::t_a48742f62b0d30 58
+cmd/vaults.go
+  s_9edc7552bb187b::t_4bb7ecd46add66 49-72,74
+  s_9edc7552bb187b::t_55ad9e9841cad0 280-283,289-293
+  s_9edc7552bb187b::t_acb30029b0e76d 621,625-627
+  s_9edc7552bb187b::t_f0334e3a460019 276,279,284-288,294
+docs/self-hosting/environment-variables.mdx
+  s_9edc7552bb187b::t_d482a51399d571 77-88,90-91,99-103
+  s_9edc7552bb187b::t_a29f275d6819fa 89,92-98
+internal/hashicorp/client_integration_test.go
+  s_9edc7552bb187b::t_5fde6603084bc8 1-13,15-161
+  s_9edc7552bb187b::t_22482f43c46274 14
+internal/store/20260617143024_hashicorp_credential_store.go
+  s_9edc7552bb187b::t_e03b702d7f4636 1-56
+internal/hashicorp/auth_test.go
+  s_9edc7552bb187b::t_c5eb70898b7468 1-96
+  s_9edc7552bb187b::t_fe6a60e2f469b7 97-168
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.10",
+  "base_commit_sha": "750ef0c13832e49e3db4d00b7c38379ab6fa21d9",
+  "prompts": {},
+  "sessions": {
+    "s_9edc7552bb187b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "12c34a39-54d3-44a2-a7e1-35585bd8e822",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}
