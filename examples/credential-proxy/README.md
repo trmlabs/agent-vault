@@ -52,7 +52,10 @@ The initial HTTP workflow is HTTPS GET or HEAD with no caller query or body. Put
 configured `__vault_KEY__` placeholder in `Authorization` or `X-Api-Key`.
 Configure an exact destination, a passthrough service authentication strategy,
 and a header substitution mapping that marker to a field of the authorized
-Vault path. All configured markers must appear in allowed headers. For HTTP
+Vault path. All configured markers must appear in allowed headers. Only caller
+`Authorization` and `X-Api-Key` headers are forwarded after substitution. Other
+caller headers, including cookies and routing/method overrides, are discarded
+for every strict request. For HTTP
 Basic authentication, send the placeholder as the username with an empty
 password, for example `curl --user "__vault_API_KEY__:"`. The proxy substitutes
 the request-time value and encodes the Basic header. The secret must not contain
@@ -62,6 +65,9 @@ formats are rejected, not passed through. This is not general browser or API
 coverage.
 
 ### Fixed read parameters
+
+A fixed-query binding must not overlap another service's host, path pattern and
+port. Configuration rejects overlaps rather than selecting by declaration order.
 
 For a GET operation with a fixed scope, the operator can add `fixed_query` to
 an exact service. The caller sends the URL without parameters. The proxy adds

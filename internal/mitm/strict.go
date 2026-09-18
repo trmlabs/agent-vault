@@ -181,7 +181,14 @@ func (p *Proxy) forwardStrict(w http.ResponseWriter, r *http.Request, target, ho
 			}
 		}
 	}
-	brokercore.ApplyInjection(r.Header, out.Header, inject)
+	// The strict profile forwards only the supported credential carriers.
+	// Arbitrary headers can change destination routing, methods or identity.
+	// Transport-owned headers are constructed below, never copied from callers.
+	for _, name := range []string{"Authorization", "X-Api-Key"} {
+		for _, value := range r.Header.Values(name) {
+			out.Header.Add(name, value)
+		}
+	}
 	used := map[string]bool{}
 	responseSecrets := map[string]string{}
 	for marker, value := range values {

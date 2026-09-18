@@ -367,3 +367,28 @@ func TestStrictCredentialProxyTunnelCapacityAndRelease(t *testing.T) {
 	}
 	f.positive(t)
 }
+
+func TestStrictDropsCallerOperationOverrides(t *testing.T) {
+	f := newStrictFixture(t)
+	original := f.upstream.Config.Handler
+	f.upstream.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for _, name := range []string{"X-HTTP-Method-Override", "X-Original-URL", "X-Rewrite-URL", "X-Forwarded-Host", "X-Custom-Policy", "Cookie"} {
+			if r.Header.Get(name) != "" {
+				http.Error(w, "caller changed operation", http.StatusConflict)
+				return
+			}
+		}
+		original.ServeHTTP(w, r)
+	})
+	resp, body := f.send(t, "/ok", func(r *http.Request) {
+		r.Header.Set("X-HTTP-Method-Override", "DELETE")
+		r.Header.Set("X-Original-URL", "/admin")
+		r.Header.Set("X-Rewrite-URL", "/admin")
+		r.Header.Set("X-Forwarded-Host", "other.example.test")
+		r.Header.Set("X-Custom-Policy", "admin")
+		r.Header.Set("Cookie", "role=admin")
+	})
+	if resp.StatusCode != 200 || body != "approved-output" {
+		t.Fatalf("unexpected operation: %d %q", resp.StatusCode, body)
+	}
+}

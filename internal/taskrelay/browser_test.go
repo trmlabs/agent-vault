@@ -236,6 +236,13 @@ func TestBrowserRelayRejectsUnsafeResponsesAndDoesNotRetryUnknownCreate(t *testi
 			if again := f.request("/v1/browser/tasks", "{}", nil); again.Code != 409 || len(f.paths) != 1 {
 				t.Fatal("unknown creation automatically retried")
 			}
+			if err := f.relay.Close(context.Background()); err == nil {
+				t.Fatal("uncertain browser creation reported clean closure")
+			}
+			if len(f.paths) != 1 {
+				t.Fatal("unknown handle must not cause blind retries")
+			}
+
 		})
 	}
 }

@@ -68,3 +68,24 @@ func TestFixedQueryValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestFixedQueryRejectsOverlappingPatterns(t *testing.T) {
+	fixed := Service{Name: "fixed", Host: "api.example.test", Path: "/v1/search", FixedQuery: FixedQuery{"limit": "1"}}
+	for _, other := range []Service{
+		{Name: "glob", Host: fixed.Host, Path: "/v1/search*"},
+		{Name: "wide", Host: fixed.Host, Path: "/v1/*"},
+		{Name: "catchall", Host: fixed.Host},
+		{Name: "hostglob", Host: "*.example.test", Path: fixed.Path},
+	} {
+		for _, pair := range [][]Service{{fixed, other}, {other, fixed}} {
+			if ValidateFixedQueryBindings(pair) == nil {
+				t.Errorf("accepted overlap with %s", other.Name)
+			}
+		}
+	}
+	for _, other := range []Service{{Name: "different-path", Host: fixed.Host, Path: "/v1/other"}, {Name: "different-host", Host: "other.example.test", Path: fixed.Path}} {
+		if err := ValidateFixedQueryBindings([]Service{fixed, other}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}

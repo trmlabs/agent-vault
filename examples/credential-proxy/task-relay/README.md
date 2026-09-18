@@ -156,3 +156,12 @@ sanitized evidence link beside each result. When these checks are accepted, the
 paired Kubernetes task can use its approved services without holding an identity
 credential. Other hosted-agent runtimes require their own trustworthy sandbox
 identity and isolation integration.
+
+### Unknown browser creation
+
+If a create response is lost or malformed, the broker may own a live browser
+whose handle the relay never received. The relay refuses further task calls
+and never retries creation blindly. Shutdown records `cleanup-unknown` and
+returns a failed exit; it does not claim physical closure. Inspect the broker's
+private audit and session state and confirm expiry or operator cleanup before
+accepting the task as closed. A close-by-task recovery operation is not provided.

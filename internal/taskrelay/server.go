@@ -3,6 +3,7 @@ package taskrelay
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -169,8 +170,11 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 			closeCtx, stop := context.WithTimeout(context.Background(), handshakeTimeout)
 			defer stop()
 			outcome := "cleanup-closed"
-			if b.Close(closeCtx) != nil {
+			if closeErr := b.Close(closeCtx); closeErr != nil {
 				outcome = "cleanup-failed"
+				if errors.Is(closeErr, errBrowserCleanupUnknown) {
+					outcome = "cleanup-unknown"
+				}
 				result = errDenied
 			}
 			if r.record("browser", outcome) != nil {

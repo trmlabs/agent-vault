@@ -2,6 +2,7 @@ package taskrelay
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -719,5 +720,47 @@ func TestOperatorConfigExampleMatchesSchema(t *testing.T) {
 	writeTestFile(t, path, b)
 	if _, e = LoadConfig(path); e != nil {
 		t.Fatal(e)
+	}
+}
+
+func TestSupervisorRecordsUnknownBrowserCleanup(t *testing.T) {
+	f := newRelayFixture(t)
+	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, "null")
+	}))
+	upstream.TLS = &tls.Config{Certificates: []tls.Certificate{f.cert}}
+	upstream.StartTLS()
+	defer upstream.Close()
+	f.c.Browser = &BrowserConfig{Listen: freeAddress(t), Upstream: f.upstream(t, upstream.Listener.Addr().String())}
+	f.start(t)
+	conn := f.dial(t, f.c.Browser.Listen)
+	_, _ = io.WriteString(conn, "POST /v1/browser/tasks HTTP/1.1\r\nHost: relay\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+	response, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	_ = response.Body.Close()
+	_ = conn.Close()
+	if response.StatusCode != http.StatusBadGateway {
+		t.Fatalf("create status %d", response.StatusCode)
+	}
+	f.state.Store(1)
+	select {
+	case <-f.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("supervisor failed to stop")
+	}
+	if f.runError == nil {
+		t.Fatal("unknown cleanup reported clean exit")
+	}
+	audit, err := os.ReadFile(f.c.AuditFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(audit, []byte("cleanup-unknown")) || bytes.Contains(audit, []byte("cleanup-closed")) {
+		t.Fatalf("wrong cleanup audit: %s", audit)
 	}
 }

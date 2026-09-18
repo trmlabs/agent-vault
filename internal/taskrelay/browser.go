@@ -51,6 +51,7 @@ var browserTaskName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$`)
 var browserProof = regexp.MustCompile(`^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$`)
 var browserHandle = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
 var errBrowserUnavailable = errors.New("browser task unavailable")
+var errBrowserCleanupUnknown = errors.New("browser cleanup outcome unknown")
 
 func NewBrowserRelay(options BrowserOptions) (*BrowserRelay, error) {
 	endpoint, err := url.Parse(options.Endpoint)
@@ -192,6 +193,12 @@ func (b *BrowserRelay) call(ctx context.Context, path string, input any, expecte
 // attempt physical browser closure. Broker expiry remains the crash fallback.
 func (b *BrowserRelay) cleanup(ctx context.Context) error {
 	if b.handle == "" {
+		if b.uncertain {
+			// The broker may own a live browser whose handle never reached us.
+			// Do not report closure or retry creation; operator reconciliation
+			// and broker expiry remain necessary.
+			return errBrowserCleanupUnknown
+		}
 		return nil
 	}
 	result, err := b.call(ctx, "/v1/browser/close", map[string]string{"handle": b.handle}, http.StatusOK, "")

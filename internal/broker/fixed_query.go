@@ -84,8 +84,8 @@ func (q *FixedQuery) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// ValidateFixedQueryBindings rejects indistinguishable service matches instead
-// of allowing declaration order to choose an operation's parameters.
+// ValidateFixedQueryBindings rejects any service pattern overlapping a fixed
+// operation, so matching precedence cannot discard its configured parameters.
 func ValidateFixedQueryBindings(services []Service) error {
 	for i, s := range services {
 		if err := s.ValidateFixedQuery(); err != nil {
@@ -95,7 +95,13 @@ func ValidateFixedQueryBindings(services []Service) error {
 			continue
 		}
 		for j, other := range services {
-			if i == j || s.Host != other.Host || s.Path != other.Path {
+			if i == j {
+				continue
+			}
+			if _, matches := matchHostPattern(other.Host, s.Host); !matches {
+				continue
+			}
+			if _, matches := matchPathGlob(other.Path, s.Path); !matches {
 				continue
 			}
 			if s.Port == nil || other.Port == nil || *s.Port == *other.Port {
