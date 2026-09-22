@@ -99,11 +99,15 @@ func TestRealVault_HTTPAuthorization(t *testing.T) {
 		t.Fatal("production Vault client failed against disposable service")
 	}
 
+	t.Run("strict-fixed-query", func(t *testing.T) { testRealVaultFixedQuery(t, hc, admin) })
 	for _, secure := range []bool{false, true} {
 		mode := "forward"
 		if secure {
 			mode = "connect"
 		}
+		t.Run(mode+"/two-actor-isolation", func(t *testing.T) {
+			testRealVaultActorCancellation(t, hc, secret, secure)
+		})
 		for _, change := range []string{"revoke", "expire", "remove-grant"} {
 			t.Run(mode+"/"+change, func(t *testing.T) {
 				st, err := store.Open(filepath.Join(t.TempDir(), "reference.db"))

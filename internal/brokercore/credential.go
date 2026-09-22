@@ -45,6 +45,9 @@ type InjectResult struct {
 	MatchedPath string
 	MatchedPort *int
 
+	// FixedQuery contains operator-owned literal parameters, never credential values.
+	FixedQuery map[string]string
+
 	// CredentialKeys are the key names referenced by the matched
 	// service. Populated before resolution so credential-missing
 	// errors still carry diagnostic context. Safe to log.
@@ -149,6 +152,10 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 	if targetPath == "" {
 		targetPath = "/"
 	}
+	if err := broker.ValidateFixedQueryBindings(services); err != nil {
+		return nil, ErrServiceNotFound
+	}
+
 	matched, score := broker.MatchService(matchHost, targetPort, targetPath, services)
 	if matched == nil {
 		// Fail closed on policy lookup errors so a transient store
@@ -158,6 +165,9 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 			return nil, ErrServiceNotFound
 		}
 		return &InjectResult{Passthrough: true}, nil
+	}
+	if err := matched.ValidateFixedQuery(); err != nil {
+		return nil, ErrServiceNotFound
 	}
 	if !matched.IsEnabled() {
 		return nil, ErrServiceDisabled
@@ -179,6 +189,7 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 		MatchedHost:    matched.Host,
 		MatchedPath:    matched.Path,
 		MatchedPort:    matched.Port,
+		FixedQuery:     matched.FixedQuery,
 		CredentialKeys: matched.CredentialKeys(),
 	}
 

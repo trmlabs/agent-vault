@@ -3,6 +3,32 @@ title: "CLI reference"
 description: "Complete reference for all Agent Vault CLI commands."
 ---
 
+## Trusted task relay
+
+```sh
+agent-vault task-relay --config /etc/task-relay/config.json
+```
+
+Run one relay per managed Kubernetes task in a separate trusted Pod. The sandbox
+uses public connection settings and placeholders; identity proofs remain in the
+relay. The relay checks the real socket peer against an operator-pinned live Pod
+UID before using its fixed HTTP, database or optional browser policy.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--config` | Required | Operator-owned JSON containing task ID, deadline, sandbox namespace/name/UID/IP, Kubernetes API trust and reviewer token path, listener certificate/key, durable audit path and fixed protocol destinations/proof paths. |
+
+No environment flags configure this command. The deadline must be in the future
+and at most eight hours away. Native TLS listeners preserve socket identity;
+proofs, private keys and audit storage must not be mounted in the sandbox.
+Pair loss, API failure, audit failure or deadline stops active work. A browser
+cleanup failure returns an error; broker expiry remains the crash fallback.
+
+The checkout's `examples/credential-proxy/task-relay/` contains the complete
+operator guide, `config.example.json`, client contracts and acceptance record.
+Its example is deliberately expired. Local tests do not establish deployed
+network isolation or support for other hosted-agent runtimes.
+
 ## Server
 
 <AccordionGroup>

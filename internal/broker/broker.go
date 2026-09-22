@@ -35,6 +35,7 @@ type Service struct {
 	Enabled       *bool          `yaml:"enabled,omitempty" json:"enabled,omitempty"`
 	Auth          Auth           `yaml:"auth" json:"auth"`
 	Substitutions []Substitution `yaml:"substitutions,omitempty" json:"substitutions,omitempty"`
+	FixedQuery    FixedQuery     `yaml:"fixed_query,omitempty" json:"fixed_query,omitempty"`
 }
 
 // MatcherPattern returns the joined inline form (`slack.com/api/*`),
@@ -346,6 +347,9 @@ func Validate(cfg *Config) error {
 	if cfg.Vault == "" {
 		return fmt.Errorf("vault is required")
 	}
+	if err := ValidateFixedQueryBindings(cfg.Services); err != nil {
+		return err
+	}
 	nameSet := make(map[string]int, len(cfg.Services))
 	for i, s := range cfg.Services {
 		if s.Host == "" {
@@ -371,6 +375,9 @@ func Validate(cfg *Config) error {
 			return fmt.Errorf("service %d: %w", i, err)
 		}
 		if err := ValidatePort(s.Port); err != nil {
+			return fmt.Errorf("service %d: %w", i, err)
+		}
+		if err := s.ValidateFixedQuery(); err != nil {
 			return fmt.Errorf("service %d: %w", i, err)
 		}
 		if err := s.Auth.Validate(); err != nil {

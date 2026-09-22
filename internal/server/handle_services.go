@@ -422,6 +422,11 @@ func (s *Server) handleServicesUpsert(w http.ResponseWriter, r *http.Request) {
 		upserted = append(upserted, svc.Name)
 	}
 
+	if err := broker.ValidateFixedQueryBindings(existing); err != nil {
+		jsonError(w, http.StatusBadRequest, "Ambiguous or invalid fixed-query services")
+		return
+	}
+
 	servicesJSON, err := json.Marshal(existing)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, "Failed to marshal services")

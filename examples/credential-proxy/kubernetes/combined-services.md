@@ -1,5 +1,9 @@
 # Verify workload proof with live credential services
 
+These direct-proof fixtures exercise broker identity and service behavior. For a
+sandbox without identity credentials, use the [separate task relay](../task-relay/README.md)
+and complete its deployed network acceptance checks.
+
 This disposable fixture sends actual Kubernetes pod proof through encrypted broker ingress to a TLS HTTP destination and PostgreSQL. Vault supplies the HTTP secret and temporary database credentials. The caller never receives those destination credentials.
 
 ## Run

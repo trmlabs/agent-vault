@@ -1,0 +1,42 @@
+{
+  "taskID": "approved-task",
+  "deadline": "2000-01-01T00:00:00Z",
+  "sandbox": {
+    "namespace": "agent-tasks",
+    "name": "replace-with-live-pod-name",
+    "uid": "replace-with-live-pod-uid",
+    "podIP": "192.0.2.1"
+  },
+  "kubernetes": {
+    "apiURL": "https://kubernetes.default.svc",
+    "caFile": "/var/run/task-relay/api/ca.crt",
+    "reviewerTokenFile": "/var/run/task-relay/api/token"
+  },
+  "tlsCertFile": "/etc/task-relay/tls/tls.crt",
+  "tlsKeyFile": "/etc/task-relay/tls/tls.key",
+  "auditFile": "/data/task-relay/audit.jsonl",
+  "connect": {
+    "listen": "0.0.0.0:14443",
+    "upstream": {
+      "address": "credential-broker.internal:14443",
+      "serverName": "credential-broker.internal",
+      "caFile": "/etc/task-relay/trust/broker-ca.crt",
+      "proofFile": "/var/run/task-relay/proofs/core",
+      "audience": "credential-broker"
+    },
+    "allowedTargets": ["approved-api.example:443"]
+  },
+  "postgres": {
+    "listen": "0.0.0.0:15443",
+    "upstream": {
+      "address": "credential-broker.internal:15443",
+      "serverName": "credential-broker.internal",
+      "caFile": "/etc/task-relay/trust/broker-ca.crt",
+      "proofFile": "/var/run/task-relay/proofs/core",
+      "audience": "credential-broker"
+    },
+    "database": "approved-database",
+    "user": "workload",
+    "placeholder": "task-relay-placeholder"
+  }
+}

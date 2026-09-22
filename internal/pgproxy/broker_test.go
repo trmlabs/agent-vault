@@ -122,6 +122,7 @@ type fakeUpstream struct {
 	lastUser    string
 	lastDB      string
 	lastAppNm   string
+	lastTimeout string
 	forbidParam string // a param key that must never be forwarded upstream
 	forbidSeen  bool
 }
@@ -216,6 +217,7 @@ func (fu *fakeUpstream) handle(conn net.Conn) {
 	fu.lastUser = startup.Parameters["user"]
 	fu.lastDB = startup.Parameters["database"]
 	fu.lastAppNm = startup.Parameters["application_name"]
+	fu.lastTimeout = startup.Parameters["statement_timeout"]
 	if fu.forbidParam != "" {
 		if _, seen := startup.Parameters[fu.forbidParam]; seen {
 			fu.forbidSeen = true
@@ -390,9 +392,10 @@ func runAgentQuery(t *testing.T, brokerAddr, token, database, query string) (str
 
 	fe := pgproto3.NewFrontend(conn, conn)
 	fe.Send(&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber, Parameters: map[string]string{
-		"user":             "agent",
-		"database":         database,
-		"application_name": "agent-under-test",
+		"user":              "agent",
+		"database":          database,
+		"application_name":  "agent-under-test",
+		"statement_timeout": "30000",
 	}})
 	if err := fe.Flush(); err != nil {
 		return "", err
@@ -505,6 +508,9 @@ func endToEndTest(t *testing.T, mode upstreamAuthMode) {
 	}
 	if upstream.lastAppNm != "agent-under-test" {
 		t.Errorf("upstream application_name = %q, want it forwarded", upstream.lastAppNm)
+	}
+	if upstream.lastTimeout != "30000" {
+		t.Errorf("upstream statement_timeout = %q, want 30000", upstream.lastTimeout)
 	}
 	if minter.mintCalls != 1 {
 		t.Errorf("mint calls = %d, want 1", minter.mintCalls)
