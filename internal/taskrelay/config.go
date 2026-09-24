@@ -20,16 +20,17 @@ import (
 
 // FixedConfig is operator-owned. None of these fields may come from requests.
 type FixedConfig struct {
-	TaskID      string           `json:"taskID"`
-	Deadline    time.Time        `json:"deadline"`
-	Sandbox     SandboxConfig    `json:"sandbox"`
-	Kubernetes  KubernetesConfig `json:"kubernetes"`
-	TLSCertFile string           `json:"tlsCertFile"`
-	TLSKeyFile  string           `json:"tlsKeyFile"`
-	AuditFile   string           `json:"auditFile"`
-	Connect     *ConnectConfig   `json:"connect,omitempty"`
-	Postgres    *PostgresConfig  `json:"postgres,omitempty"`
-	Browser     *BrowserConfig   `json:"browser,omitempty"`
+	TaskID           string           `json:"taskID"`
+	Deadline         time.Time        `json:"deadline"`
+	Sandbox          SandboxConfig    `json:"sandbox"`
+	Kubernetes       KubernetesConfig `json:"kubernetes"`
+	TLSCertFile      string           `json:"tlsCertFile"`
+	TLSKeyFile       string           `json:"tlsKeyFile"`
+	AuditFile        string           `json:"auditFile"`
+	Connect          *ConnectConfig   `json:"connect,omitempty"`
+	Postgres         *PostgresConfig  `json:"postgres,omitempty"`
+	PostgresBindings []PostgresConfig `json:"postgresBindings,omitempty"`
+	Browser          *BrowserConfig   `json:"browser,omitempty"`
 }
 type SandboxConfig struct {
 	Namespace string `json:"namespace"`
@@ -118,8 +119,10 @@ func (c FixedConfig) Validate(now time.Time) error {
 			}
 		}
 	}
-	if c.Postgres != nil {
-		p := c.Postgres
+	if len(c.PostgresBindings) > 8 || (c.Postgres != nil && len(c.PostgresBindings) != 0) {
+		return errConfig
+	}
+	for _, p := range c.postgresBindings() {
 		if check(p.Listen, p.Upstream) != nil || !safeName.MatchString(p.Database) || !safeName.MatchString(p.User) || !safeName.MatchString(p.Placeholder) {
 			return errConfig
 		}
@@ -131,6 +134,14 @@ func (c FixedConfig) Validate(now time.Time) error {
 		return errConfig
 	}
 	return nil
+}
+
+// postgresBindings preserves the legacy single binding without mixing authority.
+func (c FixedConfig) postgresBindings() []PostgresConfig {
+	if c.Postgres != nil {
+		return []PostgresConfig{*c.Postgres}
+	}
+	return c.PostgresBindings
 }
 
 func validAddress(s string) bool {

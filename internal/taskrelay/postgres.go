@@ -22,6 +22,7 @@ type cancelTarget struct {
 	address string
 	packet  []byte
 	expiry  time.Time
+	binding string
 }
 
 // PostgreSQL uses outer TLS (the sandbox's public-CA stunnel can provide it).
@@ -34,7 +35,7 @@ type cancelTarget struct {
 // API request. The paired sandbox can make the relay write a "denied:<reason>"
 // row by sending a rejected startup or placeholder; a peer that closes without
 // sending a startup packet leaves nothing.
-func (r *relay) postgres(conn net.Conn) {
+func (r *relay) postgres(conn net.Conn, binding PostgresConfig) {
 	_ = conn.SetDeadline(minTime(r.config.Deadline, time.Now().Add(handshakeTimeout)))
 	peer := conn.RemoteAddr().String()
 	// The listener hands over the connection before the TLS handshake, so a
@@ -56,11 +57,11 @@ func (r *relay) postgres(conn net.Conn) {
 		return
 	}
 	if binary.BigEndian.Uint32(packet[4:8]) == cancelCode {
-		r.cancelPostgres(peer, packet)
+		r.cancelPostgres(peer, packet, binding)
 		return
 	}
 	var startup pgproto3.StartupMessage
-	c := r.config.Postgres
+	c := &binding
 	if startup.Decode(packet[4:]) != nil || startup.ProtocolVersion != pgproto3.ProtocolVersionNumber || !validStartup(startup.Parameters, c) {
 		_ = r.record("postgres", "denied:bad-startup")
 		return
@@ -161,7 +162,7 @@ func (r *relay) postgres(conn net.Conn) {
 				return
 			}
 			var local []byte
-			local, remove, e = r.registerCancel(body, up.RemoteAddr().String(), expiry)
+			local, remove, e = r.registerCancel(body, up.RemoteAddr().String(), expiry, binding.Listen)
 			if e != nil {
 				return
 			}
@@ -267,7 +268,7 @@ func encodePGFrame(typ byte, body []byte) []byte {
 	return append(out, body...)
 }
 
-func (r *relay) registerCancel(coreKey []byte, address string, expiry time.Time) ([]byte, func(), error) {
+func (r *relay) registerCancel(coreKey []byte, address string, expiry time.Time, binding string) ([]byte, func(), error) {
 	r.cancelMu.Lock()
 	defer r.cancelMu.Unlock()
 	if r.cancellations == nil {
@@ -284,7 +285,7 @@ func (r *relay) registerCancel(coreKey []byte, address string, expiry time.Time)
 		packet := binary.BigEndian.AppendUint32(nil, 16)
 		packet = binary.BigEndian.AppendUint32(packet, cancelCode)
 		packet = append(packet, coreKey...)
-		target := &cancelTarget{active: true, address: address, packet: packet, expiry: expiry}
+		target := &cancelTarget{active: true, address: address, packet: packet, expiry: expiry, binding: binding}
 		key := string(local)
 		r.cancellations[key] = target
 		return local, func() {
@@ -301,7 +302,7 @@ func (r *relay) registerCancel(coreKey []byte, address string, expiry time.Time)
 // cancelPostgres is reached without admission: a cancel carries no session to
 // admit, only a key that must match an established one. It journals its own
 // outcome so a rejected key is as visible as a rejected startup.
-func (r *relay) cancelPostgres(peer string, packet []byte) {
+func (r *relay) cancelPostgres(peer string, packet []byte, binding PostgresConfig) {
 	if len(packet) != 16 {
 		_ = r.record("postgres", "denied:cancel")
 		return
@@ -314,7 +315,7 @@ func (r *relay) cancelPostgres(peer string, packet []byte) {
 		return
 	}
 	defer target.mu.Unlock()
-	if !target.active || !time.Now().Before(target.expiry) || r.pair.check(r.ctx, peer) != nil {
+	if target.binding != binding.Listen || !target.active || !time.Now().Before(target.expiry) || r.pair.check(r.ctx, peer) != nil {
 		_ = r.record("postgres", "denied:cancel")
 		return
 	}
@@ -322,7 +323,7 @@ func (r *relay) cancelPostgres(peer string, packet []byte) {
 		return
 	}
 	// Pin to the established broker socket, not a newly selected service replica.
-	c := r.config.Postgres.Upstream
+	c := binding.Upstream
 	c.Address = target.address
 	ctx, cancel := context.WithDeadline(r.ctx, minTime(target.expiry, time.Now().Add(handshakeTimeout)))
 	defer cancel()

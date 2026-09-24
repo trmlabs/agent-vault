@@ -115,8 +115,8 @@ func (f *relayFixture) start(t *testing.T) {
 	switch {
 	case f.c.Connect != nil:
 		address = f.c.Connect.Listen
-	case f.c.Postgres != nil:
-		address = f.c.Postgres.Listen
+	case len(f.c.postgresBindings()) != 0:
+		address = f.c.postgresBindings()[0].Listen
 	default:
 		address = f.c.Browser.Listen
 	}

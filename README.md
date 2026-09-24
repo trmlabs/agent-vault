@@ -198,7 +198,7 @@ The [credential proxy release profile](examples/credential-proxy/README.md) uses
 
 For managed Kubernetes tasks, [the trusted task relay](examples/credential-proxy/task-relay/README.md) keeps identity proofs in a separate Pod. The sandbox sends public placeholders over verified TLS. The relay checks the actual socket IP against the operator-pinned live Pod UID and applies a fixed service policy. Start it with `agent-vault task-relay --config FILE`; the guide includes a configuration example and deployment acceptance checks. Local tests establish protocol behavior, not deployed network isolation or identity for other hosted-agent runtimes.
 
-The [task relay](examples/credential-proxy/task-relay/README.md) preserves bounded PostgreSQL application names and positive statement timeouts for application clients while keeping the database and user fixed by the operator.
+The [task relay](examples/credential-proxy/task-relay/README.md) preserves bounded PostgreSQL application names and positive statement timeouts for application clients while keeping the database and user fixed by the operator. One relay can serve up to eight fixed PostgreSQL bindings on separate listeners, sharing its task identity, deadline and connection limits.
 
 The disposable verification image runs real Vault and PostgreSQL with synthetic destinations and credentials. Build and run it using the [verification commands](examples/credential-proxy/README.md#run-the-local-demonstration). Its output identifies local checks separately from required deployed validation.
 
