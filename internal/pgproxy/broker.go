@@ -55,6 +55,7 @@ type Broker struct {
 	listener     net.Listener
 	conns        map[net.Conn]struct{}
 	leaseCounts  map[string]int // live leases per actor id
+	leaseChanged chan struct{}  // wakes bounded admissions after cleanup
 	closed       bool
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -117,6 +118,7 @@ func New(addr string, opts Options) *Broker {
 		shutdownDone:   make(chan struct{}),
 		conns:          make(map[net.Conn]struct{}),
 		leaseCounts:    make(map[string]int),
+		leaseChanged:   make(chan struct{}),
 	}
 }
 
@@ -237,17 +239,28 @@ func (b *Broker) unregister(conn net.Conn) {
 	b.mu.Unlock()
 }
 
-// acquireLeaseSlot reserves one live-lease slot for actorID, returning false
-// when the actor already holds MaxLeasesPerActor. This caps credential
-// amplification: one token cannot mint unbounded dynamic DB users.
-func (b *Broker) acquireLeaseSlot(actorID string) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.leaseCounts[actorID] >= b.opts.MaxLeasesPerActor {
-		return false
+// acquireLeaseSlot preserves the actor credential cap while waiting for cleanup.
+// The caller retains its pending slot and shares a bounded admission deadline.
+func (b *Broker) acquireLeaseSlot(ctx context.Context, actorID string) bool {
+	for {
+		b.mu.Lock()
+		if ctx.Err() != nil {
+			b.mu.Unlock()
+			return false
+		}
+		if b.leaseCounts[actorID] < b.opts.MaxLeasesPerActor {
+			b.leaseCounts[actorID]++
+			b.mu.Unlock()
+			return true
+		}
+		changed := b.leaseChanged
+		b.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return false
+		}
 	}
-	b.leaseCounts[actorID]++
-	return true
 }
 
 func (b *Broker) releaseLeaseSlot(actorID string) {
@@ -255,6 +268,8 @@ func (b *Broker) releaseLeaseSlot(actorID string) {
 	defer b.mu.Unlock()
 	if b.leaseCounts[actorID] > 0 {
 		b.leaseCounts[actorID]--
+		close(b.leaseChanged)
+		b.leaseChanged = make(chan struct{})
 	}
 	if b.leaseCounts[actorID] == 0 {
 		delete(b.leaseCounts, actorID)
@@ -362,8 +377,11 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	defer cancel()
 	_ = conn.SetDeadline(time.Now().Add(b.opts.HandshakeTimeout))
 
+	// Share one admission budget across actor and global capacity.
+	admissionCtx, admissionCancel := context.WithTimeout(hsCtx, b.opts.AdmissionTimeout)
+	defer admissionCancel()
 	// Cap live credentials per agent identity before minting (fail closed).
-	if !b.acquireLeaseSlot(scope.ActorID) {
+	if !b.acquireLeaseSlot(admissionCtx, scope.ActorID) {
 		b.logger.Warn("pgproxy: per-actor live-credential limit reached",
 			slog.String("vault", scope.VaultID),
 			slog.String("actor", scope.ActorID),
@@ -375,7 +393,6 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 
 	// Global backstop: bound the total upstream connections across all databases,
 	// applied only after auth so unauthenticated handshakes cannot consume it.
-	admissionCtx, admissionCancel := context.WithTimeout(hsCtx, b.opts.AdmissionTimeout)
 	admitted := b.acquireServeSlot(admissionCtx)
 	admissionCancel()
 	if !admitted {
@@ -387,6 +404,18 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	}
 	defer b.releaseServeSlot()
 	releasePending()
+
+	// Admission can wait for cleanup. Recheck the original proof before using
+	// its scope to resolve a destination or issue another credential.
+	checkCtx, checkCancel := context.WithTimeout(hsCtx, b.opts.AuthorizationTimeout)
+	current, checkErr := b.opts.Auth.Authenticate(checkCtx, token, startup.Parameters["agent_vault_vault"])
+	valid := checkErr == nil && checkCtx.Err() == nil && current != nil &&
+		current.ActorID == scope.ActorID && current.VaultID == scope.VaultID && current.WorkloadID == scope.WorkloadID
+	checkCancel()
+	if !valid {
+		writeClientError(backend, "28000", "Agent Vault: authentication failed")
+		return
+	}
 
 	svc, err := b.opts.Databases.ResolveDatabase(hsCtx, *scope, requestedDB)
 	if err != nil {
