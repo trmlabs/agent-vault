@@ -74,6 +74,20 @@ addresses, missing protocol configuration and deadlines outside the permitted
 window fail startup. At least one protocol must be configured. Optional protocol
 sections must have usable trust files when present; omit a section until ready.
 
+### Multiple database connections
+
+Use `postgresBindings` instead of `postgres` when a task needs several databases.
+It accepts one to eight objects with the same fields as the single `postgres`
+object in the example. Give each binding a distinct `listen` address and its
+own fixed database, user, placeholder and trusted upstream. The legacy `postgres`
+object remains supported; configuring both forms is refused.
+
+Each client connects to its assigned listener. A client cannot select another
+binding by changing its startup database or user. All bindings share the task's
+pairing, deadline, journal and connection limits. If any listener cannot start,
+the relay closes the others and exits. It starts accepting requests only after
+all listeners and browser policy are ready.
+
 ## Client and protocol contract
 
 | Surface | Sandbox sends | Relay behavior |
@@ -93,7 +107,8 @@ The statement timeout preserves client behavior; it is not an authorization cont
 Database permissions still govern queries, including any permitted session changes.
 
 PostgreSQL cancellation uses a random relay-local key scoped to the active
-session. The relay checks the pairing again and maps that key to the established
+session and its database listener. Sending a key to another listener is refused
+before contacting a broker. The relay checks the pairing again and maps that key to the established
 broker connection. Broker cancellation keys never reach the sandbox; stale and
 unknown local keys are refused.
 
@@ -111,8 +126,10 @@ closure is attempted on withdrawal and deadline, using a fresh relay proof even
 after task admission has ended. Failed physical closure or audit recording
 returns a failed relay exit. Broker session expiry remains the crash fallback.
 
-The relay admits at most 32 concurrent operations and caps each listener at 32
-connections. Handshakes have a ten-second bound. Every admission checks the live
+The relay admits at most 32 concurrent operations and at most 32 accepted
+connections across all listeners, including connections still authenticating.
+A cancellation connection can also be refused at this cap; task withdrawal does
+not need a free connection and still closes the active sessions. Handshakes have a ten-second bound. Every admission checks the live
 pair; a one-second watcher with a three-second API timeout stops active streams
 on pair loss or API failure. A PostgreSQL connection is admitted (live pair check
 plus a durable `admitted` row) only after its peer address, TLS handshake,

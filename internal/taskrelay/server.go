@@ -73,19 +73,21 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 			result = errDenied
 		}
 	}()
+	listenerSlots := make(chan struct{}, maxConnections)
 	bind := func(address string) (net.Listener, error) {
 		plain, e := net.Listen("tcp", address)
 		if e != nil {
 			return nil, e
 		}
-		l := tls.NewListener(&boundedListener{Listener: plain, slots: make(chan struct{}, maxConnections)}, tlsConfig)
+		l := tls.NewListener(&boundedListener{Listener: plain, slots: listenerSlots}, tlsConfig)
 		if e == nil {
 			listeners = append(listeners, l)
 		}
 		return l, e
 	}
-	failures := make(chan error, 3)
-	serveHTTP := func(l net.Listener, h http.Handler) {
+	failures := make(chan error, 2+len(c.postgresBindings()))
+	var start []func()
+	startHTTP := func(l net.Listener, h http.Handler) {
 		tracked := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 			if !r.beginWork() {
 				http.Error(w, "unavailable", http.StatusServiceUnavailable)
@@ -105,6 +107,9 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 			}
 		}()
 	}
+	serveHTTP := func(l net.Listener, h http.Handler) {
+		start = append(start, func() { startHTTP(l, h) })
+	}
 	if c.Connect != nil {
 		l, e := bind(c.Connect.Listen)
 		if e != nil {
@@ -112,43 +117,45 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 		}
 		serveHTTP(l, http.HandlerFunc(r.connect))
 	}
-	if c.Postgres != nil {
-		l, e := bind(c.Postgres.Listen)
+	for _, binding := range c.postgresBindings() {
+		l, e := bind(binding.Listen)
 		if e != nil {
 			return errConfig
 		}
-		r.wg.Add(1)
-		go func() {
-			defer r.wg.Done()
-			stop := context.AfterFunc(ctx, func() { _ = l.Close() })
-			defer stop()
-			for {
-				conn, e := l.Accept()
-				if e != nil {
-					if ctx.Err() == nil {
-						failures <- errDenied
+		start = append(start, func() {
+			r.wg.Add(1)
+			go func() {
+				defer r.wg.Done()
+				stop := context.AfterFunc(ctx, func() { _ = l.Close() })
+				defer stop()
+				for {
+					conn, e := l.Accept()
+					if e != nil {
+						if ctx.Err() == nil {
+							failures <- errDenied
+						}
+						return
 					}
-					return
+					if !r.acquire() {
+						_ = conn.Close()
+						continue
+					}
+					if !r.beginWork() {
+						r.release()
+						_ = conn.Close()
+						return
+					}
+					go func() {
+						defer r.wg.Done()
+						defer r.release()
+						defer func() { _ = conn.Close() }()
+						stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+						defer stop()
+						r.postgres(conn, binding)
+					}()
 				}
-				if !r.acquire() {
-					_ = conn.Close()
-					continue
-				}
-				if !r.beginWork() {
-					r.release()
-					_ = conn.Close()
-					return
-				}
-				go func() {
-					defer r.wg.Done()
-					defer r.release()
-					defer func() { _ = conn.Close() }()
-					stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
-					defer stop()
-					r.postgres(conn)
-				}()
-			}
-		}()
+			}()
+		})
 	}
 	if c.Browser != nil {
 		bc := c.Browser
@@ -195,6 +202,10 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 			defer r.release()
 			b.ServeHTTP(w, req)
 		}))
+	}
+	// Admit nothing until every configured listener and browser policy is ready.
+	for _, launch := range start {
+		launch()
 	}
 	ticker := time.NewTicker(pairInterval)
 	defer ticker.Stop()
