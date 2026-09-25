@@ -74,6 +74,13 @@ addresses, missing protocol configuration and deadlines outside the permitted
 window fail startup. At least one protocol must be configured. Optional protocol
 sections must have usable trust files when present; omit a section until ready.
 
+### HTTP client compatibility
+
+CONNECT accepts an absent `Connection` header or one value of `close` or
+`keep-alive`, ignoring case. The relay discards this hop-specific header when it
+constructs the broker request. Duplicate values, lists, upgrades and caller
+identity headers remain denied; the approved target and relay proof are unchanged.
+
 ### Multiple database connections
 
 Use `postgresBindings` instead of `postgres` when a task needs several databases.
