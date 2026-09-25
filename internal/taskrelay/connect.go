@@ -31,6 +31,11 @@ func (r *relay) connect(w http.ResponseWriter, req *http.Request) {
 	for h := range req.Header {
 		switch h {
 		case "User-Agent", "Proxy-Connection":
+		case "Connection":
+			values := req.Header.Values(h)
+			if len(values) != 1 || (!strings.EqualFold(strings.TrimSpace(values[0]), "close") && !strings.EqualFold(strings.TrimSpace(values[0]), "keep-alive")) {
+				allowed = false
+			}
 		default:
 			allowed = false
 		}
