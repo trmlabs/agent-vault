@@ -196,8 +196,6 @@ HTTP forwarding and requests inside an existing HTTPS CONNECT tunnel revalidate 
 
 The [credential proxy release profile](examples/credential-proxy/README.md) uses request-time Vault reads, durable audit admission and [Kubernetes workload identity](examples/credential-proxy/kubernetes/README.md) shared by HTTP and PostgreSQL. Enable it with `AGENT_VAULT_CREDENTIAL_PROXY=true` and `AGENT_VAULT_WORKLOAD_IDENTITY_FILE`. Its read-only HTTP path supports header placeholders, including HTTP Basic with a placeholder username and empty password. Exact GET services can add an operator-configured non-secret query; caller queries and bodies remain forbidden. The task relay accepts standard single-value CONNECT `Connection: close` or `keep-alive` headers and strips them before broker authentication. Direct pod proof does not establish an individual Daytona or ToolHive session identity; deployed ingress and network isolation still require verification.
 
-A dedicated trusted manager can opt into the [read-only cleanup observer](examples/credential-proxy/cleanup-observer.md). It reports broker reconciliation state without exposing lease identifiers or granting database access.
-
 For managed Kubernetes tasks, [the trusted task relay](examples/credential-proxy/task-relay/README.md) keeps identity proofs in a separate Pod. The sandbox sends public placeholders over verified TLS. The relay checks the actual socket IP against the operator-pinned live Pod UID and applies a fixed service policy. Start it with `agent-vault task-relay --config FILE`; the guide includes a configuration example and deployment acceptance checks. Local tests establish protocol behavior, not deployed network isolation or identity for other hosted-agent runtimes.
 
 The [task relay](examples/credential-proxy/task-relay/README.md) preserves bounded PostgreSQL application names and positive statement timeouts for application clients while keeping the database and user fixed by the operator. One relay can serve up to eight fixed PostgreSQL bindings on separate listeners, sharing its task identity, deadline and connection limits. Reconnecting clients wait within the broker's bounded admission window for completed sessions to release capacity. The credential limit stays enforced, and the broker rechecks identity before issuing a credential.
@@ -211,6 +209,8 @@ The disposable verification image runs real Vault and PostgreSQL with synthetic 
 By default Agent Vault stores all state in a local SQLite database, which requires no setup. For production deployments, or when running multiple instances, set the `DATABASE_URL` environment variable (or `--database-url` flag) to a PostgreSQL connection string and Agent Vault switches to Postgres as its backend. Legacy instances can share that database. The strict credential-proxy profile currently requires a single active broker: its durable database cleanup owner is exclusive, so do not enable multiple replicas or overlapping rollouts.
 
 Migrate existing data with `agent-vault migrate-db --to postgres://...` before switching. See the [PostgreSQL guide](https://docs.agent-vault.dev/self-hosting/postgres) for deployment examples (Kubernetes, Docker Compose), architecture notes, and operational details.
+
+A dedicated trusted manager can opt into the [read-only cleanup observer](examples/credential-proxy/cleanup-observer.md). It reports broker reconciliation state without exposing lease identifiers or granting database access.
 
 ## SDK
 
