@@ -122,6 +122,19 @@ func verifyCombinedParentRecovery(t *testing.T, s combinedRecovery) {
 	t.Setenv("VAULT_TOKEN", parent.Auth.ClientToken)
 	hc, err := hashicorp.NewClient(s.ctx, slog.New(slog.DiscardHandler))
 	check(err, "fresh Vault client")
+	// Keep caller endpoints closed while replacement authority reconciles the
+	// persisted journal. Exercise the real old paths, not a readiness variable.
+	s.request(s.proof, false)
+	if conn, err := s.connect(s.proof); err == nil {
+		_ = conn.Close(s.ctx)
+		t.Fatal("old PG path admitted a caller during authentication recovery")
+	}
+	minter, err := pgproxy.NewDurableLeaseMinter(s.ctx, hc, reopened, pgproxy.DurableLeaseOptions{})
+	check(err, "recovered durable minter")
+	t.Cleanup(func() { _ = minter.Close(context.Background()) })
+	wait("fresh parent did not reconcile retained journal", func() bool { rows, err := reopened.ListDatabaseCleanup(s.ctx); return err == nil && len(rows) == 0 })
+	// Only create recovered listeners after the journal has converged. This
+	// fixture models trusted orchestration; it is not a deployed manager test.
 	identity, err = workloadidentity.New(s.identityConfig, reopened)
 	check(err, "reload caller bindings")
 	provider := brokercore.NewStoreCredentialProvider(credStoreAdapter{reopened}, make([]byte, 32))
@@ -143,10 +156,6 @@ func verifyCombinedParentRecovery(t *testing.T, s combinedRecovery) {
 	if response.StatusCode != http.StatusOK {
 		t.Fatal("fresh parent denied admitted HTTP caller")
 	}
-	minter, err := pgproxy.NewDurableLeaseMinter(s.ctx, hc, reopened, pgproxy.DurableLeaseOptions{})
-	check(err, "recovered durable minter")
-	t.Cleanup(func() { _ = minter.Close(context.Background()) })
-	wait("fresh parent did not reconcile retained journal", func() bool { rows, err := reopened.ListDatabaseCleanup(s.ctx); return err == nil && len(rows) == 0 })
 	pg := pgproxy.New("127.0.0.1:0", pgproxy.Options{Auth: combinedAuth{identity}, Databases: combinedDatabase{pgproxy.DatabaseService{Name: "database", Addr: os.Getenv("AV_TEST_PG_UPSTREAM"), Database: os.Getenv("AV_TEST_PG_DB"), Mount: "database", Role: "readonly", SSLMode: "disable"}}, Leases: minter, AuthorizationInterval: 25 * time.Millisecond})
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	check(err, "recovery PG listener")
@@ -169,5 +178,12 @@ func verifyCombinedParentRecovery(t *testing.T, s combinedRecovery) {
 		t.Fatal("recovery reused expired database identity")
 	}
 	wait("recovered session did not clean up", func() bool { rows, err := reopened.ListDatabaseCleanup(s.ctx); return err == nil && len(rows) == 0 })
+	if os.Getenv("AV_TEST_EXECUTABLE") != "" {
+		check(pg.Shutdown(s.ctx), "stop recovered PostgreSQL before executable")
+		check(proxy.Shutdown(s.ctx), "stop recovered HTTP before executable")
+		check(minter.Close(s.ctx), "close recovered lease minter")
+		check(reopened.Close(), "close persisted store before executable")
+		verifyCombinedExecutableRestart(t, s, parent.Auth.ClientToken)
+	}
 	t.Log("real projected caller remained authorized; parent expiry denied HTTP and PG admission, terminated active proxied query, removed database role/session; persisted cleanup survived broker/store recreation and fresh login restored both protocols. Broker lifecycle recreation, not executable restart; local clients.")
 }

@@ -172,7 +172,46 @@ def main():
                 assert any(item['path'] == 'auth/approle/login' and item['ttl'] > 0 for item in after)
                 assert request(base + '/v1/agents/bootstrap-agent', headers=owner)['id'] == exported['id']
                 print('PASS: login expires without renewal; same-store restart logs in again and preserves owner session/agent ID')
-                print('SCOPE: no caller admitted; post-expiry request denial, TokenReview and deployed isolation are not tested')
+                stage = 'replacement broker token and executable restart'
+                stop(process)
+                process = None
+                env.pop('VAULT_ROLE_ID')
+                env.pop('VAULT_SECRET_ID')
+                # Model only the trusted launcher's private token sink. Production
+                # workload authentication and admission/drain are separate checks.
+                sink = work / 'broker-token'
+                previous = vault('auth/token/create', {'policies': ['bootstrap'], 'ttl': '2m'})['auth']['client_token']
+                sink.write_text(previous)
+                sink.chmod(0o600)
+                env['VAULT_TOKEN'] = sink.read_text()
+                start()
+                assert request(base + '/v1/agents/bootstrap-agent', headers=owner)['id'] == exported['id']
+                vault('auth/token/revoke', {'token': previous})
+                replacement = vault('auth/token/create', {'policies': ['bootstrap'], 'ttl': '2m'})['auth']['client_token']
+                sink.write_text(replacement)
+                # Updating a file does not update the already captured environment.
+                stop(process)
+                process = None
+                log.flush()
+                failed_start_offset = (work / 'server.log').stat().st_size
+                try:
+                    start()
+                except RuntimeError:
+                    assert process.poll() is not None, 'stale-token restart must exit'
+                    failure_log = (work / 'server.log').read_bytes()[failed_start_offset:]
+                    assert b'token lookup-self' in failure_log, 'startup must reject revoked Vault token'
+                    assert b'credential proxy requires a working HashiCorp Vault client' in failure_log, 'strict provider initialization must fail'
+                else:
+                    raise AssertionError('revoked token unexpectedly allowed startup')
+                process = None
+                env['VAULT_TOKEN'] = sink.read_text()
+                start()
+                assert request(base + '/v1/agents/bootstrap-agent', headers=owner)['id'] == exported['id']
+                log.flush()
+                diagnostic = (work / 'server.log').read_bytes()
+                assert all(value.encode() not in diagnostic for value in (root, previous, replacement, secret))
+                print('PASS: revoked token refuses executable startup; private replacement token restores the same store and agent ID without logging tokens')
+                print('SCOPE: no caller admitted; GCP authentication, active-lease drain, post-expiry request denial, TokenReview and deployed isolation are not tested')
             finally:
                 try:
                     stop(process)

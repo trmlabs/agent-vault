@@ -77,6 +77,14 @@ YAML
 kubectl apply -f "$scratch/pod.yaml"
 kubectl -n combined wait --for=condition=Ready pod/agent --timeout=90s
 umask 077
+if [[ ${AV_VERIFY_EXECUTABLE:-false} == true ]]; then
+  kubectl -n combined create serviceaccount observer
+  sed -e 's/name: agent/name: observer/g' -e 's/serviceAccountName: agent/serviceAccountName: observer/' -e 's/audience: credential-proxy/audience: cleanup-observer/' "$scratch/pod.yaml" > "$scratch/observer.yaml"
+  kubectl apply -f "$scratch/observer.yaml"
+  kubectl -n combined wait --for=condition=Ready pod/observer --timeout=90s
+  kubectl -n combined exec observer -- cat /proof/allowed > "$scratch/proof/observer"
+  kubectl -n combined get serviceaccount observer -o json > "$scratch/observer-account.json"
+fi
 kubectl -n combined exec agent -- cat /proof/allowed > "$scratch/proof/allowed"
 kubectl -n combined exec agent -- cat /proof/wrong > "$scratch/proof/wrong"
 kubectl -n combined create token reviewer --duration=15m > "$scratch/proof/reviewer"
@@ -91,6 +99,9 @@ if u.scheme!='https' or u.hostname not in ('127.0.0.1','localhost'): raise Syste
 (p/'proof/ca').write_bytes(base64.b64decode(cluster['certificate-authority-data']))
 config={'apiServer':cluster['server'],'caFile':'/tmp/combined-proof/ca','reviewerTokenFile':'/tmp/combined-proof/reviewer','issuer':json.loads((p/'discovery.json').read_text())['issuer'],'audience':'credential-proxy','maxTokenLifetimeSeconds':600,'bindings':[{'namespace':'combined','serviceAccount':'agent','serviceAccountUID':json.loads((p/'account.json').read_text())['metadata']['uid'],'agentID':'fixture','vaultID':'fixture'}]}
 (p/'proof/config.json').write_text(json.dumps(config))
+if (p/'observer-account.json').exists():
+    observer={**config,'audience':'cleanup-observer','bindings':[{'namespace':'combined','serviceAccount':'observer','serviceAccountUID':json.loads((p/'observer-account.json').read_text())['metadata']['uid']}]}
+    (p/'proof/observer.json').write_text(json.dumps(observer))
 PY
 # Shares only the disposable Linux VM network so its loopback kind API is reachable.
 # No host directories are mounted and no service ports are published.
@@ -98,5 +109,10 @@ docker create --name "$container" --network host --cpus 2 --memory 2g --entrypoi
 docker start "$container" >/dev/null
 docker cp "$scratch/proof" "$container:/tmp/combined-proof"
 docker exec --user root "$container" chown -R postgres:postgres /tmp/combined-proof
-docker exec -e AV_VERIFY_COMBINED=true -e AV_TEST_WORKLOAD_CONFIG=/tmp/combined-proof/config.json -e AV_TEST_WORKLOAD_PROOF=/tmp/combined-proof/allowed -e AV_TEST_WORKLOAD_WRONG_PROOF=/tmp/combined-proof/wrong "$container" bash examples/postgres-broker/verify.sh '^TestRealPostgres_TwoSessionCancellationIsolation$|^TestRealPostgres_DatabaseSeedHistory$'
+executable_args=()
+if [[ ${AV_VERIFY_EXECUTABLE:-false} == true ]]; then
+  docker exec "$container" go build -o /tmp/agent-vault-executable .
+  executable_args=(-e AV_TEST_EXECUTABLE=/tmp/agent-vault-executable -e AV_TEST_OBSERVER_CONFIG=/tmp/combined-proof/observer.json -e AV_TEST_OBSERVER_PROOF=/tmp/combined-proof/observer)
+fi
+docker exec "${executable_args[@]}" -e AV_VERIFY_COMBINED=true -e AV_TEST_WORKLOAD_CONFIG=/tmp/combined-proof/config.json -e AV_TEST_WORKLOAD_PROOF=/tmp/combined-proof/allowed -e AV_TEST_WORKLOAD_WRONG_PROOF=/tmp/combined-proof/wrong "$container" bash examples/postgres-broker/verify.sh '^TestRealPostgres_TwoSessionCancellationIsolation$|^TestRealPostgres_DatabaseSeedHistory$'
 printf 'PASS: composed runtime proof, live services and verified TLS transport. Local clients only; no deployed bypass or network-policy claim.\n'
