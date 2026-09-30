@@ -12,6 +12,7 @@ import (
 )
 
 type CleanupJournal interface {
+	CheckDatabaseCleanupOwner(context.Context, string, time.Time) error
 	ClaimDatabaseCleanupOwner(context.Context, string, time.Time, time.Time) error
 	RenewDatabaseCleanupOwner(context.Context, string, time.Time, time.Time) error
 	ReleaseDatabaseCleanupOwner(context.Context, string) error

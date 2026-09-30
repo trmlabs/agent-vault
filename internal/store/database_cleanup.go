@@ -144,3 +144,16 @@ func (s *SQLStore) DeleteDatabaseCleanup(ctx context.Context, accessor string) e
 	_, err := s.databaseCleanupExec(ctx, s.dialect.Rebind(`DELETE FROM database_cleanup WHERE accessor = ?`), accessor)
 	return err
 }
+
+// CheckDatabaseCleanupOwner verifies current fencing without extending it.
+func (s *SQLStore) CheckDatabaseCleanupOwner(ctx context.Context, owner string, now time.Time) error {
+	var owned bool
+	err := s.db.QueryRowContext(ctx, s.dialect.Rebind(`SELECT EXISTS(SELECT 1 FROM database_cleanup_owner WHERE id = 1 AND owner = ? AND expires_ns > ?)`), owner, now.UnixNano()).Scan(&owned)
+	if err != nil {
+		return err
+	}
+	if !owned {
+		return fmt.Errorf("database cleanup ownership lost")
+	}
+	return nil
+}

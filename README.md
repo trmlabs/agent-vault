@@ -210,6 +210,8 @@ By default Agent Vault stores all state in a local SQLite database, which requir
 
 Migrate existing data with `agent-vault migrate-db --to postgres://...` before switching. See the [PostgreSQL guide](https://docs.agent-vault.dev/self-hosting/postgres) for deployment examples (Kubernetes, Docker Compose), architecture notes, and operational details.
 
+A dedicated trusted manager can opt into the [read-only cleanup observer](examples/credential-proxy/cleanup-observer.md). It reports broker reconciliation state without exposing lease identifiers or granting database access.
+
 ## SDK
 
 Agent Vault offers a TypeScript SDK in the event you'd like an orchestrator to mint a short-lived token and pass proxy config into a sandboxed agent to have it proxy requests through Agent Vault that way.

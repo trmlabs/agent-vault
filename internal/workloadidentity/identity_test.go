@@ -91,7 +91,7 @@ func setup(t *testing.T) *fixture {
 				t.Error("wrong review method")
 			}
 			var got review
-			if json.NewDecoder(r.Body).Decode(&got) != nil || got.Spec.Token != token(f.c) || !exactly(got.Spec.Audiences, "credential-proxy") {
+			if json.NewDecoder(r.Body).Decode(&got) != nil || got.Spec.Token != token(f.c) || !exactly(got.Spec.Audiences, f.c.Audience[0]) {
 				t.Error("invalid TokenReview request")
 			}
 			w.WriteHeader(f.reviewStatus)

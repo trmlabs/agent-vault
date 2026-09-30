@@ -151,3 +151,25 @@ func TestDatabaseCleanupRejectsLeaseAfterOperatorConfirmation(t *testing.T) {
 		t.Fatal("late lease persistence succeeded on a reconciled row")
 	}
 }
+
+func TestCheckDatabaseCleanupOwnerDoesNotExtendClaim(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "observe.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	now := time.Now()
+	if err := s.ClaimDatabaseCleanupOwner(ctx, "observer-test", now, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CheckDatabaseCleanupOwner(ctx, "observer-test", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CheckDatabaseCleanupOwner(ctx, "other", now); err == nil {
+		t.Fatal("wrong owner accepted")
+	}
+	if err := s.CheckDatabaseCleanupOwner(ctx, "observer-test", now.Add(2*time.Second)); err == nil {
+		t.Fatal("observation extended ownership")
+	}
+}

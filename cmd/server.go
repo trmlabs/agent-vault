@@ -289,6 +289,7 @@ func attachServerExtensions(srv *server.Server, host string, mitmPort, postgresP
 		srv.EnableCredentialProxy()
 	}
 	sessions := srv.SessionResolver()
+	var proxyIdentity workloadidentity.Config
 	if path := os.Getenv("AGENT_VAULT_WORKLOAD_IDENTITY_FILE"); path != "" {
 		config, err := workloadidentity.LoadConfig(path)
 		if err != nil {
@@ -299,6 +300,7 @@ func attachServerExtensions(srv *server.Server, host string, mitmPort, postgresP
 			return err
 		}
 		sessions = resolver
+		proxyIdentity = config
 	}
 	if err := attachMITMIfEnabled(srv, host, mitmPort, masterKey, db, maxRespBytes, maxReqBytes, sessions); err != nil {
 		return err
@@ -312,6 +314,26 @@ func attachServerExtensions(srv *server.Server, host string, mitmPort, postgresP
 	// attachHashicorpIfConfigured has run.
 	if err := attachPostgresBrokerIfEnabled(srv, host, postgresPort, logger, sessions); err != nil {
 		return err
+	}
+	observerPort, err := cleanupObserverPort(os.Getenv("AGENT_VAULT_CLEANUP_OBSERVER_FILE"), os.Getenv("AGENT_VAULT_CLEANUP_OBSERVER_PORT"))
+	if err != nil {
+		return err
+	}
+	if path := os.Getenv("AGENT_VAULT_CLEANUP_OBSERVER_FILE"); path != "" {
+		observer, err := workloadidentity.LoadConfig(path)
+		if err != nil {
+			return err
+		}
+		if err := workloadidentity.ValidateObserverSeparation(observer, proxyIdentity); err != nil {
+			return err
+		}
+		identity, err := workloadidentity.NewObserver(observer)
+		if err != nil {
+			return err
+		}
+		if err := srv.EnableCleanupObserver(identity.Authorize, observerPort); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1017,4 +1039,16 @@ func (a *caStoreAdapter) SetCAState(ctx context.Context, rec *ca.CAStateRecord) 
 		RootKeyNonce: rec.RootKeyNonce,
 		Source:       "auto",
 	})
+}
+
+// Both settings are required so adding observer identity cannot expose the owner API.
+func cleanupObserverPort(path, value string) (int, error) {
+	if path == "" && value == "" {
+		return 0, nil
+	}
+	port, err := strconv.Atoi(value)
+	if path == "" || err != nil || port < 1 || port > 65535 || strconv.Itoa(port) != value {
+		return 0, fmt.Errorf("cleanup observer requires both policy file and a numeric port from 1 through 65535")
+	}
+	return port, nil
 }
