@@ -80,11 +80,37 @@ func (v *pairVerifier) check(ctx context.Context, peer string) error {
 			DeletionTimestamp *string `json:"deletionTimestamp"`
 		} `json:"metadata"`
 		Status struct {
-			Phase string `json:"phase"`
-			PodIP string `json:"podIP"`
+			Phase             string `json:"phase"`
+			PodIP             string `json:"podIP"`
+			ContainerStatuses []struct {
+				Name         string `json:"name"`
+				RestartCount *int   `json:"restartCount"`
+				State        struct {
+					Running *struct {
+						StartedAt *time.Time `json:"startedAt"`
+					} `json:"running"`
+					Waiting    json.RawMessage `json:"waiting"`
+					Terminated json.RawMessage `json:"terminated"`
+				} `json:"state"`
+			} `json:"containerStatuses"`
 		} `json:"status"`
 	}
 	if json.Unmarshal(b, &pod) != nil || pod.Metadata.Namespace != c.Sandbox.Namespace || pod.Metadata.Name != c.Sandbox.Name || pod.Metadata.UID != c.Sandbox.UID || pod.Metadata.DeletionTimestamp != nil || pod.Status.Phase != "Running" || !net.ParseIP(pod.Status.PodIP).Equal(net.ParseIP(c.Sandbox.PodIP)) || !time.Now().Before(c.Deadline) {
+		return errDenied
+	}
+	// A surviving sidecar keeps the Pod Running after the task exits. The
+	// operator-pinned task container must be running with no reported restarts.
+	matched := false
+	for _, status := range pod.Status.ContainerStatuses {
+		if status.Name != c.Sandbox.ContainerName {
+			continue
+		}
+		if matched || status.RestartCount == nil || *status.RestartCount != 0 || status.State.Running == nil || status.State.Running.StartedAt == nil || status.State.Running.StartedAt.IsZero() || len(status.State.Waiting) != 0 || len(status.State.Terminated) != 0 {
+			return errDenied
+		}
+		matched = true
+	}
+	if !matched {
 		return errDenied
 	}
 	return nil

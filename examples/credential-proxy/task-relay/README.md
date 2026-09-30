@@ -19,9 +19,11 @@ flowchart LR
   B -->|Destination credential| D[Approved service]
 ```
 
-An operator pins the task ID, deadline, sandbox namespace/name/UID/IP and approved
+An operator pins the task ID, deadline, sandbox namespace/name/UID/IP, task container name and approved
 services in a read-only configuration. The relay matches the actual socket peer
-IP to that configuration, checks the live Pod is Running and not deleting, then
+IP to that configuration, checks the live Pod is Running and not deleting, and
+requires the named task container to be running with zero restarts. A surviving
+transport sidecar cannot keep an exited task authorized. The relay then
 uses the fixed policy. Caller headers, labels, annotations and request parameters
 cannot select an identity, proof file, broker, vault or destination policy.
 
@@ -50,7 +52,10 @@ capabilities; the relay does not distinguish individual processes or intentions.
    ```
 
    Set an RFC3339 deadline in the future, no more than eight hours after startup.
-   Recreating the sandbox requires a new reviewed pairing.
+   Set `sandbox.containerName` to the application container, not its transport
+   sidecar. Its live status must contain a running start time and zero restarts.
+   Recreating or restarting the sandbox requires a new reviewed pairing; a
+   restarted container in the same Pod is refused.
 3. Mount only in the relay: a server certificate/key, trusted API/broker
    certificate authorities, API reviewer token, and projected proof files for
    each configured broker audience. Grant the reviewer `get` only for the paired
@@ -73,6 +78,17 @@ There are no task-relay environment flags. Unknown configuration fields, invalid
 addresses, missing protocol configuration and deadlines outside the permitted
 window fail startup. At least one protocol must be configured. Optional protocol
 sections must have usable trust files when present; omit a section until ready.
+
+### Upgrade existing relay configurations
+
+`sandbox.containerName` is mandatory. Older configurations fail startup with this
+version; older binaries reject the new field. Update the relay image and its
+operator-owned configuration together while admission is stopped, then recreate
+the relay against a fresh, unrestarted task container. Do not fall back to Pod
+phase alone. The same check runs before admission and during active work, so a
+task-container exit or restart closes existing streams within the normal pairing
+watch interval and API timeout. Kubernetes readiness is not used as a substitute
+for the task container’s running state.
 
 ### HTTP client compatibility
 
