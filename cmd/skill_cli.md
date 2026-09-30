@@ -29,6 +29,10 @@ When the managed runner selects this profile, use its approved destinations, pub
 
 HTTP supports approved HTTPS GET/HEAD requests without a caller query or body, with configured placeholders only in `Authorization` or `X-Api-Key`. HTTP Basic supports a configured placeholder as the username with an empty password; never supply a real username or password. An operator may configure a fixed non-secret query for an exact GET destination; send its URL without parameters and let the proxy add them. HEAD is denied for that mapping. CONNECT clients may send one `Connection: close` or `Connection: keep-alive` header; the relay strips it. Send no `Proxy-Authorization` or other identity header. PostgreSQL uses only the operator-provided public placeholder password and fixed database/user. When several database endpoints are supplied, use the assigned endpoint for each binding; changing the database or user cannot select a different binding. The relay also preserves supported application-name, positive statement-timeout and UTF8 encoding settings; see the task relay guide for bounds. Reconnect when a connection expires; never retrieve a proof or bypass the relay. Browser access, when configured, uses only the assigned create/check/close routes with an empty JSON object; no login credentials or session handles belong in the sandbox.
 
+The assigned task container must remain running without a restart. If it exits or
+restarts, the trusted relay closes access even if a transport sidecar stays alive.
+Request a fresh approved task instead of reusing its connection settings.
+
 - `403`: denied identity, mapping, destination or request format. Stop and report it.
 - `429`: rate limited. Pause before retrying the approved request.
 - `503`: required audit recording unavailable; the outcome may be unknown. Report it without bypassing or blindly repeating the request.

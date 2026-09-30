@@ -25,18 +25,20 @@ import (
 )
 
 type relayFixture struct {
-	c         FixedConfig
-	cert      tls.Certificate
-	state     atomic.Int32
-	kubeCalls atomic.Int32 // every request the synthetic API server received
-	kube      *httptest.Server
-	done      chan struct{}
-	runError  error
+	c                 FixedConfig
+	cert              tls.Certificate
+	state             atomic.Int32
+	containerStatuses atomic.Value // immutable JSON, replaced atomically by lifecycle tests
+	kubeCalls         atomic.Int32 // every request the synthetic API server received
+	kube              *httptest.Server
+	done              chan struct{}
+	runError          error
 }
 
 func newRelayFixture(t *testing.T) *relayFixture {
 	t.Helper()
 	f := &relayFixture{}
+	f.containerStatuses.Store(json.RawMessage(`[{"name":"worker","restartCount":0,"state":{"running":{"startedAt":"2026-01-01T00:00:00Z"}}},{"name":"tunnel","restartCount":0,"state":{"running":{"startedAt":"2026-01-01T00:00:00Z"}}}]`))
 	dir := t.TempDir()
 	f.kube = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.kubeCalls.Add(1)
@@ -59,7 +61,7 @@ func newRelayFixture(t *testing.T) *relayFixture {
 			w.WriteHeader(503)
 			return
 		}
-		json.NewEncoder(w).Encode(map[string]any{"metadata": map[string]any{"name": "agent", "namespace": "sandboxes", "uid": uid, "deletionTimestamp": deletion}, "status": map[string]any{"phase": phase, "podIP": ip}})
+		json.NewEncoder(w).Encode(map[string]any{"metadata": map[string]any{"name": "agent", "namespace": "sandboxes", "uid": uid, "deletionTimestamp": deletion}, "status": map[string]any{"phase": phase, "podIP": ip, "containerStatuses": f.containerStatuses.Load()}})
 	}))
 	t.Cleanup(f.kube.Close)
 	f.cert = f.kube.TLS.Certificates[0]
@@ -70,7 +72,7 @@ func newRelayFixture(t *testing.T) *relayFixture {
 	writeTestFile(t, keyFile, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: key}))
 	reviewer := filepath.Join(dir, "reviewer")
 	writeTestFile(t, reviewer, []byte("synthetic-reviewer"))
-	f.c = FixedConfig{TaskID: "task-one", Deadline: time.Now().Add(time.Hour), Sandbox: SandboxConfig{Namespace: "sandboxes", Name: "agent", UID: "pod-uid", PodIP: "127.0.0.1"}, Kubernetes: KubernetesConfig{APIURL: f.kube.URL, CAFile: ca, ReviewerTokenFile: reviewer}, TLSCertFile: ca, TLSKeyFile: keyFile, AuditFile: filepath.Join(dir, "audit.jsonl")}
+	f.c = FixedConfig{TaskID: "task-one", Deadline: time.Now().Add(time.Hour), Sandbox: SandboxConfig{ContainerName: "worker", Namespace: "sandboxes", Name: "agent", UID: "pod-uid", PodIP: "127.0.0.1"}, Kubernetes: KubernetesConfig{APIURL: f.kube.URL, CAFile: ca, ReviewerTokenFile: reviewer}, TLSCertFile: ca, TLSKeyFile: keyFile, AuditFile: filepath.Join(dir, "audit.jsonl")}
 	return f
 }
 func writeTestFile(t *testing.T, path string, b []byte) {

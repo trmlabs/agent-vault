@@ -33,10 +33,11 @@ type FixedConfig struct {
 	Browser          *BrowserConfig   `json:"browser,omitempty"`
 }
 type SandboxConfig struct {
-	Namespace string `json:"namespace"`
-	Name      string `json:"name"`
-	UID       string `json:"uid"`
-	PodIP     string `json:"podIP"`
+	Namespace     string `json:"namespace"`
+	Name          string `json:"name"`
+	UID           string `json:"uid"`
+	PodIP         string `json:"podIP"`
+	ContainerName string `json:"containerName"`
 }
 type KubernetesConfig struct {
 	APIURL            string `json:"apiURL"`
@@ -68,6 +69,7 @@ type BrowserConfig struct {
 }
 
 var safeName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,252}$`)
+var containerName = regexp.MustCompile(`^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$`)
 var errConfig = errors.New("invalid fixed task relay configuration")
 
 // LoadConfig rejects unknown fields, trailing data and oversized configuration.
@@ -86,6 +88,9 @@ func LoadConfig(path string) (FixedConfig, error) {
 }
 
 func (c FixedConfig) Validate(now time.Time) error {
+	if !containerName.MatchString(c.Sandbox.ContainerName) {
+		return errConfig
+	}
 	if !safeName.MatchString(c.TaskID) || !c.Deadline.After(now) || c.Deadline.After(now.Add(8*time.Hour)) {
 		return errConfig
 	}

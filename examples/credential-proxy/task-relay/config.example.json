@@ -3,6 +3,7 @@
   "deadline": "2000-01-01T00:00:00Z",
   "sandbox": {
     "namespace": "agent-tasks",
+    "containerName": "worker",
     "name": "replace-with-live-pod-name",
     "uid": "replace-with-live-pod-uid",
     "podIP": "192.0.2.1"
