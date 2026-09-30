@@ -99,8 +99,9 @@ type Server struct {
 	telemetry       *telemetry.Telemetry
 	// pgBroker is the PostgreSQL credential-brokering TCP listener; nil when
 	// --postgres-port is 0 or no database services are configured.
-	pgBroker      *pgproxy.Broker
-	pgLeaseCloser interface{ Close(context.Context) error }
+	cleanupObserver http.Handler
+	pgBroker        *pgproxy.Broker
+	pgLeaseCloser   interface{ Close(context.Context) error }
 }
 
 // lockVaultServices acquires the per-vault mutation lock via the store's
@@ -967,6 +968,9 @@ func New(addr string, store Store, encKey []byte, notifier *notify.Notifier, ini
 
 	// Proposal approval details (token-based, no auth required)
 	mux.HandleFunc("GET /v1/proposals/approve-details", s.requireInitialized(ipApprovalToken(s.handleProposalApproveDetails)))
+
+	// Dedicated read-only workload observer; disabled unless configured at startup.
+	mux.HandleFunc("/v1/runtime/cleanup-status", s.handleCleanupObserver)
 
 	// Admin proposal management
 	mux.HandleFunc("GET /v1/database-cleanup", s.requireInitialized(s.requireAuth(actorAuthed(s.handleDatabaseCleanupList))))

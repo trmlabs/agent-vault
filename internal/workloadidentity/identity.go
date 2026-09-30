@@ -90,6 +90,10 @@ func LoadConfig(path string) (Config, error) {
 // New validates policy and builds a TLS-verifying client with no redirect or
 // environment-proxy fallback. It never retains a positive authentication cache.
 func New(c Config, s Store) (*Resolver, error) {
+	return newResolver(c, s, false)
+}
+
+func newResolver(c Config, s Store, observer bool) (*Resolver, error) {
 	if c.APIServer == "" {
 		c.APIServer = "https://kubernetes.default.svc"
 	}
@@ -103,7 +107,7 @@ func New(c Config, s Store) (*Resolver, error) {
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
 		return nil, errors.New("workload identity apiServer must be an HTTPS origin")
 	}
-	if s == nil || c.CAFile == "" || c.ReviewerTokenFile == "" || c.Issuer == "" || c.Audience == "" || len(c.Bindings) == 0 {
+	if (!observer && s == nil) || c.CAFile == "" || c.ReviewerTokenFile == "" || c.Issuer == "" || c.Audience == "" || len(c.Bindings) == 0 {
 		return nil, errors.New("workload identity requires trust, reviewer token, issuer, audience, store and bindings")
 	}
 	if c.TimeoutSeconds == 0 {
@@ -120,8 +124,11 @@ func New(c Config, s Store) (*Resolver, error) {
 	}
 	seen := map[string]bool{}
 	for _, b := range c.Bindings {
-		if !pathSegment(b.Namespace) || !pathSegment(b.ServiceAccount) || b.ServiceAccountUID == "" || b.AgentID == "" || b.VaultID == "" {
+		if !pathSegment(b.Namespace) || !pathSegment(b.ServiceAccount) || b.ServiceAccountUID == "" || (!observer && (b.AgentID == "" || b.VaultID == "")) {
 			return nil, errors.New("workload identity binding requires namespace, account, account UID, agent and vault")
+		}
+		if observer && (b.AgentID != "" || b.VaultID != "") {
+			return nil, errors.New("observer policy must not contain proxy grants")
 		}
 		key := b.Namespace + ":" + b.ServiceAccount
 		if seen[key] {
@@ -197,34 +204,32 @@ type review struct {
 	} `json:"status"`
 }
 
-// ResolveForProxy verifies proof for every admission and reauthorization. No
-// local/session-token fallback is allowed when this resolver is configured.
-func (r *Resolver) ResolveForProxy(ctx context.Context, token, vaultHint string) (*brokercore.ProxyScope, error) {
+func (r *Resolver) verifyProof(ctx context.Context, token string) (*Binding, claims, error) {
 	deny := brokercore.ErrInvalidSession
 	if len(token) == 0 || len(token) > 32768 {
-		return nil, deny
+		return nil, claims{}, deny
 	}
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 || parts[0] == "" || parts[2] == "" {
-		return nil, deny
+		return nil, claims{}, deny
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return nil, deny
+		return nil, claims{}, deny
 	}
 	var c claims
 	if json.Unmarshal(payload, &c) != nil {
-		return nil, deny
+		return nil, claims{}, deny
 	}
 	// This release intentionally accepts only single-audience broker proofs,
 	// a narrower policy than standard JWT audience membership.
 	now := r.now().Unix()
 	if c.Issuer != r.config.Issuer || !exactly(c.Audience, r.config.Audience) || c.Expires <= now || c.Issued <= 0 || c.Issued > now || c.NotBefore > now || c.Expires <= c.Issued || c.Expires-c.Issued > r.config.MaxTokenLifetimeSeconds {
-		return nil, deny
+		return nil, claims{}, deny
 	}
 	k := c.Kubernetes
 	if k.Pod.UID == "" || !pathSegment(k.Pod.Name) || !pathSegment(k.Namespace) || c.Subject != "system:serviceaccount:"+k.Namespace+":"+k.ServiceAccount.Name {
-		return nil, deny
+		return nil, claims{}, deny
 	}
 	var binding *Binding
 	for i := range r.config.Bindings {
@@ -235,23 +240,21 @@ func (r *Resolver) ResolveForProxy(ctx context.Context, token, vaultHint string)
 		}
 	}
 	if binding == nil {
-		return nil, deny
+		return nil, claims{}, deny
 	}
 	// Claims above only narrow policy. They become authenticated exclusively by
 	// a successful online TokenReview of the exact original token below.
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(r.config.TimeoutSeconds)*time.Second)
-	defer cancel()
 	var req review
 	req.APIVersion, req.Kind = "authentication.k8s.io/v1", "TokenReview"
 	req.Spec.Token, req.Spec.Audiences = token, []string{r.config.Audience}
 	body, _ := json.Marshal(req)
 	var verified review
 	if r.api(ctx, http.MethodPost, "/apis/authentication.k8s.io/v1/tokenreviews", body, &verified) != nil {
-		return nil, deny
+		return nil, claims{}, deny
 	}
 	s := verified.Status
 	if verified.APIVersion != req.APIVersion || verified.Kind != req.Kind || !s.Authenticated || s.Error != "" || !exactly(s.Audiences, r.config.Audience) || s.User.Username != c.Subject || s.User.UID != k.ServiceAccount.UID || !exactly(s.User.Extra["authentication.kubernetes.io/pod-uid"], k.Pod.UID) || !exactly(s.User.Extra["authentication.kubernetes.io/pod-name"], k.Pod.Name) {
-		return nil, deny
+		return nil, claims{}, deny
 	}
 	// TokenReview permits a deletion grace period. An explicit Pod read denies
 	// terminating/deleted pods immediately and pins the current object's UID.
@@ -267,11 +270,25 @@ func (r *Resolver) ResolveForProxy(ctx context.Context, token, vaultHint string)
 		} `json:"spec"`
 	}
 	if r.api(ctx, http.MethodGet, "/api/v1/namespaces/"+url.PathEscape(k.Namespace)+"/pods/"+url.PathEscape(k.Pod.Name), nil, &pod) != nil || pod.Metadata.UID != k.Pod.UID || pod.Metadata.Name != k.Pod.Name || pod.Metadata.Namespace != k.Namespace || pod.Metadata.DeletionTimestamp != nil || pod.Spec.ServiceAccountName != k.ServiceAccount.Name {
-		return nil, deny
+		return nil, claims{}, deny
 	}
 	if c.Expires <= r.now().Unix() {
-		return nil, deny
+		return nil, claims{}, deny
 	}
+	return binding, c, nil
+}
+
+// ResolveForProxy verifies proof for every admission and reauthorization. No
+// local/session-token fallback is allowed when this resolver is configured.
+func (r *Resolver) ResolveForProxy(ctx context.Context, token, vaultHint string) (*brokercore.ProxyScope, error) {
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(r.config.TimeoutSeconds)*time.Second)
+	defer cancel()
+	binding, c, err := r.verifyProof(ctx, token)
+	if err != nil {
+		return nil, err
+	}
+	deny := brokercore.ErrInvalidSession
+	k := c.Kubernetes
 	a, err := r.store.GetAgentByID(ctx, binding.AgentID)
 	if err != nil || a == nil || a.ID != binding.AgentID || a.Status != "active" || a.RevokedAt != nil {
 		return nil, deny

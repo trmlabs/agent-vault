@@ -22,6 +22,7 @@ type durableVaultFixture struct {
 	issued       int
 	next         int
 	failRevoke   bool
+	denyLookup   bool
 	loseResponse bool
 	live         map[string]bool
 	journal      *store.SQLStore
@@ -43,6 +44,10 @@ func durableFixture(t *testing.T) (*hashicorp.Client, *store.SQLStore, *durableV
 		write := func(v any) { _ = json.NewEncoder(w).Encode(v) }
 		switch {
 		case r.URL.Path == "/v1/auth/token/lookup-self":
+			if f.denyLookup {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
 			write(map[string]any{"data": map[string]any{"id": "parent"}})
 		case r.URL.Path == "/v1/auth/token/create":
 			var body map[string]any

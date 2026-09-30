@@ -289,6 +289,7 @@ func attachServerExtensions(srv *server.Server, host string, mitmPort, postgresP
 		srv.EnableCredentialProxy()
 	}
 	sessions := srv.SessionResolver()
+	var proxyIdentity workloadidentity.Config
 	if path := os.Getenv("AGENT_VAULT_WORKLOAD_IDENTITY_FILE"); path != "" {
 		config, err := workloadidentity.LoadConfig(path)
 		if err != nil {
@@ -299,6 +300,7 @@ func attachServerExtensions(srv *server.Server, host string, mitmPort, postgresP
 			return err
 		}
 		sessions = resolver
+		proxyIdentity = config
 	}
 	if err := attachMITMIfEnabled(srv, host, mitmPort, masterKey, db, maxRespBytes, maxReqBytes, sessions); err != nil {
 		return err
@@ -312,6 +314,22 @@ func attachServerExtensions(srv *server.Server, host string, mitmPort, postgresP
 	// attachHashicorpIfConfigured has run.
 	if err := attachPostgresBrokerIfEnabled(srv, host, postgresPort, logger, sessions); err != nil {
 		return err
+	}
+	if path := os.Getenv("AGENT_VAULT_CLEANUP_OBSERVER_FILE"); path != "" {
+		observer, err := workloadidentity.LoadConfig(path)
+		if err != nil {
+			return err
+		}
+		if err := workloadidentity.ValidateObserverSeparation(observer, proxyIdentity); err != nil {
+			return err
+		}
+		identity, err := workloadidentity.NewObserver(observer)
+		if err != nil {
+			return err
+		}
+		if err := srv.EnableCleanupObserver(identity.Authorize); err != nil {
+			return err
+		}
 	}
 	return nil
 }

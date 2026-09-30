@@ -51,16 +51,17 @@ type Broker struct {
 	serveMu        sync.Mutex
 	upstreamCounts map[string]int // active connections by configured upstream address
 
-	mu           sync.Mutex
-	listener     net.Listener
-	conns        map[net.Conn]struct{}
-	leaseCounts  map[string]int // live leases per actor id
-	leaseChanged chan struct{}  // wakes bounded admissions after cleanup
-	closed       bool
-	ctx          context.Context
-	cancel       context.CancelFunc
-	shutdownDone chan struct{}
-	wg           sync.WaitGroup
+	mu                   sync.Mutex
+	listener             net.Listener
+	conns                map[net.Conn]struct{}
+	connectionGeneration uint64
+	leaseCounts          map[string]int // live leases per actor id
+	leaseChanged         chan struct{}  // wakes bounded admissions after cleanup
+	closed               bool
+	ctx                  context.Context
+	cancel               context.CancelFunc
+	shutdownDone         chan struct{}
+	wg                   sync.WaitGroup
 }
 
 // New builds a Broker bound to addr (host:port). It does not listen until Serve
@@ -196,6 +197,7 @@ func (b *Broker) Serve(l net.Listener) error {
 			return nil
 		}
 		b.conns[conn] = struct{}{}
+		b.connectionGeneration++
 		b.wg.Add(1)
 		b.mu.Unlock()
 		go func() {
@@ -236,6 +238,7 @@ func (b *Broker) Shutdown(ctx context.Context) error {
 func (b *Broker) unregister(conn net.Conn) {
 	b.mu.Lock()
 	delete(b.conns, conn)
+	b.connectionGeneration++
 	b.mu.Unlock()
 }
 
