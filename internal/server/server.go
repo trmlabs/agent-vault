@@ -99,9 +99,9 @@ type Server struct {
 	telemetry       *telemetry.Telemetry
 	// pgBroker is the PostgreSQL credential-brokering TCP listener; nil when
 	// --postgres-port is 0 or no database services are configured.
-	cleanupObserver http.Handler
-	pgBroker        *pgproxy.Broker
-	pgLeaseCloser   interface{ Close(context.Context) error }
+	cleanupObserverServer *http.Server
+	pgBroker              *pgproxy.Broker
+	pgLeaseCloser         interface{ Close(context.Context) error }
 }
 
 // lockVaultServices acquires the per-vault mutation lock via the store's
@@ -969,9 +969,6 @@ func New(addr string, store Store, encKey []byte, notifier *notify.Notifier, ini
 	// Proposal approval details (token-based, no auth required)
 	mux.HandleFunc("GET /v1/proposals/approve-details", s.requireInitialized(ipApprovalToken(s.handleProposalApproveDetails)))
 
-	// Dedicated read-only workload observer; disabled unless configured at startup.
-	mux.HandleFunc("/v1/runtime/cleanup-status", s.handleCleanupObserver)
-
 	// Admin proposal management
 	mux.HandleFunc("GET /v1/database-cleanup", s.requireInitialized(s.requireAuth(actorAuthed(s.handleDatabaseCleanupList))))
 	mux.HandleFunc("POST /v1/database-cleanup/{accessor}/confirm", s.requireInitialized(s.requireAuth(actorAuthed(limitBody(s.handleDatabaseCleanupConfirm)))))
@@ -1094,6 +1091,13 @@ func (s *Server) Start() error {
 			_ = s.pgBroker.Shutdown(ctx)
 		}()
 	}
+	observerLn, err := s.listenCleanupObserver()
+	if err != nil {
+		return err
+	}
+	if observerLn != nil {
+		defer func() { _ = observerLn.Close(); _ = s.cleanupObserverServer.Close() }()
+	}
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(stop)
@@ -1138,7 +1142,14 @@ func (s *Server) Start() error {
 		go s.infisicalDynamic.SweepOrphans(pruneCtx)
 	}
 
-	errCh := make(chan error, 3)
+	errCh := make(chan error, 4)
+	if observerLn != nil {
+		go func() {
+			if err := s.cleanupObserverServer.Serve(observerLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- fmt.Errorf("cleanup observer stopped: %w", err)
+			}
+		}()
+	}
 	go func() {
 		fmt.Printf("Agent Vault server listening on %s\n", s.baseURL)
 		if !s.initialized {
@@ -1225,6 +1236,9 @@ func (s *Server) Start() error {
 	}
 	if s.mitm != nil {
 		shutdown("HTTP proxy", s.mitm.Shutdown)
+	}
+	if s.cleanupObserverServer != nil {
+		shutdown("cleanup observer", s.cleanupObserverServer.Shutdown)
 	}
 	httpErr := s.httpServer.Shutdown(ctx)
 	shutdownWG.Wait()

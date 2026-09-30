@@ -315,6 +315,10 @@ func attachServerExtensions(srv *server.Server, host string, mitmPort, postgresP
 	if err := attachPostgresBrokerIfEnabled(srv, host, postgresPort, logger, sessions); err != nil {
 		return err
 	}
+	observerPort, err := cleanupObserverPort(os.Getenv("AGENT_VAULT_CLEANUP_OBSERVER_FILE"), os.Getenv("AGENT_VAULT_CLEANUP_OBSERVER_PORT"))
+	if err != nil {
+		return err
+	}
 	if path := os.Getenv("AGENT_VAULT_CLEANUP_OBSERVER_FILE"); path != "" {
 		observer, err := workloadidentity.LoadConfig(path)
 		if err != nil {
@@ -327,7 +331,7 @@ func attachServerExtensions(srv *server.Server, host string, mitmPort, postgresP
 		if err != nil {
 			return err
 		}
-		if err := srv.EnableCleanupObserver(identity.Authorize); err != nil {
+		if err := srv.EnableCleanupObserver(identity.Authorize, observerPort); err != nil {
 			return err
 		}
 	}
@@ -1035,4 +1039,16 @@ func (a *caStoreAdapter) SetCAState(ctx context.Context, rec *ca.CAStateRecord) 
 		RootKeyNonce: rec.RootKeyNonce,
 		Source:       "auto",
 	})
+}
+
+// Both settings are required so adding observer identity cannot expose the owner API.
+func cleanupObserverPort(path, value string) (int, error) {
+	if path == "" && value == "" {
+		return 0, nil
+	}
+	port, err := strconv.Atoi(value)
+	if path == "" || err != nil || port < 1 || port > 65535 || strconv.Itoa(port) != value {
+		return 0, fmt.Errorf("cleanup observer requires both policy file and a numeric port from 1 through 65535")
+	}
+	return port, nil
 }
