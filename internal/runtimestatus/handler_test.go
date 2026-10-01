@@ -99,3 +99,44 @@ func TestRejectMutationAndCancelledAuthorization(t *testing.T) {
 		t.Fatal("missing dependencies accepted")
 	}
 }
+
+func TestProxyGrantsReportedOnlyWhenConfigured(t *testing.T) {
+	ready := func(context.Context) (Observation, error) {
+		return Observation{Initialized: true, Healthy: true, Consistent: true}, nil
+	}
+	allow := func(context.Context, string) error { return nil }
+	read := func(h http.Handler) map[string]any {
+		req := httptest.NewRequest(http.MethodGet, "/v1/runtime/cleanup-status", nil)
+		req.Header.Set("Authorization", "Bearer proof")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		var body map[string]any
+		if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		return body
+	}
+	plain, err := New(allow, ready)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, present := read(plain)["proxyGrants"]; present {
+		t.Fatal("grants reported without a configured check")
+	}
+	for _, c := range []struct {
+		ok   bool
+		err  error
+		want string
+	}{{true, nil, "authorized"}, {false, nil, "missing"}, {true, errors.New("store"), "unknown"}} {
+		h, err := New(allow, ready, func(context.Context) (bool, error) { return c.ok, c.err })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := read(h)["proxyGrants"]; got != c.want {
+			t.Fatalf("proxyGrants = %v, want %s", got, c.want)
+		}
+	}
+	if _, err := New(allow, ready, nil); err == nil {
+		t.Fatal("nil grants check accepted")
+	}
+}
