@@ -32,6 +32,10 @@ type Snapshot func(context.Context) (Observation, error)
 // observer a proxy grant. The HTTP handler supplies no fallback authentication.
 type Authorize func(context.Context, string) error
 
+// Grants reports whether every configured proxy workload binding still holds
+// its vault grant. It returns no identifiers, only the aggregate answer.
+type Grants func(context.Context) (bool, error)
+
 type response struct {
 	SchemaVersion     int    `json:"schemaVersion"`
 	Status            string `json:"status"`
@@ -39,13 +43,20 @@ type response struct {
 	UnfinishedCleanup int    `json:"unfinishedCleanup"`
 	UnknownCleanup    int    `json:"unknownCleanup"`
 	ObservedAt        string `json:"observedAt"`
+	// ProxyGrants is "authorized", "missing" or "unknown" when a Grants check
+	// is configured, so a caller can refuse to admit a workload the broker
+	// would deny. Omitted otherwise.
+	ProxyGrants string `json:"proxyGrants,omitempty"`
 }
 
 // New returns an isolated handler, not a server route. Callers must first stop
 // old admission, then obtain this observation over verified transport from the
 // expected dedicated broker. A ready response is reconciliation state only;
 // independent database evidence remains necessary for acceptance.
-func New(authorize Authorize, snapshot Snapshot) (http.Handler, error) {
+func New(authorize Authorize, snapshot Snapshot, grants ...Grants) (http.Handler, error) {
+	if len(grants) > 1 || (len(grants) == 1 && grants[0] == nil) {
+		return nil, errors.New("at most one grants check")
+	}
 	if authorize == nil || snapshot == nil {
 		return nil, errors.New("observer authorization and snapshot required")
 	}
@@ -93,6 +104,15 @@ func New(authorize Authorize, snapshot Snapshot) (http.Handler, error) {
 				result.Status = "pending"
 				if result.ActiveConnections == 0 && result.UnfinishedCleanup == 0 {
 					result.Status = "ready"
+				}
+			}
+		}
+		if len(grants) == 1 {
+			result.ProxyGrants = "unknown"
+			if authorized, err := grants[0](ctx); err == nil && ctx.Err() == nil {
+				result.ProxyGrants = "missing"
+				if authorized {
+					result.ProxyGrants = "authorized"
 				}
 			}
 		}
