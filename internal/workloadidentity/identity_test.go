@@ -336,3 +336,25 @@ func TestLoadConfigRejectsOversizeValidPrefix(t *testing.T) {
 		t.Fatal("oversized configuration accepted")
 	}
 }
+
+func TestBindingsAuthorizedTracksCurrentGrants(t *testing.T) {
+	f := setup(t)
+	ok, err := f.r.BindingsAuthorized(context.Background())
+	if err != nil || !ok {
+		t.Fatalf("granted binding reported unauthorized: %v %v", ok, err)
+	}
+	f.s.role = ""
+	if ok, err := f.r.BindingsAuthorized(context.Background()); err != nil || ok {
+		t.Fatal("revoked grant reported authorized")
+	}
+	f.s.role = "proxy"
+	f.s.status = "revoked"
+	if ok, err := f.r.BindingsAuthorized(context.Background()); err != nil || ok {
+		t.Fatal("revoked agent reported authorized")
+	}
+	f.s.status = "active"
+	f.s.err = errors.New("store unavailable")
+	if ok, err := f.r.BindingsAuthorized(context.Background()); err == nil || ok {
+		t.Fatal("store failure reported authorized")
+	}
+}

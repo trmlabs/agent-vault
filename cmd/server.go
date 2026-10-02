@@ -29,6 +29,7 @@ import (
 	"github.com/Infisical/agent-vault/internal/pgproxy"
 	"github.com/Infisical/agent-vault/internal/pidfile"
 	"github.com/Infisical/agent-vault/internal/requestlog"
+	"github.com/Infisical/agent-vault/internal/runtimestatus"
 	"github.com/Infisical/agent-vault/internal/server"
 	"github.com/Infisical/agent-vault/internal/session"
 	"github.com/Infisical/agent-vault/internal/store"
@@ -290,6 +291,7 @@ func attachServerExtensions(srv *server.Server, host string, mitmPort, postgresP
 	}
 	sessions := srv.SessionResolver()
 	var proxyIdentity workloadidentity.Config
+	var proxyResolver *workloadidentity.Resolver
 	if path := os.Getenv("AGENT_VAULT_WORKLOAD_IDENTITY_FILE"); path != "" {
 		config, err := workloadidentity.LoadConfig(path)
 		if err != nil {
@@ -301,6 +303,7 @@ func attachServerExtensions(srv *server.Server, host string, mitmPort, postgresP
 		}
 		sessions = resolver
 		proxyIdentity = config
+		proxyResolver = resolver
 	}
 	if err := attachMITMIfEnabled(srv, host, mitmPort, masterKey, db, maxRespBytes, maxReqBytes, sessions); err != nil {
 		return err
@@ -331,7 +334,11 @@ func attachServerExtensions(srv *server.Server, host string, mitmPort, postgresP
 		if err != nil {
 			return err
 		}
-		if err := srv.EnableCleanupObserver(identity.Authorize, observerPort); err != nil {
+		var grants []runtimestatus.Grants
+		if proxyResolver != nil {
+			grants = append(grants, proxyResolver.BindingsAuthorized)
+		}
+		if err := srv.EnableCleanupObserver(identity.Authorize, observerPort, grants...); err != nil {
 			return err
 		}
 	}
