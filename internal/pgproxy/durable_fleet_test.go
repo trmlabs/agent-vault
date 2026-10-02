@@ -499,8 +499,9 @@ func TestReplicaRestartHelperProcess(t *testing.T) {
 	fmt.Println("registered")
 	<-signals
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if m.Close(ctx) != nil {
+	closeErr := m.Close(ctx)
+	cancel()
+	if closeErr != nil {
 		os.Exit(5)
 	}
 	os.Exit(0)
