@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"strconv"
 	"sync"
 	"time"
 
@@ -40,6 +41,11 @@ type PoolOptions struct {
 	RotateFraction float64
 	// IdleTimeout closes server connections unused for this long. Default 5m.
 	IdleTimeout time.Duration
+	// IdleInTransaction is the server's idle_in_transaction_session_timeout
+	// on pooled connections: a client that holds a transaction open without
+	// sending anything for this long loses its session, so it cannot sit on
+	// a server connection. Default 5m.
+	IdleInTransaction time.Duration
 	// DefaultBudget is the server-connection budget for a database without a
 	// catalog maxConns. Default 50.
 	DefaultBudget int
@@ -64,6 +70,9 @@ func (o *PoolOptions) withDefaults() PoolOptions {
 	}
 	if p.IdleTimeout <= 0 {
 		p.IdleTimeout = 5 * time.Minute
+	}
+	if p.IdleInTransaction <= 0 {
+		p.IdleInTransaction = 5 * time.Minute
 	}
 	if p.DefaultBudget <= 0 {
 		p.DefaultBudget = defaultMaxConns
@@ -99,6 +108,7 @@ type credential struct {
 	issued   time.Time
 	rotateAt time.Time
 	conns    int
+	open     map[*serverConn]struct{} // every open connection on this login, idle or in use
 	retiring bool
 	revoked  bool
 	margin   time.Duration // stop opening or reusing connections this long before expiry
@@ -344,7 +354,8 @@ func (p *serverPools) open(ctx context.Context, pool *serverPool, svc DatabaseSe
 	}
 	connectCtx, cancel := context.WithTimeout(ctx, p.broker.opts.HandshakeTimeout)
 	defer cancel()
-	sess, err := connectUpstream(connectCtx, p.broker.opts.Dialer, &svc, cred.lease, nil)
+	server := map[string]string{"idle_in_transaction_session_timeout": strconv.FormatInt(p.opts.IdleInTransaction.Milliseconds(), 10)}
+	sess, err := connectUpstreamWith(connectCtx, p.broker.opts.Dialer, &svc, cred.lease, nil, server)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err != nil {
@@ -357,8 +368,13 @@ func (p *serverPools) open(ctx context.Context, pool *serverPool, svc DatabaseSe
 	for _, p := range sess.parameters {
 		reported[p.Name] = p.Value
 	}
-	return &serverConn{sess: sess, frontend: frontend, cred: cred, pool: pool, prepared: map[string]bool{}, params: map[string]string{},
-		actual: map[string]string{}, reported: reported, seen: map[string]string{}}, nil
+	conn := &serverConn{sess: sess, frontend: frontend, cred: cred, pool: pool, prepared: map[string]bool{}, params: map[string]string{},
+		actual: map[string]string{}, reported: reported, seen: map[string]string{}}
+	if cred.open == nil {
+		cred.open = map[*serverConn]struct{}{}
+	}
+	cred.open[conn] = struct{}{}
+	return conn, nil
 }
 
 // credentialFor reserves a connection on the key's current credential,
@@ -461,12 +477,27 @@ func (p *serverPools) release(conn *serverConn, reusable bool) {
 
 func (p *serverPools) closeLocked(conn *serverConn) {
 	_ = conn.sess.conn.Close()
+	delete(conn.cred.open, conn)
 	conn.cred.conns--
 	if bud := p.budgets[conn.pool.svc.Addr]; bud != nil {
 		bud.open--
 		bud.notify()
 	}
 	p.retireIfDrainedLocked(conn.pool, conn.cred)
+}
+
+// retire stops a credential's use at once: it opens and reuses no more
+// connections and is revoked when its last one closes. Used when a client
+// changed the login itself, such as its role-level defaults.
+func (p *serverPools) retire(cred *credential) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, pool := range p.pools {
+		if pool.cur == cred {
+			pool.cur = nil
+		}
+	}
+	cred.retiring = true
 }
 
 func (p *serverPools) retireIfDrainedLocked(pool *serverPool, cred *credential) {
@@ -535,10 +566,15 @@ func (p *serverPools) maintain() {
 				}
 				live = append(live, cred)
 				if !now.Before(cred.lease.ExpiresAt) {
-					// Expired with connections open: revocation ends them.
+					// Expired with connections open: close them here, rather
+					// than trust the Vault role's revocation to end them, and
+					// revoke. A session on one loses its server and ends.
 					cred.retiring, cred.revoked = true, true
 					if pool.cur == cred {
 						pool.cur = nil
+					}
+					for conn := range cred.open {
+						_ = conn.sess.conn.Close()
 					}
 					go p.revoke(cred.lease)
 				}

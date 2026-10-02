@@ -51,9 +51,9 @@ type browserFixture struct {
 	mu       sync.Mutex
 	seen     map[string]http.Header // last request headers per host
 	apiCalls atomic.Int32
-	reject   atomic.Int32  // status the API answers with, when set
-	refusal  atomic.Value  // WWW-Authenticate on a refusal, when set
-	clock    atomic.Int64  // nanoseconds the token cache's clock runs ahead
+	reject   atomic.Int32 // status the API answers with, when set
+	refusal  atomic.Value // WWW-Authenticate on a refusal, when set
+	clock    atomic.Int64 // nanoseconds the token cache's clock runs ahead
 }
 
 func (f *browserFixture) headers(host string) http.Header {
