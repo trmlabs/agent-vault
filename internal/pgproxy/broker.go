@@ -39,6 +39,11 @@ type Options struct {
 	MaxConns              int           // cap on concurrent SERVING connections = upstream DB connections (default 50)
 	MaxPendingConns       int           // cap on accepted-but-not-yet-serving connections (default 512)
 	MaxLeasesPerActor     int           // cap on live credentials/connections per workload (Pod), or per agent when no workload is known (default 16; clamped to <= MaxConns)
+	// MaxLeasesPerAgent caps one agent's sessions across all its workloads on
+	// this replica, so a pool agent with many Pods cannot take the whole
+	// serving cap (default MaxConns minus MaxLeasesPerActor, at least
+	// MaxLeasesPerActor; clamped to <= MaxConns).
+	MaxLeasesPerAgent int
 	// TrustProxyHeader reads a PROXY v1 header from the in-Pod loopback TLS
 	// terminator on every connection and uses its source as the peer address.
 	TrustProxyHeader bool
@@ -123,6 +128,11 @@ func New(addr string, opts Options) *Broker {
 		// A per-actor limit above the global ceiling has no effect.
 		opts.MaxLeasesPerActor = opts.MaxConns
 	}
+	if opts.MaxLeasesPerAgent <= 0 {
+		// Leave another agent at least one workload's worth of the cap.
+		opts.MaxLeasesPerAgent = max(opts.MaxConns-opts.MaxLeasesPerActor, opts.MaxLeasesPerActor)
+	}
+	opts.MaxLeasesPerAgent = min(opts.MaxLeasesPerAgent, opts.MaxConns)
 	ctx, cancel := context.WithCancel(context.Background()) // #nosec G118 -- Broker.Shutdown owns cancellation.
 	b := &Broker{
 		addr:           addr,
@@ -299,14 +309,14 @@ func (b *Broker) attribute(conn net.Conn, owner runtimestatus.Attribution) {
 
 // acquireLeaseSlot preserves the actor credential cap while waiting for cleanup.
 // The caller retains its pending slot and shares a bounded admission deadline.
-func (b *Broker) acquireLeaseSlot(ctx context.Context, actorID string) bool {
+func (b *Broker) acquireLeaseSlot(ctx context.Context, actorID string, limit int) bool {
 	for {
 		b.mu.Lock()
 		if ctx.Err() != nil {
 			b.mu.Unlock()
 			return false
 		}
-		if b.leaseCounts[actorID] < b.opts.MaxLeasesPerActor {
+		if b.leaseCounts[actorID] < limit {
 			b.leaseCounts[actorID]++
 			b.mu.Unlock()
 			return true
@@ -478,7 +488,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	if scope.WorkloadID != "" {
 		capKey = "workload:" + scope.WorkloadID
 	}
-	if !b.acquireLeaseSlot(admissionCtx, capKey) {
+	if !b.acquireLeaseSlot(admissionCtx, capKey, b.opts.MaxLeasesPerActor) {
 		b.logger.Warn("pgproxy: per-workload live-credential limit reached",
 			slog.String("vault", scope.VaultID),
 			slog.String("actor", scope.ActorID),
@@ -488,6 +498,20 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		return
 	}
 	defer b.releaseLeaseSlot(capKey)
+	// A pool agent's workloads together stay under the per-agent cap, taken
+	// after the workload's own so a Pod waiting at its cap holds none of it.
+	if scope.WorkloadID != "" {
+		agentKey := "agent:" + scope.ActorID
+		if !b.acquireLeaseSlot(admissionCtx, agentKey, b.opts.MaxLeasesPerAgent) {
+			b.logger.Warn("pgproxy: per-agent live-credential limit reached",
+				slog.String("vault", scope.VaultID),
+				slog.String("actor", scope.ActorID),
+				slog.Int("limit", b.opts.MaxLeasesPerAgent))
+			refuse("actor_limit", "53300", "Agent Vault: too many concurrent database sessions")
+			return
+		}
+		defer b.releaseLeaseSlot(agentKey)
+	}
 	// Across the fleet, the store holds the authoritative per-Pod count; the
 	// in-memory slot above only spares the store a call this replica can refuse.
 	if b.opts.Sessions != nil && scope.WorkloadID != "" {
