@@ -141,10 +141,16 @@ func environment() string {
 	return env
 }
 
+// rolesWithoutEnvironment keeps the plain role rule when no environment is
+// set. Only the e2e build (whose Kind fixture role is "readonly") and this
+// package's tests set it; anywhere else an unset environment refuses every
+// database entry, so the role rule cannot be skipped by leaving it out.
+var rolesWithoutEnvironment bool
+
 func validRole(role string) bool {
 	env := environment()
 	if env == "" {
-		return vaultSegment.MatchString(role)
+		return rolesWithoutEnvironment && vaultSegment.MatchString(role)
 	}
 	pattern := `^` + regexp.QuoteMeta(env) + `\.[a-z]+\.[a-z0-9]+\.[a-z0-9-]+-(readonly|readwrite)$`
 	return regexp.MustCompile(pattern).MatchString(role)
@@ -363,6 +369,9 @@ func (e *Entry) normalizePostgres() error {
 		return errors.New("postgres entries take only host, port, pools and postgres settings")
 	}
 	p := e.Postgres
+	if environment() == "" && !rolesWithoutEnvironment {
+		return errors.New("database entries need AGENT_VAULT_CATALOG_ENVIRONMENT (or validate --environment), which names their roles")
+	}
 	if p == nil || !pgName.MatchString(p.Database) || !validRole(p.Role) {
 		return errors.New("postgres entries need a database name and a Vault role")
 	}
@@ -385,7 +394,7 @@ func (e *Entry) normalizePostgres() error {
 	case p.SSLMode == "":
 		p.SSLMode = "verify-full"
 	case p.SSLMode == "verify-full":
-	case p.SSLMode == "disable" && PlaintextDatabases.Load() && clusterLocal(e.Host):
+	case p.SSLMode == "disable" && plaintextDatabases.Load() && clusterLocal(e.Host):
 	default:
 		return fmt.Errorf("sslmode %q: catalog databases use verify-full", p.SSLMode)
 	}
@@ -703,10 +712,10 @@ func clusterLocal(host string) bool {
 	return strings.HasSuffix(host, ".svc.cluster.local") || strings.HasSuffix(host, ".svc")
 }
 
-// PlaintextDatabases lets a database entry use sslmode disable. Only a test
-// harness whose fixture database serves no TLS sets it, once at startup
-// (AGENT_VAULT_CATALOG_PLAINTEXT_DATABASES); the catalog validator never does.
-var PlaintextDatabases atomic.Bool
+// plaintextDatabases lets a database entry for a Kubernetes Service host use
+// sslmode disable. Only a binary built with the e2e tag can set it (see
+// plaintext_e2e.go), for the Kind fixture database, which serves no TLS.
+var plaintextDatabases atomic.Bool
 
 func pathWithin(path, prefix string) bool {
 	if !strings.HasPrefix(path, prefix) {
