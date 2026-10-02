@@ -23,37 +23,62 @@ var _ brokercore.Attestor = (*Resolver)(nil)
 const (
 	jwksMaxAge         = time.Hour
 	jwksRefetchBackoff = 30 * time.Second
+	jwksFetchTimeout   = 10 * time.Second
 )
 
 // signingKeys caches the cluster's service-account signing keys, so a pool
 // worker's token is verified locally instead of by an API call per connection.
+// A failed fetch keeps the last good set, and one fetch runs at a time
+// outside the lock, so neither an unknown kid nor an API outage stalls or
+// fails the admissions the cached keys can still verify.
 type signingKeys struct {
-	mu      sync.Mutex
-	keys    map[string]*rsa.PublicKey
-	fetched time.Time
+	mu        sync.Mutex
+	keys      map[string]*rsa.PublicKey
+	fetched   time.Time     // last successful fetch
+	attempted time.Time     // last fetch started
+	flight    chan struct{} // closed when the running fetch ends
 }
 
 func (r *Resolver) signingKey(ctx context.Context, kid string) *rsa.PublicKey {
-	r.jwks.mu.Lock()
-	defer r.jwks.mu.Unlock()
-	now := r.now()
-	if key := r.jwks.keys[kid]; key != nil && now.Sub(r.jwks.fetched) < jwksMaxAge {
-		return key
+	j := r.jwks
+	for waited := false; ; waited = true {
+		j.mu.Lock()
+		now := r.now()
+		key := j.keys[kid]
+		// An unknown kid or an old set triggers a refetch for key rotation, at
+		// most every 30 s; meanwhile the last good keys stand.
+		if (key != nil && now.Sub(j.fetched) < jwksMaxAge) || waited || (!j.attempted.IsZero() && now.Sub(j.attempted) < jwksRefetchBackoff) {
+			j.mu.Unlock()
+			return key
+		}
+		flight := j.flight
+		if flight == nil {
+			flight = make(chan struct{})
+			j.flight, j.attempted = flight, now
+			// The fetch serves every waiter, so the caller's cancellation
+			// does not end it.
+			go r.fetchSigningKeys(context.WithoutCancel(ctx), flight)
+		}
+		j.mu.Unlock()
+		select {
+		case <-flight:
+		case <-ctx.Done():
+			return nil
+		}
 	}
-	// An unknown kid triggers a refetch for key rotation, at most every 30 s.
-	if !r.jwks.fetched.IsZero() && now.Sub(r.jwks.fetched) < jwksRefetchBackoff {
-		return nil
-	}
+}
+
+// fetchSigningKeys replaces the key set on success and leaves it alone on
+// failure, then releases the waiters.
+func (r *Resolver) fetchSigningKeys(ctx context.Context, flight chan struct{}) {
+	ctx, cancel := context.WithTimeout(ctx, jwksFetchTimeout)
+	defer cancel()
 	var set struct {
 		Keys []struct {
 			Kty, Kid, Alg, Use, N, E string
 		} `json:"keys"`
 	}
-	r.jwks.fetched = now
-	if r.api(ctx, http.MethodGet, "/openid/v1/jwks", nil, &set) != nil {
-		r.jwks.keys = nil
-		return nil
-	}
+	err := r.api(ctx, http.MethodGet, "/openid/v1/jwks", nil, &set)
 	keys := map[string]*rsa.PublicKey{}
 	for _, k := range set.Keys {
 		if k.Kty != "RSA" || k.Kid == "" || (k.Alg != "" && k.Alg != "RS256") || (k.Use != "" && k.Use != "sig") {
@@ -70,8 +95,14 @@ func (r *Resolver) signingKey(ctx context.Context, kid string) *rsa.PublicKey {
 		}
 		keys[k.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(n), E: exponent}
 	}
-	r.jwks.keys = keys
-	return keys[kid]
+	j := r.jwks
+	j.mu.Lock()
+	if err == nil {
+		j.keys, j.fetched = keys, r.now()
+	}
+	j.flight = nil
+	j.mu.Unlock()
+	close(flight)
 }
 
 // verifyLocally checks the token's signature against the cluster keys and its
@@ -124,8 +155,9 @@ type livePod struct {
 		Namespace         string  `json:"namespace"`
 		DeletionTimestamp *string `json:"deletionTimestamp"`
 		OwnerReferences   []struct {
-			UID        string `json:"uid"`
-			Controller *bool  `json:"controller"`
+			UID                string `json:"uid"`
+			Controller         *bool  `json:"controller"`
+			BlockOwnerDeletion *bool  `json:"blockOwnerDeletion"`
 		} `json:"ownerReferences"`
 	} `json:"metadata"`
 	Spec struct {
@@ -170,9 +202,16 @@ func (p *livePod) deadline(b *Binding, c claims, peer netip.Addr, now time.Time)
 	if !matched {
 		return time.Time{}
 	}
+	// ownerReferences are written by whoever creates the Pod, so this is not
+	// proof the controller made it: anyone who may create Pods under this
+	// service account in this namespace can name an approved controller.
+	// That right, restricted by RBAC or an admission policy, is the boundary.
+	// Controllers always set blockOwnerDeletion, and with the
+	// OwnerReferencesPermissionEnforcement admission plugin setting it needs
+	// update rights on the owner's finalizers, so it is required.
 	owned := false
 	for _, owner := range m.OwnerReferences {
-		if owner.Controller != nil && *owner.Controller {
+		if owner.Controller != nil && *owner.Controller && owner.BlockOwnerDeletion != nil && *owner.BlockOwnerDeletion {
 			for _, approved := range b.OwnerUIDs {
 				owned = owned || owner.UID == approved
 			}

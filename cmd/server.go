@@ -475,6 +475,9 @@ func attachPostgresBrokerIfEnabled(srv *server.Server, host string, postgresPort
 	if v := intEnvValue("AGENT_VAULT_DB_MAX_LEASES_PER_ACTOR"); v > 0 {
 		opts.MaxLeasesPerActor = v
 	}
+	if v := intEnvValue("AGENT_VAULT_DB_MAX_LEASES_PER_AGENT"); v > 0 {
+		opts.MaxLeasesPerAgent = v
+	}
 	// MaxPendingConns bounds accepted-but-not-yet-serving connections. The
 	// half-open mitigation protects the serving cap, not the accept cap: a
 	// sustained flood above this bound is refused at accept until stalled
