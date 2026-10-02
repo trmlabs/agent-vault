@@ -30,7 +30,8 @@ type PoolOptions struct {
 	// for session state, as a fraction of the budget. Default 0.1, minimum 1.
 	SessionShare float64
 	// QueueFactor bounds waiting checkouts at this multiple of the budget;
-	// QueueWait bounds how long one waits. Defaults 2 and 2 seconds. Overflow
+	// QueueWait bounds how long one waits. Defaults 20 and 5 seconds, so 50
+	// clients on a 5-connection budget queue rather than fail. Overflow
 	// and timeouts are refused with SQLSTATE 53300.
 	QueueFactor int
 	QueueWait   time.Duration
@@ -53,10 +54,10 @@ func (o *PoolOptions) withDefaults() PoolOptions {
 		p.SessionShare = 0.1
 	}
 	if p.QueueFactor < 1 {
-		p.QueueFactor = 2
+		p.QueueFactor = 20
 	}
 	if p.QueueWait <= 0 {
-		p.QueueWait = 2 * time.Second
+		p.QueueWait = 5 * time.Second
 	}
 	if p.RotateFraction <= 0 || p.RotateFraction >= 1 {
 		p.RotateFraction = 0.5
