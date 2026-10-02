@@ -115,11 +115,13 @@ func (c *countingDirectory) Lookup(ctx context.Context, subject string, groups [
 // directory every time, a T2 recheck may use the cache, and a refused recheck
 // purges the person.
 func TestCatalogDatabaseResolverFreshT2AdmissionsAndPurge(t *testing.T) {
+	httpcatalog.Environment.Store("staging")
+	t.Cleanup(func() { httpcatalog.Environment.Store("") })
 	catalog, err := httpcatalog.Parse([]byte(`{"pools":[
 	  {"name":"claude","namespace":"n","serviceAccount":"claude","identity":"claude-session","ccpoolID":"ccpool_abc","ceiling":"T2"}],
 	 "entries":[
-	  {"name":"t1db","kind":"postgres","host":"db.example","pools":["claude"],"tier":"T1","requires":["` + t1Group + `"],"postgres":{"database":"t1db","mount":"database","role":"t1-ro"}},
-	  {"name":"t2db","kind":"postgres","host":"db.example","pools":["claude"],"tier":"T2","requires":["` + t2Group + `"],"postgres":{"database":"t2db","mount":"database","role":"t2-ro"}}]}`))
+	  {"name":"t1db","kind":"postgres","host":"db.example","pools":["claude"],"tier":"T1","requires":["` + t1Group + `"],"postgres":{"database":"t1db","mount":"database","role":"staging.us.crunchy.t1-readonly"}},
+	  {"name":"t2db","kind":"postgres","host":"db.example","pools":["claude"],"tier":"T2","requires":["` + t2Group + `"],"postgres":{"database":"t2db","mount":"database","role":"staging.us.crunchy.t2-readonly"}}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
