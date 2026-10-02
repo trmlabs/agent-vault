@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/Infisical/agent-vault/internal/githubapp"
 	"github.com/Infisical/agent-vault/internal/hashicorp"
@@ -45,7 +46,11 @@ func httpHeaderAdapter(ctx context.Context, srv *server.Server, getenv func(stri
 			if err != nil {
 				return nil, err
 			}
-			adapter.GitTokens = &githubapp.Minter{Signer: signer}
+			api := getenv("AGENT_VAULT_GITHUB_API_URL")
+			if api != "" && !strings.HasPrefix(api, "https://") {
+				return nil, fmt.Errorf("AGENT_VAULT_GITHUB_API_URL must be https")
+			}
+			adapter.GitTokens = &githubapp.Minter{Signer: signer, API: api}
 			break
 		}
 	}

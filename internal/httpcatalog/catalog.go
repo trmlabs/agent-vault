@@ -36,7 +36,7 @@ type Entry struct {
 	// ForwardHeaders are extra request headers the vendor needs, such as an
 	// API version. Every other caller header except a fixed safe set is dropped.
 	ForwardHeaders   []string `json:"forwardHeaders,omitempty"`
-	MaxRequestBytes  int64    `json:"maxRequestBytes,omitempty"`  // default 1 MiB; git 512 MiB
+	MaxRequestBytes  int64    `json:"maxRequestBytes,omitempty"`  // default 1 MiB; git 1 GiB (a push)
 	MaxResponseBytes int64    `json:"maxResponseBytes,omitempty"` // default 32 MiB; git 4 GiB
 	// Kind "git" makes the entry a git smart-HTTP binding: paths, methods
 	// and the credential are derived from Git, and the key is a GitHub App
@@ -283,7 +283,7 @@ func (e *Entry) normalizeGit() error {
 		}
 	}
 	if e.MaxRequestBytes == 0 {
-		e.MaxRequestBytes = 512 << 20
+		e.MaxRequestBytes = 1 << 30
 	}
 	if e.MaxResponseBytes == 0 {
 		e.MaxResponseBytes = 4 << 30

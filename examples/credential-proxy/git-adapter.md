@@ -16,6 +16,7 @@ A git entry in `AGENT_VAULT_HTTP_CATALOG_FILE` lists repositories, not paths:
 | Field | Rule |
 | --- | --- |
 | `repos[].access` | `read` allows clone and fetch. `write` also allows push. |
+| `maxRequestBytes` | Default 1 GiB, the largest push accepted. Fetch negotiation may be gzip-compressed; it passes through unchanged. |
 | `repos[].refPrefixes` | Optional, write only. A push that would create, update or delete any ref outside these prefixes is refused before it reaches GitHub. Push certificates are refused when prefixes are set. |
 | `appID`, `installationID` | The GitHub App installation that mints tokens. |
 
@@ -33,7 +34,7 @@ Import the App's private key into Vault Transit, so it never leaves Vault, and g
 path "transit/sign/github-app/sha2-256" { capabilities = ["update"] }
 ```
 
-Set `AGENT_VAULT_GITHUB_APP_TRANSIT_KEY=github-app` (mount `AGENT_VAULT_GITHUB_APP_TRANSIT_MOUNT`, default `transit`). The fallback, `AGENT_VAULT_GITHUB_APP_KV_PATH`, reads a PEM from field `private_key` on the `gatehouse` KV mount into broker memory for each signature. Creating the App, and choosing its permissions and installation, is a separate decision.
+Set `AGENT_VAULT_GITHUB_APP_TRANSIT_KEY=github-app` (mount `AGENT_VAULT_GITHUB_APP_TRANSIT_MOUNT`, default `transit`). `AGENT_VAULT_GITHUB_API_URL` overrides `https://api.github.com`, for GitHub Enterprise Server or a test server. The fallback, `AGENT_VAULT_GITHUB_APP_KV_PATH`, reads a PEM from field `private_key` on the `gatehouse` KV mount into broker memory for each signature. Creating the App, and choosing its permissions and installation, is a separate decision.
 
 ## Branch protection
 

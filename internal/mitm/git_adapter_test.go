@@ -45,7 +45,8 @@ type gitFixture struct {
 	mu                                 sync.Mutex
 	minted                             map[string]string // token -> "repo:contents"
 	requests                           []string          // contents permission per mint
-	gitCalls                           []string          // repo:service seen with a valid token
+	gitCalls                           []string          // METHOD repo:service seen with a valid token
+	receivePacks                       int               // POSTs to git-receive-pack that reached GitHub at all
 }
 
 func runGit(t *testing.T, dir string, env []string, args ...string) (string, error) {
@@ -107,13 +108,18 @@ func newGitFixture(t *testing.T) *gitFixture {
 		scope, known := f.minted[token]
 		f.mu.Unlock()
 		repo, service := gitRequestScope(r)
+		if r.Method == http.MethodPost && service == "git-receive-pack" {
+			f.mu.Lock()
+			f.receivePacks++
+			f.mu.Unlock()
+		}
 		// Like GitHub: the token must name this repository, and a push needs write.
 		if !ok || user != "x-access-token" || !known || !strings.HasPrefix(scope, repo+":") || (service == "git-receive-pack" && !strings.HasSuffix(scope, ":write")) {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
 		f.mu.Lock()
-		f.gitCalls = append(f.gitCalls, repo+":"+service)
+		f.gitCalls = append(f.gitCalls, r.Method+" "+repo+":"+service)
 		f.mu.Unlock()
 		cgiHandler.ServeHTTP(w, r)
 	}))
@@ -273,11 +279,18 @@ func TestGitPushesOutsideTheBindingAreRefused(t *testing.T) {
 	if out, err := f.git(t, clone, "commit", "--allow-empty", "-m", "direct to main"); err != nil {
 		t.Fatal(out)
 	}
+	f.mu.Lock()
+	packsBefore := f.receivePacks
+	f.mu.Unlock()
 	if out, err := f.git(t, clone, "push", "origin", "main"); err == nil {
 		t.Fatalf("push to main accepted: %s", out)
 	}
-	if f.bareRef(t, "trmlabs/trm-b2b", "refs/heads/main") != before || f.audit.last().Outcome != "ref_outside_binding" {
-		t.Fatalf("main changed or refusal not recorded: %+v", f.audit.last())
+	// The broker refused the pack itself: GitHub never received the push.
+	f.mu.Lock()
+	reached := f.receivePacks - packsBefore
+	f.mu.Unlock()
+	if reached != 0 || f.bareRef(t, "trmlabs/trm-b2b", "refs/heads/main") != before || f.audit.last().Outcome != "ref_outside_binding" {
+		t.Fatalf("push to main reached GitHub %d times, or main changed: %+v", reached, f.audit.last())
 	}
 	if out, err := f.git(t, clone, "push", "origin", "HEAD:refs/tags/v9"); err == nil {
 		t.Fatalf("tag push accepted: %s", out)
@@ -293,7 +306,7 @@ func TestGitPushesOutsideTheBindingAreRefused(t *testing.T) {
 		t.Fatalf("push to a read-only binding: %s %+v", out, f.audit.last())
 	}
 	f.mu.Lock()
-	if strings.Contains(strings.Join(f.gitCalls, ","), "trmlabs/docs:git-receive-pack") {
+	if strings.Contains(strings.Join(f.gitCalls, ","), "POST trmlabs/docs:git-receive-pack") {
 		t.Error("a push to the read-only repository reached GitHub")
 	}
 	f.mu.Unlock()

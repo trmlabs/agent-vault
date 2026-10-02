@@ -17,7 +17,7 @@ func TestGitEntriesParseAndReject(t *testing.T) {
 		t.Fatal(err)
 	}
 	e := c.Entries()[0]
-	if e.Git.Repos[0].Repo != "trmlabs/trm-b2b" || e.MaxRequestBytes != 512<<20 || e.MaxResponseBytes != 4<<30 || !c.HasHost("github.com", 443) {
+	if e.Git.Repos[0].Repo != "trmlabs/trm-b2b" || e.MaxRequestBytes != 1<<30 || e.MaxResponseBytes != 4<<30 || !c.HasHost("github.com", 443) {
 		t.Fatalf("normalized: %+v", e)
 	}
 	for name, doc := range map[string]string{
