@@ -186,9 +186,9 @@ func TestFivePostgresBindingsRoutingCancellationAndWithdrawal(t *testing.T) {
 		t.Fatal("wrong binding reached upstream")
 	}
 	for i, c := range clients {
-		_, _ = c.Write([]byte{'x'})
-		var b [1]byte
-		if _, e := io.ReadFull(c, b[:]); e != nil || b[0] != 'x' {
+		// The backend echoes; the relay passes whole frames.
+		_, _ = c.Write(encodePGFrame('d', []byte{'x'}))
+		if typ, b, e := readPGFrame(c, 16); e != nil || typ != 'd' || string(b) != "x" {
 			t.Fatalf("binding %d did not remain usable", i)
 		}
 	}

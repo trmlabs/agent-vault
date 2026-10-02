@@ -42,10 +42,28 @@ func TestAuthorizationRefusalKeepsItsCodeNotItsDetail(t *testing.T) {
 	}
 }
 
+// A developer can tell the actionable refusals apart, in the relay's words.
+func TestKnownBrokerRefusalsKeepTheirCodeWithFixedText(t *testing.T) {
+	for code, want := range map[string]string{
+		"57P03": "Gatehouse is starting; retry in a few seconds",
+		"3D000": "this database isn't in the Gatehouse catalog for your pool",
+		"28000": "Gatehouse could not verify this worker",
+		"53300": "too many concurrent database sessions for this worker",
+		"42501": "not authorized for this database",
+	} {
+		frame := refusalFrame(sqlState(errorBody(code, "detail the broker must not leak")))
+		if frame[0] != 'E' || sqlState(frame[5:]) != code || !bytes.Contains(frame, []byte(want)) || bytes.Contains(frame, []byte("must not leak")) {
+			t.Errorf("%s: frame %q", code, frame)
+		}
+	}
+}
+
 func TestOtherBrokerErrorsBecomeOneGenericRefusal(t *testing.T) {
-	frame := refusalFrame(sqlState(errorBody("28000", "detail the broker must not leak")))
-	if sqlState(frame[5:]) != "08004" || bytes.Contains(frame, []byte("must not leak")) {
-		t.Fatalf("frame %q", frame)
+	for _, code := range []string{"XX000", "08006", "08004"} {
+		frame := refusalFrame(sqlState(errorBody(code, "detail the broker must not leak")))
+		if sqlState(frame[5:]) != "08004" || bytes.Contains(frame, []byte("must not leak")) {
+			t.Fatalf("%s: frame %q", code, frame)
+		}
 	}
 	if sqlState([]byte{'C'}) != "" {
 		t.Fatal("malformed body parsed")
