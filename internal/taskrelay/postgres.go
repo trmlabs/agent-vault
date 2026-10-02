@@ -356,8 +356,11 @@ func sqlState(body []byte) string {
 // refusalFrame is a relay-authored FATAL error. Broker message text is never
 // forwarded; only a capacity refusal keeps its code and a fixed explanation.
 func refusalFrame(code string) []byte {
-	if code == "53300" {
+	switch code {
+	case "53300":
 		return errorFrame(code, "Gatehouse: too many concurrent database sessions for this worker; close one and retry")
+	case "42501":
+		return errorFrame(code, "Gatehouse: this session's person is not authorized for this database")
 	}
 	return errorFrame("08004", "Gatehouse: the broker refused this connection")
 }

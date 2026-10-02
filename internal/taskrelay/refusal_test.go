@@ -35,6 +35,13 @@ func TestCapacityRefusalKeepsItsCode(t *testing.T) {
 	}
 }
 
+func TestAuthorizationRefusalKeepsItsCodeNotItsDetail(t *testing.T) {
+	frame := refusalFrame(sqlState(errorBody("42501", "Agent Vault: not authorized for database \"x\" (not_entitled)")))
+	if sqlState(frame[5:]) != "42501" || !bytes.Contains(frame, []byte("not authorized for this database")) || bytes.Contains(frame, []byte("not_entitled")) {
+		t.Fatalf("frame %q", frame)
+	}
+}
+
 func TestOtherBrokerErrorsBecomeOneGenericRefusal(t *testing.T) {
 	frame := refusalFrame(sqlState(errorBody("28000", "detail the broker must not leak")))
 	if sqlState(frame[5:]) != "08004" || bytes.Contains(frame, []byte("must not leak")) {
