@@ -107,7 +107,7 @@ func TestDurableLeaseFencesBeforeTakeoverWhenPartitioned(t *testing.T) {
 		defer cancel()
 		_ = a.Close(ctx)
 	})
-	if _, err := a.Mint(context.Background(), "vault", fleetService); err != nil {
+	if _, err := a.Mint(context.Background(), AgentScope{VaultID: "vault"}, fleetService); err != nil {
 		t.Fatal(err)
 	}
 	survivor, err := NewDurableLeaseMinter(context.Background(), client, st, DurableLeaseOptions{OwnerTTL: 3 * time.Second, RetryInterval: 50 * time.Millisecond})
@@ -158,7 +158,7 @@ func TestDurableLeaseFencesBeforeTakeoverWhenPartitioned(t *testing.T) {
 	if records, _ := st.ListOwnedDatabaseCleanup(context.Background(), a.owner); len(records) != 1 {
 		t.Fatalf("record left the fenced replica early: %d", len(records))
 	}
-	if _, err := a.Mint(context.Background(), "vault", fleetService); err == nil {
+	if _, err := a.Mint(context.Background(), AgentScope{VaultID: "vault"}, fleetService); err == nil {
 		t.Fatal("fenced replica minted")
 	}
 	waitWithin(t, 5*time.Second, "survivor revoked the partitioned replica's credential", func() bool {
@@ -183,7 +183,7 @@ func TestDurableLeaseSurvivesBriefStoreOutage(t *testing.T) {
 	if a.Fenced() {
 		t.Fatal("brief outage fenced the replica")
 	}
-	if _, err := a.Mint(context.Background(), "vault", fleetService); err != nil {
+	if _, err := a.Mint(context.Background(), AgentScope{VaultID: "vault"}, fleetService); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -197,7 +197,7 @@ func TestDurableLeaseTwoSurvivorsTakeOverOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	for range 6 {
-		if _, err := dead.Mint(context.Background(), "vault", fleetService); err != nil {
+		if _, err := dead.Mint(context.Background(), AgentScope{VaultID: "vault"}, fleetService); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -235,7 +235,7 @@ func TestDurableLeaseRestartRecoversCrashedPredecessor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := old.Mint(context.Background(), "vault", fleetService); err != nil {
+	if _, err := old.Mint(context.Background(), AgentScope{VaultID: "vault"}, fleetService); err != nil {
 		t.Fatal(err)
 	}
 	old.cancel()
@@ -249,7 +249,7 @@ func TestDurableLeaseRestartRecoversCrashedPredecessor(t *testing.T) {
 	if took < time.Second {
 		t.Fatalf("predecessor's credential revoked before its row expired (%s)", took)
 	}
-	if _, err := restarted.Mint(context.Background(), "vault", fleetService); err != nil {
+	if _, err := restarted.Mint(context.Background(), AgentScope{VaultID: "vault"}, fleetService); err != nil {
 		t.Fatal(err)
 	}
 }

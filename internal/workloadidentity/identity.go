@@ -38,6 +38,9 @@ type Binding struct {
 	ContainerName string   `json:"containerName,omitempty"`
 	MaxPodSeconds int64    `json:"maxPodSeconds,omitempty"`
 	Pool          string   `json:"pool,omitempty"` // catalog pool name reported as ProxyScope.Pool
+	// ListAgents is valid only in observer policy. It lets the admission
+	// controller read every agent's outstanding cleanup by agent and Pod UID.
+	ListAgents bool `json:"listAgents,omitempty"`
 }
 
 // Config selects one Kubernetes trust domain and explicit workload grants.
@@ -149,6 +152,9 @@ func newResolver(c Config, s Store, observer bool) (*Resolver, error) {
 					return nil, errors.New("pool binding owner UID must be non-empty")
 				}
 			}
+		}
+		if !observer && b.ListAgents {
+			return nil, errors.New("proxy policy must not contain observer access")
 		}
 		key := b.Namespace + ":" + b.ServiceAccount
 		if seen[key] {
@@ -296,6 +302,40 @@ func (r *Resolver) verifyProof(ctx context.Context, token string) (*Binding, cla
 		return nil, claims{}, deny
 	}
 	return binding, c, nil
+}
+
+// BindingsAuthorized reports whether every configured binding still resolves to
+// an active agent with a proxy, member or admin role on its vault: the same
+// store checks ResolveForProxy applies, without a proof. A revoked grant or a
+// store restored without it reports false. Store errors are returned.
+func (r *Resolver) BindingsAuthorized(ctx context.Context) (bool, error) {
+	if len(r.config.Bindings) == 0 {
+		return false, nil
+	}
+	for _, binding := range r.config.Bindings {
+		a, err := r.store.GetAgentByID(ctx, binding.AgentID)
+		if err != nil {
+			return false, err
+		}
+		if a == nil || a.ID != binding.AgentID || a.Status != "active" || a.RevokedAt != nil {
+			return false, nil
+		}
+		v, err := r.store.GetVaultByID(ctx, binding.VaultID)
+		if err != nil {
+			return false, err
+		}
+		if v == nil || v.ID != binding.VaultID {
+			return false, nil
+		}
+		role, err := r.store.GetVaultRole(ctx, a.ID, v.ID)
+		if err != nil {
+			return false, err
+		}
+		if role != "proxy" && role != "member" && role != "admin" {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // ResolveForProxy verifies proof for every admission and reauthorization. No

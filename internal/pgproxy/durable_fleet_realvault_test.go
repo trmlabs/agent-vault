@@ -50,7 +50,7 @@ func TestRealVault_FleetReplicaHelper(t *testing.T) {
 		role = "readonly"
 	}
 	svc := &DatabaseService{Name: "durable", Addr: os.Getenv("AV_TEST_PG_UPSTREAM"), Database: os.Getenv("AV_TEST_PG_DB"), Mount: "database", Role: role, SSLMode: "disable"}
-	lease, err := m.Mint(ctx, "vault", svc)
+	lease, err := m.Mint(ctx, AgentScope{VaultID: "vault"}, svc)
 	if err != nil {
 		t.Fatal(err)
 	}

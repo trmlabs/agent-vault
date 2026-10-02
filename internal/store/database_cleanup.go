@@ -10,7 +10,11 @@ import (
 )
 
 // DatabaseCleanup stores only a revocation reference, never a token or password.
-type DatabaseCleanup struct{ Accessor, Binding, LeaseID string }
+// ActorID names the actor whose connection minted the credential; an empty
+// ActorID is unattributed (legacy or unknown) and counts against every actor.
+// WorkloadID is that connection's verified runtime instance UID; an empty
+// WorkloadID counts against every instance of the actor.
+type DatabaseCleanup struct{ Accessor, Binding, LeaseID, ActorID, WorkloadID string }
 
 // ErrDatabaseCleanupOwnershipLost means the owner row expired or was released.
 // An expired owner can never renew, so its records belong to the survivors.
@@ -141,19 +145,19 @@ func (s *SQLStore) AddDatabaseCleanup(ctx context.Context, owner string, record 
 	if record.Accessor == "" || record.Binding == "" {
 		return fmt.Errorf("incomplete database cleanup record")
 	}
-	result, err := s.databaseCleanupExec(ctx, s.dialect.Rebind(`INSERT INTO database_cleanup (accessor, binding, owner)
-		SELECT ?, ?, ? WHERE `+s.liveOwner()), record.Accessor, record.Binding, owner, owner)
+	result, err := s.databaseCleanupExec(ctx, s.dialect.Rebind(`INSERT INTO database_cleanup (accessor, binding, actor_id, workload_id, owner)
+		SELECT ?, ?, ?, ?, ? WHERE `+s.liveOwner()), record.Accessor, record.Binding, record.ActorID, record.WorkloadID, owner, owner)
 	return affectedOne(result, err, ErrDatabaseCleanupOwnershipLost)
 }
 
 // ListDatabaseCleanup returns the whole fleet's unresolved records.
 func (s *SQLStore) ListDatabaseCleanup(ctx context.Context) ([]DatabaseCleanup, error) {
-	return s.listDatabaseCleanup(ctx, `SELECT accessor, binding, lease_id FROM database_cleanup WHERE reconciliation_evidence = '' ORDER BY accessor`)
+	return s.listDatabaseCleanup(ctx, `SELECT accessor, binding, lease_id, actor_id, workload_id FROM database_cleanup WHERE reconciliation_evidence = '' ORDER BY accessor`)
 }
 
 // ListOwnedDatabaseCleanup returns only the records one owner must resolve.
 func (s *SQLStore) ListOwnedDatabaseCleanup(ctx context.Context, owner string) ([]DatabaseCleanup, error) {
-	return s.listDatabaseCleanup(ctx, s.dialect.Rebind(`SELECT accessor, binding, lease_id FROM database_cleanup
+	return s.listDatabaseCleanup(ctx, s.dialect.Rebind(`SELECT accessor, binding, lease_id, actor_id, workload_id FROM database_cleanup
 		WHERE reconciliation_evidence = '' AND owner = ? ORDER BY accessor`), owner)
 }
 
@@ -166,7 +170,7 @@ func (s *SQLStore) listDatabaseCleanup(ctx context.Context, query string, args .
 	var records []DatabaseCleanup
 	for rows.Next() {
 		var record DatabaseCleanup
-		if err := rows.Scan(&record.Accessor, &record.Binding, &record.LeaseID); err != nil {
+		if err := rows.Scan(&record.Accessor, &record.Binding, &record.LeaseID, &record.ActorID, &record.WorkloadID); err != nil {
 			return nil, err
 		}
 		records = append(records, record)
