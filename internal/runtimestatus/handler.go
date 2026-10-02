@@ -202,7 +202,7 @@ func parseQuery(raw string) (query, bool) {
 		return query{}, false
 	}
 	for _, r := range id {
-		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.') {
+		if !agentIDRune(r) {
 			return query{}, false
 		}
 	}
@@ -307,4 +307,9 @@ func New(authorize Authorize, snapshot Snapshot, grants ...Grants) (http.Handler
 		w.WriteHeader(code)
 		_ = json.NewEncoder(w).Encode(result)
 	}), nil
+}
+
+// agentIDRune allows agent UUIDs and the "pool:<name>" owner of a pooled credential.
+func agentIDRune(r rune) bool {
+	return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.' || r == ':'
 }
