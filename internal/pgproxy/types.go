@@ -11,6 +11,7 @@ package pgproxy
 import (
 	"context"
 	"net"
+	"net/netip"
 	"time"
 )
 
@@ -21,7 +22,8 @@ type AgentScope struct {
 	VaultName  string
 	ActorID    string
 	WorkloadID string
-	Pool       string // catalog pool name; empty matches no catalog grant
+	Pool       string    // catalog pool name; empty matches no catalog grant
+	NotAfter   time.Time // zero, or when the session must end (a pool Pod's deadline)
 }
 
 // AgentAuthenticator validates the agent's Agent Vault token (presented in the
@@ -30,6 +32,13 @@ type AgentScope struct {
 // SessionResolver to this interface. It must fail closed.
 type AgentAuthenticator interface {
 	Authenticate(ctx context.Context, token, vaultHint string) (*AgentScope, error)
+}
+
+// PeerAuthenticator also binds admission to the connection's peer address, as
+// pool workers require. renewal is true for the periodic recheck of an open
+// session: the token may have expired, but its Pod must still qualify.
+type PeerAuthenticator interface {
+	AuthenticatePeer(ctx context.Context, token, vaultHint string, peer netip.Addr, renewal bool) (*AgentScope, error)
 }
 
 // DatabaseService is a resolved upstream database the agent may reach: a

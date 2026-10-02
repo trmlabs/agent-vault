@@ -31,6 +31,10 @@ type FixedConfig struct {
 	Postgres         *PostgresConfig  `json:"postgres,omitempty"`
 	PostgresBindings []PostgresConfig `json:"postgresBindings,omitempty"`
 	Browser          *BrowserConfig   `json:"browser,omitempty"`
+	// Self runs the relay as a sidecar in the worker's own Pod: loopback,
+	// plaintext listeners only, and no Kubernetes pairing, because the broker
+	// verifies this Pod's token and address on every connection.
+	Self bool `json:"self,omitempty"`
 }
 type SandboxConfig struct {
 	Namespace     string `json:"namespace"`
@@ -84,10 +88,18 @@ func LoadConfig(path string) (FixedConfig, error) {
 	if d.Decode(&c) != nil || d.Decode(new(any)) != io.EOF {
 		return c, errConfig
 	}
+	// A sidecar's config is static in the Pod template, so its relay lifetime
+	// starts with the container; the broker enforces the Pod's real deadline.
+	if c.Self && c.Deadline.IsZero() {
+		c.Deadline = time.Now().Add(8 * time.Hour).Add(-time.Minute)
+	}
 	return c, c.Validate(time.Now())
 }
 
 func (c FixedConfig) Validate(now time.Time) error {
+	if c.Self {
+		return c.validateSelf(now)
+	}
 	if !containerName.MatchString(c.Sandbox.ContainerName) {
 		return errConfig
 	}
@@ -134,6 +146,46 @@ func (c FixedConfig) Validate(now time.Time) error {
 	}
 	if c.Browser != nil && check(c.Browser.Listen, c.Browser.Upstream) != nil {
 		return errConfig
+	}
+	if len(used) == 0 {
+		return errConfig
+	}
+	return nil
+}
+
+// validateSelf allows only loopback listeners, no browser and no pairing input.
+func (c FixedConfig) validateSelf(now time.Time) error {
+	if !safeName.MatchString(c.TaskID) || !c.Deadline.After(now) || c.Deadline.After(now.Add(8*time.Hour)) || c.AuditFile == "" || c.Browser != nil ||
+		c.Sandbox != (SandboxConfig{}) || c.Kubernetes != (KubernetesConfig{}) || c.TLSCertFile != "" || c.TLSKeyFile != "" {
+		return errConfig
+	}
+	used := map[string]bool{}
+	check := func(listen string, upstream UpstreamConfig) error {
+		host, _, _ := net.SplitHostPort(listen)
+		ip := net.ParseIP(host)
+		if !validAddress(listen) || ip == nil || !ip.IsLoopback() || used[listen] || !validAddress(upstream.Address) || upstream.ServerName == "" || upstream.CAFile == "" || upstream.ProofFile == "" || upstream.Audience == "" {
+			return errConfig
+		}
+		used[listen] = true
+		return nil
+	}
+	if c.Connect != nil {
+		if check(c.Connect.Listen, c.Connect.Upstream) != nil || len(c.Connect.AllowedTargets) == 0 || len(c.Connect.AllowedTargets) > 32 {
+			return errConfig
+		}
+		for _, target := range c.Connect.AllowedTargets {
+			if !validAddress(target) {
+				return errConfig
+			}
+		}
+	}
+	if len(c.PostgresBindings) > 8 || (c.Postgres != nil && len(c.PostgresBindings) != 0) {
+		return errConfig
+	}
+	for _, p := range c.postgresBindings() {
+		if check(p.Listen, p.Upstream) != nil || !safeName.MatchString(p.Database) || !safeName.MatchString(p.User) || !safeName.MatchString(p.Placeholder) {
+			return errConfig
+		}
 	}
 	if len(used) == 0 {
 		return errConfig

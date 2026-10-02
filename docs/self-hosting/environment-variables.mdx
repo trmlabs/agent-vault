@@ -99,7 +99,7 @@ GCP IAM and GCP ID Token share `INFISICAL_GCP_AUTH_IDENTITY_ID`; setting `INFISI
 
 Setting `VAULT_ADDR` enables HashiCorp-Vault-backed vaults. The legacy profile synchronizes a KV item into an encrypted local snapshot. The credential-proxy profile reads destination values at request time and denies failed lookups without local-value fallback. Local mutations are rejected. See [Credential stores](/learn/credential-stores).
 
-Supply env vars for one auth method. Detection picks the first complete group in priority order: AppRole → Token. Agent Vault honors the standard Vault client environment, so `VAULT_CACERT`, `VAULT_SKIP_VERIFY`, and `VAULT_NAMESPACE` work as they do for the `vault` CLI.
+Supply env vars for one auth method. Detection picks the first complete group in priority order: AppRole → JWT → Token. Agent Vault honors the standard Vault client environment, so `VAULT_CACERT`, `VAULT_SKIP_VERIFY`, and `VAULT_NAMESPACE` work as they do for the `vault` CLI.
 
 | Variable | Required | Description |
 |----------|----------|-------------|
@@ -108,9 +108,14 @@ Supply env vars for one auth method. Detection picks the first complete group in
 | `VAULT_ROLE_ID` | Conditional (AppRole Auth) | AppRole RoleID. Selected over Token when set alongside `VAULT_SECRET_ID`. |
 | `VAULT_SECRET_ID` | Conditional (AppRole Auth) | AppRole SecretID. |
 | `VAULT_APPROLE_MOUNT` | Optional (AppRole Auth) | AppRole auth mount path. Defaults to `approle`; override for non-default Enterprise/HCP mounts (e.g. `prod-approle`). |
+| `VAULT_JWT_ROLE` | Conditional (JWT Auth) | JWT auth role. Set together with `VAULT_JWT_TOKEN_FILE`. |
+| `VAULT_JWT_TOKEN_FILE` | Conditional (JWT Auth) | Path to a projected service-account token, read fresh at every login. |
+| `VAULT_JWT_MOUNT` | Optional (JWT Auth) | JWT auth mount path. Defaults to `jwt`. |
 | `VAULT_NAMESPACE` | Optional | Vault Enterprise / HCP namespace. |
 | `VAULT_CACERT` | Optional | Path to a CA cert bundle for TLS verification (standard Vault variable). |
 | `VAULT_SKIP_VERIFY` | Optional | Disable TLS verification for the legacy profile (not recommended). The credential-proxy profile rejects this setting; legacy startup logs a warning when it is enabled. |
+
+JWT auth requires a login with a fixed maximum lifetime (`token_explicit_max_ttl`). The server renews each login, logs in again every 20 minutes, and creates database sessions only under a login with at least 35 minutes left whose refresh and renewal are not overdue; otherwise it refuses new sessions. A session's reported expiry never exceeds its parent login's maximum. Older logins stay until their last session ends, then are revoked; at most three are held, and a refresh waits rather than exceed that.
 
 A `VAULT_TOKEN` is validated at startup (a `lookup-self` probe), so an expired or malformed token fails fast rather than surfacing as a per-vault sync error on the first poll.
 

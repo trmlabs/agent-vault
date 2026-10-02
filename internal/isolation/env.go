@@ -20,10 +20,10 @@ const (
 // differ only in Host (loopback vs host.docker.internal) and CAPath
 // (host-local vs container-local bind mount).
 type ProxyEnvParams struct {
-	Host    string // MITM listener host from the child's point of view
-	Port    int
-	Token   string
-	Vault   string
+	Host   string // MITM listener host from the child's point of view
+	Port   int
+	Token  string
+	Vault  string
 	CAPath string // path the child reads the CA PEM from
 }
 

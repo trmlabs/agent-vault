@@ -30,6 +30,9 @@ const (
 	AuthToken AuthMethod = "token"
 	// AuthAppRole authenticates with a RoleID/SecretID pair.
 	AuthAppRole AuthMethod = "approle"
+	// AuthJWT logs in with a projected service-account token file and logs in
+	// again on a schedule, so a fixed maximum login lifetime needs no restart.
+	AuthJWT AuthMethod = "jwt"
 )
 
 // authProbe is one row in the priority-ordered detection table.
@@ -43,6 +46,7 @@ type authProbe struct {
 // both are present.
 var authProbes = []authProbe{
 	{AuthAppRole, []string{"VAULT_ROLE_ID", "VAULT_SECRET_ID"}},
+	{AuthJWT, []string{"VAULT_JWT_ROLE", "VAULT_JWT_TOKEN_FILE"}},
 	{AuthToken, []string{"VAULT_TOKEN"}},
 }
 
@@ -79,4 +83,4 @@ var ErrNotConfigured = fmt.Errorf("hashicorp: VAULT_ADDR not set")
 
 // ErrNoAuthMethod signals that VAULT_ADDR is set but no auth-method env vars
 // are configured; surfaced as an operator-facing error.
-var ErrNoAuthMethod = fmt.Errorf("hashicorp: VAULT_ADDR is set but no auth-method env vars are configured (set VAULT_TOKEN, or VAULT_ROLE_ID + VAULT_SECRET_ID)")
+var ErrNoAuthMethod = fmt.Errorf("hashicorp: VAULT_ADDR is set but no auth-method env vars are configured (set VAULT_TOKEN, VAULT_ROLE_ID + VAULT_SECRET_ID, or VAULT_JWT_ROLE + VAULT_JWT_TOKEN_FILE)")

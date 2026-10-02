@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"regexp"
 	"strconv"
@@ -40,7 +41,34 @@ func (a agentAuthAdapter) Authenticate(ctx context.Context, token, vaultHint str
 	if err != nil {
 		return nil, err
 	}
-	return &pgproxy.AgentScope{VaultID: scope.VaultID, VaultName: scope.VaultName, ActorID: scope.ActorID(), WorkloadID: scope.WorkloadID, Pool: scope.Pool}, nil
+	return agentScope(scope), nil
+}
+
+// AuthenticatePeer admits pool workers by token plus peer address. A loopback
+// peer (no PROXY header from the TLS terminator) keeps the token-only check.
+func (a agentAuthAdapter) AuthenticatePeer(ctx context.Context, token, vaultHint string, peer netip.Addr, renewal bool) (*pgproxy.AgentScope, error) {
+	attestor, ok := a.resolver.(brokercore.Attestor)
+	if !ok || !peer.IsValid() || peer.IsLoopback() {
+		return a.Authenticate(ctx, token, vaultHint)
+	}
+	var scope *brokercore.ProxyScope
+	var err error
+	if again, ok := a.resolver.(brokercore.Reattestor); ok && renewal {
+		scope, err = again.Reattest(ctx, token, peer)
+	} else {
+		scope, err = attestor.Attest(ctx, token, peer)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if vaultHint != "" && vaultHint != scope.VaultName {
+		return nil, brokercore.ErrVaultHintMismatch
+	}
+	return agentScope(scope), nil
+}
+
+func agentScope(scope *brokercore.ProxyScope) *pgproxy.AgentScope {
+	return &pgproxy.AgentScope{VaultID: scope.VaultID, VaultName: scope.VaultName, ActorID: scope.ActorID(), WorkloadID: scope.WorkloadID, NotAfter: scope.NotAfter, Pool: scope.Pool}
 }
 
 // DatabaseServiceConfig is one configured upstream database within a vault, as
