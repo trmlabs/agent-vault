@@ -86,7 +86,7 @@ func setupPool(t *testing.T) *poolFixture {
 	os.WriteFile(tokenFile, []byte("reviewer"), 0600)
 	c := Config{APIServer: srv.URL, CAFile: caFile, ReviewerTokenFile: tokenFile, Issuer: f.c.Issuer, Audience: "gatehouse",
 		Bindings: []Binding{{Namespace: "pool", ServiceAccount: "worker", ServiceAccountUID: "account-uid", AgentID: "agent", VaultID: "vault",
-			OwnerUIDs: []string{"pool-controller-uid"}, ContainerName: "agent", MaxPodSeconds: 3600}}}
+			OwnerUIDs: []string{"pool-controller-uid"}, ContainerName: "agent", MaxPodSeconds: 3600, Pool: "database-developers"}}}
 	r, err := New(c, &fakeStore{status: "active", role: "proxy"})
 	if err != nil {
 		t.Fatal(err)
@@ -110,7 +110,7 @@ func TestAttestAdmitsPoolPodWithItsDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if scope.AgentID != "agent" || scope.WorkloadID != "pod-uid" || scope.VaultName != "allowed" {
+	if scope.AgentID != "agent" || scope.WorkloadID != "pod-uid" || scope.VaultName != "allowed" || scope.Pool != "database-developers" {
 		t.Fatalf("scope %+v", scope)
 	}
 	// activeDeadlineSeconds (1800) is earlier than the binding's 3600.
@@ -222,6 +222,7 @@ func TestPoolBindingValidation(t *testing.T) {
 		"lifetime missing":  func(b *Binding) { b.MaxPodSeconds = 0 },
 		"empty owner":       func(b *Binding) { b.OwnerUIDs = []string{""} },
 		"bad container":     func(b *Binding) { b.ContainerName = "Bad Name" },
+		"bad pool name":     func(b *Binding) { b.Pool = "Pool A" },
 	} {
 		b := base
 		mutate(&b)

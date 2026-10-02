@@ -212,6 +212,15 @@ func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKe
 	if len(resolver) > 0 {
 		sessions = resolver[0]
 	}
+	// Pool workers are admitted by Attest by default. The fallback keeps every
+	// caller on online TokenReview; hiding Attest makes pool bindings refuse.
+	switch mode := os.Getenv("AGENT_VAULT_WORKLOAD_ATTESTATION"); mode {
+	case "":
+	case "tokenreview":
+		sessions = tokenReviewOnly{sessions}
+	default:
+		return fmt.Errorf("AGENT_VAULT_WORKLOAD_ATTESTATION must be unset or tokenreview")
+	}
 	var extraSANs []string
 	if u, err := url.Parse(srv.BaseURL()); err == nil {
 		if h := u.Hostname(); h != "" {
@@ -391,6 +400,15 @@ func attachPostgresBrokerIfEnabled(srv *server.Server, host string, postgresPort
 	if len(resolver) > 0 {
 		sessions = resolver[0]
 	}
+	// Pool workers are admitted by Attest by default. The fallback keeps every
+	// caller on online TokenReview; hiding Attest makes pool bindings refuse.
+	switch mode := os.Getenv("AGENT_VAULT_WORKLOAD_ATTESTATION"); mode {
+	case "":
+	case "tokenreview":
+		sessions = tokenReviewOnly{sessions}
+	default:
+		return fmt.Errorf("AGENT_VAULT_WORKLOAD_ATTESTATION must be unset or tokenreview")
+	}
 	opts := pgproxy.Options{
 		Auth:      server.NewAgentAuthAdapter(sessions),
 		Databases: srv.DatabaseResolver(),
@@ -445,6 +463,9 @@ func attachPostgresBrokerIfEnabled(srv *server.Server, host string, postgresPort
 	srv.AttachPostgresBroker(pgproxy.New(net.JoinHostPort(host, strconv.Itoa(postgresPort)), opts))
 	return nil
 }
+
+// tokenReviewOnly exposes only ResolveForProxy, hiding a resolver's Attest.
+type tokenReviewOnly struct{ brokercore.SessionResolver }
 
 // boolEnvValue reports whether the named environment variable is set to a
 // truthy value (per strconv.ParseBool). Unset or unparseable is false.

@@ -2,7 +2,10 @@ package pgproxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"sync"
@@ -177,4 +180,99 @@ func TestPoolRecheckUsesRenewal(t *testing.T) {
 	}
 	defer conn.Close()
 	waitFor(t, 2*time.Second, func() bool { auth.mu.Lock(); defer auth.mu.Unlock(); return auth.renewals > 0 }, "no renewal recheck")
+}
+
+// spoofedConn reports a chosen remote address, as a connection arriving from
+// off the Pod would, while carrying bytes over a real socket.
+type spoofedConn struct {
+	net.Conn
+	remote net.Addr
+}
+
+func (c spoofedConn) RemoteAddr() net.Addr { return c.remote }
+
+func handleWithRemote(t *testing.T, b *Broker, remote net.Addr, header string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		_, _ = c.Write([]byte(header))
+		fe := pgproto3.NewFrontend(c, c)
+		fe.Send(&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber, Parameters: map[string]string{"user": "agent", "database": "appdb"}})
+		_ = fe.Flush()
+		if _, ok := mustReceive(fe).(*pgproto3.AuthenticationCleartextPassword); ok {
+			fe.Send(&pgproto3.PasswordMessage{Password: "projected-token"})
+			_ = fe.Flush()
+			_ = mustReceive(fe)
+		}
+	}()
+	server, err := ln.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() { defer close(done); b.handleConn(spoofedConn{Conn: server, remote: remote}, func() {}) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("handler did not finish")
+	}
+}
+
+func mustReceive(fe *pgproto3.Frontend) pgproto3.BackendMessage {
+	msg, err := fe.Receive()
+	if err != nil {
+		return nil
+	}
+	return msg
+}
+
+func TestForgedProxyHeaderFromNonLoopbackPeerIsRefused(t *testing.T) {
+	newBroker := func(auth AgentAuthenticator) *Broker {
+		lease := newLease()
+		return New("127.0.0.1:0", Options{Auth: auth, Databases: &fakeResolver{svc: &DatabaseService{Name: "a", Addr: "127.0.0.1:1"}},
+			Leases: &fakeMinter{lease: lease}, TrustProxyHeader: true, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	}
+	forged := header("10.244.0.9")
+	auth := &fakePeerAuth{}
+	handleWithRemote(t, newBroker(auth), &net.TCPAddr{IP: net.IPv4(10, 244, 0, 66), Port: 40000}, forged)
+	if len(auth.seen()) != 0 {
+		t.Fatal("a PROXY header from a non-loopback connection reached authentication")
+	}
+	// Positive control: the same header from the loopback terminator is parsed.
+	control := &fakePeerAuth{}
+	handleWithRemote(t, newBroker(control), &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40000}, forged)
+	if seen := control.seen(); len(seen) == 0 || seen[0] != netip.MustParseAddr("10.244.0.9") {
+		t.Fatalf("loopback terminator's header not used: %v", seen)
+	}
+}
+
+func TestProxyHeaderRequiresLoopbackListener(t *testing.T) {
+	ln, err := net.Listen("tcp", "0.0.0.0:0") // #nosec G102 -- the test proves this listener is refused
+	if err != nil {
+		t.Skip("cannot bind a non-loopback listener here")
+	}
+	b := New(ln.Addr().String(), Options{Auth: &fakePeerAuth{}, Databases: &fakeResolver{}, Leases: &fakeMinter{}, TrustProxyHeader: true,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	if err := b.Serve(ln); err == nil {
+		t.Fatal("a PROXY-reading broker served on a non-loopback listener")
+	}
+	loop, _ := net.Listen("tcp", "127.0.0.1:0")
+	control := New(loop.Addr().String(), Options{Auth: &fakePeerAuth{}, Databases: &fakeResolver{}, Leases: &fakeMinter{}, TrustProxyHeader: true,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	served := make(chan error, 1)
+	go func() { served <- control.Serve(loop) }()
+	time.Sleep(100 * time.Millisecond)
+	_ = control.Shutdown(context.Background())
+	if err := <-served; err != nil && !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("loopback listener refused: %v", err)
+	}
 }

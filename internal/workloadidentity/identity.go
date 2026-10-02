@@ -37,6 +37,7 @@ type Binding struct {
 	OwnerUIDs     []string `json:"ownerUIDs,omitempty"`
 	ContainerName string   `json:"containerName,omitempty"`
 	MaxPodSeconds int64    `json:"maxPodSeconds,omitempty"`
+	Pool          string   `json:"pool,omitempty"` // catalog pool name reported as ProxyScope.Pool
 }
 
 // Config selects one Kubernetes trust domain and explicit workload grants.
@@ -136,7 +137,10 @@ func newResolver(c Config, s Store, observer bool) (*Resolver, error) {
 		if observer && (b.AgentID != "" || b.VaultID != "") {
 			return nil, errors.New("observer policy must not contain proxy grants")
 		}
-		if len(b.OwnerUIDs) != 0 || b.ContainerName != "" || b.MaxPodSeconds != 0 {
+		if len(b.OwnerUIDs) != 0 || b.ContainerName != "" || b.MaxPodSeconds != 0 || b.Pool != "" {
+			if b.Pool != "" && !pathSegment(b.Pool) {
+				return nil, errors.New("pool binding name must be a lowercase DNS-style name")
+			}
 			if observer || len(b.OwnerUIDs) == 0 || len(b.OwnerUIDs) > 16 || b.PodUID != "" || b.MaxPodSeconds < 60 || b.MaxPodSeconds > 8*3600 || (b.ContainerName != "" && !pathSegment(b.ContainerName)) {
 				return nil, errors.New("pool binding requires 1 to 16 owner UIDs, no Pod UID and a 60 s to 8 h Pod lifetime")
 			}
