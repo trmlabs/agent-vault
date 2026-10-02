@@ -56,7 +56,7 @@ func attachAuthorization(adapter *mitm.HeaderAdapter, getenv func(string) string
 // that would need them.
 func loadAuthorization(getenv func(string) string) (authorization, error) {
 	var a authorization
-	client := &http.Client{Timeout: 5 * time.Second,
+	client := &http.Client{Timeout: 5 * time.Second, CheckRedirect: runnerid.RefuseRedirects,
 		Transport: &http.Transport{DialContext: netguard.SafeDialContext(netguard.AllowPrivateFromEnv()), TLSHandshakeTimeout: 5 * time.Second}}
 	if url := getenv("AGENT_VAULT_RUNNER_JWKS_URL"); url != "" {
 		if !strings.HasPrefix(url, "https://") {

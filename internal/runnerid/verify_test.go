@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -136,5 +137,59 @@ func TestKeyRotationAndStaleKeys(t *testing.T) {
 	*now = now.Add(2 * time.Hour) // keys older than an hour and the issuer is down
 	if _, err := v.Verify(context.Background(), sign(t, key, "k1", personClaims(*now))); err == nil {
 		t.Fatal("stale keys were trusted while the JWKS was unreachable")
+	}
+}
+
+// Concurrent verifies share one key fetch, a cancelled caller does not fail it,
+// and redirects are refused.
+func TestKeyFetchIsSharedAndRefusesRedirects(t *testing.T) {
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	iss := &issuer{keys: map[string]*ecdsa.PrivateKey{"k1": key}}
+	var fetches atomic.Int32
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/redirect" {
+			http.Redirect(w, r, "/jwks", http.StatusFound)
+			return
+		}
+		fetches.Add(1)
+		<-release
+		iss.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	client := srv.Client()
+	client.CheckRedirect = RefuseRedirects
+	v := &Verifier{JWKSURL: srv.URL + "/jwks", Issuer: "ccr", Client: client}
+	cancelled, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	results := make(chan bool, 5)
+	for i := 0; i < 5; i++ {
+		ctx := context.Background()
+		if i == 0 {
+			ctx = cancelled // the one that starts the fetch, then gives up
+		}
+		wg.Add(1)
+		go func() { defer wg.Done(); results <- v.key(ctx, "k1") != nil }()
+		if i == 0 {
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	close(release)
+	wg.Wait()
+	close(results)
+	ok := 0
+	for r := range results {
+		if r {
+			ok++
+		}
+	}
+	if fetches.Load() != 1 || ok < 4 {
+		t.Fatalf("fetches %d, callers with a key %d: want one shared fetch serving the uncancelled callers", fetches.Load(), ok)
+	}
+	redirected := &Verifier{JWKSURL: srv.URL + "/redirect", Issuer: "ccr", Client: client}
+	if redirected.key(context.Background(), "k1") != nil {
+		t.Fatal("a redirected key fetch was followed")
 	}
 }

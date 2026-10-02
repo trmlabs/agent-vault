@@ -68,8 +68,9 @@ type Verifier struct {
 
 	mu        sync.Mutex
 	keys      map[string]*ecdsa.PublicKey
-	loaded    time.Time // last successful fetch
-	attempted time.Time // last fetch attempt
+	loaded    time.Time     // last successful fetch
+	attempted time.Time     // last fetch attempt
+	inflight  chan struct{} // closed when the fetch in progress ends
 }
 
 func (v *Verifier) now() time.Time {
@@ -147,7 +148,7 @@ func (v *Verifier) Verify(ctx context.Context, token string) (Session, error) {
 	case c.Act.AttestedBy.Sub != "":
 		session.Kind, session.Subject = KindPerson, c.Act.AttestedBy.Sub
 	}
-	if len(session.Subject) > 256 || strings.ContainsAny(session.Subject, " \t\r\n\"\\") {
+	if len(session.Subject) > 256 || strings.ContainsAny(session.Subject, " \"\\") || strings.ContainsFunc(session.Subject, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
 		return Session{}, ErrInvalid
 	}
 	return session, nil
@@ -173,36 +174,68 @@ func audience(raw json.RawMessage) []string {
 
 func (v *Verifier) key(ctx context.Context, kid string) *ecdsa.PublicKey {
 	v.mu.Lock()
-	defer v.mu.Unlock()
 	now := v.now()
 	fresh := !v.loaded.IsZero() && now.Sub(v.loaded) < keysMaxAge
 	if k := v.keys[kid]; k != nil && fresh {
+		v.mu.Unlock()
 		return k
+	}
+	// One fetch at a time, outside the lock: concurrent verifies wait for it
+	// instead of each holding the lock across a network call.
+	if wait := v.inflight; wait != nil {
+		v.mu.Unlock()
+		select {
+		case <-wait:
+		case <-ctx.Done():
+			return nil
+		}
+		return v.current(kid)
 	}
 	// An unknown kid or stale keys refetch, at most every 30 seconds.
 	if !v.attempted.IsZero() && now.Sub(v.attempted) < refetchBackoff {
+		defer v.mu.Unlock()
 		if fresh {
 			return v.keys[kid]
 		}
 		return nil
 	}
 	v.attempted = now
-	keys, err := v.fetch(ctx)
-	if err != nil {
-		// Keep serving keys loaded within the last hour; never older ones.
-		if fresh {
-			return v.keys[kid]
-		}
+	done := make(chan struct{})
+	v.inflight = done
+	v.mu.Unlock()
+	// The caller's cancellation must not fail the refresh for everyone else.
+	keys, err := v.fetch(context.WithoutCancel(ctx))
+	v.mu.Lock()
+	if err == nil {
+		v.keys, v.loaded = keys, now
+	}
+	v.inflight = nil
+	close(done)
+	v.mu.Unlock()
+	// On failure the last good keys keep serving within their hour.
+	return v.current(kid)
+}
+
+// current returns a key from the last good set while it is within its hour.
+func (v *Verifier) current(kid string) *ecdsa.PublicKey {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.loaded.IsZero() || v.now().Sub(v.loaded) >= keysMaxAge {
 		return nil
 	}
-	v.keys, v.loaded = keys, now
-	return keys[kid]
+	return v.keys[kid]
+}
+
+// RefuseRedirects is an http.Client CheckRedirect that follows no redirect:
+// the signing keys come only from the configured https URL.
+func RefuseRedirects(*http.Request, []*http.Request) error {
+	return errors.New("runner JWKS redirect refused")
 }
 
 func (v *Verifier) fetch(ctx context.Context) (map[string]*ecdsa.PublicKey, error) {
 	client := v.Client
 	if client == nil {
-		client = &http.Client{Timeout: 5 * time.Second}
+		client = &http.Client{Timeout: 5 * time.Second, CheckRedirect: RefuseRedirects}
 	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
