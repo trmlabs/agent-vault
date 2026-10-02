@@ -107,11 +107,11 @@ func TestRealVault_DurableDatabaseCleanupFailure(t *testing.T) {
 	defer st.Close()
 	m := newDurableForTest(t, client, st)
 	ctx := context.Background()
-	first, err := m.Mint(ctx, "vault", "", svc)
+	first, err := m.Mint(ctx, AgentScope{VaultID: "vault"}, svc)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := m.Mint(ctx, "vault", "", svc)
+	second, err := m.Mint(ctx, AgentScope{VaultID: "vault"}, svc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestRealVault_DurableDatabaseCleanupFailure(t *testing.T) {
 	if err = m.Revoke(ctx, first.ID); err == nil {
 		t.Fatal("database cleanup dependency failure accepted")
 	}
-	if _, err = m.Mint(ctx, "vault", "", svc); err == nil {
+	if _, err = m.Mint(ctx, AgentScope{VaultID: "vault"}, svc); err == nil {
 		t.Fatal("unreconciled binding admitted")
 	}
 	var one int
@@ -137,7 +137,7 @@ func TestRealVault_DurableDatabaseCleanupFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	started := time.Now()
-	third, err := m.Mint(ctx, "vault", "", svc)
+	third, err := m.Mint(ctx, AgentScope{VaultID: "vault"}, svc)
 	if err != nil {
 		t.Fatal("restored cleanup did not recover", err)
 	}
@@ -248,7 +248,7 @@ func TestRealVault_DurableInterruptedIssuance(t *testing.T) {
 	defer st.Close()
 	m := newDurableForTest(t, client, st)
 	ctx := context.Background()
-	if _, err = m.Mint(ctx, "vault", "", svc); err == nil {
+	if _, err = m.Mint(ctx, AgentScope{VaultID: "vault"}, svc); err == nil {
 		t.Fatal("lost issuance accepted")
 	}
 	if orphanName.Load() == nil || orphanName.Load().(string) == "" {
@@ -258,12 +258,12 @@ func TestRealVault_DurableInterruptedIssuance(t *testing.T) {
 		t.Fatal("Vault cleanup outage accepted")
 	}
 	m2 := newDurableForTest(t, client, st)
-	if _, err = m2.Mint(ctx, "vault", "", svc); err == nil {
+	if _, err = m2.Mint(ctx, AgentScope{VaultID: "vault"}, svc); err == nil {
 		t.Fatal("restart reopened unresolved binding")
 	}
 	failCleanup.Store(false)
 	started := time.Now()
-	if _, err = m2.Mint(ctx, "vault", "", svc); err == nil {
+	if _, err = m2.Mint(ctx, AgentScope{VaultID: "vault"}, svc); err == nil {
 		t.Fatal("unknown issuance automatically reopened")
 	}
 	assertDatabaseRemoved(t, admin, orphanName.Load().(string))
@@ -274,7 +274,7 @@ func TestRealVault_DurableInterruptedIssuance(t *testing.T) {
 	if err = m2.ConfirmDatabaseCleanup(ctx, records[0].Accessor, "real fixture: matched issued username; observed zero roles and sessions after accessor revoke"); err != nil {
 		t.Fatal(err)
 	}
-	lease, err := m2.Mint(ctx, "vault", "", svc)
+	lease, err := m2.Mint(ctx, AgentScope{VaultID: "vault"}, svc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,7 +303,7 @@ func TestRealVault_DurableCrashHelper(t *testing.T) {
 		t.Fatal(err)
 	}
 	svc := &DatabaseService{Name: "durable", Addr: os.Getenv("AV_TEST_PG_UPSTREAM"), Database: os.Getenv("AV_TEST_PG_DB"), Mount: "database", Role: "readonly", SSLMode: "disable"}
-	lease, err := m.Mint(ctx, "vault", "", svc)
+	lease, err := m.Mint(ctx, AgentScope{VaultID: "vault"}, svc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -368,7 +368,7 @@ func TestRealVault_DurableProcessCrash(t *testing.T) {
 	time.Sleep(3200 * time.Millisecond)
 	started := time.Now()
 	m := newDurableForTest(t, client, st)
-	lease, err := m.Mint(context.Background(), "vault", "", svc)
+	lease, err := m.Mint(context.Background(), AgentScope{VaultID: "vault"}, svc)
 	if err != nil {
 		t.Fatal(err)
 	}

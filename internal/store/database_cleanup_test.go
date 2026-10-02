@@ -190,13 +190,13 @@ func checkDatabaseCleanupRecordsActor(t *testing.T, s *SQLStore) {
 		_ = s.DeleteDatabaseCleanup(ctx, "actor-b")
 		_ = s.ReleaseDatabaseCleanupOwner(ctx, "owner")
 	})
-	for _, record := range []DatabaseCleanup{{Accessor: "actor-a", Binding: "vault/db", ActorID: "agent-one"}, {Accessor: "actor-b", Binding: "vault/db"}} {
+	for _, record := range []DatabaseCleanup{{Accessor: "actor-a", Binding: "vault/db", ActorID: "agent-one", WorkloadID: "pod-uid-one"}, {Accessor: "actor-b", Binding: "vault/db"}} {
 		if err := s.AddDatabaseCleanup(ctx, "owner", record); err != nil {
 			t.Fatal(err)
 		}
 	}
 	rows, err := s.ListDatabaseCleanup(ctx)
-	if err != nil || len(rows) != 2 || rows[0].ActorID != "agent-one" || rows[1].ActorID != "" {
+	if err != nil || len(rows) != 2 || rows[0].ActorID != "agent-one" || rows[0].WorkloadID != "pod-uid-one" || rows[1].ActorID != "" || rows[1].WorkloadID != "" {
 		t.Fatalf("actor attribution not retained: %+v %v", rows, err)
 	}
 }
@@ -221,7 +221,7 @@ func checkDatabaseCleanupActorMigration(t *testing.T, open func() (*SQLStore, er
 		`CREATE TABLE database_cleanup (accessor TEXT PRIMARY KEY, binding TEXT NOT NULL,
 			lease_id TEXT NOT NULL DEFAULT '', reconciliation_evidence TEXT NOT NULL DEFAULT '')`,
 		`INSERT INTO database_cleanup (accessor, binding, lease_id) VALUES ('legacy-known', 'vault/db', 'database/creds/reader/one'), ('legacy-unknown', 'vault/db', '')`,
-		`DELETE FROM schema_migrations WHERE name = '20261001120000_database_cleanup_actor'`,
+		`DELETE FROM schema_migrations WHERE name IN ('20261001120000_database_cleanup_actor', '20261001130000_database_cleanup_workload')`,
 	} {
 		if _, err := s.db.Exec(statement); err != nil {
 			t.Fatal(err)

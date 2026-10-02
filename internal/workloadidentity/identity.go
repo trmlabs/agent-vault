@@ -32,6 +32,9 @@ type Binding struct {
 	PodUID            string `json:"podUID"`
 	AgentID           string `json:"agentID"`
 	VaultID           string `json:"vaultID"`
+	// ListAgents is valid only in observer policy. It lets the admission
+	// controller read every agent's outstanding cleanup by agent and Pod UID.
+	ListAgents bool `json:"listAgents,omitempty"`
 }
 
 // Config selects one Kubernetes trust domain and explicit workload grants.
@@ -129,6 +132,9 @@ func newResolver(c Config, s Store, observer bool) (*Resolver, error) {
 		}
 		if observer && (b.AgentID != "" || b.VaultID != "") {
 			return nil, errors.New("observer policy must not contain proxy grants")
+		}
+		if !observer && b.ListAgents {
+			return nil, errors.New("proxy policy must not contain observer access")
 		}
 		key := b.Namespace + ":" + b.ServiceAccount
 		if seen[key] {

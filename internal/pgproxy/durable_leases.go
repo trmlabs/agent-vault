@@ -235,8 +235,8 @@ func (m *DurableLeaseMinter) reconcile(ctx context.Context, binding string) erro
 	return failure
 }
 
-func (m *DurableLeaseMinter) Mint(ctx context.Context, vaultID, actorID string, svc *DatabaseService) (*Lease, error) {
-	if svc == nil || vaultID == "" || svc.Name == "" {
+func (m *DurableLeaseMinter) Mint(ctx context.Context, scope AgentScope, svc *DatabaseService) (*Lease, error) {
+	if svc == nil || scope.VaultID == "" || svc.Name == "" {
 		return nil, fmt.Errorf("database binding is required")
 	}
 	ctx, cancel := context.WithCancel(ctx)
@@ -250,7 +250,7 @@ func (m *DurableLeaseMinter) Mint(ctx context.Context, vaultID, actorID string, 
 	if m.ctx.Err() != nil {
 		return nil, fmt.Errorf("database cleanup authority unavailable")
 	}
-	binding := databaseBinding(vaultID, svc)
+	binding := databaseBinding(scope.VaultID, svc)
 	if err := m.reconcile(ctx, binding); err != nil {
 		return nil, err
 	}
@@ -258,7 +258,7 @@ func (m *DurableLeaseMinter) Mint(ctx context.Context, vaultID, actorID string, 
 	if err != nil {
 		return nil, err
 	}
-	record := store.DatabaseCleanup{Accessor: session.Accessor, Binding: binding, ActorID: actorID}
+	record := store.DatabaseCleanup{Accessor: session.Accessor, Binding: binding, ActorID: scope.ActorID, WorkloadID: scope.WorkloadID}
 	if err := m.journal.AddDatabaseCleanup(ctx, m.owner, record); err != nil {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
 		defer cleanupCancel()

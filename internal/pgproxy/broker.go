@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
+
+	"github.com/Infisical/agent-vault/internal/runtimestatus"
 )
 
 // Options configures a Broker. Auth, Databases, and Leases are required; the
@@ -54,7 +56,7 @@ type Broker struct {
 	mu                   sync.Mutex
 	listener             net.Listener
 	conns                map[net.Conn]struct{}
-	connActors           map[net.Conn]string // authenticated actor per connection; absent means unattributed
+	connActors           map[net.Conn]runtimestatus.Attribution // authenticated actor and instance; absent means unattributed
 	connectionGeneration uint64
 	leaseCounts          map[string]int // live leases per actor id
 	leaseChanged         chan struct{}  // wakes bounded admissions after cleanup
@@ -119,7 +121,7 @@ func New(addr string, opts Options) *Broker {
 		cancel:         cancel,
 		shutdownDone:   make(chan struct{}),
 		conns:          make(map[net.Conn]struct{}),
-		connActors:     make(map[net.Conn]string),
+		connActors:     make(map[net.Conn]runtimestatus.Attribution),
 		leaseCounts:    make(map[string]int),
 		leaseChanged:   make(chan struct{}),
 	}
@@ -245,11 +247,11 @@ func (b *Broker) unregister(conn net.Conn) {
 	b.mu.Unlock()
 }
 
-func (b *Broker) attribute(conn net.Conn, actorID string) {
+func (b *Broker) attribute(conn net.Conn, owner runtimestatus.Attribution) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if _, ok := b.conns[conn]; ok {
-		b.connActors[conn] = actorID
+		b.connActors[conn] = owner
 	}
 }
 
@@ -385,7 +387,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		return
 	}
 	// Until now this connection counted against every actor's cleanup status.
-	b.attribute(conn, scope.ActorID)
+	b.attribute(conn, runtimestatus.Attribution{ActorID: scope.ActorID, WorkloadID: scope.WorkloadID})
 
 	// Authenticated: a longer budget for the mint + upstream-connect phase, which
 	// can be slow when role DDL serializes at scale.
@@ -456,7 +458,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	}
 	defer b.releaseUpstreamSlot(svc)
 
-	lease, err := b.opts.Leases.Mint(hsCtx, scope.VaultID, scope.ActorID, svc)
+	lease, err := b.opts.Leases.Mint(hsCtx, *scope, svc)
 	if err != nil {
 		b.logger.Error("pgproxy: credential minting failed",
 			slog.String("vault", scope.VaultID),

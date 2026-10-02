@@ -119,7 +119,7 @@ type blockingMint struct {
 	started chan struct{}
 }
 
-func (m *blockingMint) Mint(ctx context.Context, _, _ string, _ *DatabaseService) (*Lease, error) {
+func (m *blockingMint) Mint(ctx context.Context, _ AgentScope, _ *DatabaseService) (*Lease, error) {
 	close(m.started)
 	<-ctx.Done()
 	return nil, ctx.Err()

@@ -28,7 +28,7 @@ func (ingressCredentials) Inject(context.Context, string, string, int, string) (
 
 type ingressLeases struct{ minted atomic.Int64 }
 
-func (l *ingressLeases) Mint(context.Context, string, string, *pgproxy.DatabaseService) (*pgproxy.Lease, error) {
+func (l *ingressLeases) Mint(context.Context, pgproxy.AgentScope, *pgproxy.DatabaseService) (*pgproxy.Lease, error) {
 	n := l.minted.Add(1)
 	return &pgproxy.Lease{ID: fmt.Sprintf("fixture-%d", n), Username: "destination-user", Password: "destination-fixture", ExpiresAt: time.Now().Add(time.Minute)}, nil
 }

@@ -61,9 +61,9 @@ type combinedMinter struct {
 	mints atomic.Int64
 }
 
-func (m *combinedMinter) Mint(ctx context.Context, vault, actor string, svc *pgproxy.DatabaseService) (*pgproxy.Lease, error) {
+func (m *combinedMinter) Mint(ctx context.Context, scope pgproxy.AgentScope, svc *pgproxy.DatabaseService) (*pgproxy.Lease, error) {
 	m.mints.Add(1)
-	return m.DurableLeaseMinter.Mint(ctx, vault, actor, svc)
+	return m.DurableLeaseMinter.Mint(ctx, scope, svc)
 }
 
 // The TLS tunnel is a disposable transport fixture, not deployment configuration.

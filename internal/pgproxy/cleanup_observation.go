@@ -29,16 +29,16 @@ func CleanupSnapshot(b *Broker, m *DurableLeaseMinter) runtimestatus.Snapshot {
 		}
 		// An empty actor (unauthenticated connection, legacy record) is
 		// unattributed and counts against every actor.
-		actors := make(map[string]runtimestatus.Counts)
+		attributed := make(map[runtimestatus.Attribution]runtimestatus.Counts)
 		var unattributed runtimestatus.Counts
-		tally := func(actor string, change func(*runtimestatus.Counts)) {
-			if actor == "" {
+		tally := func(owner runtimestatus.Attribution, change func(*runtimestatus.Counts)) {
+			if owner.ActorID == "" {
 				change(&unattributed)
 				return
 			}
-			counts := actors[actor]
+			counts := attributed[owner]
 			change(&counts)
-			actors[actor] = counts
+			attributed[owner] = counts
 		}
 		b.mu.Lock()
 		before := b.connectionGeneration
@@ -70,7 +70,7 @@ func CleanupSnapshot(b *Broker, m *DurableLeaseMinter) runtimestatus.Snapshot {
 			if !known {
 				unknown++
 			}
-			tally(record.ActorID, func(c *runtimestatus.Counts) {
+			tally(runtimestatus.Attribution{ActorID: record.ActorID, WorkloadID: record.WorkloadID}, func(c *runtimestatus.Counts) {
 				c.UnfinishedCleanup++
 				if !known {
 					c.UnknownCleanup++
@@ -87,6 +87,6 @@ func CleanupSnapshot(b *Broker, m *DurableLeaseMinter) runtimestatus.Snapshot {
 			return result, fmt.Errorf("cleanup authority unavailable")
 		}
 		return runtimestatus.Observation{Initialized: true, Healthy: true, Consistent: consistent, ActiveConnections: active, UnfinishedCleanup: len(records), UnknownCleanup: unknown,
-			Actors: actors, Unattributed: unattributed}, nil
+			Attributed: attributed, Unattributed: unattributed}, nil
 	}
 }

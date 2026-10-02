@@ -31,7 +31,7 @@ func newVaultLikeMinter(initTTL, maxTTL time.Duration) *vaultLikeMinter {
 	return &vaultLikeMinter{initTTL: initTTL, maxTTL: maxTTL, expiry: map[string]time.Time{}, maxExpiry: map[string]time.Time{}}
 }
 
-func (m *vaultLikeMinter) Mint(_ context.Context, _, _ string, _ *DatabaseService) (*Lease, error) {
+func (m *vaultLikeMinter) Mint(_ context.Context, _ AgentScope, _ *DatabaseService) (*Lease, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.mintCalls++
