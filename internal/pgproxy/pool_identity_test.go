@@ -155,6 +155,39 @@ func TestPoolCapIsPerWorkloadNotPerAgent(t *testing.T) {
 	other.Close()
 }
 
+// One pool agent's Pods together stay under the per-agent cap, so an agent
+// with many Pods cannot take the whole serving cap from other agents.
+func TestPoolAgentHasAnAggregateCap(t *testing.T) {
+	lease := newLease()
+	upstream := startFakeUpstream(t, authTrust, lease.Password)
+	_, addr := startBroker(t, Options{
+		Auth:              &fakePeerAuth{},
+		Databases:         &fakeResolver{svc: &DatabaseService{Name: "analytics", Addr: upstream.addr(), Mount: "database", Role: "readonly"}},
+		Leases:            &fakeMinter{lease: lease},
+		TrustProxyHeader:  true,
+		MaxLeasesPerActor: 1,
+		MaxLeasesPerAgent: 2,
+		AdmissionTimeout:  100 * time.Millisecond,
+	})
+	for _, ip := range []string{"10.244.0.9", "10.244.0.10"} {
+		conn, err := openSession(t, addr, header(ip))
+		if err != nil {
+			t.Fatalf("%s: %v", ip, err)
+		}
+		defer conn.Close()
+	}
+	if conn, err := openSession(t, addr, header("10.244.0.11")); err == nil {
+		conn.Close()
+		t.Fatal("a third Pod of the agent exceeded the per-agent cap")
+	}
+}
+
+func TestPoolAgentCapDefaultLeavesRoomForOthers(t *testing.T) {
+	if b := New("127.0.0.1:0", Options{MaxConns: 50, MaxLeasesPerActor: 16}); b.opts.MaxLeasesPerAgent != 34 {
+		t.Fatalf("default per-agent cap %d, want 34", b.opts.MaxLeasesPerAgent)
+	}
+}
+
 func TestPoolSessionEndsAtThePodDeadline(t *testing.T) {
 	auth := &fakePeerAuth{notAfter: time.Now().Add(400 * time.Millisecond)}
 	addr := poolBroker(t, auth, 4)
