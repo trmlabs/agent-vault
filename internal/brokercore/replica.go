@@ -25,13 +25,13 @@ func ReplicaName(getenv func(string) string) string {
 // ErrFleetReplicaName means brokers share a store but this one has no
 // AGENT_VAULT_REPLICA. Two replicas that fell back to the same name would
 // share cleanup ownership and an audit chain, so a fleet never falls back.
-var ErrFleetReplicaName = errors.New("AGENT_VAULT_REPLICA (the Pod name, from the downward API) is required when brokers share a store (DATABASE_URL)")
+var ErrFleetReplicaName = errors.New("AGENT_VAULT_REPLICA (the Pod name, from the downward API) is required when brokers share a store (DATABASE_URL or DATABASE_URL_FILE)")
 
 // FleetReplicaName is ReplicaName, except that brokers sharing a store
-// (DATABASE_URL set) must name themselves with AGENT_VAULT_REPLICA: no
+// (DATABASE_URL or DATABASE_URL_FILE set) must name themselves with AGENT_VAULT_REPLICA: no
 // fallback to AGENT_VAULT_AUDIT_REPLICA or the hostname.
 func FleetReplicaName(getenv func(string) string) (string, error) {
-	if getenv("DATABASE_URL") == "" {
+	if getenv("DATABASE_URL") == "" && getenv("DATABASE_URL_FILE") == "" {
 		return ReplicaName(getenv), nil
 	}
 	if v := getenv("AGENT_VAULT_REPLICA"); v != "" {
