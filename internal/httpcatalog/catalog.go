@@ -655,6 +655,18 @@ func (c Catalog) HasHost(host string, port int) bool {
 	return false
 }
 
+// HasAuth0Domain reports whether host is the Auth0 domain of a
+// browser-session entry: the only hosts the broker's own logins may reach.
+func (c Catalog) HasAuth0Domain(host string) bool {
+	host = strings.ToLower(host)
+	for _, e := range c.entries {
+		if e.BrowserSession != nil && e.BrowserSession.Auth0.Domain == host {
+			return true
+		}
+	}
+	return false
+}
+
 // Entries returns a copy of the catalog, for wiring and diagnostics.
 func (c Catalog) Entries() []Entry { return append([]Entry(nil), c.entries...) }
 

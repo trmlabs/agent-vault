@@ -110,7 +110,8 @@ func fakeAuth0(t *testing.T, lifetime int, logins *atomic.Int32, status *atomic.
 		if r.URL.Path != "/oauth/token" || body["grant_type"] != "http://auth0.com/oauth/grant-type/password-realm" ||
 			body["username"] != browserSecrets["email"] || body["password"] != browserSecrets["password"] ||
 			body["client_id"] != browserSecrets["client_id"] || body["client_secret"] != browserSecrets["client_secret"] ||
-			body["realm"] != "Username-Password-Authentication" || body["audience"] != "https://api.example.com" {
+			body["realm"] != "Username-Password-Authentication" || body["audience"] != "https://api.example.com" ||
+			body["scope"] != "openid profile email" { // the broker never asks for a refresh token
 			http.Error(w, `{"error":"invalid_grant","error_description":"Wrong email or password for qa-user@example.test"}`, http.StatusForbidden)
 			return
 		}
@@ -160,11 +161,17 @@ func TestAuth0TokensLoginCacheAndRefresh(t *testing.T) {
 	if renewed, _ := tokens.Token(context.Background(), entry); renewed.Value() != "synthetic-access-token-2" {
 		t.Fatal("token not refreshed before expiry")
 	}
+	tokens.Invalidate(entry) // a minute-old token is kept: a worker cannot force logins
+	if kept, _ := tokens.Token(context.Background(), entry); kept.Value() != "synthetic-access-token-2" {
+		t.Fatal("fresh token dropped")
+	}
+	now = now.Add(reloginInterval)
 	tokens.Invalidate(entry)
 	if after, _ := tokens.Token(context.Background(), entry); after.Value() != "synthetic-access-token-3" {
 		t.Fatal("invalidated token reused")
 	}
 	status.Store(http.StatusTooManyRequests)
+	now = now.Add(reloginInterval)
 	tokens.Invalidate(entry)
 	if _, err := tokens.Token(context.Background(), entry); !errors.Is(err, ErrBrowserLogin) {
 		t.Fatalf("failed login: %v", err)
@@ -186,5 +193,29 @@ func TestAuth0TokensRefuseBadLogins(t *testing.T) {
 	}
 	if _, err := (&Auth0Tokens{Keys: &Keys{Vault: fieldVault{}}}).Token(context.Background(), &c.Entries()[0]); err == nil {
 		t.Fatal("login without a guarded client")
+	}
+}
+
+// The login body holds the test user's password and the client secret; a
+// redirect, even a 307 that would re-send it, is never followed.
+func TestAuth0LoginNeverFollowsARedirect(t *testing.T) {
+	var elsewhere atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/oauth/token" {
+			elsewhere.Add(1)
+			return
+		}
+		http.Redirect(w, r, "https://collector.example.com/steal", http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(srv.Close)
+	addr := strings.TrimPrefix(srv.URL, "https://")
+	client := srv.Client()
+	client.Transport.(*http.Transport).DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, addr)
+	}
+	c, _ := Parse([]byte(`{"entries":[` + browserEntryJSON("") + `]}`))
+	tokens := &Auth0Tokens{Keys: &Keys{Vault: fieldVault{}}, Client: client}
+	if _, err := tokens.Token(context.Background(), &c.Entries()[0]); !errors.Is(err, ErrBrowserLogin) || elsewhere.Load() != 0 {
+		t.Fatalf("redirect followed: err=%v requests elsewhere=%d", err, elsewhere.Load())
 	}
 }

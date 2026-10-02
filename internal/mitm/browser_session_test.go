@@ -51,7 +51,9 @@ type browserFixture struct {
 	mu       sync.Mutex
 	seen     map[string]http.Header // last request headers per host
 	apiCalls atomic.Int32
-	reject   atomic.Bool
+	reject   atomic.Int32  // status the API answers with, when set
+	refusal  atomic.Value  // WWW-Authenticate on a refusal, when set
+	clock    atomic.Int64  // nanoseconds the token cache's clock runs ahead
 }
 
 func (f *browserFixture) headers(host string) http.Header {
@@ -92,7 +94,14 @@ func newBrowserFixture(t *testing.T) *browserFixture {
 		case "api.example.com":
 			f.apiCalls.Add(1)
 			want := fmt.Sprintf("Bearer synthetic-real-access-token-%d", f.logins.Load())
-			if f.reject.Load() || r.Header.Get("Authorization") != want {
+			if status := f.reject.Load(); status != 0 {
+				if challenge, _ := f.refusal.Load().(string); challenge != "" {
+					w.Header().Set("WWW-Authenticate", challenge)
+				}
+				w.WriteHeader(int(status))
+				return
+			}
+			if r.Header.Get("Authorization") != want {
 				w.WriteHeader(http.StatusUnauthorized)
 				return
 			}
@@ -126,7 +135,8 @@ func newBrowserFixture(t *testing.T) *browserFixture {
 		t.Fatal(err)
 	}
 	authClient := &http.Client{Transport: &http.Transport{DialContext: dial, TLSClientConfig: &tls.Config{RootCAs: upstreamRoots}}}
-	tokens := &httpcatalog.Auth0Tokens{Keys: &httpcatalog.Keys{Vault: browserVault{}}, Client: authClient}
+	tokens := &httpcatalog.Auth0Tokens{Keys: &httpcatalog.Keys{Vault: browserVault{}}, Client: authClient,
+		Now: func() time.Time { return time.Now().Add(time.Duration(f.clock.Load())) }}
 	f.sessions = &scopeResolver{scope: &brokercore.ProxyScope{VaultID: "vault-1", AgentID: "pool-agent", Pool: "database-developers",
 		WorkloadID: "pod-uid-1", VaultRole: "proxy", NotAfter: time.Now().Add(30 * time.Minute).Truncate(time.Second)}}
 	proxyURL, roots, p := setupProxy(t, f.sessions, &fakeCredProvider{}, func(o *Options) {
@@ -292,8 +302,9 @@ func TestBrowserRefusals(t *testing.T) {
 	}
 }
 
-// The app loads with no credential and none of its cookies; a refused token
-// is dropped and the next call logs in again.
+// The app loads with no credential and none of its cookies; a token the API
+// refuses as invalid is dropped and the next call logs in again, but no more
+// than once a minute, and a refusal that is not about the token never does.
 func TestBrowserAppAndTokenRenewal(t *testing.T) {
 	f := newBrowserFixture(t)
 	resp, body := f.do(t, "GET", "https://app.example.com/index.html", func(r *http.Request) { r.Header.Set("Cookie", "leak=1") })
@@ -303,14 +314,36 @@ func TestBrowserAppAndTokenRenewal(t *testing.T) {
 	if seen := f.headers("app.example.com"); seen.Get("Authorization") != "" || seen.Get("Cookie") != "" {
 		t.Fatalf("app request carried a credential: %v", seen)
 	}
-	f.reject.Store(true)
-	if resp, _ := f.do(t, "GET", "https://api.example.com/v1/cases", bearerPlaceholder); resp == nil || resp.StatusCode != 401 {
-		t.Fatalf("refused token: %v", resp)
+	call := func(status int, logins int32) {
+		t.Helper()
+		if resp, _ := f.do(t, "GET", "https://api.example.com/v1/cases", bearerPlaceholder); resp == nil || resp.StatusCode != status || f.logins.Load() != logins {
+			t.Fatalf("want %d after %d logins: %v logins=%d", status, logins, resp, f.logins.Load())
+		}
 	}
-	f.reject.Store(false)
-	if resp, _ := f.do(t, "GET", "https://api.example.com/v1/cases", bearerPlaceholder); resp == nil || resp.StatusCode != 200 || f.logins.Load() != 2 {
-		t.Fatalf("no fresh login after a refusal: %v logins=%d", resp, f.logins.Load())
+	refuse := func(status int32, challenge string) {
+		t.Helper()
+		f.reject.Store(status)
+		f.refusal.Store(challenge)
+		call(int(status), f.logins.Load())
+		f.reject.Store(0)
 	}
+	call(200, 1)
+	f.clock.Add(int64(2 * time.Minute))
+	// Refusals that say nothing about the token keep it.
+	refuse(http.StatusForbidden, "")
+	refuse(http.StatusUnauthorized, `Bearer realm="api", error="insufficient_scope"`)
+	call(200, 1)
+	// A refusal of a fresh token keeps it too: a worker cannot force logins.
+	f.clock.Store(0)
+	refuse(http.StatusUnauthorized, "")
+	call(200, 1)
+	// Past the interval, an invalid-token refusal drops it.
+	f.clock.Store(int64(2 * time.Minute))
+	refuse(http.StatusUnauthorized, `Bearer realm="api", error="invalid_token", error_description="expired"`)
+	call(200, 2)
+	f.clock.Add(int64(2 * time.Minute))
+	refuse(http.StatusUnauthorized, "")
+	call(200, 3)
 }
 
 // TestBrowserSeedFile writes a seed for the real-browser check in

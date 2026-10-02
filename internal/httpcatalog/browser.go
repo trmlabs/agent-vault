@@ -27,7 +27,8 @@ type Auth0Binding struct {
 	ClientID string `json:"clientID"` // the app's public client: names the browser cache entries
 	Audience string `json:"audience"`
 	// Scope is what the app's client requests; the browser cache key uses it.
-	// Default "openid profile email offline_access" (auth0-spa-js with refresh tokens).
+	// Default "openid profile email offline_access" (auth0-spa-js with refresh
+	// tokens). The broker's own login drops offline_access.
 	Scope string `json:"scope,omitempty"`
 	Realm string `json:"realm"` // database connection holding the test user
 	// TokenClient is a KV version 2 secret with fields client_id and

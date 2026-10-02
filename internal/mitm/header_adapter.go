@@ -254,7 +254,7 @@ func (p *Proxy) forwardCatalog(w http.ResponseWriter, r *http.Request, target, h
 		_ = a.Audit.Record(done)
 	}
 	needles := secretRepresentations(map[string]string{"key": secret.Value(), "credential": credential})
-	p.relayScreened(w, out, needles, entry.MaxResponseBytes, finish, func() {
+	p.relayScreened(w, out, needles, entry.MaxResponseBytes, finish, func(*http.Response) {
 		// The vendor may have rotated or revoked the key; read the newest next.
 		a.Keys.Invalidate(entry.Key)
 	}, nil)
@@ -262,9 +262,9 @@ func (p *Proxy) forwardCatalog(w http.ResponseWriter, r *http.Request, target, h
 
 // relayScreened sends out upstream and streams the response back, refusing
 // compressed or upgraded responses and any that carry a needle. rejected runs
-// on a 401 or 403. tooLarge, when set, reports that the request body was cut
+// on a 401 or 403 and may look at the response to decide what it means. tooLarge, when set, reports that the request body was cut
 // off at its limit.
-func (p *Proxy) relayScreened(w http.ResponseWriter, out *http.Request, needles [][]byte, limit int64, finish func(int, string), rejected func(), tooLarge func() bool) {
+func (p *Proxy) relayScreened(w http.ResponseWriter, out *http.Request, needles [][]byte, limit int64, finish func(int, string), rejected func(*http.Response), tooLarge func() bool) {
 	resp, err := p.upstream.RoundTrip(out)
 	if err != nil {
 		if tooLarge != nil && tooLarge() {
@@ -278,7 +278,7 @@ func (p *Proxy) relayScreened(w http.ResponseWriter, out *http.Request, needles 
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		rejected()
+		rejected(resp)
 	}
 	encoding := resp.Header.Get("Content-Encoding")
 	if resp.Header.Get("Upgrade") != "" || (encoding != "" && encoding != "identity") || headersContain(resp.Header, needles) {
