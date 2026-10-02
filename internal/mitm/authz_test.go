@@ -48,8 +48,8 @@ func authzProxy(t *testing.T) (*Proxy, *httpcatalog.Entry, *httpcatalog.Entry) {
 	  {"name":"cursor","namespace":"n","serviceAccount":"cursor"},
 	  {"name":"claude","namespace":"n","serviceAccount":"claude","identity":"claude-session","ccpoolID":"ccpool_abc","ceiling":"T1"}],
 	 "entries":[
-	  {"name":"open","host":"api.vendor.example","pathPrefixes":["/open/"],"methods":["GET"],"header":"Authorization","placeholder":"__vault_KEY__","key":{"mount":"m","path":"p","field":"f"},"pools":["cursor","claude"]},
-	  {"name":"gated","host":"api.vendor.example","pathPrefixes":["/gated/"],"methods":["GET"],"header":"Authorization","placeholder":"__vault_KEY__","key":{"mount":"m","path":"p","field":"f"},"pools":["claude"],"tier":"T1","requires":["` + authzGroup + `"]}]}`))
+	  {"name":"open","host":"api.vendor.example","pathPrefixes":["/open/"],"methods":["GET"],"header":"Authorization","placeholder":"__vault_KEY__","key":{"mount":"gatehouse","path":"vendors/p","field":"f"},"pools":["cursor","claude"]},
+	  {"name":"gated","host":"api.vendor.example","pathPrefixes":["/gated/"],"methods":["GET"],"header":"Authorization","placeholder":"__vault_KEY__","key":{"mount":"gatehouse","path":"vendors/p","field":"f"},"pools":["claude"],"tier":"T1","requires":["` + authzGroup + `"]}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
