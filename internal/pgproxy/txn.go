@@ -129,7 +129,8 @@ func (b *Broker) servePooled(ctx context.Context, conn net.Conn, backend *pgprot
 	parameters, err := b.pools.parameters(ctx, key, scope.VaultID, svc)
 	if err != nil {
 		b.logger.Warn("pgproxy: pooled session could not start", slog.String("service", svc.Name), slog.String("error", err.Error()))
-		code, message := poolRefusal(err)
+		code, message, outcome := poolRefusal(err)
+		b.auditDenied(event, outcome)
 		writeClientError(backend, code, message)
 		return
 	}
@@ -182,14 +183,16 @@ func (b *Broker) servePooled(ctx context.Context, conn net.Conn, backend *pgprot
 	s.run(relayCtx)
 }
 
-func poolRefusal(err error) (string, string) {
+// poolRefusal maps a pool error to the client's SQLSTATE and message, and to
+// the audit outcome that alerting counts: a saturated budget is a degraded mode.
+func poolRefusal(err error) (code, message, outcome string) {
 	switch {
 	case errors.Is(err, errPoolBudget):
-		return "53300", "Agent Vault: database connection budget exhausted; retry shortly"
+		return "53300", "Agent Vault: database connection budget exhausted; retry shortly", "pool_budget"
 	case errors.Is(err, errPinnedShare):
-		return "53300", "Agent Vault: no session-mode connection available for session state (SET, temp tables, LISTEN, advisory locks)"
+		return "53300", "Agent Vault: no session-mode connection available for session state (SET, temp tables, LISTEN, advisory locks)", "pinned_share"
 	default:
-		return "08006", "Agent Vault: could not reach the database"
+		return "08006", "Agent Vault: could not reach the database", "upstream"
 	}
 }
 
@@ -233,7 +236,8 @@ func (s *pooledSession) run(ctx context.Context) {
 		if !errors.As(err, &refusal) {
 			return // server connection lost or client gone
 		}
-		code, message := poolRefusal(refusal.err)
+		code, message, outcome := poolRefusal(refusal.err)
+		s.b.auditDenied(s.event, outcome)
 		if _, simple := msg.(*pgproto3.Query); simple {
 			s.writeClient(&pgproto3.ErrorResponse{Severity: "ERROR", Code: code, Message: message}, &pgproto3.ReadyForQuery{TxStatus: s.status()})
 			continue
