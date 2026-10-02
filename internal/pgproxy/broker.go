@@ -404,7 +404,14 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		peer = remote.Addr().Unmap()
 	}
 
-	clientReader := &messageReader{reader: conn, startup: true}
+	// The sidecar's session line, if any, precedes the startup packet.
+	_ = conn.SetDeadline(time.Now().Add(b.opts.StartupTimeout))
+	session, stream, err := readSessionPreamble(conn)
+	if err != nil {
+		b.logger.Debug("pgproxy: session preamble refused")
+		return
+	}
+	clientReader := &messageReader{reader: stream, startup: true}
 	backend := pgproto3.NewBackend(clientReader, conn)
 	backend.SetMaxBodyLen(maxAuthMessageBytes)
 
@@ -445,6 +452,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	// Audit identity comes only from the verified scope. The binding is added
 	// once the database resolves.
 	event := auditchain.Event{Pool: scope.Pool, Agent: scope.ActorID, PodUID: scope.WorkloadID, Session: newSessionID()}
+	connCtx := WithSession(b.ctx, session)
 	refuse := func(outcome, code, message string) {
 		b.auditDenied(event, outcome)
 		writeClientError(backend, code, message)
@@ -465,7 +473,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 
 	// Authenticated: a longer budget for the mint + upstream-connect phase, which
 	// can be slow when role DDL serializes at scale.
-	hsCtx, cancel := context.WithTimeout(b.ctx, b.opts.HandshakeTimeout)
+	hsCtx, cancel := context.WithTimeout(connCtx, b.opts.HandshakeTimeout)
 	defer cancel()
 	_ = conn.SetDeadline(time.Now().Add(b.opts.HandshakeTimeout))
 
@@ -545,7 +553,20 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		return
 	}
 
-	svc, err := b.opts.Databases.ResolveDatabase(hsCtx, *scope, requestedDB)
+	var who Requester
+	svc, err := b.opts.Databases.ResolveDatabase(withRequesterRecord(hsCtx, &who), *scope, requestedDB)
+	event.RequesterKind, event.TokenSHA256, event.RequesterOID = who.Kind, who.TokenSHA256, who.ObjectID
+	event.Tier, event.Decision, event.Groups, event.CacheAgeSec = who.Tier, who.Decision, who.Groups, who.CacheAgeSec
+	if who.Kind == "person" || who.Kind == "agent" {
+		event.Requester = who.Subject
+	}
+	var refused *RefusedError
+	if errors.As(err, &refused) {
+		b.logger.Warn("pgproxy: database refused by the authorization model",
+			slog.String("vault", scope.VaultID), slog.String("database", requestedDB), slog.String("decision", refused.Outcome))
+		refuse(refused.Outcome, "42501", fmt.Sprintf("Agent Vault: not authorized for database %q (%s)", requestedDB, refused.Outcome))
+		return
+	}
 	if err != nil {
 		b.logger.Warn("pgproxy: database service resolution failed",
 			slog.String("vault", scope.VaultID),
@@ -659,7 +680,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		slog.String("upstream", svc.Addr),
 		slog.String("lease", lease.ID))
 
-	relayCtx, relayCancel := context.WithCancel(b.ctx)
+	relayCtx, relayCancel := context.WithCancel(connCtx)
 	defer relayCancel()
 	terminate := sync.OnceFunc(func() {
 		_ = conn.Close()

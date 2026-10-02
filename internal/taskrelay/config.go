@@ -55,8 +55,10 @@ type UpstreamConfig struct {
 	ProofFile  string `json:"proofFile"`
 	Audience   string `json:"audience"`
 	// SessionFile, in self mode, holds the Claude runner's session token. The
-	// relay sends it to the broker on each CONNECT so the broker can verify
-	// the person behind the session. A missing or empty file sends nothing.
+	// relay sends it to the broker on each CONNECT, and on each PostgreSQL
+	// connection as a preamble line ahead of the startup it authors, so the
+	// broker can verify the person behind the session. A missing or empty
+	// file sends nothing.
 	SessionFile string `json:"sessionFile,omitempty"`
 }
 type ConnectConfig struct {
@@ -169,6 +171,11 @@ func (c FixedConfig) Validate(now time.Time) error {
 func (c FixedConfig) validateSelf(now time.Time) error {
 	if c.Connect != nil && c.Connect.Upstream.SessionFile != "" && !strings.HasPrefix(c.Connect.Upstream.SessionFile, "/") {
 		return errConfig
+	}
+	for _, p := range c.postgresBindings() {
+		if p.Upstream.SessionFile != "" && !strings.HasPrefix(p.Upstream.SessionFile, "/") {
+			return errConfig
+		}
 	}
 	if !safeName.MatchString(c.TaskID) || !c.Deadline.After(now) || c.Deadline.After(now.Add(8*time.Hour)) || c.AuditFile == "" || c.Browser != nil ||
 		c.Sandbox != (SandboxConfig{}) || c.Kubernetes != (KubernetesConfig{}) || c.TLSCertFile != "" || c.TLSKeyFile != "" {

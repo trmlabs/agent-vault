@@ -23,7 +23,7 @@ func TestCatalogDatabaseResolverFollowsTheLiveCatalog(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := httpcatalog.NewSource(first, 1)
-	r := NewCatalogDatabaseResolver(source)
+	r := NewCatalogDatabaseResolver(source, nil, nil)
 	svc, err := r.ResolveDatabase(context.Background(), pgproxy.AgentScope{ActorID: "agent-uuid-1", Pool: "cursor"}, "b2bcore")
 	if err != nil || svc.Addr != "p.abc.db.postgresbridge.com:5432" || svc.Database != "core" || svc.SSLMode != "verify-full" || svc.MaxConns != 5 {
 		t.Fatalf("resolved %+v %v", svc, err)

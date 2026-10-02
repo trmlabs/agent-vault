@@ -152,7 +152,7 @@ func (b *Broker) servePooled(ctx context.Context, conn net.Conn, backend *pgprot
 	b.logger.Info("pgproxy: pooled session established", slog.String("vault", scope.VaultID), slog.String("actor", scope.ActorID),
 		slog.String("workload", scope.WorkloadID), slog.String("service", svc.Name))
 
-	relayCtx, relayCancel := context.WithCancel(b.ctx)
+	relayCtx, relayCancel := context.WithCancel(WithSession(b.ctx, Session(ctx)))
 	defer relayCancel()
 	authorizationDone := make(chan struct{})
 	go func() {

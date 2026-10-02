@@ -121,6 +121,13 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig) {
 	stop := context.AfterFunc(r.ctx, func() { _ = up.Close() })
 	defer stop()
 	_ = up.SetDeadline(minTime(expiry, time.Now().Add(handshakeTimeout)))
+	// The runner session rides the broker-side stream ahead of the startup
+	// packet this sidecar authors; the worker's own bytes never carry it.
+	if session := readSession(c.Upstream); session != "" {
+		if _, e = io.WriteString(up, "GHSESS1 "+session+"\n"); e != nil {
+			return
+		}
+	}
 	if _, e = up.Write(packet); e != nil {
 		return
 	}
