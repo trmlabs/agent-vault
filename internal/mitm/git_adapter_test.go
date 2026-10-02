@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/http/cgi"
+	"net/http/cgi" // #nosec G504 -- runs git http-backend in tests; the advisory applies to Go before 1.6.3
 	"net/http/httptest"
 	"net/url"
 	"os"
