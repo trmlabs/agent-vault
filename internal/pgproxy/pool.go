@@ -542,6 +542,8 @@ func (p *serverPools) close() {
 }
 
 // stats reports open server connections per upstream, for tests and status.
+//
+//nolint:unused // used by the realpg tests
 func (p *serverPools) stats(addr string) (open, idle int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
