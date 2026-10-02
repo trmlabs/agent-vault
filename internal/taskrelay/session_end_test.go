@@ -211,3 +211,18 @@ func TestUnreadableProofIsNamed(t *testing.T) {
 		t.Fatalf("unreadable proof frame %q %q %v", typ, body, e)
 	}
 }
+
+// A session the broker ends with its own FATAL (a planned restart, a lost
+// upstream) is told once: the relay adds no second ending after it.
+func TestBrokerFatalIsTheOnlyEnding(t *testing.T) {
+	worker, broker := session(t, time.Now().Add(time.Minute))
+	_, _ = broker.Write(encodePGFrame('E', reasonBody("FATAL", "08006", "upstream")))
+	broker.Close()
+	typ, body, e := readPGFrame(worker, 4096)
+	if e != nil || typ != 'E' || sqlState(body) != "08006" || !bytes.Contains(body, []byte("could not reach the database")) {
+		t.Fatalf("broker ending %q %q %v", typ, body, e)
+	}
+	if typ, body, e := readPGFrame(worker, 4096); e == nil {
+		t.Fatalf("a second ending followed: %q %q", typ, body)
+	}
+}
