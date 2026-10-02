@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Infisical/agent-vault/internal/auditchain"
 	"github.com/Infisical/agent-vault/internal/brokercore"
 	"github.com/Infisical/agent-vault/internal/ratelimit"
 )
@@ -112,7 +113,8 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		writeProxyAuthChallenge(w, "Proxy-Authorization required")
 		return
 	}
-	_, err = p.sessions.ResolveForProxy(r.Context(), token, hint)
+	peer, peerErr := peerFromContext(r.Context())
+	connectScope, err := p.resolveScope(r.Context(), token, hint, peer, peerErr, false)
 	if err != nil {
 		p.recordAuthFailure(r)
 		if p.strictCredentialProxy {
@@ -120,6 +122,12 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeAuthError(w, err)
+		return
+	}
+	// With a catalog, refuse an unlisted host before minting a certificate
+	// for it or opening a tunnel.
+	if p.strictCredentialProxy && p.adapter.valid() && !p.adapter.Catalog.Current().HasHost(host, port) {
+		p.adapterDeny(w, auditchain.Event{Pool: connectScope.Pool, Agent: connectScope.AgentID, PodUID: connectScope.WorkloadID}, http.StatusForbidden, "unlisted")
 		return
 	}
 
@@ -174,7 +182,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// A tunnel can outlive its token or grant. Recheck each request
 			// against the original proxy identity before injecting credentials.
-			scope, err := p.sessions.ResolveForProxy(r.Context(), token, hint)
+			scope, err := p.resolveScope(r.Context(), token, hint, peer, peerErr, true)
 			if err != nil {
 				w.Header().Set("Connection", "close")
 				if p.strictCredentialProxy {
@@ -203,6 +211,12 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 				_ = listener.Close()
 			}
 		},
+	}
+	// The identity check runs at connect and per request; a tunnel, including a
+	// response still streaming, must not outlive the worker Pod's deadline.
+	if !connectScope.NotAfter.IsZero() {
+		deadline := time.AfterFunc(time.Until(connectScope.NotAfter), func() { _ = tlsConn.Close() })
+		defer deadline.Stop()
 	}
 	_ = srv.Serve(listener)
 }

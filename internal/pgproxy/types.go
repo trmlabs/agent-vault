@@ -21,6 +21,7 @@ type AgentScope struct {
 	VaultName  string
 	ActorID    string
 	WorkloadID string
+	Pool       string // catalog pool name; empty matches no catalog grant
 }
 
 // AgentAuthenticator validates the agent's Agent Vault token (presented in the

@@ -29,6 +29,7 @@ package mitm
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"log/slog"
 	"net"
 	"net/http"
@@ -60,6 +61,9 @@ type Proxy struct {
 	strictCredentialProxy bool
 	durableAudit          requestlog.Durable
 	strictTunnels         chan struct{}
+	adapter               *HeaderAdapter
+	attestor              brokercore.Attestor
+	peerReader            PeerReader
 }
 
 // Options carries the dependencies a Proxy needs. BaseURL is the
@@ -71,16 +75,21 @@ type Proxy struct {
 type Options struct {
 	MaxCredentialProxyTunnels int                // <=0 defaults to 128 pending or active CONNECT tunnels
 	StrictCredentialProxy     bool               // bounded header-placeholder release path
-	DurableAudit              requestlog.Durable // mandatory when strict mode is enabled
-	CA                        ca.Provider
-	Sessions                  brokercore.SessionResolver
-	Credentials               brokercore.CredentialProvider
-	BaseURL                   string
-	Logger                    *slog.Logger
-	RateLimit                 *ratelimit.Registry
-	LogSink                   requestlog.Sink // nil → Nop
-	MaxResponseBytes          int64           // 0 = unlimited (default); >0 = cap in bytes
-	MaxRequestBytes           int64           // 0 → DefaultMaxRequestBytes (1 GiB)
+	DurableAudit              requestlog.Durable // mandatory when strict mode is enabled, unless HeaderAdapter is set
+	HeaderAdapter             *HeaderAdapter     // strict mode only: catalog destinations with signed audit
+	// Attestor, when set, admits workers by projected token and real peer
+	// address instead of Sessions; Sessions remains the token-review fallback.
+	Attestor         brokercore.Attestor
+	PeerReader       PeerReader // nil: the TCP remote address
+	CA               ca.Provider
+	Sessions         brokercore.SessionResolver
+	Credentials      brokercore.CredentialProvider
+	BaseURL          string
+	Logger           *slog.Logger
+	RateLimit        *ratelimit.Registry
+	LogSink          requestlog.Sink // nil → Nop
+	MaxResponseBytes int64           // 0 = unlimited (default); >0 = cap in bytes
+	MaxRequestBytes  int64           // 0 → DefaultMaxRequestBytes (1 GiB)
 }
 
 // New builds a Proxy bound to addr. The returned Proxy does not begin
@@ -116,6 +125,9 @@ func New(addr string, opts Options) *Proxy {
 		ca:                    opts.CA,
 		strictCredentialProxy: opts.StrictCredentialProxy,
 		durableAudit:          opts.DurableAudit,
+		adapter:               opts.HeaderAdapter,
+		attestor:              opts.Attestor,
+		peerReader:            opts.PeerReader,
 		strictTunnels:         make(chan struct{}, tunnelLimit),
 		sessions:              opts.Sessions,
 		creds:                 opts.Credentials,
@@ -132,6 +144,7 @@ func New(addr string, opts Options) *Proxy {
 		Addr:              addr,
 		Handler:           http.HandlerFunc(p.dispatch),
 		ReadHeaderTimeout: 10 * time.Second,
+		ConnContext:       withPeerConn,
 	}
 	return p
 }
@@ -170,9 +183,18 @@ func (p *Proxy) ListenAndServe() error {
 // http.ErrServerClosed in that case.
 // Useful for tests that need to bind :0 and learn the resulting port.
 func (p *Proxy) Serve(l net.Listener) error {
+	// A PROXY header names the worker, so it is accepted only on a listener
+	// bound to loopback, where the sole peers are the broker Pod's own
+	// containers (the TLS terminator), never a remote client.
+	if p.peerReader != nil {
+		if addr, ok := l.Addr().(*net.TCPAddr); !ok || !addr.IP.IsLoopback() {
+			_ = l.Close()
+			return errors.New("PROXY header peers require a loopback listener")
+		}
+	}
 	p.isListening.Store(true)
 	defer p.isListening.Store(false)
-	return p.httpServer.Serve(l)
+	return p.httpServer.Serve(peerListener{Listener: l, reader: p.peerReader})
 }
 
 // Shutdown gracefully stops the listener. In-flight CONNECT tunnels are
@@ -181,7 +203,20 @@ func (p *Proxy) Serve(l net.Listener) error {
 // Shutdown returns; the tunnels will die with it.
 func (p *Proxy) Shutdown(ctx context.Context) error {
 	p.upstream.CloseIdleConnections()
-	return p.httpServer.Shutdown(ctx)
+	err := p.httpServer.Shutdown(ctx)
+	p.revokeGitTokens()
+	return err
+}
+
+// revokeGitTokens revokes every cached GitHub installation token, which GitHub
+// would otherwise honour for up to an hour after the broker stops.
+func (p *Proxy) revokeGitTokens() {
+	if p.adapter == nil {
+		return
+	}
+	if tokens, ok := p.adapter.GitTokens.(interface{ RevokeAll() }); ok {
+		tokens.RevokeAll()
+	}
 }
 
 func (p *Proxy) dispatch(w http.ResponseWriter, r *http.Request) {

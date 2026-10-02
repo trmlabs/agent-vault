@@ -148,7 +148,8 @@ func (p *Proxy) handleForward(w http.ResponseWriter, r *http.Request) {
 		writeProxyAuthChallenge(w, "Proxy-Authorization required")
 		return
 	}
-	scope, err := p.sessions.ResolveForProxy(r.Context(), token, hint)
+	peer, peerErr := peerFromContext(r.Context())
+	scope, err := p.resolveScope(r.Context(), token, hint, peer, peerErr, false)
 	if err != nil {
 		p.recordAuthFailure(r)
 		if p.strictCredentialProxy {

@@ -101,6 +101,15 @@ jobs:
       - name: Run tests
         run: go test -race -count=1 ./...
 
+      # The e2e build (the Kind fixture's) compiles extra files; vet all of it
+      # and test every package that has e2e-only code.
+      - name: Vet and test the e2e build
+        run: |
+          set -euo pipefail
+          go vet -tags e2e ./...
+          mapfile -t packages < <(grep -rlE --include='*.go' '^//go:build e2e' cmd internal | xargs -n1 dirname | sort -u | sed 's|^|./|')
+          if [ "${#packages[@]}" -gt 0 ]; then go test -race -count=1 -tags e2e "${packages[@]}"; fi
+
   # Security-critical: always run on every PR (see go-test for rationale).
   go-lint:
     runs-on: ubuntu-latest

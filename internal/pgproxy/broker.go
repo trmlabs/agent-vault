@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
+
+	"github.com/Infisical/agent-vault/internal/auditchain"
 )
 
 // Options configures a Broker. Auth, Databases, and Leases are required; the
@@ -33,6 +35,7 @@ type Options struct {
 	MaxConns              int           // cap on concurrent SERVING connections = upstream DB connections (default 50)
 	MaxPendingConns       int           // cap on accepted-but-not-yet-serving connections (default 512)
 	MaxLeasesPerActor     int           // cap on live credentials/connections per agent identity (default 16; clamped to <= MaxConns)
+	Audit                 AuditTrail    // signed audit trail; nil disables it
 }
 
 // Broker is the PostgreSQL credential-brokering TCP listener. It mirrors the
@@ -62,6 +65,7 @@ type Broker struct {
 	cancel               context.CancelFunc
 	shutdownDone         chan struct{}
 	wg                   sync.WaitGroup
+	denied               deniedLimiter
 }
 
 // New builds a Broker bound to addr (host:port). It does not listen until Serve
@@ -152,6 +156,7 @@ func (b *Broker) Serve(l net.Listener) error {
 
 	b.isListening.Store(true)
 	defer b.isListening.Store(false)
+	b.watchAudit()
 	if leases, ok := b.opts.Leases.(interface{ AuthorityDone() <-chan struct{} }); ok {
 		go func() {
 			select {
@@ -370,7 +375,23 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 			err = fmt.Errorf("incomplete agent scope")
 		}
 		b.logger.Warn("pgproxy: agent authentication failed", slog.String("error", err.Error()))
+		// Anyone can reach this point, so these rows are rate-limited.
+		if b.denied.allow(time.Now(), b.logger) {
+			b.auditDenied(auditchain.Event{}, "authentication")
+		}
 		writeClientError(backend, "28000", "Agent Vault: authentication failed")
+		return
+	}
+	// Audit identity comes only from the verified scope. The binding is added
+	// once the database resolves.
+	event := auditchain.Event{Pool: scope.Pool, Agent: scope.ActorID, PodUID: scope.WorkloadID, Session: newSessionID()}
+	refuse := func(outcome, code, message string) {
+		b.auditDenied(event, outcome)
+		writeClientError(backend, code, message)
+	}
+	if err := b.auditAdmit(); err != nil {
+		b.logger.Error("pgproxy: audit trail unavailable; refusing session", slog.String("error", err.Error()))
+		refuse("audit_unavailable", "08004", "Agent Vault: audit unavailable")
 		return
 	}
 
@@ -389,7 +410,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 			slog.String("vault", scope.VaultID),
 			slog.String("actor", scope.ActorID),
 			slog.Int("limit", b.opts.MaxLeasesPerActor))
-		writeClientError(backend, "53300", "Agent Vault: too many concurrent database sessions")
+		refuse("actor_limit", "53300", "Agent Vault: too many concurrent database sessions")
 		return
 	}
 	defer b.releaseLeaseSlot(scope.ActorID)
@@ -402,7 +423,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		b.logger.Warn("pgproxy: serving-connection limit reached",
 			slog.String("vault", scope.VaultID),
 			slog.Int("max_conns", b.opts.MaxConns))
-		writeClientError(backend, "53300", "Agent Vault: too many concurrent database connections")
+		refuse("capacity", "53300", "Agent Vault: too many concurrent database connections")
 		return
 	}
 	defer b.releaseServeSlot()
@@ -416,7 +437,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		current.ActorID == scope.ActorID && current.VaultID == scope.VaultID && current.WorkloadID == scope.WorkloadID
 	checkCancel()
 	if !valid {
-		writeClientError(backend, "28000", "Agent Vault: authentication failed")
+		refuse("authentication", "28000", "Agent Vault: authentication failed")
 		return
 	}
 
@@ -426,9 +447,10 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 			slog.String("vault", scope.VaultID),
 			slog.String("database", requestedDB),
 			slog.String("error", err.Error()))
-		writeClientError(backend, "3D000", fmt.Sprintf("Agent Vault: no database service for %q", requestedDB))
+		refuse("no_database", "3D000", fmt.Sprintf("Agent Vault: no database service for %q", requestedDB))
 		return
 	}
+	event.Binding = databaseBinding(scope.VaultID, svc)
 
 	// Per-database budget: bound the connections to THIS upstream so a burst to
 	// one database cannot starve the others behind the same broker. Applied
@@ -438,7 +460,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 			slog.String("vault", scope.VaultID),
 			slog.String("service", svc.Name),
 			slog.String("upstream", svc.Addr))
-		writeClientError(backend, "53300", "Agent Vault: too many concurrent connections to this database")
+		refuse("database_limit", "53300", "Agent Vault: too many concurrent connections to this database")
 		return
 	}
 	defer b.releaseUpstreamSlot(svc)
@@ -449,12 +471,12 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 			slog.String("vault", scope.VaultID),
 			slog.String("service", svc.Name),
 			slog.String("error", err.Error()))
-		writeClientError(backend, "08006", "Agent Vault: could not obtain a database credential")
+		refuse("credential", "08006", "Agent Vault: could not obtain a database credential")
 		return
 	}
 	// Once minted, the credential must be revoked when this connection ends.
 	if lease == nil {
-		writeClientError(backend, "08006", "Agent Vault: invalid database lease")
+		refuse("credential", "08006", "Agent Vault: invalid database lease")
 		return
 	}
 	defer func() {
@@ -468,7 +490,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	}()
 
 	if lease.ID == "" || lease.Username == "" || lease.Password == "" || !lease.ExpiresAt.After(time.Now()) {
-		writeClientError(backend, "08006", "Agent Vault: invalid database lease")
+		refuse("credential", "08006", "Agent Vault: invalid database lease")
 		return
 	}
 	// Never finish a slow handshake using a credential that has expired.
@@ -480,7 +502,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 			slog.String("service", svc.Name),
 			slog.String("upstream", svc.Addr),
 			slog.String("error", err.Error()))
-		writeClientError(backend, "08006", "Agent Vault: could not connect to the database")
+		refuse("upstream", "08006", "Agent Vault: could not connect to the database")
 		return
 	}
 	defer func() { _ = upstream.conn.Close() }()
@@ -495,6 +517,19 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		return
 	}
 	defer unregisterCancel()
+	// No query may reach the database before its session row exists.
+	opened := event
+	opened.Event, opened.Outcome = auditchain.EventSessionOpen, "admitted"
+	if err := b.auditRecord(opened); err != nil {
+		b.logger.Error("pgproxy: audit trail unavailable; refusing session", slog.String("error", err.Error()))
+		writeClientError(backend, "08004", "Agent Vault: audit unavailable")
+		return
+	}
+	defer func() {
+		closed := event
+		closed.Event, closed.Outcome = auditchain.EventSessionClose, "closed"
+		_ = b.auditRecord(closed)
+	}()
 	if err := sendClientReady(backend, upstream); err != nil {
 		b.logger.Debug("pgproxy: completing agent handshake failed", slog.String("error", err.Error()))
 		return

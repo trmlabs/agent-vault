@@ -62,6 +62,14 @@ func (p *Proxy) finishStrictAudit(ctx context.Context, id, result string, status
 }
 
 func (p *Proxy) strictDeny(w http.ResponseWriter, r *http.Request, a requestlog.Attempt, status int) {
+	if p.adapter != nil {
+		if !p.adapter.valid() {
+			http.Error(w, "audit unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		p.adapterUnauthenticatedDeny(w, r, a, status)
+		return
+	}
 	a.Decision = "deny"
 	if p.durableAudit == nil {
 		http.Error(w, "audit unavailable", http.StatusServiceUnavailable)
@@ -86,6 +94,14 @@ func (p *Proxy) strictUnauthenticatedDeny(w http.ResponseWriter, r *http.Request
 }
 
 func (p *Proxy) forwardStrict(w http.ResponseWriter, r *http.Request, target, host string, port int, useTLS bool, scope *brokercore.ProxyScope) {
+	if p.adapter != nil {
+		if !p.adapter.valid() {
+			http.Error(w, "credential adapter unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		p.forwardCatalog(w, r, target, host, port, useTLS, scope)
+		return
+	}
 	attempt := strictAttempt(scope, nil, r.Method, host, target, "deny")
 	deny := func(status int) { p.strictDeny(w, r, attempt, status) }
 	// The first release is a read-only, header-only workflow. Reject unsupported
