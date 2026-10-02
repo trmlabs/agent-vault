@@ -35,6 +35,9 @@ type PoolOptions struct {
 	RotateFraction float64
 	// IdleTimeout closes server connections unused for this long. Default 5m.
 	IdleTimeout time.Duration
+	// DefaultBudget is the server-connection budget for a database without a
+	// catalog maxConns. Default 50.
+	DefaultBudget int
 }
 
 func (o *PoolOptions) withDefaults() PoolOptions {
@@ -57,6 +60,9 @@ func (o *PoolOptions) withDefaults() PoolOptions {
 	if p.IdleTimeout <= 0 {
 		p.IdleTimeout = 5 * time.Minute
 	}
+	if p.DefaultBudget <= 0 {
+		p.DefaultBudget = defaultMaxConns
+	}
 	return p
 }
 
@@ -68,9 +74,16 @@ var (
 
 // poolKey names one credential's server connections. The replica is implicit:
 // each broker process has its own pools.
+// Every field that decides privileges is in the key: two entitlement tiers
+// are different bindings with different roles, so they never share a server
+// connection, and a binding whose role or target changes gets new ones.
 type poolKey struct {
-	pool    string // catalog pool name, or the actor when there is none
-	binding string // vault/service, the identity the cleanup journal uses
+	pool     string // catalog pool name, or the actor when there is none
+	binding  string // vault/service, the identity the cleanup journal uses
+	mount    string
+	role     string
+	addr     string
+	database string
 }
 
 // credential is one Vault-issued database login shared by a pool key's
@@ -92,9 +105,15 @@ type serverConn struct {
 	cred     *credential
 	pool     *serverPool
 	prepared map[string]bool   // broker-named prepared statements on this connection
-	params   map[string]string // session parameters applied by the broker
+	params   map[string]string // session parameters applied by the broker, as the client sent them
+	actual   map[string]string // the same, as the server normalized them
 	pinned   bool
 	idleAt   time.Time
+	// reported holds the server's last reported parameters as the broker left
+	// them; seen holds reports made while a client held the connection. A
+	// difference at check-in is session state the client left behind.
+	reported map[string]string
+	seen     map[string]string
 }
 
 type serverPool struct {
@@ -146,7 +165,7 @@ func (p *serverPools) budgetFor(svc *DatabaseService) *budget {
 	// falls back to the conservative default, not to that cap.
 	limit := svc.MaxConns
 	if limit <= 0 {
-		limit = defaultMaxConns
+		limit = p.opts.DefaultBudget
 	}
 	limit = max(1, limit/p.opts.Replicas)
 	bud, ok := p.budgets[svc.Addr]
@@ -283,7 +302,12 @@ func (p *serverPools) open(ctx context.Context, pool *serverPool, svc DatabaseSe
 		return nil, fmt.Errorf("connect upstream: %w", err)
 	}
 	frontend := pgproto3.NewFrontend(sess.conn, sess.conn)
-	return &serverConn{sess: sess, frontend: frontend, cred: cred, pool: pool, prepared: map[string]bool{}, params: map[string]string{}}, nil
+	reported := map[string]string{}
+	for _, p := range sess.parameters {
+		reported[p.Name] = p.Value
+	}
+	return &serverConn{sess: sess, frontend: frontend, cred: cred, pool: pool, prepared: map[string]bool{}, params: map[string]string{},
+		actual: map[string]string{}, reported: reported, seen: map[string]string{}}, nil
 }
 
 // credentialFor reserves a connection on the key's current credential,

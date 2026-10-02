@@ -143,7 +143,7 @@ func (c *Chain) Admit() error {
 // caller must not start or continue the action it describes.
 func (c *Chain) Record(e Event) error {
 	switch e.Event {
-	case EventSessionOpen, EventSessionClose, EventDenied, EventHTTPRequest, EventHTTPResponse, EventTransaction:
+	case EventSessionOpen, EventSessionClose, EventDenied, EventHTTPRequest, EventHTTPResponse, EventTransaction, EventStateLeak:
 	default:
 		return ErrInvalidEvent
 	}

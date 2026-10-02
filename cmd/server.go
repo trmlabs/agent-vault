@@ -438,7 +438,7 @@ func attachPostgresBrokerIfEnabled(srv *server.Server, host string, postgresPort
 	// and one rotating credential per pool and database. MaxConns then caps
 	// client sessions; each database's server budget comes from the catalog.
 	if boolEnvValue("AGENT_VAULT_DB_POOLING") {
-		opts.Pool = &pgproxy.PoolOptions{Replicas: intEnvValue("AGENT_VAULT_DB_POOL_REPLICAS")}
+		opts.Pool = &pgproxy.PoolOptions{Replicas: intEnvValue("AGENT_VAULT_DB_POOL_REPLICAS"), DefaultBudget: intEnvValue("AGENT_VAULT_DB_POOL_BUDGET")}
 	}
 	srv.AttachPostgresBroker(pgproxy.New(net.JoinHostPort(host, strconv.Itoa(postgresPort)), opts))
 	return nil

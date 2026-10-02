@@ -24,9 +24,10 @@ const (
 	EventCheckpoint       = "checkpoint"
 	EventCheckpointFailed = "checkpoint_failed"
 	EventKeyRotated       = "key_rotated"
-	EventHTTPRequest      = "http_request"  // admitted, before the upstream call
-	EventHTTPResponse     = "http_response" // outcome and status of that call
-	EventTransaction      = "transaction"   // one database transaction on a pooled connection
+	EventHTTPRequest      = "http_request"      // admitted, before the upstream call
+	EventHTTPResponse     = "http_response"     // outcome and status of that call
+	EventTransaction      = "transaction"       // one database transaction on a pooled connection
+	EventStateLeak        = "state_leak_caught" // check-in found session state the classifier missed; reset
 )
 
 // Row is one audit record. It carries identifiers and fixed outcome codes

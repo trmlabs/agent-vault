@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -521,6 +522,8 @@ func TestRealPostgres_PoolReplacesDeadIdleConnections(t *testing.T) {
 	if _, err := a.Exec(ctx, "SELECT 1"); err != nil {
 		t.Fatal(err)
 	}
+	// Check-in finishes after the client has its answer; wait for it.
+	waitFor(t, 2*time.Second, func() bool { _, idle := f.broker.pools.stats(f.env.upAddr); return idle == 1 }, "connection checked in")
 	f.broker.pools.mu.Lock()
 	for _, pool := range f.broker.pools.pools {
 		for _, conn := range pool.idle {
@@ -534,5 +537,206 @@ func TestRealPostgres_PoolReplacesDeadIdleConnections(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if _, err := a.Exec(ctx, "SELECT 2"); err != nil {
 		t.Fatalf("dead idle connection handed to a client: %v", err)
+	}
+}
+
+// The classifier cannot see inside functions. A function that sets a session
+// setting, creates a temp table or takes a session advisory lock passes as a
+// plain SELECT; the check-in backstop finds the state, resets the connection
+// and audits the catch, so the next client starts clean.
+func TestRealPostgres_PoolCheckInCatchesStateTheClassifierMissed(t *testing.T) {
+	f := newPoolFixture(t, 1, time.Hour, PoolOptions{})
+	ctx := context.Background()
+	suffix := strings.TrimPrefix(f.env.roles[0], "pool_a_")
+	schema := "other_" + suffix
+	f.env.exec(fmt.Sprintf("CREATE FUNCTION %s.sneaky_path() RETURNS text LANGUAGE sql AS $$ SELECT set_config('search_path', '%s', false) $$", schema, schema))
+	f.env.exec(fmt.Sprintf("CREATE FUNCTION %s.sneaky_temp() RETURNS void LANGUAGE plpgsql AS $$ BEGIN CREATE TEMP TABLE IF NOT EXISTS sneaky (id int); END $$", schema))
+	f.env.exec(fmt.Sprintf("CREATE FUNCTION %s.sneaky_lock() RETURNS void LANGUAGE sql AS $$ SELECT pg_advisory_lock(4242) $$", schema))
+	for _, role := range f.env.roles {
+		f.env.exec(fmt.Sprintf("GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA %s TO %s", schema, role))
+	}
+	leaks := func() int {
+		n := 0
+		for _, e := range f.audit.recorded() {
+			if e.Event == auditchain.EventStateLeak {
+				n++
+			}
+		}
+		return n
+	}
+	for i, call := range []string{"sneaky_path()", "sneaky_temp()", "sneaky_lock()"} {
+		a := f.connect(t, nil)
+		if _, err := a.Exec(ctx, "SELECT "+schema+"."+call); err != nil {
+			t.Fatalf("%s: %v", call, err)
+		}
+		waitFor(t, 3*time.Second, func() bool { return leaks() == i+1 }, "state leak caught for "+call)
+		b := f.connect(t, nil) // budget 1: the same server connection
+		var path string
+		var temps, locks int
+		if err := b.QueryRow(ctx, "SELECT current_setting('search_path'), (SELECT count(*) FROM pg_class WHERE relnamespace = pg_my_temp_schema()),"+
+			" (SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid())").Scan(&path, &temps, &locks); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(path, schema) || temps != 0 || locks != 0 {
+			t.Fatalf("after %s the next client saw search_path=%q temps=%d advisory locks=%d", call, path, temps, locks)
+		}
+	}
+	// SET LOCAL ends with its transaction: not a leak.
+	a := f.connect(t, nil)
+	tx, err := a.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "SET LOCAL TimeZone = 'Asia/Tokyo'"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if leaks() != 3 {
+		t.Fatalf("SET LOCAL was reported as a leak: %d", leaks())
+	}
+}
+
+// Two entitlement tiers are two bindings with two database roles. Their
+// clients never share a server connection: every transaction runs as its
+// own tier's role, even with both tiers busy on one small shared budget.
+func TestRealPostgres_PoolKeySeparatesEntitlementTiers(t *testing.T) {
+	env := newPoolEnv(t)
+	minter := &tierMinter{env: env}
+	tiers := map[string]*DatabaseService{
+		"tier1": {Name: "tier1", Addr: env.upAddr, Database: env.db, Mount: "database", Role: "t1-readonly", SSLMode: "disable", MaxConns: 2},
+		"tier2": {Name: "tier2", Addr: env.upAddr, Database: env.db, Mount: "database", Role: "t2-readwrite", SSLMode: "disable", MaxConns: 2},
+	}
+	b, addr := startBroker(t, Options{
+		Auth: &fakeAuth{scope: &AgentScope{VaultID: "vault-1", ActorID: "agent-uuid-1", WorkloadID: "pod-uid-1", Pool: "cursor"}},
+		Databases: resolverFunc(func(_ context.Context, _ AgentScope, requested string) (*DatabaseService, error) {
+			if svc, ok := tiers[requested]; ok {
+				copied := *svc
+				return &copied, nil
+			}
+			return nil, errors.New("unknown")
+		}),
+		Leases: minter, MaxConns: 500, MaxLeasesPerActor: 500, Pool: &PoolOptions{QueueFactor: 20},
+	})
+	f := &poolFixture{env: env, broker: b, addr: addr}
+	want := map[string]string{"tier1": env.roles[0], "tier2": env.roles[1]}
+	var wg sync.WaitGroup
+	errs := make(chan error, 20)
+	for i := range 20 {
+		tier := []string{"tier1", "tier2"}[i%2]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			conn := f.connectTo(t, tier)
+			for range 15 {
+				var user string
+				if err := conn.QueryRow(context.Background(), "SELECT current_user").Scan(&user); err != nil {
+					errs <- err
+					return
+				}
+				if user != want[tier] {
+					errs <- fmt.Errorf("a %s client ran as %s", tier, user)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	b.pools.mu.Lock()
+	keys := len(b.pools.pools)
+	b.pools.mu.Unlock()
+	if keys != 2 {
+		t.Fatalf("%d pool keys, want one per tier", keys)
+	}
+}
+
+type tierMinter struct {
+	env *poolEnv
+	mu  sync.Mutex
+	n   int
+}
+
+func (m *tierMinter) Mint(_ context.Context, _ string, svc *DatabaseService) (*Lease, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.n++
+	role := m.env.roles[0]
+	if svc.Role == "t2-readwrite" {
+		role = m.env.roles[1]
+	}
+	return &Lease{ID: fmt.Sprintf("tier-lease-%d", m.n), Username: role, Password: m.env.pw, ExpiresAt: time.Now().Add(time.Hour)}, nil
+}
+func (m *tierMinter) Renew(context.Context, string, time.Duration) (time.Time, error) {
+	return time.Time{}, errors.New("unused")
+}
+func (m *tierMinter) Revoke(context.Context, string) error { return nil }
+
+func (f *poolFixture) connectTo(t *testing.T, database string) *pgx.Conn {
+	t.Helper()
+	host, port, _ := net.SplitHostPort(f.addr)
+	conn, err := pgx.Connect(context.Background(), fmt.Sprintf("host=%s port=%s user=workload password=agent-token dbname=%s sslmode=disable", host, port, database))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close(context.Background()) })
+	return conn
+}
+
+// libpq is what psycopg drives, so libpq's default startup packet is
+// psycopg's: user, database, application_name (psql sets one) and the
+// locale's client_encoding, which is SQL_ASCII under the C locale. Requires
+// AV_TEST_PSQL, a psql binary.
+func TestRealPostgres_PoolLibpqDefaultStartup(t *testing.T) {
+	psql := os.Getenv("AV_TEST_PSQL")
+	if psql == "" {
+		t.Skip("set AV_TEST_PSQL to a psql binary")
+	}
+	f := newPoolFixture(t, 1, time.Hour, PoolOptions{})
+	host, port, _ := net.SplitHostPort(f.addr)
+	for _, locale := range []string{"en_US.UTF-8", "C"} {
+		cmd := exec.Command(psql, fmt.Sprintf("host=%s port=%s user=workload dbname=core sslmode=disable", host, port), "-At", "-c",
+			"SELECT current_setting('client_encoding') || '|' || (SELECT count(*) FROM generate_series(1, 3))")
+		cmd.Env = []string{"PGPASSWORD=agent-token", "LC_ALL=" + locale, "LANG=" + locale, "PATH=" + os.Getenv("PATH")}
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("libpq with LC_ALL=%s: %v: %s", locale, err, out)
+		}
+		if got := strings.TrimSpace(string(out)); !strings.HasSuffix(got, "|3") {
+			t.Fatalf("libpq with LC_ALL=%s answered %q", locale, got)
+		}
+	}
+}
+
+// node-postgres 8.x sends only user and database by default and uses unnamed
+// statements with parameters. Requires AV_TEST_NODE_PG_MODULES, a
+// node_modules directory containing pg.
+func TestRealPostgres_PoolNodePgDefaultStartup(t *testing.T) {
+	modules := os.Getenv("AV_TEST_NODE_PG_MODULES")
+	if modules == "" {
+		t.Skip("set AV_TEST_NODE_PG_MODULES")
+	}
+	f := newPoolFixture(t, 2, time.Hour, PoolOptions{QueueFactor: 10})
+	host, port, _ := net.SplitHostPort(f.addr)
+	script := `const { Client } = require('pg');
+(async () => {
+  const clients = await Promise.all([0,1,2,3,4].map(async () => { const c = new Client({ host: process.argv[1], port: +process.argv[2], user: 'workload', password: 'agent-token', database: 'core' }); await c.connect(); return c; }));
+  const sums = await Promise.all(clients.map(async (c, i) => { await c.query('BEGIN'); const r = await c.query('SELECT $1::int + $2::int AS s', [i, 10]); await c.query('COMMIT'); return r.rows[0].s; }));
+  await Promise.all(clients.map(c => c.end()));
+  console.log(JSON.stringify(sums));
+})().catch(e => { console.error(e.message); process.exit(1); });`
+	cmd := exec.Command("node", "-e", script, host, port)
+	cmd.Env = append(os.Environ(), "NODE_PATH="+modules)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("node pg: %v: %s", err, out)
+	}
+	if got := strings.TrimSpace(string(out)); got != "[10,11,12,13,14]" {
+		t.Fatalf("node pg answered %s", got)
 	}
 }

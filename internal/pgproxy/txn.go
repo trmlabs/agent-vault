@@ -24,7 +24,26 @@ import (
 // sessionParams are the startup parameters a pooled session may set. The
 // broker applies each client's values to whichever server connection it is
 // given, so they never leak from one client to the next.
-var sessionParams = []string{"DateStyle", "TimeZone", "extra_float_digits", "search_path", "standard_conforming_strings", "statement_timeout"}
+var sessionParams = []string{"DateStyle", "TimeZone", "client_encoding", "extra_float_digits", "search_path", "standard_conforming_strings", "statement_timeout"}
+
+// validSessionParam accepts the values drivers send by default. client_encoding
+// is any encoding name (libpq sends the locale's, such as SQL_ASCII under the C
+// locale); the server rejects a name it does not support. The rest use the
+// same bounds as unpooled sessions.
+func validSessionParam(name, value string) bool {
+	if name != "client_encoding" {
+		return validStartupValue(name, value)
+	}
+	if value == "" || len(value) > 32 {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		if c := value[i]; !(c == '_' || c == '-' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9') {
+			return false
+		}
+	}
+	return true
+}
 
 var errRebind = errors.New("server connection released; bind again")
 
@@ -89,20 +108,16 @@ func serverStatementName(query string, types []uint32) string {
 // client leaves, the session is terminated, or the pool fails it.
 func (b *Broker) servePooled(ctx context.Context, conn net.Conn, backend *pgproto3.Backend, scope AgentScope, svc *DatabaseService, token, hint, requested string,
 	startupParams map[string]string, event auditchain.Event) {
-	key := poolKey{pool: scope.Pool, binding: databaseBinding(scope.VaultID, svc)}
+	key := poolKey{pool: scope.Pool, binding: databaseBinding(scope.VaultID, svc), mount: svc.Mount, role: svc.Role, addr: svc.Addr, database: svc.Database}
 	if key.pool == "" {
 		key.pool = "actor:" + scope.ActorID
 	}
 	s := &pooledSession{b: b, key: key, vaultID: scope.VaultID, svc: *svc, client: conn, backend: backend, event: event,
 		params: map[string]string{}, txStatus: 'I', statements: map[string]clientStatement{}}
 	for _, name := range sessionParams {
-		if value, ok := startupParams[name]; ok && validStartupValue(name, value) {
+		if value, ok := startupParams[name]; ok && validSessionParam(name, value) {
 			s.params[name] = value
 		}
-	}
-	if encoding, ok := startupParams["client_encoding"]; ok && encoding != "UTF8" && encoding != "utf8" && encoding != "UNICODE" {
-		writeClientError(backend, "0A000", "Agent Vault: pooled connections support only UTF8")
-		return
 	}
 	unregister, clientKey, err := b.registerPooledCancel(s)
 	if err != nil {
@@ -335,14 +350,21 @@ func (s *pooledSession) syncParams(conn *serverConn) error {
 	_ = conn.sess.conn.SetReadDeadline(time.Now().Add(s.b.opts.HandshakeTimeout))
 	defer func() { _ = conn.sess.conn.SetReadDeadline(time.Time{}) }()
 	failed := false
+	var normalized []string // set_config returns each value as the server stores it
 	for done := false; !done; {
 		msg, err := f.Receive()
 		if err != nil {
 			return err
 		}
-		switch msg.(type) {
+		switch m := msg.(type) {
 		case *pgproto3.ErrorResponse:
 			failed = true
+		case *pgproto3.DataRow:
+			if len(m.Values) == 1 {
+				normalized = append(normalized, string(m.Values[0]))
+			}
+		case *pgproto3.ParameterStatus:
+			conn.reported[m.Name] = m.Value // the broker's own change
 		case *pgproto3.ReadyForQuery:
 			done = true
 		}
@@ -350,11 +372,16 @@ func (s *pooledSession) syncParams(conn *serverConn) error {
 	if failed {
 		return &refusalError{fmt.Errorf("session parameters rejected by the database")}
 	}
+	if len(normalized) != len(set) {
+		return &refusalError{fmt.Errorf("session parameters not confirmed by the database")}
+	}
 	for _, name := range reset {
 		delete(conn.params, name)
+		delete(conn.actual, name)
 	}
-	for _, kv := range set {
+	for i, kv := range set {
 		conn.params[kv[0]] = kv[1]
+		conn.actual[kv[0]] = normalized[i]
 	}
 	return nil
 }
@@ -511,6 +538,8 @@ func (s *pooledSession) readServer(conn *serverConn, done chan struct{}) {
 			}
 			s.swallow = kept
 			clear(conn.prepared)
+		case *pgproto3.ParameterStatus:
+			conn.seen[m.Name] = m.Value
 		case *pgproto3.DataRow:
 			s.dataRows++
 			flush = s.dataRows%64 == 0
@@ -541,7 +570,7 @@ func (s *pooledSession) readServer(conn *serverConn, done chan struct{}) {
 		}
 		if release {
 			conn.frontend = pgproto3.NewFrontend(conn.sess.conn, conn.sess.conn)
-			s.b.pools.release(conn, true)
+			s.b.pools.release(conn, s.verifyClean(conn))
 			return
 		}
 	}
@@ -586,10 +615,104 @@ func (s *pooledSession) end() {
 	<-done
 	_ = conn.sess.conn.SetReadDeadline(time.Time{})
 	conn.frontend = pgproto3.NewFrontend(conn.sess.conn, conn.sess.conn)
-	if reusable && pinned {
+	switch {
+	case reusable && pinned:
 		reusable = discardAll(conn, s.b.opts.HandshakeTimeout) == nil
+	case reusable:
+		reusable = s.verifyClean(conn)
 	}
 	s.b.pools.release(conn, reusable)
+}
+
+// leakCheck finds session state on a connection that left transaction mode
+// unnoticed: temporary tables, listened channels, session advisory locks,
+// holdable cursors, or settings changed for the session other than the
+// startup parameters the broker applies itself.
+// The parameters the broker applied must still hold exactly its values; any
+// other setting changed for the session is a leak.
+func leakCheck(conn *serverConn) string {
+	names := make([]string, 0, len(conn.actual))
+	var check strings.Builder
+	check.WriteString("SELECT EXISTS (SELECT 1 FROM pg_class WHERE relnamespace = pg_my_temp_schema())" +
+		" OR EXISTS (SELECT 1 FROM pg_listening_channels())" +
+		" OR EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid())" +
+		" OR EXISTS (SELECT 1 FROM pg_cursors WHERE is_holdable)")
+	for _, name := range sessionParams { // fixed names only, never client text
+		value, ok := conn.actual[name]
+		if !ok {
+			continue
+		}
+		names = append(names, name)
+		check.WriteString(" OR current_setting('" + name + "') IS DISTINCT FROM " + dollarQuote(value))
+	}
+	check.WriteString(" OR EXISTS (SELECT 1 FROM pg_settings WHERE source = 'session' AND name <> ALL ('{" + strings.Join(names, ",") + "}'::text[]))")
+	return check.String()
+}
+
+// verifyClean is the backstop behind needsSession, run at every check-in
+// after the client already has its answer: a connection with state the
+// classifier missed is reset with DISCARD ALL before anyone else gets it, and
+// the catch is audited. It reports whether the connection may be reused.
+func (s *pooledSession) verifyClean(conn *serverConn) bool {
+	// A reported parameter that ends the session differing from where the
+	// broker left it was set for the session. SET LOCAL reverts at commit,
+	// so its final report matches and is not a leak.
+	leaked := false
+	for name, value := range conn.seen {
+		if conn.reported[name] != value {
+			leaked = true
+		}
+	}
+	clear(conn.seen)
+	if !leaked {
+		dirty, err := queryBool(conn, leakCheck(conn), s.b.opts.HandshakeTimeout)
+		if err != nil {
+			return false
+		}
+		leaked = dirty
+	}
+	if !leaked {
+		return true
+	}
+	e := s.event
+	e.Event, e.Outcome = auditchain.EventStateLeak, "reset"
+	_ = s.b.auditRecord(e)
+	s.b.logger.Warn("pgproxy: session state found at check-in; resetting the connection", slog.String("service", s.svc.Name))
+	if discardAll(conn, s.b.opts.HandshakeTimeout) != nil {
+		return false
+	}
+	return true
+}
+
+// queryBool runs a one-row, one-column boolean query on an idle connection.
+func queryBool(conn *serverConn, sql string, timeout time.Duration) (bool, error) {
+	conn.frontend.Send(&pgproto3.Query{String: sql})
+	if err := conn.frontend.Flush(); err != nil {
+		return false, err
+	}
+	_ = conn.sess.conn.SetReadDeadline(time.Now().Add(timeout))
+	defer func() { _ = conn.sess.conn.SetReadDeadline(time.Time{}) }()
+	var value string
+	failed := false
+	for {
+		msg, err := conn.frontend.Receive()
+		if err != nil {
+			return false, err
+		}
+		switch m := msg.(type) {
+		case *pgproto3.DataRow:
+			if len(m.Values) == 1 {
+				value = string(m.Values[0])
+			}
+		case *pgproto3.ErrorResponse:
+			failed = true
+		case *pgproto3.ReadyForQuery:
+			if failed || m.TxStatus != 'I' {
+				return false, errors.New("check query failed")
+			}
+			return value == "t", nil
+		}
+	}
 }
 
 // ping round-trips an empty query, which the server answers without work.
@@ -634,12 +757,16 @@ func discardAll(conn *serverConn, timeout time.Duration) error {
 		switch m := msg.(type) {
 		case *pgproto3.ErrorResponse:
 			failed = true
+		case *pgproto3.ParameterStatus:
+			conn.reported[m.Name] = m.Value
 		case *pgproto3.ReadyForQuery:
 			if failed || m.TxStatus != 'I' {
 				return errors.New("DISCARD ALL failed")
 			}
+			clear(conn.seen)
 			clear(conn.prepared)
 			clear(conn.params)
+			clear(conn.actual)
 			return nil
 		}
 	}
