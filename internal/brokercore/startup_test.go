@@ -43,6 +43,12 @@ func TestStartupValue(t *testing.T) {
 		{"search_path", "public\x00; drop table t", "", false},
 		{"search_path", strings.Repeat("s", 257), "", false},
 		{"standard_conforming_strings", "on", "on", true},
+		{"standard_conforming_strings", "ON", "on", true},
+		// Off, the server reads backslash escapes the broker's lexer does not.
+		{"standard_conforming_strings", "off", "", false},
+		{"standard_conforming_strings", "false", "", false},
+		{"standard_conforming_strings", "0", "", false},
+		{"standard_conforming_strings", "no", "", false},
 		// Fail closed on everything else.
 		{"options", "-c statement_timeout=0", "", false},
 		{"replication", "database", "", false},
@@ -95,7 +101,8 @@ func TestStartupValueAcceptsDriverDefaults(t *testing.T) {
 		t.Fatalf("accepted set changed: %v", StartupParameters)
 	}
 	for _, key := range StartupParameters {
-		if _, ok := StartupValue(key, ""); key != "statement_timeout" && key != "client_encoding" && !ok {
+		fixed := key == "statement_timeout" || key == "client_encoding" || key == "standard_conforming_strings"
+		if _, ok := StartupValue(key, ""); !fixed && !ok {
 			t.Errorf("%s refused an empty value", key)
 		}
 	}

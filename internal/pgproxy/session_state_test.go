@@ -69,3 +69,13 @@ func TestDollarQuoteClosesOnlyAtTheEnd(t *testing.T) {
 		}
 	}
 }
+
+// A function can run PREPARE through dynamic SQL, which the classifier never
+// sees; the check-in query must look for SQL-level prepared statements too.
+// TestRealPostgres_PoolCheckInCatchesStateTheClassifierMissed proves the
+// query against a server.
+func TestLeakCheckLooksForSQLPreparedStatements(t *testing.T) {
+	if q := leakCheck(&serverConn{}); !strings.Contains(q, "pg_prepared_statements WHERE from_sql") {
+		t.Fatalf("leakCheck does not look for SQL prepared statements: %s", q)
+	}
+}

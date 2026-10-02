@@ -560,8 +560,8 @@ func TestRealPostgres_PoolReplacesDeadIdleConnections(t *testing.T) {
 }
 
 // The classifier cannot see inside functions. A function that sets a session
-// setting, creates a temp table or takes a session advisory lock passes as a
-// plain SELECT; the check-in backstop finds the state, resets the connection
+// setting, creates a temp table, takes a session advisory lock or prepares an
+// SQL statement passes as a plain SELECT; the check-in backstop finds the state, resets the connection
 // and audits the catch, so the next client starts clean.
 func TestRealPostgres_PoolCheckInCatchesStateTheClassifierMissed(t *testing.T) {
 	f := newPoolFixture(t, 1, time.Hour, PoolOptions{})
@@ -571,6 +571,7 @@ func TestRealPostgres_PoolCheckInCatchesStateTheClassifierMissed(t *testing.T) {
 	f.env.exec(fmt.Sprintf("CREATE FUNCTION %s.sneaky_path() RETURNS text LANGUAGE sql AS $$ SELECT set_config('search_path', '%s', false) $$", schema, schema))
 	f.env.exec(fmt.Sprintf("CREATE FUNCTION %s.sneaky_temp() RETURNS void LANGUAGE plpgsql AS $$ BEGIN CREATE TEMP TABLE IF NOT EXISTS sneaky (id int); END $$", schema))
 	f.env.exec(fmt.Sprintf("CREATE FUNCTION %s.sneaky_lock() RETURNS void LANGUAGE sql AS $$ SELECT pg_advisory_lock(4242) $$", schema))
+	f.env.exec(fmt.Sprintf("CREATE FUNCTION %s.sneaky_prepare() RETURNS void LANGUAGE plpgsql AS $$ BEGIN EXECUTE 'PREPARE sneaky AS SELECT 1'; END $$", schema))
 	for _, role := range f.env.roles {
 		f.env.exec(fmt.Sprintf("GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA %s TO %s", schema, role))
 	}
@@ -583,7 +584,7 @@ func TestRealPostgres_PoolCheckInCatchesStateTheClassifierMissed(t *testing.T) {
 		}
 		return n
 	}
-	for i, call := range []string{"sneaky_path()", "sneaky_temp()", "sneaky_lock()"} {
+	for i, call := range []string{"sneaky_path()", "sneaky_temp()", "sneaky_lock()", "sneaky_prepare()"} {
 		a := f.connect(t, nil)
 		if _, err := a.Exec(ctx, "SELECT "+schema+"."+call); err != nil {
 			t.Fatalf("%s: %v", call, err)
@@ -591,13 +592,14 @@ func TestRealPostgres_PoolCheckInCatchesStateTheClassifierMissed(t *testing.T) {
 		waitFor(t, 3*time.Second, func() bool { return leaks() == i+1 }, "state leak caught for "+call)
 		b := f.connect(t, nil) // budget 1: the same server connection
 		var path string
-		var temps, locks int
+		var temps, locks, prepared int
 		if err := b.QueryRow(ctx, "SELECT current_setting('search_path'), (SELECT count(*) FROM pg_class WHERE relnamespace = pg_my_temp_schema()),"+
-			" (SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid())").Scan(&path, &temps, &locks); err != nil {
+			" (SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()),"+
+			" (SELECT count(*) FROM pg_prepared_statements WHERE from_sql)").Scan(&path, &temps, &locks, &prepared); err != nil {
 			t.Fatal(err)
 		}
-		if strings.Contains(path, schema) || temps != 0 || locks != 0 {
-			t.Fatalf("after %s the next client saw search_path=%q temps=%d advisory locks=%d", call, path, temps, locks)
+		if strings.Contains(path, schema) || temps != 0 || locks != 0 || prepared != 0 {
+			t.Fatalf("after %s the next client saw search_path=%q temps=%d advisory locks=%d SQL prepared statements=%d", call, path, temps, locks, prepared)
 		}
 	}
 	// SET LOCAL ends with its transaction: not a leak.
@@ -613,7 +615,7 @@ func TestRealPostgres_PoolCheckInCatchesStateTheClassifierMissed(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(200 * time.Millisecond)
-	if leaks() != 3 {
+	if leaks() != 4 {
 		t.Fatalf("SET LOCAL was reported as a leak: %d", leaks())
 	}
 }
