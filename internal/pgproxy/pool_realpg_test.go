@@ -369,6 +369,16 @@ func TestRealPostgres_PoolRefusesBeyondBudgetAndSessionShare(t *testing.T) {
 	if waited := time.Since(started); waited < 250*time.Millisecond || waited > 3*time.Second {
 		t.Fatalf("queue wait %v, want about 300ms", waited)
 	}
+	// Both refusals are audited, so a saturated budget can raise an alert.
+	outcomes := map[string]int{}
+	for _, e := range f.audit.recorded() {
+		if e.Event == auditchain.EventDenied {
+			outcomes[e.Outcome]++
+		}
+	}
+	if outcomes["pinned_share"] != 1 || outcomes["pool_budget"] != 1 {
+		t.Fatalf("refusals audited as %v", outcomes)
+	}
 }
 
 // A client that disconnects inside a transaction never hands its open
