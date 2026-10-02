@@ -73,7 +73,7 @@ func newAPIFixture(t *testing.T) *apiFixture {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		if echo {
-			fmt.Fprintf(w, `{"debug":%q}`, token)
+			fmt.Fprintf(w, `{"debug":%q}`, token) //nolint:gosec // G705: a fake GitHub echoing a synthetic token to test redaction; nothing renders it
 			return
 		}
 		fmt.Fprintf(w, `{"number":12,"received":%d}`, len(body))

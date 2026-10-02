@@ -24,7 +24,7 @@ Only git's three smart-HTTP endpoints are served: `info/refs` with one `service`
 
 ## Tokens
 
-For each request the broker uses a token scoped to exactly one repository, with `metadata: read` plus `contents: read`, or `contents: write` only for a push to a `write` binding. A token GitHub returns with any wider scope is revoked and refused. Tokens are reused until ten minutes before their one-hour expiry. One mint is shared across concurrent requests, and a failed mint is not retried for five seconds. A 401 or 403 from GitHub drops the token, at most once per repository every 30 seconds. The worker sends no `Authorization` header; a request that carries one is refused. Responses that echo the token in any encoding are cut off.
+For each request the broker uses a token scoped to exactly one repository, with `metadata: read` plus `contents: read`, or `contents: write` only for a push to a `write` binding. A token GitHub returns with any wider scope is revoked and refused. Tokens are reused until ten minutes before their one-hour expiry. One mint is shared across concurrent requests, and a failed mint is not retried for five seconds. A 401 or 403 from GitHub drops and revokes the token, at most once per repository every 30 seconds. A catalog change that removes a repository or narrows its access revokes the tokens it no longer grants, and a stopping broker revokes every token it holds. The worker sends no `Authorization` header; a request that carries one is refused. Responses that echo the token in any encoding are cut off.
 
 ## The App key
 

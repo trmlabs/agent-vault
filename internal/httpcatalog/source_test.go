@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -52,6 +53,8 @@ func TestSourceSwapsValidVersionsAndKeepsLastGood(t *testing.T) {
 	var rejected []int
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	var changes atomic.Int32
+	source.OnChange(func(Catalog) { changes.Add(1) })
 	go source.Watch(ctx, 5*time.Millisecond, loader.load, func(version int, err error) {
 		mu.Lock()
 		rejected = append(rejected, version)
@@ -78,6 +81,8 @@ func TestSourceSwapsValidVersionsAndKeepsLastGood(t *testing.T) {
 	if !source.Current().HasHost("api.serpapi.com", 443) || source.Current().HasHost("serpapi.com", 443) {
 		t.Fatal("new catalog not in force")
 	}
+	// Each swapped-in version is announced once; the refused one is not.
+	waitFor(t, "change hook", func() bool { return changes.Load() == 1 })
 	// Vault unreachable: reported, catalog kept.
 	loader.set("", 0, errors.New("sealed"))
 	waitFor(t, "load failure", func() bool { mu.Lock(); defer mu.Unlock(); return len(rejected) > 1 })
@@ -146,6 +151,72 @@ func TestPoolsAndPostgresEntries(t *testing.T) {
 	} {
 		if _, err := Parse([]byte(bad)); err == nil {
 			t.Errorf("%s accepted", name)
+		}
+	}
+}
+
+// Catalog databases are reached with verify-full only: the other modes skip
+// the certificate check, so someone on the path could relay SCRAM. Only a
+// test harness with a TLS-less fixture may allow disable, and never require.
+func TestCatalogDatabasesUseVerifyFull(t *testing.T) {
+	doc := `{"pools":[{"name":"pool-a","namespace":"agents","serviceAccount":"worker"}],"entries":[` + validEntry + `,
+		{"name":"core","kind":"postgres","host":"p.abc.db.postgresbridge.com","pools":["pool-a"],"postgres":{"database":"core","mount":"database","role":"r-readonly","sslmode":"MODE"}}]}`
+	mode := func(m string) error { _, err := Parse([]byte(strings.Replace(doc, "MODE", m, 1))); return err }
+	if err := mode("verify-full"); err != nil {
+		t.Fatalf("verify-full refused: %v", err)
+	}
+	for _, m := range []string{"disable", "allow", "prefer", "require", "verify-ca"} {
+		if mode(m) == nil {
+			t.Errorf("sslmode %s accepted", m)
+		}
+	}
+	PlaintextDatabases.Store(true)
+	t.Cleanup(func() { PlaintextDatabases.Store(false) })
+	if err := mode("disable"); err != nil {
+		t.Fatalf("test harness switch did not allow disable: %v", err)
+	}
+	if mode("require") == nil {
+		t.Fatal("the test harness switch allowed require")
+	}
+}
+
+// A ";" in a prefix would let a granted prefix name a path parameter.
+func TestPathPrefixesRefuseSemicolons(t *testing.T) {
+	bad := strings.Replace(`{"entries":[`+validEntry+`]}`, `"pathPrefixes":["`, `"pathPrefixes":["/v1;x`, 1)
+	if !strings.Contains(bad, "/v1;x") {
+		t.Fatal("test document did not change")
+	}
+	if _, err := Parse([]byte(bad)); err == nil {
+		t.Fatal("prefix with ; accepted")
+	}
+}
+
+// Git grants answer per installation, repository and scope, so cached tokens
+// can follow a catalog change.
+func TestGitGranted(t *testing.T) {
+	doc := `{"entries":[
+		{"name":"git","kind":"git","host":"github.com","pools":["pool-a"],"git":{"appID":7,"installationID":42,"repos":[{"repo":"trmlabs/a","access":"write"},{"repo":"trmlabs/b","access":"read"}]}},
+		{"name":"api","kind":"github-api","host":"api.github.com","pools":["pool-a"],"git":{"appID":7,"installationID":42,"repos":[{"repo":"trmlabs/a","access":"write"}]}}]}`
+	c, err := Parse([]byte(doc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		installation int64
+		repo, scope  string
+		want         bool
+	}{
+		{42, "trmlabs/a", "contents-write", true},
+		{42, "TrmLabs/A", "contents-read", true},
+		{42, "trmlabs/b", "contents-read", true},
+		{42, "trmlabs/b", "contents-write", false},
+		{42, "trmlabs/a", "pull-requests", true},
+		{42, "trmlabs/b", "pull-requests", false},
+		{43, "trmlabs/a", "contents-read", false},
+		{42, "trmlabs/c", "contents-read", false},
+	} {
+		if got := c.GitGranted(tc.installation, tc.repo, tc.scope); got != tc.want {
+			t.Errorf("GitGranted(%d, %s, %s) = %v, want %v", tc.installation, tc.repo, tc.scope, got, tc.want)
 		}
 	}
 }

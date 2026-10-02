@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/http/cgi"
+	"net/http/cgi" //nolint:gosec // G504: runs git http-backend as the test's fake GitHub; Httpoxy affects only Go before 1.6.3
 	"net/http/httptest"
 	"net/url"
 	"os"

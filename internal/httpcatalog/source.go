@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -18,6 +19,17 @@ import (
 type Source struct {
 	current atomic.Pointer[Catalog]
 	version atomic.Int64
+
+	mu       sync.Mutex
+	onChange []func(Catalog)
+}
+
+// OnChange runs f after each new catalog version is swapped in, so state
+// derived from an older version (cached tokens) can follow it.
+func (s *Source) OnChange(f func(Catalog)) {
+	s.mu.Lock()
+	s.onChange = append(s.onChange, f)
+	s.mu.Unlock()
 }
 
 // NewSource starts from a validated catalog at a version (0 for a file).
@@ -79,6 +91,12 @@ func (s *Source) Watch(ctx context.Context, interval time.Duration, load Loader,
 		}
 		s.current.Store(&c)
 		s.version.Store(int64(version))
+		s.mu.Lock()
+		hooks := append([](func(Catalog)){}, s.onChange...)
+		s.mu.Unlock()
+		for _, f := range hooks {
+			f(c)
+		}
 	}
 }
 

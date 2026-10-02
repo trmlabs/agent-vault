@@ -133,7 +133,7 @@ func newAdapterFixture(t *testing.T, options ...func(*Options)) *adapterFixture 
 		case "/v1/chat/completions":
 			body, _ := io.ReadAll(r.Body)
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintf(w, `{"method":%q,"bytes":%d}`, r.Method, len(body))
+			fmt.Fprintf(w, `{"method":%q,"bytes":%d}`, r.Method, len(body)) //nolint:gosec // G705: a test upstream echoing JSON to the test client; nothing renders it
 		case "/v1/stream":
 			w.Header().Set("Content-Type", "text/event-stream")
 			fmt.Fprint(w, "data: first\n\n")
@@ -255,7 +255,11 @@ func TestAdapterRefusesOutsideTheCatalog(t *testing.T) {
 	}
 	// An unlisted host is refused before the tunnel opens.
 	r, _ := http.NewRequest("GET", "https://other.example.net:"+strconv.Itoa(f.port)+"/v1/chat", nil)
-	if _, err := f.client.Do(r); err == nil || f.audit.last().Outcome != "unlisted" || f.calls.Load() != 0 {
+	resp, err := f.client.Do(r)
+	if err == nil {
+		_ = resp.Body.Close()
+	}
+	if err == nil || f.audit.last().Outcome != "unlisted" || f.calls.Load() != 0 {
 		t.Fatalf("unlisted host tunnelled: %v %+v", err, f.audit.last())
 	}
 	// A pool without the grant matches the route but is refused.
@@ -394,5 +398,23 @@ func TestAdapterRefusesAScopeWithoutAPool(t *testing.T) {
 	f.sessions.set(&brokercore.ProxyScope{VaultID: "vault-1", AgentID: "agent-uuid-1", WorkloadID: "pod-uid-1"})
 	if code, _, _ := f.do(t, "POST", "/v1/chat/completions", "{}", nil); code != 403 || f.audit.last().Outcome != "pool" || f.calls.Load() != 0 {
 		t.Fatalf("pool-less scope admitted: %d %+v", code, f.audit.last())
+	}
+}
+
+// Paths some backends normalise differently are refused before the prefix
+// match: path parameters and segments that begin with "..".
+func TestUnsafePathRefusesTraversalForms(t *testing.T) {
+	for path, unsafe := range map[string]bool{
+		"/v1/allowed/..;/admin": true,
+		"/v1/allowed;x=1":       true,
+		"/v1/allowed/..x":       true,
+		"/v1/allowed/../admin":  true,
+		"/v1/allowed/./x":       true,
+		"/v1/allowed/a..b":      false,
+		"/v1/allowed/x.json":    false,
+	} {
+		if got := unsafePath(path); got != unsafe {
+			t.Errorf("unsafePath(%q) = %v, want %v", path, got, unsafe)
+		}
 	}
 }

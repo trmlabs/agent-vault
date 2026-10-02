@@ -173,7 +173,46 @@ func (m *Minter) Invalidate(app App, repo string, permissions Permissions) {
 		return
 	}
 	m.invalidated[key] = m.now()
+	if t, ok := m.cache[key]; ok {
+		// GitHub rejected it; revoke it anyway so no copy outlives its use.
+		go m.revoke(m.api(), m.client(), t.value)
+	}
 	delete(m.cache, key)
+}
+
+// Prune revokes and drops every cached token keep no longer allows, after a
+// catalog change removes or narrows a repository's grant.
+func (m *Minter) Prune(keep func(installation int64, repo string, p Permissions) bool) {
+	m.mu.Lock()
+	var gone []string
+	for key, t := range m.cache {
+		if !keep(key.installation, key.repo, key.permissions) {
+			gone = append(gone, t.value)
+			delete(m.cache, key)
+		}
+	}
+	m.mu.Unlock()
+	for _, value := range gone {
+		m.revoke(m.api(), m.client(), value)
+	}
+}
+
+// RevokeAll revokes and drops every cached token, for shutdown and drain:
+// a token GitHub still honours for up to an hour must not outlive the broker.
+func (m *Minter) RevokeAll() { m.Prune(func(int64, string, Permissions) bool { return false }) }
+
+func (m *Minter) api() string {
+	if api := strings.TrimSuffix(m.API, "/"); api != "" {
+		return api
+	}
+	return "https://api.github.com"
+}
+
+func (m *Minter) client() *http.Client {
+	if m.Client != nil {
+		return m.Client
+	}
+	return &http.Client{Timeout: 15 * time.Second}
 }
 
 func (m *Minter) jwt(ctx context.Context, appID int64) (string, error) {
@@ -201,10 +240,7 @@ func (m *Minter) mint(ctx context.Context, app App, key tokenKey) (Token, error)
 	}
 	requested := key.permissions.request()
 	body, _ := json.Marshal(map[string]any{"repositories": []string{name}, "permissions": requested})
-	api := strings.TrimSuffix(m.API, "/")
-	if api == "" {
-		api = "https://api.github.com"
-	}
+	api := m.api()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, api+"/app/installations/"+strconv.FormatInt(app.InstallationID, 10)+"/access_tokens", bytes.NewReader(body))
 	if err != nil {
 		return Token{}, ErrUnavailable
@@ -213,10 +249,7 @@ func (m *Minter) mint(ctx context.Context, app App, key tokenKey) (Token, error)
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 	req.Header.Set("Content-Type", "application/json")
-	client := m.Client
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
-	}
+	client := m.client()
 	resp, err := client.Do(req)
 	if err != nil {
 		return Token{}, ErrUnavailable
@@ -277,7 +310,7 @@ func tokenShape(t string) bool {
 	}
 	for i := 0; i < len(t); i++ {
 		c := t[i]
-		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-') {
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '_' && c != '-' {
 			return false
 		}
 	}
