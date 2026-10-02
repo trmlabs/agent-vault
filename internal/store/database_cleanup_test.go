@@ -174,7 +174,9 @@ func TestCheckDatabaseCleanupOwnerDoesNotExtendClaim(t *testing.T) {
 	}
 }
 
-func TestDatabaseCleanupRecordsActor(t *testing.T) { checkDatabaseCleanupRecordsActor(t, openTestDB(t)) }
+func TestDatabaseCleanupRecordsActor(t *testing.T) {
+	checkDatabaseCleanupRecordsActor(t, openTestDB(t))
+}
 
 func checkDatabaseCleanupRecordsActor(t *testing.T, s *SQLStore) {
 	t.Helper()
