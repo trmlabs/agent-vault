@@ -1,6 +1,7 @@
 package taskrelay
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -10,6 +11,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -115,6 +117,7 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig) {
 	}
 	up, e := dialUpstream(r.ctx, c.Upstream)
 	if e != nil {
+		_, _ = conn.Write(errorFrame("08001", unreachableMessage))
 		return
 	}
 	defer func() { _ = up.Close() }()
@@ -205,7 +208,7 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig) {
 	if _, e = conn.Write(response); e != nil {
 		return
 	}
-	copyTunnel(r.ctx, conn, conn, up, up, expiry)
+	copyPostgres(r.ctx, conn, up, expiry)
 }
 
 // validStartup fixes database and user to the binding and allows only the
@@ -353,16 +356,84 @@ func sqlState(body []byte) string {
 	return ""
 }
 
-// refusalFrame is a relay-authored FATAL error. Broker message text is never
-// forwarded; only a capacity refusal keeps its code and a fixed explanation.
+// refusalMessages are the broker refusals a developer can act on, each with
+// fixed relay-authored text. Broker message text is never forwarded.
+var refusalMessages = map[string]string{
+	"53300": "Gatehouse: too many concurrent database sessions for this worker; close one and retry",
+	"42501": "Gatehouse: this session's person is not authorized for this database",
+	"57P03": "Gatehouse is starting; retry in a few seconds",
+	"3D000": "this database isn't in the Gatehouse catalog for your pool",
+	"28000": "Gatehouse could not verify this worker",
+}
+
+const (
+	sessionEndedMessage = "Gatehouse ended the session (deadline or revocation)"
+	unreachableMessage  = "cannot reach Gatehouse"
+)
+
+// refusalFrame is a relay-authored FATAL error for a broker startup refusal:
+// a known code keeps its code and fixed text; anything else is one generic
+// refusal.
 func refusalFrame(code string) []byte {
-	switch code {
-	case "53300":
-		return errorFrame(code, "Gatehouse: too many concurrent database sessions for this worker; close one and retry")
-	case "42501":
-		return errorFrame(code, "Gatehouse: this session's person is not authorized for this database")
+	if message, ok := refusalMessages[code]; ok {
+		return errorFrame(code, message)
 	}
 	return errorFrame("08004", "Gatehouse: the broker refused this connection")
+}
+
+// copyPostgres relays an established session. Broker frames are relayed
+// whole, so when the broker ends the session (deadline, revocation, a failed
+// recheck) at a frame boundary while the worker is still connected, the
+// worker gets one relay-authored FATAL frame instead of a silent close.
+func copyPostgres(ctx context.Context, client, up net.Conn, deadline time.Time) {
+	_ = client.SetDeadline(deadline)
+	_ = up.SetDeadline(deadline)
+	stop := context.AfterFunc(ctx, func() { _ = client.Close(); _ = up.Close() })
+	defer stop()
+	var clientDone atomic.Bool
+	done := make(chan struct{}, 1)
+	go func() {
+		// Only the worker closing its side ends the session quietly; a
+		// deadline or a broker close ends it with the relay's frame.
+		if _, e := io.Copy(up, client); e == nil {
+			clientDone.Store(true)
+		}
+		_ = up.Close()
+		done <- struct{}{}
+	}()
+	if relayFrames(client, bufio.NewReaderSize(up, 32<<10)) && !clientDone.Load() {
+		_ = client.SetWriteDeadline(time.Now().Add(time.Second))
+		_, _ = client.Write(errorFrame("08006", sessionEndedMessage))
+	}
+	_ = client.Close()
+	_ = up.Close()
+	<-done
+}
+
+// relayFrames copies whole PostgreSQL backend frames from src to dst. It
+// returns true when src ended between frames, the only point where the relay
+// may add a frame of its own.
+func relayFrames(dst io.Writer, src *bufio.Reader) bool {
+	w := bufio.NewWriterSize(dst, 32<<10)
+	var head [5]byte
+	for {
+		if src.Buffered() == 0 && w.Flush() != nil {
+			return false
+		}
+		if n, e := io.ReadFull(src, head[:]); e != nil {
+			return n == 0 && w.Flush() == nil
+		}
+		length := binary.BigEndian.Uint32(head[1:])
+		if length < 4 {
+			return false
+		}
+		if _, e := w.Write(head[:]); e != nil {
+			return false
+		}
+		if _, e := io.CopyN(w, src, int64(length-4)); e != nil {
+			return false
+		}
+	}
 }
 
 // errorFrame builds a FATAL ErrorResponse with relay-authored text only.

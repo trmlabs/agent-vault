@@ -3,7 +3,6 @@ package taskrelay
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"net"
 	"strings"
 	"testing"
@@ -114,11 +113,11 @@ func TestTaskContainerExitClosesEstablishedDatabaseStream(t *testing.T) {
 			f.c.PostgresBindings = []PostgresConfig{binding}
 			f.start(t)
 			client, _ := openBinding(t, f, binding)
-			if _, e := client.Write([]byte{'x'}); e != nil {
+			// The backend echoes; the relay passes whole frames.
+			if _, e := client.Write(encodePGFrame('d', []byte{'x'})); e != nil {
 				t.Fatal(e)
 			}
-			var value [1]byte
-			if _, e := io.ReadFull(client, value[:]); e != nil || value[0] != 'x' {
+			if typ, value, e := readPGFrame(client, 16); e != nil || typ != 'd' || string(value) != "x" {
 				t.Fatal("positive stream control failed")
 			}
 			worker := runningContainer("worker")
@@ -137,7 +136,7 @@ func TestTaskContainerExitClosesEstablishedDatabaseStream(t *testing.T) {
 				t.Fatal("withdrawal returned success")
 			}
 			client.SetReadDeadline(time.Now().Add(time.Second))
-			_, e := client.Read(value[:])
+			_, e := client.Read(make([]byte, 1))
 			if e == nil {
 				t.Fatal("stream remained open")
 			}
