@@ -12,10 +12,10 @@ Not all of this is live yet:
 
 | Part | Status |
 |---|---|
-| Gatehouse support for all six destination kinds | Built, in the agent-vault repository |
+| Gatehouse support for all six destination kinds | Built on agent-vault branches; not merged to main or in a release yet |
 | Adding an entry with one trm-infra pull request | The module is written and in review; it is not merged or connected to Vault yet |
 | Entries limited to named people (tiers T1 and T2) | Refused today. The live Entra group lookup stays off until Security approves its app registration. |
-| Database entries | Open to every worker in the pool (tier T0) only; the database path cannot yet carry a person |
+| Database entries above T0 | The database path carries the person's session, so T1 and T2 databases work once the Entra lookup is on, as for HTTP |
 | Repository and pull request entries | Wait for the GitHub App, which is not created yet |
 
 ## Add a destination with one catalog entry
@@ -24,7 +24,9 @@ Once the trm-infra module is merged, the catalog is `gatehouse-catalog.yaml`,
 read by `vault/terraform/modules/gatehouse-catalog` in trm-infra. You add one
 entry and open one pull request; Atlantis, the Terraform pull request bot,
 creates the Vault access the entry needs, and Gatehouse picks up the change
-within 30 seconds with no restart. Check an entry locally first:
+within 30 seconds with no restart. Check an entry locally first, with an
+`agent-vault` binary built from the Gatehouse branch (the command is not in a
+release yet):
 
 ```sh
 agent-vault broker-catalog validate --require-pools gatehouse-catalog.yaml
@@ -136,7 +138,9 @@ end-to-end test harness's.
 ## Every refusal names its cause
 
 HTTP refusals carry an `X-Request-Id` header. Give it to Security to find the
-exact audit row.
+exact audit row. Database refusals pass through the sidecar, which keeps
+only the codes below and reports every other refusal as 08004, without the
+reason; Security finds it in the audit trail from the pool and the time.
 
 | You see | Usually means | Fix |
 |---|---|---|
@@ -148,9 +152,8 @@ exact audit row.
 | 502 | The service could not be reached, or its response was refused, for example because it echoed the credential | Check the service |
 | 503 | Gatehouse could not get the credential, or its audit trail is down | Retry; tell Security if it persists |
 | Postgres 28P01 | Wrong placeholder password | Use the binding's placeholder |
-| Postgres 28000 | Gatehouse could not verify the worker's identity | Retry; tell Security if it persists |
-| Postgres 3D000 | The binding's database is not in the catalog, not granted to your pool, or above T0 | Add the entry or the grant |
+| Postgres 42501 | The tier check refused this database for this session | Request the group, or use a pool with a person behind it |
 | Postgres 53300 | Too many sessions for this worker, or the database's connection budget is full for now | Close idle sessions, or retry |
-| Postgres 57P03 | That Gatehouse replica is starting or failing over | Retry; another replica answers |
-| Postgres 08006 | No credential, or the database is unreachable | Retry; tell Security if it persists |
-| Postgres 08004 | A database or user other than the binding's, a refused startup setting, or the audit trail is down | Use the binding's database and user, set other settings with `SET`, or retry |
+| Postgres 08004 | Gatehouse refused the connection: a database or user other than the binding's, a refused startup setting, a database not in the catalog or not granted to your pool, a replica still starting, no credential, or the audit trail is down | Check the binding's database, user and startup settings, then retry; tell Security the pool and time if it persists |
+| Postgres 08006 during a session | The database became unreachable | Retry; tell Security if it persists |
+| Connection closed with no error | The sidecar could not reach Gatehouse | Retry; tell Security if it persists |
