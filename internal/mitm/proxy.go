@@ -29,6 +29,7 @@ package mitm
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"log/slog"
 	"net"
 	"net/http"
@@ -182,6 +183,15 @@ func (p *Proxy) ListenAndServe() error {
 // http.ErrServerClosed in that case.
 // Useful for tests that need to bind :0 and learn the resulting port.
 func (p *Proxy) Serve(l net.Listener) error {
+	// A PROXY header names the worker, so it is accepted only on a listener
+	// bound to loopback, where the sole peers are the broker Pod's own
+	// containers (the TLS terminator), never a remote client.
+	if p.peerReader != nil {
+		if addr, ok := l.Addr().(*net.TCPAddr); !ok || !addr.IP.IsLoopback() {
+			_ = l.Close()
+			return errors.New("PROXY header peers require a loopback listener")
+		}
+	}
 	p.isListening.Store(true)
 	defer p.isListening.Store(false)
 	return p.httpServer.Serve(peerListener{Listener: l, reader: p.peerReader})

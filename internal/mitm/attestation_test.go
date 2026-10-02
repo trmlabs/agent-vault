@@ -9,11 +9,14 @@ import (
 	"net/http"
 	"net/netip"
 	"strings"
+	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Infisical/agent-vault/internal/brokercore"
+	"github.com/Infisical/agent-vault/internal/requestlog"
 )
 
 type fakeAttestor struct {
@@ -165,5 +168,83 @@ func TestTunnelEndsAtScopeDeadline(t *testing.T) {
 	}
 	if waited := time.Since(started); waited > 3*time.Second {
 		t.Fatalf("tunnel outlived the deadline by %v", waited)
+	}
+}
+
+// spoofedListener makes every accepted connection report a remote, non-loopback
+// peer, as a client reaching the listener from outside the Pod would.
+type spoofedListener struct{ net.Listener }
+
+type spoofedConn struct{ net.Conn }
+
+func (spoofedConn) RemoteAddr() net.Addr { return &net.TCPAddr{IP: net.ParseIP("10.9.8.7"), Port: 40000} }
+
+func (l spoofedListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return spoofedConn{c}, nil
+}
+
+// A client outside the broker Pod sends a forged PROXY header claiming a
+// worker's address. The header is never parsed, the Attestor is never asked,
+// and the connection is refused. The same bytes from a loopback peer are
+// parsed and attested, so the test can tell the two apart.
+func TestForgedProxyHeaderFromNonLoopbackPeerIsRefused(t *testing.T) {
+	send := func(t *testing.T, spoof bool) (bool, []netip.Addr, string) {
+		attestor := &fakeAttestor{err: errors.New("stop after attestation")}
+		var parsed atomic.Bool
+		reader := func(c net.Conn) (netip.Addr, error) { parsed.Store(true); return readTestProxyV1(c) }
+		p := New("127.0.0.1:0", Options{Logger: slog.New(slog.DiscardHandler), Attestor: attestor, PeerReader: reader,
+			StrictCredentialProxy: true, DurableAudit: &faultAudit{sink: requestlog.NewDurable(nil)},
+			Sessions: &fakeSessionResolver{resolve: func(string, string) (*brokercore.ProxyScope, error) {
+				t.Error("token review consulted")
+				return nil, brokercore.ErrInvalidSession
+			}}})
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var accepted net.Listener = l
+		if spoof {
+			accepted = spoofedListener{l}
+		}
+		go func() { _ = p.httpServer.Serve(peerListener{Listener: accepted, reader: p.peerReader}) }()
+		t.Cleanup(func() { _ = p.httpServer.Close() })
+		c, err := net.Dial("tcp", l.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+		_, _ = io.WriteString(c, "PROXY TCP4 10.20.30.40 10.0.0.1 51000 14443\r\nCONNECT example.com:443 HTTP/1.1\r\n"+
+			"Host: example.com:443\r\nProxy-Authorization: Basic d29ya2xvYWQtdG9rZW46\r\n\r\n")
+		response, _ := io.ReadAll(c)
+		return parsed.Load(), attestor.seen(), string(response)
+	}
+	parsed, attested, response := send(t, true)
+	if parsed || len(attested) != 0 || strings.Contains(response, " 200 ") {
+		t.Fatalf("forged header honored: parsed=%v attested=%v response=%q", parsed, attested, response)
+	}
+	parsed, attested, _ = send(t, false)
+	if !parsed || len(attested) != 1 || attested[0] != netip.MustParseAddr("10.20.30.40") {
+		t.Fatalf("control: loopback header not used: parsed=%v attested=%v", parsed, attested)
+	}
+}
+
+// The broker refuses to serve PROXY-header peers on any listener not bound to
+// loopback, so the header can only ever come from inside the Pod.
+func TestProxyHeaderRequiresLoopbackListener(t *testing.T) {
+	p := New("0.0.0.0:0", Options{Attestor: &fakeAttestor{}, PeerReader: readTestProxyV1})
+	l, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Serve(l); err == nil || !strings.Contains(err.Error(), "loopback") {
+		t.Fatalf("non-loopback listener served PROXY peers: %v", err)
+	}
+	if _, err := l.Accept(); err == nil {
+		t.Fatal("listener left open")
 	}
 }
