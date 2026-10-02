@@ -40,14 +40,16 @@ var (
 	googleScope    = regexp.MustCompile(`^https://www\.googleapis\.com/auth/[a-z0-9._-]+$`)
 	// Storage roles a boundary may carry: object data only, never bucket or IAM administration.
 	storageRoles = map[string]bool{"roles/storage.objectViewer": true, "roles/storage.objectCreator": true, "roles/storage.objectUser": true}
-	// Hosts that mint or manage credentials are never a destination.
-	mintingHosts = map[string]bool{"sts.googleapis.com": true, "iamcredentials.googleapis.com": true, "oauth2.googleapis.com": true,
-		"iam.googleapis.com": true, "accounts.google.com": true, "www.googleapis.com": true}
+	// Data-plane hosts an entry may reach. A minted token, cloud-platform
+	// scope included, never goes to a host that mints credentials or changes
+	// IAM; reaching another service is a code change, not a catalog line.
+	dataPlaneHosts = map[string]bool{"storage.googleapis.com": true, "bigquery.googleapis.com": true, "bigquerystorage.googleapis.com": true}
 )
 
 // gcpForwardHeaders are the request headers Google clients need, besides an
-// entry's ForwardHeaders.
-var gcpForwardHeaders = []string{"Accept", "Content-Type", "User-Agent", "X-Goog-Api-Client", "X-Goog-User-Project",
+// entry's ForwardHeaders. X-Goog-User-Project, which bills another project,
+// passes only when the entry names it in forwardHeaders.
+var gcpForwardHeaders = []string{"Accept", "Content-Type", "User-Agent", "X-Goog-Api-Client",
 	"X-Upload-Content-Type", "X-Upload-Content-Length", "Content-Range", "Range", "If-Match", "If-None-Match"}
 
 func (e *Entry) normalizeGCP() error {
@@ -58,8 +60,8 @@ func (e *Entry) normalizeGCP() error {
 	if g == nil {
 		return errors.New("gcp entries need gcp settings")
 	}
-	if !strings.HasSuffix(e.Host, ".googleapis.com") || mintingHosts[e.Host] {
-		return errors.New("gcp entries reach a googleapis.com service, never one that mints or manages credentials")
+	if !dataPlaneHosts[e.Host] {
+		return errors.New("gcp entries reach a listed Google data-plane host: storage, bigquery or bigquerystorage.googleapis.com")
 	}
 	// Cloud data: never T0, so never granted to a pool without a person behind it.
 	if e.Tier != "T1" && e.Tier != "T2" {

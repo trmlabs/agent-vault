@@ -67,6 +67,8 @@ func TestGCPEntryRejects(t *testing.T) {
 		"granted to the Cursor pool":     sub(gcsEntry, `"pools":["claude"]`, `"pools":["claude","cursor"]`),
 		"tier T0":                        sub(sub(gcsEntry, `"tier":"T1"`, `"tier":"T0"`), `"requires":["`+gcpGroup+`"],`, ``),
 		"minting host":                   sub(bqEntry, `bigquery.googleapis.com`, `iamcredentials.googleapis.com`),
+		"IAM-changing host":              sub(bqEntry, `bigquery.googleapis.com`, `cloudresourcemanager.googleapis.com`),
+		"unlisted Google service":        sub(bqEntry, `bigquery.googleapis.com`, `compute.googleapis.com`),
 		"not Google":                     sub(bqEntry, `bigquery.googleapis.com`, `bigquery.example.com`),
 		"prefix without slash":           sub(gcsEntry, `teams/analytics/`, `teams/analytics`),
 		"prefix breaking CEL":            sub(gcsEntry, `teams/analytics/`, `teams/a')||true||('/`),
@@ -158,5 +160,24 @@ func TestGCPTokensDownscopeAndImpersonate(t *testing.T) {
 	tokens.Invalidate(&entries[1])
 	if _, err := tokens.Token(context.Background(), &entries[1]); !errors.Is(err, ErrGCPToken) {
 		t.Fatalf("refused mint: %v", err)
+	}
+}
+
+// The billing header bills another project, so it passes only on opt-in.
+func TestGCPUserProjectHeaderIsOptIn(t *testing.T) {
+	c, err := Parse([]byte(`{` + gcpPools + `,"entries":[` + bqEntry + `]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := c.Entries()[0]
+	if !e.GCPForwardsHeader("x-goog-api-client") || e.GCPForwardsHeader("X-Goog-User-Project") {
+		t.Fatal("billing header forwarded by default")
+	}
+	opted, err := Parse([]byte(`{` + gcpPools + `,"entries":[` + strings.Replace(bqEntry, `"gcp":`, `"forwardHeaders":["X-Goog-User-Project"],"gcp":`, 1) + `]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e := opted.Entries()[0]; !e.GCPForwardsHeader("x-goog-user-project") {
+		t.Fatal("opted-in billing header refused")
 	}
 }
