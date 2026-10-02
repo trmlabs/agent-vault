@@ -36,8 +36,29 @@ type Entry struct {
 	// ForwardHeaders are extra request headers the vendor needs, such as an
 	// API version. Every other caller header except a fixed safe set is dropped.
 	ForwardHeaders   []string `json:"forwardHeaders,omitempty"`
-	MaxRequestBytes  int64    `json:"maxRequestBytes,omitempty"`  // default 1 MiB
-	MaxResponseBytes int64    `json:"maxResponseBytes,omitempty"` // default 32 MiB
+	MaxRequestBytes  int64    `json:"maxRequestBytes,omitempty"`  // default 1 MiB; git 512 MiB
+	MaxResponseBytes int64    `json:"maxResponseBytes,omitempty"` // default 32 MiB; git 4 GiB
+	// Kind "git" makes the entry a git smart-HTTP binding: paths, methods
+	// and the credential are derived from Git, and the key is a GitHub App
+	// installation token minted per repository instead of a stored key.
+	Kind string      `json:"kind,omitempty"`
+	Git  *GitBinding `json:"git,omitempty"`
+}
+
+// GitBinding names the GitHub App installation that mints tokens and the
+// repositories a pool may reach, each read-only or read-write.
+type GitBinding struct {
+	AppID          int64     `json:"appID"`
+	InstallationID int64     `json:"installationID"`
+	Repos          []GitRepo `json:"repos"`
+}
+
+// GitRepo is one repository. RefPrefixes, when set, restrict which refs a
+// push may create, update or delete (for example refs/heads/cursor/).
+type GitRepo struct {
+	Repo        string   `json:"repo"` // owner/name
+	Access      string   `json:"access"`
+	RefPrefixes []string `json:"refPrefixes,omitempty"`
 }
 
 // KeyRef locates a key in a KV version 2 secret. A new KV version rotates it.
@@ -55,6 +76,9 @@ var (
 	ErrUnlisted  = errors.New("destination not in catalog")
 	ErrMethod    = errors.New("method not allowed for destination")
 	ErrPool      = errors.New("pool not granted destination")
+	ErrReadOnly  = errors.New("repository binding is read-only")
+	repoPattern  = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,38}/[a-z0-9._-]{1,100}$`)
+	refPattern   = regexp.MustCompile(`^refs/[A-Za-z0-9._/-]+$`)
 	placeholder  = regexp.MustCompile(`^__vault_[A-Z][A-Z0-9_]*__$`)
 	hostPattern  = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$`)
 	tokenPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]*$`)
@@ -105,6 +129,7 @@ func Parse(data []byte) (Catalog, error) {
 	}
 	names := map[string]bool{}
 	routes := map[string]string{}
+	kinds := map[string]string{}
 	for i := range file.Entries {
 		e := &file.Entries[i]
 		if err := e.normalize(); err != nil {
@@ -114,6 +139,20 @@ func Parse(data []byte) (Catalog, error) {
 			return Catalog{}, fmt.Errorf("duplicate HTTP catalog entry %q", e.Name)
 		}
 		names[e.Name] = true
+		hostKey := fmt.Sprintf("%s:%d", e.Host, e.Port)
+		if kind, ok := kinds[hostKey]; ok && kind != e.Kind {
+			return Catalog{}, fmt.Errorf("host %s mixes git and header entries", hostKey)
+		}
+		kinds[hostKey] = e.Kind
+		if e.Git != nil {
+			for _, repo := range e.Git.Repos {
+				route := hostKey + " git " + repo.Repo
+				if other, ok := routes[route]; ok {
+					return Catalog{}, fmt.Errorf("HTTP catalog entries %q and %q share repository %s", other, e.Name, repo.Repo)
+				}
+				routes[route] = e.Name
+			}
+		}
 		for _, prefix := range e.PathPrefixes {
 			route := fmt.Sprintf("%s:%d%s", e.Host, e.Port, prefix)
 			if other, ok := routes[route]; ok {
@@ -139,6 +178,16 @@ func (e *Entry) normalize() error {
 	}
 	if e.Port < 1 || e.Port > 65535 {
 		return errors.New("invalid port")
+	}
+	switch e.Kind {
+	case "git":
+		return e.normalizeGit()
+	case "":
+		if e.Git != nil {
+			return errors.New("git settings require kind git")
+		}
+	default:
+		return fmt.Errorf("unknown kind %q", e.Kind)
 	}
 	if len(e.PathPrefixes) == 0 {
 		return errors.New("at least one path prefix is required")
@@ -197,6 +246,115 @@ func (e *Entry) normalize() error {
 	return nil
 }
 
+func (e *Entry) normalizeGit() error {
+	if len(e.PathPrefixes) > 0 || len(e.Methods) > 0 || e.Header != "" || e.Scheme != "" || e.Placeholder != "" || e.Key != (KeyRef{}) || len(e.ForwardHeaders) > 0 {
+		return errors.New("git entries derive paths, methods and credentials; leave them unset")
+	}
+	g := e.Git
+	if g == nil || g.AppID <= 0 || g.InstallationID <= 0 || len(g.Repos) == 0 {
+		return errors.New("git entries need an App ID, an installation ID and repositories")
+	}
+	if len(e.Pools) == 0 {
+		return errors.New("at least one pool is required")
+	}
+	for _, pool := range e.Pools {
+		if !idPattern.MatchString(pool) {
+			return fmt.Errorf("invalid pool %q", pool)
+		}
+	}
+	seen := map[string]bool{}
+	for i := range g.Repos {
+		r := &g.Repos[i]
+		r.Repo = strings.ToLower(r.Repo)
+		if !repoPattern.MatchString(r.Repo) || strings.Contains(r.Repo, "..") || strings.HasSuffix(r.Repo, ".git") || seen[r.Repo] {
+			return fmt.Errorf("invalid or duplicate repository %q", r.Repo)
+		}
+		seen[r.Repo] = true
+		if r.Access != "read" && r.Access != "write" {
+			return fmt.Errorf("repository %s access must be read or write", r.Repo)
+		}
+		if r.Access == "read" && len(r.RefPrefixes) > 0 {
+			return fmt.Errorf("repository %s is read-only; ref prefixes apply to pushes", r.Repo)
+		}
+		for _, prefix := range r.RefPrefixes {
+			if !refPattern.MatchString(prefix) || strings.Contains(prefix, "..") || strings.Contains(prefix, "//") {
+				return fmt.Errorf("invalid ref prefix %q", prefix)
+			}
+		}
+	}
+	if e.MaxRequestBytes == 0 {
+		e.MaxRequestBytes = 512 << 20
+	}
+	if e.MaxResponseBytes == 0 {
+		e.MaxResponseBytes = 4 << 30
+	}
+	if e.MaxRequestBytes < 1 || e.MaxRequestBytes > 2<<30 || e.MaxResponseBytes < 1 || e.MaxResponseBytes > 8<<30 {
+		return errors.New("size limits out of range")
+	}
+	return nil
+}
+
+// GitRequest is a matched git smart-HTTP request.
+type GitRequest struct {
+	Entry *Entry
+	Repo  GitRepo
+	Write bool // receive-pack: the push service
+}
+
+// GitMatch routes a request to a git entry. ok is false when the host has no
+// git entries, so the request belongs to header entries. Only the three
+// smart-HTTP endpoints exist: info/refs with exactly one service parameter,
+// and POST to git-upload-pack or git-receive-pack. A push needs write access.
+func (c Catalog) GitMatch(host string, port int, method, path, rawQuery, pool string) (GitRequest, bool, error) {
+	host = strings.ToLower(host)
+	var hostEntries []*Entry
+	for i := range c.entries {
+		if e := &c.entries[i]; e.Kind == "git" && e.Host == host && e.Port == port {
+			hostEntries = append(hostEntries, e)
+		}
+	}
+	if len(hostEntries) == 0 {
+		return GitRequest{}, false, nil
+	}
+	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	if !strings.HasPrefix(path, "/") || len(parts) < 3 {
+		return GitRequest{}, true, ErrUnlisted
+	}
+	repo := strings.ToLower(parts[0] + "/" + strings.TrimSuffix(parts[1], ".git"))
+	endpoint := strings.Join(parts[2:], "/")
+	var write bool
+	switch {
+	case endpoint == "info/refs" && (rawQuery == "service=git-upload-pack" || rawQuery == "service=git-receive-pack"):
+		if method != "GET" {
+			return GitRequest{}, true, ErrMethod
+		}
+		write = rawQuery == "service=git-receive-pack"
+	case (endpoint == "git-upload-pack" || endpoint == "git-receive-pack") && rawQuery == "":
+		if method != "POST" {
+			return GitRequest{}, true, ErrMethod
+		}
+		write = endpoint == "git-receive-pack"
+	default:
+		return GitRequest{}, true, ErrUnlisted
+	}
+	for _, e := range hostEntries {
+		for _, r := range e.Git.Repos {
+			if r.Repo != repo {
+				continue
+			}
+			matched := GitRequest{Entry: e, Repo: r, Write: write}
+			switch {
+			case !contains(e.Pools, pool):
+				return matched, true, ErrPool
+			case write && r.Access != "write":
+				return matched, true, ErrReadOnly
+			}
+			return matched, true, nil
+		}
+	}
+	return GitRequest{}, true, ErrUnlisted
+}
+
 // Match returns the entry for a request, choosing the longest path prefix
 // that matches on a segment boundary. A host or path outside the catalog is
 // ErrUnlisted; a listed route with another method is ErrMethod; a pool
@@ -207,7 +365,7 @@ func (c Catalog) Match(host string, port int, method, path, pool string) (*Entry
 	bestLen := -1
 	for i := range c.entries {
 		e := &c.entries[i]
-		if e.Host != host || e.Port != port {
+		if e.Kind != "" || e.Host != host || e.Port != port {
 			continue
 		}
 		for _, prefix := range e.PathPrefixes {

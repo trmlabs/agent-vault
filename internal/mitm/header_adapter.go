@@ -13,6 +13,7 @@ import (
 
 	"github.com/Infisical/agent-vault/internal/auditchain"
 	"github.com/Infisical/agent-vault/internal/brokercore"
+	"github.com/Infisical/agent-vault/internal/githubapp"
 	"github.com/Infisical/agent-vault/internal/httpcatalog"
 	"github.com/Infisical/agent-vault/internal/requestlog"
 )
@@ -31,10 +32,24 @@ type HeaderAdapter struct {
 		Admit() error
 		Record(auditchain.Event) error
 	}
+	// GitTokens mints repository-scoped installation tokens for git entries.
+	// Required when the catalog has any.
+	GitTokens interface {
+		Token(ctx context.Context, app githubapp.App, repo string, write bool) (githubapp.Token, error)
+		Invalidate(app githubapp.App, repo string, write bool)
+	}
 }
 
 func (a *HeaderAdapter) valid() bool {
-	return a != nil && len(a.Catalog.Entries()) > 0 && a.Keys != nil && a.Audit != nil
+	if a == nil || len(a.Catalog.Entries()) == 0 || a.Keys == nil || a.Audit == nil {
+		return false
+	}
+	for _, e := range a.Catalog.Entries() {
+		if e.Kind == "git" && a.GitTokens == nil {
+			return false
+		}
+	}
+	return true
 }
 
 const placeholderMarker = "__vault_"
@@ -87,6 +102,10 @@ func (p *Proxy) forwardCatalog(w http.ResponseWriter, r *http.Request, target, h
 	}
 	if !useTLS {
 		deny(http.StatusBadRequest, "plain_http")
+		return
+	}
+	if git, ok, err := a.Catalog.GitMatch(host, port, r.Method, r.URL.Path, r.URL.RawQuery, scope.AgentID); ok {
+		p.forwardGit(w, r, target, scope, event, git, err)
 		return
 	}
 	entry, err := a.Catalog.Match(host, port, r.Method, r.URL.Path, scope.AgentID)
@@ -191,16 +210,31 @@ func (p *Proxy) forwardCatalog(w http.ResponseWriter, r *http.Request, target, h
 		_ = a.Audit.Record(done)
 	}
 	needles := secretRepresentations(map[string]string{"key": secret.Value(), "credential": credential})
+	p.relayScreened(w, out, needles, entry.MaxResponseBytes, finish, func() {
+		// The vendor may have rotated or revoked the key; read the newest next.
+		a.Keys.Invalidate(entry.Key)
+	}, nil)
+}
+
+// relayScreened sends out upstream and streams the response back, refusing
+// compressed or upgraded responses and any that carry a needle. rejected runs
+// on a 401 or 403. tooLarge, when set, reports that the request body was cut
+// off at its limit.
+func (p *Proxy) relayScreened(w http.ResponseWriter, out *http.Request, needles [][]byte, limit int64, finish func(int, string), rejected func(), tooLarge func() bool) {
 	resp, err := p.upstream.RoundTrip(out)
 	if err != nil {
+		if tooLarge != nil && tooLarge() {
+			finish(http.StatusRequestEntityTooLarge, "request_too_large")
+			http.Error(w, http.StatusText(http.StatusRequestEntityTooLarge), http.StatusRequestEntityTooLarge)
+			return
+		}
 		finish(http.StatusBadGateway, "upstream_error")
 		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		// The vendor may have rotated or revoked the key; read the newest next.
-		a.Keys.Invalidate(entry.Key)
+		rejected()
 	}
 	encoding := resp.Header.Get("Content-Encoding")
 	if resp.Header.Get("Upgrade") != "" || (encoding != "" && encoding != "identity") || headersContain(resp.Header, needles) {
@@ -215,7 +249,7 @@ func (p *Proxy) forwardCatalog(w http.ResponseWriter, r *http.Request, target, h
 		w.Header()[name] = append([]string(nil), values...)
 	}
 	w.WriteHeader(resp.StatusCode)
-	outcome := screenedCopy(w, resp.Body, needles, entry.MaxResponseBytes)
+	outcome := screenedCopy(w, resp.Body, needles, limit)
 	finish(resp.StatusCode, outcome)
 	if outcome != "completed" {
 		// The status line is already sent; abort the connection so the worker

@@ -1,0 +1,84 @@
+package httpcatalog
+
+import (
+	"errors"
+	"strings"
+	"testing"
+)
+
+const gitEntry = `{"name":"github","host":"github.com","kind":"git","pools":["pool-a"],
+	"git":{"appID":7,"installationID":42,"repos":[
+		{"repo":"TRMLabs/trm-b2b","access":"write","refPrefixes":["refs/heads/cursor/"]},
+		{"repo":"trmlabs/docs","access":"read"}]}}`
+
+func TestGitEntriesParseAndReject(t *testing.T) {
+	c, err := Parse([]byte(`{"entries":[` + gitEntry + `]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := c.Entries()[0]
+	if e.Git.Repos[0].Repo != "trmlabs/trm-b2b" || e.MaxRequestBytes != 512<<20 || e.MaxResponseBytes != 4<<30 || !c.HasHost("github.com", 443) {
+		t.Fatalf("normalized: %+v", e)
+	}
+	for name, doc := range map[string]string{
+		"header fields":      strings.Replace(gitEntry, `"kind":"git"`, `"kind":"git","header":"Authorization"`, 1),
+		"no app":             strings.Replace(gitEntry, `"appID":7`, `"appID":0`, 1),
+		"bad access":         strings.Replace(gitEntry, `"access":"read"`, `"access":"admin"`, 1),
+		"read with prefixes": strings.Replace(gitEntry, `"access":"read"`, `"access":"read","refPrefixes":["refs/heads/x/"]`, 1),
+		"bad ref prefix":     strings.Replace(gitEntry, `refs/heads/cursor/`, `heads/cursor`, 1),
+		"traversal repo":     strings.Replace(gitEntry, `trmlabs/docs`, `trmlabs/..`, 1),
+		"dot git repo":       strings.Replace(gitEntry, `trmlabs/docs`, `trmlabs/docs.git`, 1),
+		"duplicate repo":     strings.Replace(gitEntry, `trmlabs/docs`, `trmlabs/trm-b2b`, 1),
+		"unknown kind":       strings.Replace(gitEntry, `"kind":"git"`, `"kind":"ssh"`, 1),
+		"git without kind":   strings.Replace(gitEntry, `"kind":"git",`, ``, 1),
+	} {
+		if _, err := Parse([]byte(`{"entries":[` + doc + `]}`)); err == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+	header := strings.Replace(validEntry, `"serpapi.com"`, `"github.com"`, 1)
+	if _, err := Parse([]byte(`{"entries":[` + gitEntry + `,` + header + `]}`)); err == nil {
+		t.Error("git and header entries mixed on one host")
+	}
+	twin := strings.Replace(strings.Replace(gitEntry, `"github"`, `"github-2"`, 1), `trmlabs/docs`, `trmlabs/other`, 1)
+	if _, err := Parse([]byte(`{"entries":[` + gitEntry + `,` + twin + `]}`)); err == nil {
+		t.Error("a repository bound twice")
+	}
+}
+
+func TestGitMatchEndpointsAndAccess(t *testing.T) {
+	c, err := Parse([]byte(`{"entries":[` + gitEntry + `,` + validEntry + `]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		method, path, query, pool, repo string
+		write                           bool
+		err                             error
+	}{
+		{"GET", "/trmlabs/trm-b2b.git/info/refs", "service=git-upload-pack", "pool-a", "trmlabs/trm-b2b", false, nil},
+		{"POST", "/TRMLabs/trm-b2b/git-upload-pack", "", "pool-a", "trmlabs/trm-b2b", false, nil},
+		{"GET", "/trmlabs/trm-b2b.git/info/refs", "service=git-receive-pack", "pool-a", "trmlabs/trm-b2b", true, nil},
+		{"POST", "/trmlabs/trm-b2b.git/git-receive-pack", "", "pool-a", "trmlabs/trm-b2b", true, nil},
+		{"POST", "/trmlabs/docs.git/git-upload-pack", "", "pool-a", "trmlabs/docs", false, nil},
+		{"POST", "/trmlabs/docs.git/git-receive-pack", "", "pool-a", "trmlabs/docs", true, ErrReadOnly},
+		{"GET", "/trmlabs/docs.git/info/refs", "service=git-receive-pack", "pool-a", "trmlabs/docs", true, ErrReadOnly},
+		{"POST", "/trmlabs/trm-b2b.git/git-upload-pack", "", "pool-b", "trmlabs/trm-b2b", false, ErrPool},
+		{"POST", "/trmlabs/secret.git/git-upload-pack", "", "pool-a", "", false, ErrUnlisted},
+		{"GET", "/trmlabs/trm-b2b.git/info/refs", "service=git-upload-pack&x=1", "pool-a", "", false, ErrUnlisted},
+		{"GET", "/trmlabs/trm-b2b.git/info/lfs/objects/batch", "", "pool-a", "", false, ErrUnlisted},
+		{"GET", "/trmlabs/trm-b2b.git/git-upload-pack", "", "pool-a", "", false, ErrMethod},
+		{"GET", "/trmlabs/trm-b2b", "", "pool-a", "", false, ErrUnlisted},
+	} {
+		got, ok, err := c.GitMatch("github.com", 443, tc.method, tc.path, tc.query, tc.pool)
+		if !ok || !errors.Is(err, tc.err) || (tc.repo != "" && (got.Repo.Repo != tc.repo || got.Write != tc.write)) {
+			t.Errorf("%s %s?%s: ok=%v repo=%q write=%v err=%v", tc.method, tc.path, tc.query, ok, got.Repo.Repo, got.Write, err)
+		}
+	}
+	if _, ok, _ := c.GitMatch("serpapi.com", 443, "GET", "/search", "", "pool-a"); ok {
+		t.Fatal("header host routed to git")
+	}
+	if e, err := c.Match("github.com", 443, "POST", "/trmlabs/trm-b2b.git/git-upload-pack", "pool-a"); e != nil || !errors.Is(err, ErrUnlisted) {
+		t.Fatal("git entry matched as a header entry")
+	}
+}

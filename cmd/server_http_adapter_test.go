@@ -38,3 +38,9 @@ func TestHTTPHeaderAdapterStartupRefusals(t *testing.T) {
 		t.Fatalf("adapter without Vault: %v", err)
 	}
 }
+
+func TestGitHubAppSignerRequiresAKeyLocation(t *testing.T) {
+	if _, err := githubAppSigner(nil, func(string) string { return "" }); err == nil || !strings.Contains(err.Error(), "GITHUB_APP") {
+		t.Fatalf("git entries without an App key location: %v", err)
+	}
+}
