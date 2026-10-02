@@ -735,7 +735,10 @@ func (s *pooledSession) verifyClean(conn *serverConn) bool {
 		}
 	}
 	clear(conn.seen)
-	if !leaked {
+	// The query runs even when a reported parameter already showed state:
+	// DISCARD ALL would reset that parameter but neither role-level defaults
+	// nor a switched role, so those are checked before any reuse.
+	{
 		state, err := queryValue(conn, leakCheck(conn), s.b.opts.HandshakeTimeout)
 		if err != nil || state != "clean" && state != "state" && state != "role" && state != "switched" {
 			return false
@@ -756,7 +759,7 @@ func (s *pooledSession) verifyClean(conn *serverConn) bool {
 			s.b.pools.retire(conn.cred)
 			return false
 		}
-		leaked = state == "state"
+		leaked = leaked || state == "state"
 	}
 	if !leaked {
 		return true
