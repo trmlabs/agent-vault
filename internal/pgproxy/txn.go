@@ -71,10 +71,12 @@ type pooledSession struct {
 const (
 	maxSessionStatements     = 1000
 	maxSessionStatementBytes = 16 << 20
-	// clientWriteTimeout ends a session whose client stops reading, so a
-	// full socket cannot hold a server connection.
-	clientWriteTimeout = 30 * time.Second
 )
+
+// clientWriteTimeout ends a session whose client stops reading, so a full
+// socket cannot hold a server connection. A variable only so tests can
+// shorten it.
+var clientWriteTimeout = 30 * time.Second
 
 var (
 	errRoleChange     = errors.New("role change on a pooled connection")
@@ -687,10 +689,13 @@ func leakCheck(conn *serverConn) string {
 	var check strings.Builder
 	// DISCARD SEQUENCES drops currval and lastval state, which no catalog
 	// shows; it runs in the same round trip as the check. Role-level defaults
-	// ('role') survive DISCARD ALL and reach every connection on the login;
-	// anything else ('state') is reset with DISCARD ALL.
+	// ('role') survive DISCARD ALL and reach every connection on the login. A
+	// role switched with SET ROLE ('switched') would hand the next client
+	// another role's access, so that connection is closed, never reset and
+	// reused. Anything else ('state') is reset with DISCARD ALL.
 	check.WriteString("DISCARD SEQUENCES; SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_db_role_setting" +
-		" WHERE setrole = (SELECT oid FROM pg_roles WHERE rolname = session_user)) THEN 'role' WHEN" +
+		" WHERE setrole = (SELECT oid FROM pg_roles WHERE rolname = session_user)) THEN 'role'" +
+		" WHEN current_user <> session_user THEN 'switched' WHEN" +
 		" EXISTS (SELECT 1 FROM pg_class WHERE relnamespace = pg_my_temp_schema())" +
 		" OR EXISTS (SELECT 1 FROM pg_type WHERE typnamespace = pg_my_temp_schema())" +
 		" OR EXISTS (SELECT 1 FROM pg_proc WHERE pronamespace = pg_my_temp_schema())" +
@@ -698,8 +703,7 @@ func leakCheck(conn *serverConn) string {
 		" OR EXISTS (SELECT 1 FROM pg_listening_channels())" +
 		" OR EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid())" +
 		" OR EXISTS (SELECT 1 FROM pg_cursors WHERE is_holdable)" +
-		" OR EXISTS (SELECT 1 FROM pg_prepared_statements WHERE from_sql)" +
-		" OR current_user <> session_user")
+		" OR EXISTS (SELECT 1 FROM pg_prepared_statements WHERE from_sql)")
 	for _, name := range sessionParams { // fixed names only, never client text
 		value, ok := conn.actual[name]
 		if !ok {
@@ -728,9 +732,19 @@ func (s *pooledSession) verifyClean(conn *serverConn) bool {
 		}
 	}
 	clear(conn.seen)
-	if !leaked {
+	// The query runs even when a reported parameter already showed state:
+	// DISCARD ALL would reset that parameter but neither role-level defaults
+	// nor a switched role, so those are checked before any reuse.
+	{
 		state, err := queryValue(conn, leakCheck(conn), s.b.opts.HandshakeTimeout)
-		if err != nil || state != "clean" && state != "state" && state != "role" {
+		if err != nil || state != "clean" && state != "state" && state != "role" && state != "switched" {
+			return false
+		}
+		if state == "switched" {
+			e := s.event
+			e.Event, e.Outcome = auditchain.EventStateLeak, "role_switched"
+			_ = s.b.auditRecord(e)
+			s.b.logger.Warn("pgproxy: a switched role found at check-in; closing the connection", slog.String("service", s.svc.Name))
 			return false
 		}
 		if state == "role" {
@@ -742,7 +756,7 @@ func (s *pooledSession) verifyClean(conn *serverConn) bool {
 			s.b.pools.retire(conn.cred)
 			return false
 		}
-		leaked = state == "state"
+		leaked = leaked || state == "state"
 	}
 	if !leaked {
 		return true

@@ -27,6 +27,8 @@ entries:
 `
 
 func TestBrokerCatalogValidate(t *testing.T) {
+	httpcatalog.Environment.Store("staging")
+	t.Cleanup(func() { httpcatalog.Environment.Store("") })
 	var out bytes.Buffer
 	if err := validateBrokerCatalog([]byte(exampleCatalogYAML), []string{".postgresbridge.com", "serpapi.com"}, true, &out); err != nil {
 		t.Fatal(err)

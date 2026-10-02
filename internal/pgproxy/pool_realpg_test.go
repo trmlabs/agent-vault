@@ -833,3 +833,98 @@ func TestRealPostgres_PoolCheckInCatchesTheReviewedLeaks(t *testing.T) {
 	f.env.exec("ALTER ROLE " + f.env.roles[1] + " RESET ALL")
 	_ = user
 }
+
+// A role switched behind a plain SELECT would hand the next client of the
+// connection another role's access. Check-in closes that connection rather
+// than reset it, and the next client is back on the pool login.
+func TestRealPostgres_PoolCheckInClosesASwitchedRole(t *testing.T) {
+	f := newPoolFixture(t, 1, time.Hour, PoolOptions{})
+	ctx := context.Background()
+	suffix := strings.TrimPrefix(f.env.roles[0], "pool_a_")
+	schema := "other_" + suffix
+	other := "pool_other_" + suffix
+	f.env.exec("CREATE ROLE " + other + " NOLOGIN")
+	t.Cleanup(func() { f.env.exec("DROP ROLE IF EXISTS " + other) })
+	for _, role := range f.env.roles {
+		f.env.exec(fmt.Sprintf("GRANT %s TO %s", other, role))
+	}
+	f.env.exec(fmt.Sprintf("CREATE FUNCTION %s.become_other() RETURNS void LANGUAGE plpgsql AS $$ BEGIN EXECUTE 'SET ROLE %s'; END $$", schema, other))
+	for _, role := range f.env.roles {
+		f.env.exec(fmt.Sprintf("GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA %s TO %s", schema, role))
+	}
+	switched := func() int {
+		n := 0
+		for _, e := range f.audit.recorded() {
+			if e.Event == auditchain.EventStateLeak && e.Outcome == "role_switched" {
+				n++
+			}
+		}
+		return n
+	}
+	a := f.connect(t, nil)
+	var pidBefore int
+	if err := a.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&pidBefore); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Exec(ctx, "SELECT "+schema+".become_other()"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 3*time.Second, func() bool { return switched() == 1 }, "switched role caught at check-in")
+	_ = a.Close(ctx)
+	b := f.connect(t, nil) // budget 1: whatever server connection is left
+	var current, session string
+	var pidAfter int
+	if err := b.QueryRow(ctx, "SELECT current_user, session_user, pg_backend_pid()").Scan(&current, &session, &pidAfter); err != nil {
+		t.Fatal(err)
+	}
+	if current != session || current == other {
+		t.Fatalf("next client runs as %q on login %q: the switched role leaked", current, session)
+	}
+	if pidAfter == pidBefore {
+		t.Fatal("the connection with the switched role was reused")
+	}
+}
+
+// A reported parameter changed alongside role-level defaults must not let
+// check-in skip the role check: DISCARD ALL resets the parameter but not the
+// login's defaults, which would then reach every later client.
+func TestRealPostgres_PoolCheckInChecksRolesEvenWhenAParameterChanged(t *testing.T) {
+	f := newPoolFixture(t, 1, time.Hour, PoolOptions{})
+	ctx := context.Background()
+	suffix := strings.TrimPrefix(f.env.roles[0], "pool_a_")
+	schema := "other_" + suffix
+	f.env.exec(fmt.Sprintf("CREATE FUNCTION %s.plant_defaults_quietly() RETURNS void LANGUAGE plpgsql AS $$ BEGIN "+
+		"EXECUTE 'ALTER ROLE CURRENT_USER SET work_mem = ''7MB'''; PERFORM set_config('application_name', 'planted', false); END $$", schema))
+	for _, role := range f.env.roles {
+		f.env.exec(fmt.Sprintf("GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA %s TO %s", schema, role))
+	}
+	t.Cleanup(func() {
+		for _, role := range f.env.roles {
+			f.env.exec("ALTER ROLE " + role + " RESET ALL")
+		}
+	})
+	retired := func() int {
+		n := 0
+		for _, e := range f.audit.recorded() {
+			if e.Event == auditchain.EventStateLeak && e.Outcome == "role_defaults" {
+				n++
+			}
+		}
+		return n
+	}
+	a := f.connect(t, nil)
+	if _, err := a.Exec(ctx, "SELECT "+schema+".plant_defaults_quietly()"); err != nil {
+		t.Fatal(err)
+	}
+	mints, _ := f.minter.counts()
+	waitFor(t, 3*time.Second, func() bool { return retired() == 1 }, "role-level defaults caught despite the changed parameter")
+	_ = a.Close(ctx)
+	b := f.connect(t, nil)
+	var workMem string
+	if err := b.QueryRow(ctx, "SHOW work_mem").Scan(&workMem); err != nil {
+		t.Fatal(err)
+	}
+	if now, _ := f.minter.counts(); now != mints+1 {
+		t.Fatalf("credential with changed role defaults kept in use: %d mints, want %d", now, mints+1)
+	}
+}
