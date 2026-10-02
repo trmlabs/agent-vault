@@ -114,6 +114,9 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	peer, peerErr := peerFromContext(r.Context())
+	// The runner session token, set by the sidecar on CONNECT only; requests
+	// inside the tunnel cannot supply or replace it.
+	session := r.Header.Get(SessionHeader)
 	connectScope, err := p.resolveScope(r.Context(), token, hint, peer, peerErr, false)
 	if err != nil {
 		p.recordAuthFailure(r)
@@ -192,7 +195,8 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 				writeAuthError(w, err)
 				return
 			}
-			p.forwardHandler(target, host, port, scope).ServeHTTP(w, r)
+			r.Header.Del(SessionHeader)
+			p.forwardHandler(target, host, port, scope).ServeHTTP(w, r.WithContext(withSessionToken(r.Context(), session)))
 		}),
 		// ReadHeaderTimeout and ReadTimeout bound the request side
 		// (slow-loris defense). IdleTimeout caps keep-alives between

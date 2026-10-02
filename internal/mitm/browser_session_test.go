@@ -115,7 +115,9 @@ func newBrowserFixture(t *testing.T) *browserFixture {
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
 	addr := srv.Listener.Addr().String()
-	dial := func(ctx context.Context, network, _ string) (net.Conn, error) { return (&net.Dialer{}).DialContext(ctx, network, addr) }
+	dial := func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, addr)
+	}
 	catalog, err := httpcatalog.Parse([]byte(`{"entries":[{"name":"staging-app","kind":"browser-session","host":"api.example.com",
 		"placeholder":"` + browserPlaceholder + `","pools":["database-developers"],"browserSession":{"appHost":"app.example.com",
 		"auth0":{"domain":"auth.example.com","clientID":"spaClient1","audience":"https://api.example.com","realm":"Username-Password-Authentication",
@@ -271,12 +273,12 @@ func TestBrowserRefusals(t *testing.T) {
 		status      int
 		outcome     string
 	}{
-		"own token":           {"GET", "https://api.example.com/v1/cases", func(r *http.Request) { r.Header.Set("Authorization", "Bearer real-looking") }, 400, "credential_header"},
+		"own token":            {"GET", "https://api.example.com/v1/cases", func(r *http.Request) { r.Header.Set("Authorization", "Bearer real-looking") }, 400, "credential_header"},
 		"placeholder in query": {"GET", "https://api.example.com/v1/cases?q=" + browserPlaceholder, bearerPlaceholder, 400, "request_shape"},
-		"websocket":           {"GET", "https://api.example.com/v1/socket", func(r *http.Request) { bearerPlaceholder(r); r.Header.Set("Upgrade", "websocket") }, 400, "request_shape"},
-		"seed by POST":        {"POST", "https://api.example.com" + httpcatalog.BrowserSeedPath, nil, 405, "method"},
-		"credential to app":   {"GET", "https://app.example.com/", bearerPlaceholder, 400, "credential_header"},
-		"post to app":         {"POST", "https://app.example.com/", nil, 405, "method"},
+		"websocket":            {"GET", "https://api.example.com/v1/socket", func(r *http.Request) { bearerPlaceholder(r); r.Header.Set("Upgrade", "websocket") }, 400, "request_shape"},
+		"seed by POST":         {"POST", "https://api.example.com" + httpcatalog.BrowserSeedPath, nil, 405, "method"},
+		"credential to app":    {"GET", "https://app.example.com/", bearerPlaceholder, 400, "credential_header"},
+		"post to app":          {"POST", "https://app.example.com/", nil, 405, "method"},
 	} {
 		calls := f.apiCalls.Load()
 		resp, _ := f.do(t, tc.method, tc.url, tc.mutate)

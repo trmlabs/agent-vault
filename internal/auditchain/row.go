@@ -39,20 +39,28 @@ type Row struct {
 	Seq       uint64 `json:"seq"`
 	Time      string `json:"ts"`
 	Event     string `json:"event"`
-	Pool      string `json:"pool,omitempty"`       // catalog pool name of the worker
-	Agent     string `json:"agent,omitempty"`      // broker agent ID (store UUID)
-	PodUID    string `json:"podUID,omitempty"`     // verified runtime instance
-	Binding   string `json:"binding,omitempty"`    // vault/service
-	Session   string `json:"session,omitempty"`    // broker-generated session ID
-	Outcome   string `json:"outcome,omitempty"`    // fixed code
-	Requester string `json:"requester,omitempty"`  // developer identity, only from a verified source
-	Method    string `json:"method,omitempty"`     // HTTP rows only
-	Status    int    `json:"status,omitempty"`     // HTTP response rows: upstream or broker status
-	Duration  int64  `json:"durationMs,omitempty"` // transaction rows: milliseconds from first message to completion
-	SignedSeq uint64 `json:"signedSeq,omitempty"`  // checkpoint: the chain head it signs
-	SignedMAC string `json:"signedMAC,omitempty"`
-	Signature string `json:"signature,omitempty"` // checkpoint: Transit "vault:vN:..." signature
-	PrevKey   int    `json:"prevKeyVersion,omitempty"`
+	Pool      string `json:"pool,omitempty"`      // catalog pool name of the worker
+	Agent     string `json:"agent,omitempty"`     // broker agent ID (store UUID)
+	PodUID    string `json:"podUID,omitempty"`    // verified runtime instance
+	Binding   string `json:"binding,omitempty"`   // vault/service
+	Session   string `json:"session,omitempty"`   // broker-generated session ID
+	Outcome   string `json:"outcome,omitempty"`   // fixed code
+	Requester string `json:"requester,omitempty"` // developer identity, only from a verified source
+	// Authorization decision fields (see mitm authorize).
+	RequesterKind string `json:"requesterKind,omitempty"` // person, agent, workload or none
+	RequesterOID  string `json:"requesterOID,omitempty"`  // Entra object ID of a person
+	TokenSHA256   string `json:"tokenSHA256,omitempty"`   // runner session token hash; never the token
+	Tier          string `json:"tier,omitempty"`
+	Decision      string `json:"decision,omitempty"`
+	Groups        string `json:"groups,omitempty"` // required groups checked
+	CacheAgeSec   int64  `json:"cacheAgeSec,omitempty"`
+	Method        string `json:"method,omitempty"`     // HTTP rows only
+	Status        int    `json:"status,omitempty"`     // HTTP response rows: upstream or broker status
+	Duration      int64  `json:"durationMs,omitempty"` // transaction rows: milliseconds from first message to completion
+	SignedSeq     uint64 `json:"signedSeq,omitempty"`  // checkpoint: the chain head it signs
+	SignedMAC     string `json:"signedMAC,omitempty"`
+	Signature     string `json:"signature,omitempty"` // checkpoint: Transit "vault:vN:..." signature
+	PrevKey       int    `json:"prevKeyVersion,omitempty"`
 	// chain_start: the previous boot and its last persisted checkpoint row,
 	// so a deleted boot or a truncated tail is detectable.
 	PrevBoot          uint64 `json:"prevBoot,omitempty"`

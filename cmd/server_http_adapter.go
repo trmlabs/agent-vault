@@ -95,6 +95,9 @@ func httpHeaderAdapter(ctx context.Context, srv *server.Server, getenv func(stri
 	}
 	keys := &httpcatalog.Keys{Vault: client.Logical()}
 	adapter := &mitm.HeaderAdapter{Catalog: source, Keys: keys, Audit: chain}
+	if err := attachAuthorization(adapter, getenv); err != nil {
+		return nil, err
+	}
 	// Browser-session test users log in through Auth0 from the broker, over
 	// the same guarded dialer as every other upstream.
 	adapter.BrowserTokens = &httpcatalog.Auth0Tokens{Keys: keys, Client: &http.Client{Timeout: 10 * time.Second,

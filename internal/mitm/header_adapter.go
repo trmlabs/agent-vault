@@ -13,9 +13,11 @@ import (
 
 	"github.com/Infisical/agent-vault/internal/auditchain"
 	"github.com/Infisical/agent-vault/internal/brokercore"
+	"github.com/Infisical/agent-vault/internal/entitlement"
 	"github.com/Infisical/agent-vault/internal/githubapp"
 	"github.com/Infisical/agent-vault/internal/httpcatalog"
 	"github.com/Infisical/agent-vault/internal/requestlog"
+	"github.com/Infisical/agent-vault/internal/runnerid"
 )
 
 // HeaderAdapter replaces the strict profile's per-vault services with an
@@ -26,7 +28,14 @@ type HeaderAdapter struct {
 	// Catalog is read once per request, so a reloaded catalog applies to the
 	// next request; an httpcatalog.Catalog or a live *httpcatalog.Source.
 	Catalog interface{ Current() httpcatalog.Catalog }
-	Keys    interface {
+	// Runner verifies Claude runner session tokens for claude-session pools;
+	// Entitlements answers live group membership. Without them, entries above
+	// T0 are refused on those pools.
+	Runner interface {
+		Verify(context.Context, string) (runnerid.Session, error)
+	}
+	Entitlements *entitlement.Cache
+	Keys         interface {
 		Get(context.Context, httpcatalog.KeyRef) (httpcatalog.Secret, error)
 		Invalidate(httpcatalog.KeyRef)
 	}
@@ -105,21 +114,43 @@ func (p *Proxy) forwardCatalog(w http.ResponseWriter, r *http.Request, target, h
 		return
 	}
 	catalog := a.Catalog.Current()
+	// Every matched entry passes the authorization model before any credential
+	// is fetched: pool ceiling, then the verified requester's entitlements.
+	refused := func(entry *httpcatalog.Entry, err error) bool {
+		if err != nil || entry == nil {
+			return false
+		}
+		if outcome := p.authorize(r.Context(), scope, entry, &event); outcome != "" {
+			event.Binding = entry.Name
+			deny(http.StatusForbidden, outcome)
+			return true
+		}
+		return false
+	}
 	if git, ok, err := catalog.GitMatch(host, port, r.Method, r.URL.Path, r.URL.RawQuery, scope.Pool); ok {
-		p.forwardGit(w, r, target, scope, event, git, err)
+		if !refused(git.Entry, err) {
+			p.forwardGit(w, r, target, scope, event, git, err)
+		}
 		return
 	}
 	if api, ok, err := catalog.GitHubAPIMatch(host, port, r.Method, r.URL.Path, r.URL.RawQuery, scope.Pool); ok {
-		p.forwardGitHubAPI(w, r, target, scope, event, api, err)
+		if !refused(api.Entry, err) {
+			p.forwardGitHubAPI(w, r, target, scope, event, api, err)
+		}
 		return
 	}
 	if browser, ok, err := catalog.BrowserMatch(host, port, r.Method, r.URL.Path, scope.Pool); ok {
-		p.forwardBrowser(w, r, target, scope, event, browser, err)
+		if !refused(browser.Entry, err) {
+			p.forwardBrowser(w, r, target, scope, event, browser, err)
+		}
 		return
 	}
 	entry, err := catalog.Match(host, port, r.Method, r.URL.Path, scope.Pool)
 	if entry != nil {
 		event.Binding = entry.Name
+	}
+	if refused(entry, err) {
+		return
 	}
 	switch {
 	case errors.Is(err, httpcatalog.ErrUnlisted):

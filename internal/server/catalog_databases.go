@@ -33,6 +33,11 @@ func (r catalogDatabaseResolver) ResolveDatabase(_ context.Context, scope pgprox
 	case err != nil:
 		return nil, fmt.Errorf("no database %q in the catalog", requestedDatabase)
 	}
+	// The PostgreSQL path carries no runner session yet, so it cannot prove a
+	// person: entries above T0 are refused here until it does.
+	if entry.Tier != "" && entry.Tier != "T0" {
+		return nil, fmt.Errorf("database %q needs a verified person, which this connection cannot carry", requestedDatabase)
+	}
 	p := entry.Postgres
 	svc := &pgproxy.DatabaseService{Name: entry.Name, Addr: net.JoinHostPort(entry.Host, strconv.Itoa(entry.Port)),
 		Database: p.Database, Mount: p.Mount, Role: p.Role, SSLMode: p.SSLMode, MaxConns: p.MaxConns}
