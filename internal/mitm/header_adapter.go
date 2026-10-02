@@ -40,6 +40,12 @@ type HeaderAdapter struct {
 		Token(ctx context.Context, app githubapp.App, repo string, permissions githubapp.Permissions) (githubapp.Token, error)
 		Invalidate(app githubapp.App, repo string, permissions githubapp.Permissions)
 	}
+	// BrowserTokens logs browser-session test users in. Without it, those
+	// requests are refused.
+	BrowserTokens interface {
+		Token(context.Context, *httpcatalog.Entry) (httpcatalog.BrowserToken, error)
+		Invalidate(*httpcatalog.Entry)
+	}
 }
 
 func (a *HeaderAdapter) valid() bool {
@@ -105,6 +111,10 @@ func (p *Proxy) forwardCatalog(w http.ResponseWriter, r *http.Request, target, h
 	}
 	if api, ok, err := catalog.GitHubAPIMatch(host, port, r.Method, r.URL.Path, r.URL.RawQuery, scope.Pool); ok {
 		p.forwardGitHubAPI(w, r, target, scope, event, api, err)
+		return
+	}
+	if browser, ok, err := catalog.BrowserMatch(host, port, r.Method, r.URL.Path, scope.Pool); ok {
+		p.forwardBrowser(w, r, target, scope, event, browser, err)
 		return
 	}
 	entry, err := catalog.Match(host, port, r.Method, r.URL.Path, scope.Pool)

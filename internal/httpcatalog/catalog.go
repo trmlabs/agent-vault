@@ -42,9 +42,12 @@ type Entry struct {
 	// GitHub REST binding limited to opening pull requests and commenting on
 	// them. Paths, methods and the credential are derived from the kind; the
 	// key is a GitHub App installation token minted per repository.
-	Kind     string           `json:"kind,omitempty"`
-	Git      *GitBinding      `json:"git,omitempty"`
-	Postgres *PostgresBinding `json:"postgres,omitempty"`
+	// Kind "browser-session" lets an agent's own browser use a web app as a
+	// test user; see BrowserSessionBinding.
+	Kind           string                 `json:"kind,omitempty"`
+	Git            *GitBinding            `json:"git,omitempty"`
+	Postgres       *PostgresBinding       `json:"postgres,omitempty"`
+	BrowserSession *BrowserSessionBinding `json:"browserSession,omitempty"`
 }
 
 // GitBinding names the GitHub App installation that mints tokens and the
@@ -182,10 +185,18 @@ func Parse(data []byte) (Catalog, error) {
 			}
 		}
 		hostKey := fmt.Sprintf("%s:%d", e.Host, e.Port)
-		if kind, ok := kinds[hostKey]; ok && kind != e.Kind {
-			return Catalog{}, fmt.Errorf("host %s mixes git and header entries", hostKey)
+		if kind, ok := kinds[hostKey]; ok && (kind != e.Kind || e.Kind == "browser-session") {
+			return Catalog{}, fmt.Errorf("host %s mixes entry kinds or repeats a browser-session host", hostKey)
 		}
 		kinds[hostKey] = e.Kind
+		if e.BrowserSession != nil {
+			// The app host belongs to its entry alone.
+			appKey := fmt.Sprintf("%s:%d", e.BrowserSession.AppHost, e.Port)
+			if _, ok := kinds[appKey]; ok {
+				return Catalog{}, fmt.Errorf("browser app host %s is already in the catalog", appKey)
+			}
+			kinds[appKey] = "browser-session-app"
+		}
 		if e.Git != nil {
 			for _, repo := range e.Git.Repos {
 				route := hostKey + " " + e.Kind + " " + repo.Repo
@@ -248,9 +259,11 @@ func (e *Entry) normalize() error {
 			return errors.New("github-api request limit is at most 16 MiB")
 		}
 		return nil
+	case "browser-session":
+		return e.normalizeBrowser()
 	case "":
-		if e.Git != nil || e.Postgres != nil {
-			return errors.New("git or postgres settings require their kind")
+		if e.Git != nil || e.Postgres != nil || e.BrowserSession != nil {
+			return errors.New("git, postgres or browserSession settings require their kind")
 		}
 	default:
 		return fmt.Errorf("unknown kind %q", e.Kind)
@@ -314,7 +327,7 @@ func (e *Entry) normalize() error {
 
 func (e *Entry) normalizePostgres() error {
 	if len(e.PathPrefixes) > 0 || len(e.Methods) > 0 || e.Header != "" || e.Scheme != "" || e.Placeholder != "" || e.Key != (KeyRef{}) ||
-		len(e.ForwardHeaders) > 0 || e.Git != nil || e.MaxRequestBytes != 0 || e.MaxResponseBytes != 0 {
+		len(e.ForwardHeaders) > 0 || e.Git != nil || e.BrowserSession != nil || e.MaxRequestBytes != 0 || e.MaxResponseBytes != 0 {
 		return errors.New("postgres entries take only host, port, pools and postgres settings")
 	}
 	p := e.Postgres
@@ -383,7 +396,7 @@ func (c Catalog) CheckHosts(suffixes []string) error {
 }
 
 func (e *Entry) normalizeGit() error {
-	if e.Postgres != nil {
+	if e.Postgres != nil || e.BrowserSession != nil {
 		return errors.New("postgres settings require kind postgres")
 	}
 	if len(e.PathPrefixes) > 0 || len(e.Methods) > 0 || e.Header != "" || e.Scheme != "" || e.Placeholder != "" || e.Key != (KeyRef{}) || len(e.ForwardHeaders) > 0 {
@@ -594,6 +607,9 @@ func (c Catalog) HasHost(host string, port int) bool {
 	host = strings.ToLower(host)
 	for _, e := range c.entries {
 		if e.Kind != "postgres" && e.Host == host && e.Port == port {
+			return true
+		}
+		if e.BrowserSession != nil && e.BrowserSession.AppHost == host && e.Port == port {
 			return true
 		}
 	}
