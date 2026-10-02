@@ -138,10 +138,16 @@ func environment() string {
 	return env
 }
 
+// rolesWithoutEnvironment keeps the plain role rule when no environment is
+// set. Only the e2e build (whose Kind fixture role is "readonly") and this
+// package's tests set it; anywhere else an unset environment refuses every
+// database entry, so the role rule cannot be skipped by leaving it out.
+var rolesWithoutEnvironment bool
+
 func validRole(role string) bool {
 	env := environment()
 	if env == "" {
-		return vaultSegment.MatchString(role)
+		return rolesWithoutEnvironment && vaultSegment.MatchString(role)
 	}
 	pattern := `^` + regexp.QuoteMeta(env) + `\.[a-z]+\.[a-z0-9]+\.[a-z0-9-]+-(readonly|readwrite)$`
 	return regexp.MustCompile(pattern).MatchString(role)
@@ -350,6 +356,9 @@ func (e *Entry) normalizePostgres() error {
 		return errors.New("postgres entries take only host, port, pools and postgres settings")
 	}
 	p := e.Postgres
+	if environment() == "" && !rolesWithoutEnvironment {
+		return errors.New("database entries need AGENT_VAULT_CATALOG_ENVIRONMENT (or validate --environment), which names their roles")
+	}
 	if p == nil || !pgName.MatchString(p.Database) || !validRole(p.Role) {
 		return errors.New("postgres entries need a database name and a Vault role")
 	}
