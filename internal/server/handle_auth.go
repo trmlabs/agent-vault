@@ -47,18 +47,18 @@ func (s *Server) generateAndSendVerificationCode(ctx context.Context, email stri
 		return false, fmt.Errorf("failed to create verification: %w", err)
 	}
 
-	// Send verification code via email or log to stderr.
+	// Send the verification code by email only. The code is a credential:
+	// never write it to logs, which are copied to shared log storage.
 	emailSent := false
 	if s.notifier.Enabled() {
 		body := strings.Replace(verificationCodeEmailHTML, "{{CODE}}", html.EscapeString(code), 1)
 		if err := s.notifier.SendHTMLMail([]string{email}, "Agent Vault verification code", body); err != nil {
 			fmt.Fprintf(os.Stderr, "[agent-vault] Failed to send verification email to %s: %v\n", email, err)
-			fmt.Fprintf(os.Stderr, "[agent-vault] Email verification code for %s: %s\n", email, code)
 		} else {
 			emailSent = true
 		}
 	} else {
-		fmt.Fprintf(os.Stderr, "[agent-vault] Email verification code for %s: %s\n", email, code)
+		fmt.Fprintf(os.Stderr, "[agent-vault] Email verification code for %s not delivered: SMTP is not configured\n", email)
 	}
 
 	return emailSent, nil
@@ -397,18 +397,18 @@ func (s *Server) handleForgotPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Send code via email or log to stderr.
+	// Send the reset code by email only. The code resets an account,
+	// including the owner's: never write it to logs.
 	emailSent := false
 	if s.notifier.Enabled() {
 		body := strings.Replace(passwordResetEmailHTML, "{{CODE}}", html.EscapeString(code), 1)
 		if err := s.notifier.SendHTMLMail([]string{req.Email}, "Agent Vault password reset code", body); err != nil {
 			fmt.Fprintf(os.Stderr, "[agent-vault] Failed to send password reset email to %s: %v\n", req.Email, err)
-			fmt.Fprintf(os.Stderr, "[agent-vault] Password reset code for %s: %s\n", req.Email, code)
 		} else {
 			emailSent = true
 		}
 	} else {
-		fmt.Fprintf(os.Stderr, "[agent-vault] Password reset code for %s: %s\n", req.Email, code)
+		fmt.Fprintf(os.Stderr, "[agent-vault] Password reset code for %s not delivered: SMTP is not configured\n", req.Email)
 	}
 
 	uniformResponse(emailSent)

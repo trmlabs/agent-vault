@@ -14,7 +14,7 @@ import (
 // EnableCleanupObserver is startup-only and opt-in. It accepts no owner session
 // or proxy permission as observer authority. A separate loopback-only listener
 // contains no management routes and requires verified, restricted TLS transport.
-func (s *Server) EnableCleanupObserver(authorize runtimestatus.Authorize, port int) error {
+func (s *Server) EnableCleanupObserver(authorize runtimestatus.Authorize, port int, grants ...runtimestatus.Grants) error {
 	if !s.credentialProxy || s.pgBroker == nil {
 		return fmt.Errorf("cleanup observer requires strict database broker")
 	}
@@ -22,7 +22,7 @@ func (s *Server) EnableCleanupObserver(authorize runtimestatus.Authorize, port i
 	if !ok {
 		return fmt.Errorf("cleanup observer requires durable database cleanup")
 	}
-	handler, err := runtimestatus.New(authorize, pgproxy.CleanupSnapshot(s.pgBroker, minter))
+	handler, err := runtimestatus.New(authorize, pgproxy.CleanupSnapshot(s.pgBroker, minter), grants...)
 	if err != nil {
 		return err
 	}

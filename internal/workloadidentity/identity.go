@@ -278,6 +278,40 @@ func (r *Resolver) verifyProof(ctx context.Context, token string) (*Binding, cla
 	return binding, c, nil
 }
 
+// BindingsAuthorized reports whether every configured binding still resolves to
+// an active agent with a proxy, member or admin role on its vault: the same
+// store checks ResolveForProxy applies, without a proof. A revoked grant or a
+// store restored without it reports false. Store errors are returned.
+func (r *Resolver) BindingsAuthorized(ctx context.Context) (bool, error) {
+	if len(r.config.Bindings) == 0 {
+		return false, nil
+	}
+	for _, binding := range r.config.Bindings {
+		a, err := r.store.GetAgentByID(ctx, binding.AgentID)
+		if err != nil {
+			return false, err
+		}
+		if a == nil || a.ID != binding.AgentID || a.Status != "active" || a.RevokedAt != nil {
+			return false, nil
+		}
+		v, err := r.store.GetVaultByID(ctx, binding.VaultID)
+		if err != nil {
+			return false, err
+		}
+		if v == nil || v.ID != binding.VaultID {
+			return false, nil
+		}
+		role, err := r.store.GetVaultRole(ctx, a.ID, v.ID)
+		if err != nil {
+			return false, err
+		}
+		if role != "proxy" && role != "member" && role != "admin" {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 // ResolveForProxy verifies proof for every admission and reauthorization. No
 // local/session-token fallback is allowed when this resolver is configured.
 func (r *Resolver) ResolveForProxy(ctx context.Context, token, vaultHint string) (*brokercore.ProxyScope, error) {
