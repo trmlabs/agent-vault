@@ -73,7 +73,7 @@ func TestAuthorizeModel(t *testing.T) {
 		want              string
 	}{
 		{"Cursor pool, T0", "cursor", "", open, ""},
-		{"Cursor pool, T1 (defense in depth; the catalog never grants it)", "cursor", "alice", gated, "pool_ceiling"},
+		{"Cursor pool, T1 (defense in depth; the catalog never grants it)", "cursor", "", gated, "pool_ceiling"},
 		{"member", "claude", "alice", gated, ""},
 		{"non-member", "claude", "bob", gated, "not_entitled"},
 		{"no session token", "claude", "", gated, "no_person"},
@@ -82,6 +82,7 @@ func TestAuthorizeModel(t *testing.T) {
 		{"agent session, T1", "claude", "slack", gated, "no_person"},
 		{"agent session, T0", "claude", "slack", open, ""},
 		{"token for another runner pool", "claude", "other", gated, "session_pool"},
+		{"a session on a pool that takes none", "cursor", "alice", open, "session_unexpected"},
 	}
 	for _, c := range cases {
 		event := auditchain.Event{}

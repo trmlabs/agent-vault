@@ -26,10 +26,16 @@ type Requester struct {
 
 // Resolve derives the requester for a pool from the session token the sidecar
 // relayed (empty when none). It returns a refusal code when a presented token
-// is invalid or was issued for another runner pool: a bad token is refused
-// even for T0, never silently ignored.
+// is invalid, was issued for another runner pool, or arrives on a pool that
+// takes no session: a bad token is refused even for T0, never silently
+// ignored. A Claude-session pool with no session has no person: T0 only.
 func Resolve(ctx context.Context, pool httpcatalog.Pool, session string, v Verifier) (Requester, string) {
 	who := Requester{Kind: "none"}
+	// Only a Claude-session pool's sidecar relays a session. One arriving on
+	// any other pool is a misconfigured or forged channel, never ignored.
+	if session != "" && pool.Identity != "claude-session" {
+		return who, "session_unexpected"
+	}
 	switch pool.Identity {
 	case "workload":
 		who.Kind = "workload"

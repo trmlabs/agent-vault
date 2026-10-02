@@ -2,6 +2,8 @@ package pgproxy
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
 	"net"
 	"strings"
 	"sync"
@@ -138,3 +140,73 @@ func TestMalformedPreambleIsRefused(t *testing.T) {
 		t.Fatal("a malformed preamble reached the resolver")
 	}
 }
+
+func TestStalledPreambleIsDroppedAtTheStartupDeadline(t *testing.T) {
+	r := &sessionResolver{}
+	lease := newLease()
+	upstream := startFakeUpstream(t, authTrust, lease.Password)
+	r.svc = &DatabaseService{Name: "analytics", Addr: upstream.addr()}
+	_, addr := startBroker(t, Options{Auth: &fakePeerAuth{}, Databases: r, Leases: &fakeMinter{lease: lease},
+		TrustProxyHeader: true, StartupTimeout: 200 * time.Millisecond})
+	conn, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	// A prefix and part of a token, then nothing: no newline ever arrives.
+	if _, err := conn.Write([]byte(header("10.244.0.9") + "GHSESS1 eyJhbGci")); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("broker answered a stalled preamble")
+	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatal("broker held a stalled preamble open past its startup deadline")
+	}
+	if waited := time.Since(start); waited > 2*time.Second {
+		t.Fatalf("closed after %v", waited)
+	}
+	if len(r.calls()) != 0 {
+		t.Fatal("a stalled preamble reached the resolver")
+	}
+}
+
+func TestSessionTokenNeverReachesLogsErrorsOrAudit(t *testing.T) {
+	var logs strings.Builder
+	var mu sync.Mutex
+	r := &sessionResolver{}
+	r.want.Store("another")
+	lease := newLease()
+	upstream := startFakeUpstream(t, authTrust, lease.Password)
+	r.svc = &DatabaseService{Name: "analytics", Addr: upstream.addr()}
+	audit := &recordingAudit{}
+	_, addr := startBroker(t, Options{Auth: &fakePeerAuth{}, Databases: r, Leases: &fakeMinter{lease: lease}, Audit: audit,
+		TrustProxyHeader: true, Logger: slog.New(slog.NewTextHandler(writerFunc(func(p []byte) (int, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			return logs.Write(p)
+		}), &slog.HandlerOptions{Level: slog.LevelDebug}))})
+	_, err := openSession(t, addr, header("10.244.0.9")+"GHSESS1 "+runnerToken+"\n")
+	if err == nil {
+		t.Fatal("refused requester admitted")
+	}
+	_, _ = openSession(t, addr, header("10.244.0.9")+"GHSESS1 "+runnerToken+" trailing\n")
+	time.Sleep(100 * time.Millisecond)
+	mu.Lock()
+	text := logs.String()
+	mu.Unlock()
+	signature := runnerToken[strings.LastIndex(runnerToken, ".")+1:]
+	if strings.Contains(text, signature) || strings.Contains(err.Error(), signature) {
+		t.Fatal("the session token reached a log line or a client error")
+	}
+	for _, e := range audit.recorded() {
+		if strings.Contains(fmt.Sprintf("%+v", e), signature) {
+			t.Fatal("the session token reached the audit trail")
+		}
+	}
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }

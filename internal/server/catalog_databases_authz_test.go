@@ -75,6 +75,7 @@ func TestCatalogDatabaseResolverAppliesTheAuthorizationModel(t *testing.T) {
 		{"T1 token for another runner pool", "claude", "other", "t1db", "session_pool"},
 		{"T2 member", "claude", "carol", "t2db", ""},
 		{"T2 refused to a T1-only person", "claude", "alice", "t2db", "not_entitled"},
+		{"a session on a pool that takes none", "cursor", "alice", "open", "session_unexpected"},
 	}
 	for _, c := range cases {
 		ctx := pgproxy.WithSession(context.Background(), c.token)

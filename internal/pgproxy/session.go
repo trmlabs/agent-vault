@@ -15,8 +15,9 @@ import (
 // fixed header, so a stream without it is read unchanged.
 const sessionPreamble = "GHSESS1 "
 
-// maxSessionBytes bounds the token line before authentication.
-const maxSessionBytes = 16 * 1024
+// maxSessionBytes bounds the token line before authentication. The caller's
+// startup deadline bounds how long it may take to arrive.
+const maxSessionBytes = 8 * 1024
 
 var errSessionPreamble = errors.New("malformed session preamble")
 
@@ -49,7 +50,11 @@ func readSessionPreamble(conn net.Conn) (string, io.Reader, error) {
 	if len(token) == 0 {
 		return "", nil, errSessionPreamble
 	}
-	return string(token), conn, nil
+	// The string copy lives for the session, because every recheck verifies it
+	// again; the read buffer does not.
+	session := string(token)
+	clear(token)
+	return session, conn, nil
 }
 
 func tokenByte(c byte) bool {

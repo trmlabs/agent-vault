@@ -118,7 +118,7 @@ func readSession(c UpstreamConfig) string {
 	if c.SessionFile == "" {
 		return ""
 	}
-	b, e := readBoundedFile(c.SessionFile, 16<<10)
+	b, e := readBoundedFile(c.SessionFile, 8<<10) // the broker reads no more
 	if e != nil {
 		return ""
 	}
