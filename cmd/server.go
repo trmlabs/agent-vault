@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -221,6 +222,14 @@ func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKe
 	default:
 		return fmt.Errorf("AGENT_VAULT_WORKLOAD_ATTESTATION must be unset or tokenreview")
 	}
+	// Pool workers need a real peer address, which behind the in-Pod TLS
+	// terminator only a PROXY header supplies; without it, keep token review.
+	var attestor brokercore.Attestor
+	var peerReader mitm.PeerReader
+	if boolEnvValue("AGENT_VAULT_MITM_PROXY_PROTOCOL") {
+		attestor, _ = sessions.(brokercore.Attestor)
+		peerReader = func(c net.Conn) (netip.Addr, error) { return brokercore.ReadProxyV1(c, c.RemoteAddr()) }
+	}
 	var extraSANs []string
 	if u, err := url.Parse(srv.BaseURL()); err == nil {
 		if h := u.Hostname(); h != "" {
@@ -247,6 +256,8 @@ func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKe
 			DurableAudit:          requestlog.NewDurable(db),
 			HeaderAdapter:         adapter,
 			Sessions:              sessions,
+			Attestor:              attestor,
+			PeerReader:            peerReader,
 			Credentials:           srv.CredentialProvider(),
 			BaseURL:               srv.BaseURL(),
 			Logger:                srv.Logger(),
