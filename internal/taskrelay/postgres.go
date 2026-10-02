@@ -493,17 +493,20 @@ const maxBrokerErrorBytes = 16 << 10
 
 // relayFrames copies whole PostgreSQL backend frames from src to dst. It
 // returns true when src ended between frames, the only point where the relay
-// may add a frame of its own.
+// may add a frame of its own, and the session has not already been told why
+// it ends (a FATAL error was the last thing relayed).
 func relayFrames(dst io.Writer, src *bufio.Reader) bool {
 	w := bufio.NewWriterSize(dst, 32<<10)
 	var head [5]byte
+	told := false
 	for {
 		if src.Buffered() == 0 && w.Flush() != nil {
 			return false
 		}
 		if n, e := io.ReadFull(src, head[:]); e != nil {
-			return n == 0 && w.Flush() == nil
+			return n == 0 && w.Flush() == nil && !told
 		}
+		told = false
 		length := binary.BigEndian.Uint32(head[1:])
 		if length < 4 {
 			return false
@@ -519,6 +522,7 @@ func relayFrames(dst io.Writer, src *bufio.Reader) bool {
 			if errorField(body, brokercore.RefusalReasonField) != "" {
 				frame = brokerRefusal("FATAL", body)
 			}
+			told = errorField(frame[5:], 'S') == "FATAL"
 			if _, e := w.Write(frame); e != nil {
 				return false
 			}
