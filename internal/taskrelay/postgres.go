@@ -401,7 +401,8 @@ func copyPostgres(ctx context.Context, client, up net.Conn, deadline time.Time) 
 		_ = up.Close()
 		done <- struct{}{}
 	}()
-	if relayFrames(client, bufio.NewReaderSize(up, 32<<10)) && !clientDone.Load() {
+	// A relay that is itself stopping (task withdrawn) closes without a frame.
+	if relayFrames(client, bufio.NewReaderSize(up, 32<<10)) && !clientDone.Load() && ctx.Err() == nil {
 		_ = client.SetWriteDeadline(time.Now().Add(time.Second))
 		_, _ = client.Write(errorFrame("08006", sessionEndedMessage))
 	}
