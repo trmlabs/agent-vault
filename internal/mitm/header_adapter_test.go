@@ -94,9 +94,32 @@ type adapterFixture struct {
 	acceptsV string
 	seen     atomic.Value // http.Header of the last vendor request
 	release  chan struct{}
+	sessions *scopeResolver
 }
 
-func newAdapterFixture(t *testing.T) *adapterFixture {
+// scopeResolver lets a test change the admitted scope without touching the
+// running proxy.
+type scopeResolver struct {
+	mu    sync.Mutex
+	scope *brokercore.ProxyScope
+}
+
+func (s *scopeResolver) ResolveForProxy(_ context.Context, token, _ string) (*brokercore.ProxyScope, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if token != "workload-token" {
+		return nil, brokercore.ErrInvalidSession
+	}
+	return s.scope, nil
+}
+
+func (s *scopeResolver) set(scope *brokercore.ProxyScope) {
+	s.mu.Lock()
+	s.scope = scope
+	s.mu.Unlock()
+}
+
+func newAdapterFixture(t *testing.T, options ...func(*Options)) *adapterFixture {
 	t.Helper()
 	f := &adapterFixture{keys: &adapterKeys{value: adapterKeyV1}, audit: &adapterAudit{}, acceptsV: adapterKeyV1, release: make(chan struct{})}
 	f.vendor = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -141,10 +164,13 @@ func newAdapterFixture(t *testing.T) *adapterFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	scope := &brokercore.ProxyScope{VaultID: "vault-1", AgentID: "pool-agent", WorkloadID: "pod-uid-1", VaultRole: "proxy"}
-	proxyURL, roots, p := setupProxy(t, validTokenResolver("workload-token", scope), &fakeCredProvider{}, func(o *Options) {
+	f.sessions = &scopeResolver{scope: &brokercore.ProxyScope{VaultID: "vault-1", AgentID: "pool-agent", WorkloadID: "pod-uid-1", VaultRole: "proxy"}}
+	proxyURL, roots, p := setupProxy(t, f.sessions, &fakeCredProvider{}, func(o *Options) {
 		o.StrictCredentialProxy = true
 		o.HeaderAdapter = &HeaderAdapter{Catalog: catalog, Keys: f.keys, Audit: f.audit}
+		for _, option := range options {
+			option(o)
+		}
 	})
 	f.proxy = p
 	vendorRoots := x509.NewCertPool()
@@ -234,7 +260,7 @@ func TestAdapterRefusesOutsideTheCatalog(t *testing.T) {
 	}
 	// A pool without the grant matches the route but is refused.
 	other := &brokercore.ProxyScope{VaultID: "vault-1", AgentID: "other-pool", WorkloadID: "pod-9"}
-	f.proxy.sessions = validTokenResolver("workload-token", other)
+	f.sessions.set(other)
 	if code, _, _ := f.do(t, "POST", "/v1/chat/completions", "{}", nil); code != 403 || f.audit.last().Outcome != "pool" || f.calls.Load() != 0 {
 		t.Fatalf("ungranted pool: %d %+v", code, f.audit.last())
 	}

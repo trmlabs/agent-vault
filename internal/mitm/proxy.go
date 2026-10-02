@@ -61,6 +61,8 @@ type Proxy struct {
 	durableAudit          requestlog.Durable
 	strictTunnels         chan struct{}
 	adapter               *HeaderAdapter
+	attestor              brokercore.Attestor
+	peerReader            PeerReader
 }
 
 // Options carries the dependencies a Proxy needs. BaseURL is the
@@ -74,15 +76,19 @@ type Options struct {
 	StrictCredentialProxy     bool               // bounded header-placeholder release path
 	DurableAudit              requestlog.Durable // mandatory when strict mode is enabled, unless HeaderAdapter is set
 	HeaderAdapter             *HeaderAdapter     // strict mode only: catalog destinations with signed audit
-	CA                        ca.Provider
-	Sessions                  brokercore.SessionResolver
-	Credentials               brokercore.CredentialProvider
-	BaseURL                   string
-	Logger                    *slog.Logger
-	RateLimit                 *ratelimit.Registry
-	LogSink                   requestlog.Sink // nil → Nop
-	MaxResponseBytes          int64           // 0 = unlimited (default); >0 = cap in bytes
-	MaxRequestBytes           int64           // 0 → DefaultMaxRequestBytes (1 GiB)
+	// Attestor, when set, admits workers by projected token and real peer
+	// address instead of Sessions; Sessions remains the token-review fallback.
+	Attestor         brokercore.Attestor
+	PeerReader       PeerReader // nil: the TCP remote address
+	CA               ca.Provider
+	Sessions         brokercore.SessionResolver
+	Credentials      brokercore.CredentialProvider
+	BaseURL          string
+	Logger           *slog.Logger
+	RateLimit        *ratelimit.Registry
+	LogSink          requestlog.Sink // nil → Nop
+	MaxResponseBytes int64           // 0 = unlimited (default); >0 = cap in bytes
+	MaxRequestBytes  int64           // 0 → DefaultMaxRequestBytes (1 GiB)
 }
 
 // New builds a Proxy bound to addr. The returned Proxy does not begin
@@ -119,6 +125,8 @@ func New(addr string, opts Options) *Proxy {
 		strictCredentialProxy: opts.StrictCredentialProxy,
 		durableAudit:          opts.DurableAudit,
 		adapter:               opts.HeaderAdapter,
+		attestor:              opts.Attestor,
+		peerReader:            opts.PeerReader,
 		strictTunnels:         make(chan struct{}, tunnelLimit),
 		sessions:              opts.Sessions,
 		creds:                 opts.Credentials,
@@ -135,6 +143,7 @@ func New(addr string, opts Options) *Proxy {
 		Addr:              addr,
 		Handler:           http.HandlerFunc(p.dispatch),
 		ReadHeaderTimeout: 10 * time.Second,
+		ConnContext:       withPeerConn,
 	}
 	return p
 }
@@ -175,7 +184,7 @@ func (p *Proxy) ListenAndServe() error {
 func (p *Proxy) Serve(l net.Listener) error {
 	p.isListening.Store(true)
 	defer p.isListening.Store(false)
-	return p.httpServer.Serve(l)
+	return p.httpServer.Serve(peerListener{Listener: l, reader: p.peerReader})
 }
 
 // Shutdown gracefully stops the listener. In-flight CONNECT tunnels are
