@@ -170,12 +170,19 @@ func TestCatalogDatabasesUseVerifyFull(t *testing.T) {
 			t.Errorf("sslmode %s accepted", m)
 		}
 	}
-	PlaintextDatabases.Store(true)
-	t.Cleanup(func() { PlaintextDatabases.Store(false) })
-	if err := mode("disable"); err != nil {
-		t.Fatalf("test harness switch did not allow disable: %v", err)
+	plaintextDatabases.Store(true) // what an e2e build's AllowPlaintextDatabases sets
+	t.Cleanup(func() { plaintextDatabases.Store(false) })
+	if mode("disable") == nil {
+		t.Fatal("the test harness switch allowed plaintext to a public host")
 	}
-	if mode("require") == nil {
+	local := func(m string) error {
+		_, err := Parse([]byte(strings.Replace(strings.Replace(doc, "MODE", m, 1), "p.abc.db.postgresbridge.com", "fixture-db.gatehouse.svc.cluster.local", 1)))
+		return err
+	}
+	if err := local("disable"); err != nil {
+		t.Fatalf("test harness switch did not allow disable to a cluster Service: %v", err)
+	}
+	if local("require") == nil {
 		t.Fatal("the test harness switch allowed require")
 	}
 }
@@ -218,5 +225,78 @@ func TestGitGranted(t *testing.T) {
 		if got := c.GitGranted(tc.installation, tc.repo, tc.scope); got != tc.want {
 			t.Errorf("GitGranted(%d, %s, %s) = %v, want %v", tc.installation, tc.repo, tc.scope, got, tc.want)
 		}
+	}
+}
+
+// The catalog refuses the strings the Terraform module refuses, since they
+// end up in the broker's Vault policy.
+func TestCatalogRefusesPolicyUnsafeStrings(t *testing.T) {
+	keyDoc := func(mount, path string) string {
+		return `{"entries":[{"name":"serpapi","host":"serpapi.com","pathPrefixes":["/search"],"methods":["GET"],"header":"X-Api-Key",
+			"placeholder":"__vault_SERPAPI_KEY__","key":{"mount":"` + mount + `","path":"` + path + `","field":"key"},"pools":["pool-a"]}]}`
+	}
+	if _, err := Parse([]byte(keyDoc("gatehouse", "vendors/serpapi"))); err != nil {
+		t.Fatalf("valid key refused: %v", err)
+	}
+	for name, doc := range map[string]string{
+		"star path":          keyDoc("gatehouse", "*"),
+		"quote-injected":     keyDoc("gatehouse", `vendors/x\" } path \"sys/policies/acl/*`),
+		"dot-dot":            keyDoc("gatehouse", "vendors/../stage/broker-owner"),
+		"outside vendors":    keyDoc("gatehouse", "stage/broker-owner"),
+		"plus mount":         keyDoc("gate+house", "vendors/serpapi"),
+		"upper-case mount":   keyDoc("Gatehouse", "vendors/serpapi"),
+		"long path":          keyDoc("gatehouse", "vendors/"+strings.Repeat("a", 127)),
+		"vendors only":       keyDoc("gatehouse", "vendors"),
+		"upper-case segment": keyDoc("gatehouse", "vendors/SerpApi"),
+	} {
+		if _, err := Parse([]byte(doc)); err == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+}
+
+// With an environment set, roles must be that environment's named roles, and
+// access is write exactly for -readwrite roles.
+func TestCatalogDatabaseRolesAndAccess(t *testing.T) {
+	doc := func(mount, role, access string) string {
+		a := ""
+		if access != "" {
+			a = `,"access":"` + access + `"`
+		}
+		return `{"entries":[{"name":"core","kind":"postgres","host":"p.abc.db.postgresbridge.com","pools":["pool-a"],
+			"postgres":{"database":"core","mount":"` + mount + `","role":"` + role + `"` + a + `}}]}`
+	}
+	Environment.Store("staging")
+	t.Cleanup(func() { Environment.Store("") })
+	for name, tc := range map[string]struct {
+		mount, role, access string
+		ok                  bool
+	}{
+		"readonly default read": {"database", "staging.us.crunchy.core-readonly", "", true},
+		"readwrite with write":  {"database", "staging.us.crunchy.core-readwrite", "write", true},
+		"readwrite as read":     {"database", "staging.us.crunchy.core-readwrite", "", false},
+		"readonly as write":     {"database", "staging.us.crunchy.core-readonly", "write", false},
+		"bad access":            {"database", "staging.us.crunchy.core-readonly", "admin", false},
+		"other environment":     {"database", "prod.us.crunchy.core-readonly", "", false},
+		"no suffix":             {"database", "staging.us.crunchy.core", "", false},
+		"bare role":             {"database", "readonly", "", false},
+		"plus mount":            {"data+base", "staging.us.crunchy.core-readonly", "", false},
+		"nested mount":          {"db/staging", "staging.us.crunchy.core-readonly", "", true},
+	} {
+		c, err := Parse([]byte(doc(tc.mount, tc.role, tc.access)))
+		if (err == nil) != tc.ok {
+			t.Errorf("%s: err=%v, want ok=%v", name, err, tc.ok)
+			continue
+		}
+		if err == nil && tc.access == "" {
+			if e, _ := c.Database("core", "pool-a"); e.Postgres.Access != "read" {
+				t.Errorf("%s: access defaulted to %q, want read", name, e.Postgres.Access)
+			}
+		}
+	}
+	// Without an environment, test roles such as "readonly" still load.
+	Environment.Store("")
+	if _, err := Parse([]byte(doc("database", "readonly", ""))); err != nil {
+		t.Fatalf("plain role refused without an environment: %v", err)
 	}
 }

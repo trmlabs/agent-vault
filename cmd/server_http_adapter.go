@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -33,11 +34,10 @@ func brokerCatalog(ctx context.Context, client *hashicorp.Client, getenv func(st
 	if sharedCatalog.started {
 		return sharedCatalog.source, nil
 	}
-	// Test harnesses whose fixture database serves no TLS only.
-	if v := getenv("AGENT_VAULT_CATALOG_PLAINTEXT_DATABASES"); v == "1" || v == "true" {
-		httpcatalog.PlaintextDatabases.Store(true)
-		logger.Warn("broker catalog: plaintext database entries allowed (AGENT_VAULT_CATALOG_PLAINTEXT_DATABASES); never set this outside a test harness")
+	if err := catalogEnvironment(getenv); err != nil {
+		return nil, err
 	}
+	testPlaintextDatabases(getenv, logger)
 	var source *httpcatalog.Source
 	if location := getenv("AGENT_VAULT_CATALOG_VAULT_PATH"); location != "" {
 		mount, path, ok := strings.Cut(location, "/")
@@ -135,6 +135,19 @@ func gitScope(p githubapp.Permissions) string {
 	}
 }
 
+var transitKeyName = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,126}$`)
+
+// catalogEnvironment applies AGENT_VAULT_CATALOG_ENVIRONMENT, the environment
+// every catalog database role must be named for (such as staging).
+func catalogEnvironment(getenv func(string) string) error {
+	env := getenv("AGENT_VAULT_CATALOG_ENVIRONMENT")
+	if env != "" && !regexp.MustCompile(`^[a-z]+$`).MatchString(env) {
+		return fmt.Errorf("AGENT_VAULT_CATALOG_ENVIRONMENT must be lower-case letters")
+	}
+	httpcatalog.Environment.Store(env)
+	return nil
+}
+
 // githubAppSigner signs App JWTs with the App key imported into Transit, so
 // the key never leaves Vault. AGENT_VAULT_GITHUB_APP_KV_PATH selects the
 // fallback, a PEM on the gatehouse KV mount read into the broker per signature.
@@ -143,6 +156,10 @@ func githubAppSigner(client *hashicorp.Client, getenv func(string) string) (gith
 		mount := getenv("AGENT_VAULT_GITHUB_APP_TRANSIT_MOUNT")
 		if mount == "" {
 			mount = "transit"
+		}
+		// The same shapes the catalog's Terraform module accepts.
+		if !transitKeyName.MatchString(key) || !httpcatalog.ValidMount(mount) {
+			return nil, fmt.Errorf("AGENT_VAULT_GITHUB_APP_TRANSIT_KEY or _MOUNT has an invalid name")
 		}
 		return githubapp.TransitSigner{Vault: client.Logical(), Mount: mount, Key: key}, nil
 	}

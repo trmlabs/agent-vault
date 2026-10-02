@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"slices"
 	"strconv"
 	"time"
@@ -241,6 +242,23 @@ func sslMode(mode string) string {
 //   - require: request TLS, fail if the server declines; encrypt without
 //     verifying the certificate (matching libpq).
 //   - verify-full: as require, but verify the certificate chain and hostname.
+// privatePeer reports whether the connection's remote end is a loopback or
+// private (RFC 1918, IPv6 unique local) address, or not an IP address at all
+// (a local socket). Plaintext never goes to a public address, whatever the
+// sslmode says.
+func privatePeer(conn net.Conn) bool {
+	tcp, ok := conn.RemoteAddr().(*net.TCPAddr)
+	if !ok {
+		return true
+	}
+	addr, ok := netip.AddrFromSlice(tcp.IP)
+	if !ok {
+		return false
+	}
+	addr = addr.Unmap()
+	return addr.IsLoopback() || addr.IsPrivate()
+}
+
 func negotiateUpstreamTLS(ctx context.Context, conn net.Conn, svc *DatabaseService) (net.Conn, bool, error) {
 	switch svc.SSLMode {
 	case "", "disable", "prefer", "require", "verify-full":
@@ -249,6 +267,9 @@ func negotiateUpstreamTLS(ctx context.Context, conn net.Conn, svc *DatabaseServi
 	}
 	mode := sslMode(svc.SSLMode)
 	if mode == "disable" {
+		if !privatePeer(conn) {
+			return nil, false, fmt.Errorf("plaintext refused: the database is not on a private address")
+		}
 		return conn, false, nil
 	}
 	// SSLRequest: 4-byte length (8) + the 80877103 request code.
@@ -265,6 +286,9 @@ func negotiateUpstreamTLS(ctx context.Context, conn net.Conn, svc *DatabaseServi
 	if resp[0] != 'S' {
 		if mode == "require" || mode == "verify-full" {
 			return nil, false, fmt.Errorf("upstream does not support TLS but sslmode=%s requires it", mode)
+		}
+		if !privatePeer(conn) {
+			return nil, false, fmt.Errorf("plaintext refused: the database is not on a private address")
 		}
 		return conn, false, nil // prefer: fall back to plaintext
 	}
