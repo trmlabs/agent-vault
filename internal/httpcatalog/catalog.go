@@ -94,6 +94,9 @@ type PostgresBinding struct {
 	Role     string `json:"role"`
 	SSLMode  string `json:"sslmode,omitempty"`  // default verify-full
 	MaxConns int    `json:"maxConns,omitempty"` // 0: the broker's default budget
+	// Access is "read" (the default) or "write", and must be "write" exactly
+	// when the role is a -readwrite role.
+	Access string `json:"access,omitempty"`
 }
 
 // Current lets a fixed Catalog stand wherever a live, reloading one can.
@@ -117,7 +120,35 @@ var (
 	tokenPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]*$`)
 	idPattern    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 	kvPattern    = regexp.MustCompile(`^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$`)
+	// The same shapes the catalog's Terraform module accepts, since these
+	// strings end up in the broker's Vault policy.
+	vendorKeyPath = regexp.MustCompile(`^vendors(/[a-z0-9][a-z0-9_-]*)+$`)
+	vaultMount    = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*(/[a-z0-9][a-z0-9_-]*)*$`)
 )
+
+// ValidMount reports whether a Vault mount path has the policy-safe shape
+// the catalog and broker settings share: lower-case segments, at most 127
+// characters.
+func ValidMount(mount string) bool { return len(mount) <= 127 && vaultMount.MatchString(mount) }
+
+// Environment, when set (AGENT_VAULT_CATALOG_ENVIRONMENT, such as staging),
+// requires every database role to be that environment's named role:
+// <env>.<region>.<cluster>.<name>-readonly or -readwrite.
+var Environment atomic.Value // string
+
+func environment() string {
+	env, _ := Environment.Load().(string)
+	return env
+}
+
+func validRole(role string) bool {
+	env := environment()
+	if env == "" {
+		return vaultSegment.MatchString(role)
+	}
+	pattern := `^` + regexp.QuoteMeta(env) + `\.[a-z]+\.[a-z0-9]+\.[a-z0-9-]+-(readonly|readwrite)$`
+	return regexp.MustCompile(pattern).MatchString(role)
+}
 
 var allowedMethods = map[string]bool{"GET": true, "HEAD": true, "POST": true, "PUT": true, "PATCH": true, "DELETE": true}
 
@@ -296,8 +327,8 @@ func (e *Entry) normalize() error {
 	if !placeholder.MatchString(e.Placeholder) {
 		return errors.New("placeholder must look like __vault_NAME__")
 	}
-	if !kvPattern.MatchString(e.Key.Mount) || !kvPattern.MatchString(e.Key.Path) || e.Key.Field == "" || strings.Contains(e.Key.Path, "..") {
-		return errors.New("key needs a KV mount, path and field")
+	if !ValidMount(e.Key.Mount) || len(e.Key.Path) > 127 || !vendorKeyPath.MatchString(e.Key.Path) || e.Key.Field == "" {
+		return errors.New("key needs a KV mount, a path under vendors/ and a field")
 	}
 	if len(e.Pools) == 0 {
 		return errors.New("at least one pool is required")
@@ -332,13 +363,21 @@ func (e *Entry) normalizePostgres() error {
 		return errors.New("postgres entries take only host, port, pools and postgres settings")
 	}
 	p := e.Postgres
-	if p == nil || !pgName.MatchString(p.Database) || !vaultSegment.MatchString(p.Role) {
+	if p == nil || !pgName.MatchString(p.Database) || !validRole(p.Role) {
 		return errors.New("postgres entries need a database name and a Vault role")
 	}
-	for _, segment := range strings.Split(p.Mount, "/") {
-		if !vaultSegment.MatchString(segment) {
-			return errors.New("invalid Vault database mount")
-		}
+	if !ValidMount(p.Mount) {
+		return errors.New("invalid Vault database mount")
+	}
+	writes := strings.HasSuffix(p.Role, "-readwrite")
+	switch {
+	case p.Access == "":
+		p.Access = "read"
+	case p.Access != "read" && p.Access != "write":
+		return fmt.Errorf("access %q: read or write", p.Access)
+	}
+	if (p.Access == "write") != writes {
+		return errors.New("access is write exactly when the role is a -readwrite role")
 	}
 	// Modes that skip the certificate check let anyone on the network path
 	// relay SCRAM and hold a session as the minted user.
@@ -346,7 +385,7 @@ func (e *Entry) normalizePostgres() error {
 	case p.SSLMode == "":
 		p.SSLMode = "verify-full"
 	case p.SSLMode == "verify-full":
-	case p.SSLMode == "disable" && PlaintextDatabases.Load():
+	case p.SSLMode == "disable" && PlaintextDatabases.Load() && clusterLocal(e.Host):
 	default:
 		return fmt.Errorf("sslmode %q: catalog databases use verify-full", p.SSLMode)
 	}
@@ -656,6 +695,12 @@ func (c Catalog) GitGranted(installation int64, repo, scope string) bool {
 		}
 	}
 	return false
+}
+
+// clusterLocal reports whether host is a Kubernetes Service name, the only
+// kind of host a plaintext database entry may name.
+func clusterLocal(host string) bool {
+	return strings.HasSuffix(host, ".svc.cluster.local") || strings.HasSuffix(host, ".svc")
 }
 
 // PlaintextDatabases lets a database entry use sslmode disable. Only a test
