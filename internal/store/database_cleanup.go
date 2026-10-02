@@ -16,6 +16,41 @@ import (
 // WorkloadID counts against every instance of the actor.
 type DatabaseCleanup struct{ Accessor, Binding, LeaseID, ActorID, WorkloadID string }
 
+// ErrReplicaNameInUse means another broker process that is still renewing its
+// owner row uses the same replica name. Two processes under one name would
+// share an audit chain and confuse cleanup ownership, so the later one must not
+// run.
+var ErrReplicaNameInUse = errors.New("another live broker process holds this replica name")
+
+// replicaPattern is the LIKE pattern for every owner row of owner's replica,
+// or "" when the owner carries no replica name. Replica names are DNS-style,
+// so they hold no LIKE wildcards.
+func replicaPattern(owner string) string {
+	replica, _, ok := strings.Cut(owner, "/")
+	if !ok || replica == "" {
+		return ""
+	}
+	return replica + "/%"
+}
+
+// replicaNameInUse reports whether another live owner row shares owner's replica name.
+func (s *SQLStore) replicaNameInUse(ctx context.Context, owner string) (bool, error) {
+	pattern := replicaPattern(owner)
+	if pattern == "" {
+		return false, nil
+	}
+	var n int
+	err := s.db.QueryRowContext(ctx, s.dialect.Rebind(`SELECT COUNT(*) FROM database_cleanup_replica
+		WHERE owner LIKE ? AND owner <> ? AND expires_ms > `+s.dbNowMs()), pattern, owner).Scan(&n)
+	return n > 0, err
+}
+
+// noOtherLiveReplicaOwner is a condition (binding pattern, owner) true while
+// no other live owner row shares the replica name.
+func (s *SQLStore) noOtherLiveReplicaOwner() string {
+	return `NOT EXISTS (SELECT 1 FROM database_cleanup_replica other WHERE other.owner LIKE ? AND other.owner <> ? AND other.expires_ms > ` + s.dbNowMs() + `)`
+}
+
 // ErrDatabaseCleanupOwnershipLost means the owner row expired or was released.
 // An expired owner can never renew, so its records belong to the survivors.
 var ErrDatabaseCleanupOwnershipLost = errors.New("database cleanup ownership lost")
@@ -70,18 +105,34 @@ func (s *SQLStore) ClaimDatabaseCleanupOwner(ctx context.Context, owner string, 
 	if owner == "" || ttl <= 0 {
 		return fmt.Errorf("invalid database cleanup owner")
 	}
+	// Owner IDs are replica/boot. A second live boot under one replica name is
+	// refused here, in the same statement that registers the owner.
+	pattern := replicaPattern(owner)
 	result, err := s.databaseCleanupExec(ctx, s.dialect.Rebind(`INSERT INTO database_cleanup_replica (owner, expires_ms)
-		SELECT ?, `+s.dbNowMs()+` + ? WHERE NOT EXISTS (SELECT 1 FROM database_cleanup_replica WHERE owner = ?)`), owner, ttl.Milliseconds(), owner)
-	return affectedOne(result, err, fmt.Errorf("database cleanup owner already registered"))
+		SELECT ?, `+s.dbNowMs()+` + ? WHERE NOT EXISTS (SELECT 1 FROM database_cleanup_replica WHERE owner = ?)
+		AND (CAST(? AS TEXT) = '' OR `+s.noOtherLiveReplicaOwner()+`)`), owner, ttl.Milliseconds(), owner, pattern, pattern, owner)
+	if err = affectedOne(result, err, fmt.Errorf("database cleanup owner already registered")); err != nil {
+		if inUse, checkErr := s.replicaNameInUse(ctx, owner); checkErr == nil && inUse {
+			return ErrReplicaNameInUse
+		}
+	}
+	return err
 }
 
 // RenewDatabaseCleanupOwner extends a live owner. It never revives an expired
 // one: after expiry a survivor may already have claimed the records.
 func (s *SQLStore) RenewDatabaseCleanupOwner(ctx context.Context, owner string, ttl time.Duration) error {
 	now := s.dbNowMs()
+	pattern := replicaPattern(owner)
 	result, err := s.databaseCleanupExec(ctx, s.dialect.Rebind(`UPDATE database_cleanup_replica SET expires_ms = `+now+` + ?
-		WHERE owner = ? AND expires_ms > `+now), ttl.Milliseconds(), owner)
-	return affectedOne(result, err, ErrDatabaseCleanupOwnershipLost)
+		WHERE owner = ? AND expires_ms > `+now+` AND (CAST(? AS TEXT) = '' OR `+s.noOtherLiveReplicaOwner()+`)`), ttl.Milliseconds(), owner, pattern, pattern, owner)
+	if err = affectedOne(result, err, ErrDatabaseCleanupOwnershipLost); errors.Is(err, ErrDatabaseCleanupOwnershipLost) {
+		// Both processes under a duplicated name stop renewing and fence.
+		if inUse, checkErr := s.replicaNameInUse(ctx, owner); checkErr == nil && inUse {
+			return ErrReplicaNameInUse
+		}
+	}
+	return err
 }
 
 // ReleaseDatabaseCleanupOwner ends ownership at once. Records the owner still

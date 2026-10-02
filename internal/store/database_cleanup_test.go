@@ -515,3 +515,53 @@ func checkDatabaseCleanupActorMigration(t *testing.T, open func() (*SQLStore, er
 		}
 	}
 }
+
+// One replica name, two live processes: the second is refused, and if a race
+// ever registered both, neither renews (both fence).
+func TestDatabaseCleanupReplicaNameIsExclusive(t *testing.T) { checkReplicaNameExclusive(t, openTestDB(t)) }
+
+func checkReplicaNameExclusive(t *testing.T, s *SQLStore) {
+	t.Helper()
+	ctx := context.Background()
+	if err := s.ClaimDatabaseCleanupOwner(ctx, "broker-0/aaaa", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimDatabaseCleanupOwner(ctx, "broker-0/bbbb", time.Minute); !errors.Is(err, ErrReplicaNameInUse) {
+		t.Fatalf("second boot under the same name: %v, want ErrReplicaNameInUse", err)
+	}
+	if err := s.ClaimDatabaseCleanupOwner(ctx, "broker-1/cccc", time.Minute); err != nil {
+		t.Fatalf("another replica name refused: %v", err)
+	}
+	// Owners without a replica name are not grouped.
+	if err := s.ClaimDatabaseCleanupOwner(ctx, "dddd", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimDatabaseCleanupOwner(ctx, "eeee", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RenewDatabaseCleanupOwner(ctx, "broker-0/aaaa", time.Minute); err != nil {
+		t.Fatalf("sole holder could not renew: %v", err)
+	}
+	// Simulate a racing claim that slipped past the check.
+	if _, err := s.db.ExecContext(ctx, s.dialect.Rebind(`INSERT INTO database_cleanup_replica (owner, expires_ms) VALUES (?, `+s.dbNowMs()+` + 60000)`), "broker-0/ffff"); err != nil {
+		t.Fatal(err)
+	}
+	for _, owner := range []string{"broker-0/aaaa", "broker-0/ffff"} {
+		if err := s.RenewDatabaseCleanupOwner(ctx, owner, time.Minute); !errors.Is(err, ErrReplicaNameInUse) {
+			t.Fatalf("%s renewed beside a duplicate: %v", owner, err)
+		}
+	}
+	if err := s.RenewDatabaseCleanupOwner(ctx, "broker-1/cccc", time.Minute); err != nil {
+		t.Fatalf("an unrelated replica stopped renewing: %v", err)
+	}
+	// Once the other boot is gone, the name is free again.
+	if err := s.ReleaseDatabaseCleanupOwner(ctx, "broker-0/ffff"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReleaseDatabaseCleanupOwner(ctx, "broker-0/aaaa"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimDatabaseCleanupOwner(ctx, "broker-0/gggg", time.Minute); err != nil {
+		t.Fatalf("name not reusable after release: %v", err)
+	}
+}

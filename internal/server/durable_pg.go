@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 
 	"github.com/Infisical/agent-vault/internal/brokercore"
@@ -21,11 +22,14 @@ func NewDurableVaultLeaseMinter(ctx context.Context, client *hashicorp.Client, s
 	if !ok {
 		return nil, fmt.Errorf("PostgreSQL broker requires durable cleanup storage")
 	}
-	replica := brokercore.ReplicaName(os.Getenv)
+	replica, err := brokercore.FleetReplicaName(os.Getenv)
+	if err != nil {
+		return nil, err
+	}
 	if !brokercore.ValidReplicaName(replica) {
 		return nil, fmt.Errorf("broker replica name must be a DNS-style name (set AGENT_VAULT_REPLICA from the Pod name)")
 	}
-	return pgproxy.NewDurableLeaseMinter(ctx, client, journal, pgproxy.DurableLeaseOptions{Replica: replica})
+	return pgproxy.NewDurableLeaseMinter(ctx, client, journal, pgproxy.DurableLeaseOptions{Replica: replica, Logger: slog.Default()})
 }
 
 // brokerSessionStore is the store surface the fleet-wide session cap needs.

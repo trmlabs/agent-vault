@@ -5,6 +5,8 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,6 +50,8 @@ type DurableLeaseOptions struct {
 	// Replica names the broker in owner IDs, for operators. Each process adds a
 	// random suffix, so a restarted Pod never inherits its predecessor's records.
 	Replica string
+	// Logger names a refused start or a duplicate-name fence. Default discard.
+	Logger *slog.Logger
 }
 
 type durableLease struct {
@@ -115,8 +119,12 @@ func NewDurableLeaseMinter(ctx context.Context, client *hashicorp.Client, journa
 	}
 	m := &DurableLeaseMinter{client: client, journal: journal, opts: opts, owner: owner, done: make(chan struct{}), active: make(map[string]durableLease), kick: make(chan struct{}, 1)}
 	m.ctx, m.cancel = context.WithCancel(ctx)
-	sent := time.Now()
-	if err := journal.ClaimDatabaseCleanupOwner(ctx, m.owner, opts.OwnerTTL); err != nil {
+	if opts.Logger == nil {
+		opts.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+		m.opts.Logger = opts.Logger
+	}
+	sent, err := claimOwner(ctx, journal, m.owner, opts)
+	if err != nil {
 		m.cancel()
 		return nil, err
 	}
@@ -131,6 +139,31 @@ func NewDurableLeaseMinter(ctx context.Context, client *hashicorp.Client, journa
 	}
 	go m.run()
 	return m, nil
+}
+
+// claimOwner registers this process. Another process under the same replica
+// name may be a crashed predecessor whose row has not expired yet, so the
+// claim is retried until a row that stopped renewing would have expired; a
+// name still held after that belongs to a live process, and this one refuses
+// to start.
+func claimOwner(ctx context.Context, journal CleanupJournal, owner string, opts DurableLeaseOptions) (time.Time, error) {
+	deadline := time.Now().Add(opts.OwnerTTL + opts.Heartbeat)
+	for {
+		sent := time.Now()
+		err := journal.ClaimDatabaseCleanupOwner(ctx, owner, opts.OwnerTTL)
+		if !errors.Is(err, store.ErrReplicaNameInUse) {
+			return sent, err
+		}
+		if time.Now().After(deadline) {
+			opts.Logger.Error("pgproxy: replica name held by another live broker; refusing to start", slog.String("replica", opts.Replica))
+			return time.Time{}, fmt.Errorf("%w: replica %q (each broker needs its own AGENT_VAULT_REPLICA)", store.ErrReplicaNameInUse, opts.Replica)
+		}
+		select {
+		case <-ctx.Done():
+			return time.Time{}, ctx.Err()
+		case <-time.After(opts.Heartbeat):
+		}
+	}
 }
 
 // AuthorityDone closes when this replica fences itself or closes. The broker
@@ -183,6 +216,10 @@ func (m *DurableLeaseMinter) heartbeat() bool {
 	ctx, cancel := context.WithTimeout(m.ctx, min(m.opts.Heartbeat, remaining))
 	defer cancel()
 	err := m.journal.RenewDatabaseCleanupOwner(ctx, m.owner, m.opts.OwnerTTL)
+	if errors.Is(err, store.ErrReplicaNameInUse) {
+		m.opts.Logger.Error("pgproxy: replica name held by another live broker; fencing", slog.String("replica", m.opts.Replica))
+		return false
+	}
 	if errors.Is(err, store.ErrDatabaseCleanupOwnershipLost) {
 		return false
 	}
