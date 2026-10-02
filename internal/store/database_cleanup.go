@@ -108,9 +108,23 @@ func (s *SQLStore) ClaimDatabaseCleanupOwner(ctx context.Context, owner string, 
 	// Owner IDs are replica/boot. A second live boot under one replica name is
 	// refused here, in the same statement that registers the owner.
 	pattern := replicaPattern(owner)
-	result, err := s.databaseCleanupExec(ctx, s.dialect.Rebind(`INSERT INTO database_cleanup_replica (owner, expires_ms)
+	var result sql.Result
+	err := s.auditWrite(ctx, func(tx *sql.Tx) error {
+		// Under READ COMMITTED two boots starting together could both pass
+		// the NOT EXISTS check; a transaction-scoped lock on the replica name
+		// makes the check and the insert one step. SQLite writes are already
+		// serialized.
+		if pattern != "" && s.dialect.Name() == "postgres" {
+			if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "gatehouse-replica:"+pattern); err != nil {
+				return err
+			}
+		}
+		var err error
+		result, err = tx.ExecContext(ctx, s.dialect.Rebind(`INSERT INTO database_cleanup_replica (owner, expires_ms)
 		SELECT ?, `+s.dbNowMs()+` + ? WHERE NOT EXISTS (SELECT 1 FROM database_cleanup_replica WHERE owner = ?)
 		AND (CAST(? AS TEXT) = '' OR `+s.noOtherLiveReplicaOwner()+`)`), owner, ttl.Milliseconds(), owner, pattern, pattern, owner)
+		return err
+	})
 	if err = affectedOne(result, err, fmt.Errorf("database cleanup owner already registered")); err != nil {
 		if inUse, checkErr := s.replicaNameInUse(ctx, owner); checkErr == nil && inUse {
 			return ErrReplicaNameInUse

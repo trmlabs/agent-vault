@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -567,3 +568,34 @@ func checkReplicaNameExclusive(t *testing.T, s *SQLStore) {
 		t.Fatalf("name not reusable after release: %v", err)
 	}
 }
+
+// Boots that start at the same moment under one replica name: exactly one
+// registers, however the claims interleave.
+func checkConcurrentReplicaClaims(t *testing.T, s *SQLStore) {
+	t.Helper()
+	ctx := context.Background()
+	replica := "race-" + time.Now().Format("150405.000000000")
+	const boots = 16
+	var wg sync.WaitGroup
+	var won atomic.Int32
+	for i := range boots {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if s.ClaimDatabaseCleanupOwner(ctx, fmt.Sprintf("%s/boot-%02d", replica, i), time.Minute) == nil {
+				won.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	t.Cleanup(func() {
+		for i := range boots {
+			_ = s.ReleaseDatabaseCleanupOwner(ctx, fmt.Sprintf("%s/boot-%02d", replica, i))
+		}
+	})
+	if n := won.Load(); n != 1 {
+		t.Fatalf("%d concurrent boots registered one replica name, want 1", n)
+	}
+}
+
+func TestConcurrentReplicaClaims(t *testing.T) { checkConcurrentReplicaClaims(t, openTestDB(t)) }
