@@ -56,7 +56,7 @@ func setupPool(t *testing.T) *poolFixture {
 	controller := true
 	f.pod = map[string]any{
 		"metadata": map[string]any{"name": "worker-abc", "namespace": "pool", "uid": "pod-uid",
-			"ownerReferences": []any{map[string]any{"uid": "pool-controller-uid", "controller": controller}}},
+			"ownerReferences": []any{map[string]any{"uid": "pool-controller-uid", "controller": controller, "blockOwnerDeletion": true}}},
 		"spec": map[string]any{"serviceAccountName": "worker", "activeDeadlineSeconds": 1800},
 		"status": map[string]any{"phase": "Running", "podIP": workerIP.String(), "startTime": f.start.UTC().Format(time.RFC3339),
 			"containerStatuses": []any{map[string]any{"name": "agent", "restartCount": 0, "state": map[string]any{"running": map[string]any{}}}}},
@@ -148,6 +148,10 @@ func TestAttestRefusals(t *testing.T) {
 		"no peer":       func(f *poolFixture) (string, netip.Addr) { return f.token(f.c), netip.Addr{} },
 		"Pod outside the pool": func(f *poolFixture) (string, netip.Addr) {
 			f.pod["metadata"].(map[string]any)["ownerReferences"] = []any{map[string]any{"uid": "other-controller", "controller": true}}
+			return f.token(f.c), workerIP
+		},
+		"controller reference without blockOwnerDeletion": func(f *poolFixture) (string, netip.Addr) {
+			f.pod["metadata"].(map[string]any)["ownerReferences"] = []any{map[string]any{"uid": "pool-controller-uid", "controller": true}}
 			return f.token(f.c), workerIP
 		},
 		"owner that is not the controller": func(f *poolFixture) (string, netip.Addr) {

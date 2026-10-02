@@ -155,8 +155,9 @@ type livePod struct {
 		Namespace         string  `json:"namespace"`
 		DeletionTimestamp *string `json:"deletionTimestamp"`
 		OwnerReferences   []struct {
-			UID        string `json:"uid"`
-			Controller *bool  `json:"controller"`
+			UID                string `json:"uid"`
+			Controller         *bool  `json:"controller"`
+			BlockOwnerDeletion *bool  `json:"blockOwnerDeletion"`
 		} `json:"ownerReferences"`
 	} `json:"metadata"`
 	Spec struct {
@@ -201,9 +202,16 @@ func (p *livePod) deadline(b *Binding, c claims, peer netip.Addr, now time.Time)
 	if !matched {
 		return time.Time{}
 	}
+	// ownerReferences are written by whoever creates the Pod, so this is not
+	// proof the controller made it: anyone who may create Pods under this
+	// service account in this namespace can name an approved controller.
+	// That right, restricted by RBAC or an admission policy, is the boundary.
+	// Controllers always set blockOwnerDeletion, and with the
+	// OwnerReferencesPermissionEnforcement admission plugin setting it needs
+	// update rights on the owner's finalizers, so it is required.
 	owned := false
 	for _, owner := range m.OwnerReferences {
-		if owner.Controller != nil && *owner.Controller {
+		if owner.Controller != nil && *owner.Controller && owner.BlockOwnerDeletion != nil && *owner.BlockOwnerDeletion {
 			for _, approved := range b.OwnerUIDs {
 				owned = owned || owner.UID == approved
 			}
