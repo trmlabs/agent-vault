@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -274,5 +275,79 @@ func TestProxyHeaderRequiresLoopbackListener(t *testing.T) {
 	_ = control.Shutdown(context.Background())
 	if err := <-served; err != nil && !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("loopback listener refused: %v", err)
+	}
+}
+
+// fakeLedger stands in for the shared store: one count per workload across
+// every broker that uses it.
+type fakeLedger struct {
+	mu       sync.Mutex
+	sessions map[string]string
+	err      error
+}
+
+func (l *fakeLedger) Add(_ context.Context, id, workload string, limit int) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.err != nil {
+		return l.err
+	}
+	n := 0
+	for _, w := range l.sessions {
+		if w == workload {
+			n++
+		}
+	}
+	if limit > 0 && n >= limit {
+		return ErrSessionLimit
+	}
+	l.sessions[id] = workload
+	return nil
+}
+
+func (l *fakeLedger) Remove(_ context.Context, id string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.sessions, id)
+	return nil
+}
+
+func fleetBroker(t *testing.T, ledger SessionLedger, cap int) string {
+	t.Helper()
+	lease := newLease()
+	upstream := startFakeUpstream(t, authTrust, lease.Password)
+	_, addr := startBroker(t, Options{Auth: &fakePeerAuth{}, Sessions: ledger, TrustProxyHeader: true, MaxLeasesPerActor: cap,
+		Databases: &fakeResolver{svc: &DatabaseService{Name: "analytics", Addr: upstream.addr(), Mount: "database", Role: "readonly"}},
+		Leases:    &fakeMinter{lease: lease}, AuthorizationInterval: time.Second})
+	return addr
+}
+
+func TestPodCapHoldsAcrossBrokerReplicas(t *testing.T) {
+	ledger := &fakeLedger{sessions: map[string]string{}}
+	first, second := fleetBroker(t, ledger, 1), fleetBroker(t, ledger, 1)
+	held, err := openSession(t, first, header("10.244.0.9"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conn, err := openSession(t, second, header("10.244.0.9")); err == nil {
+		conn.Close()
+		t.Fatal("a second replica let the same Pod past its cap")
+	} else if !strings.Contains(err.Error(), "53300") {
+		t.Fatalf("refusal was not the capacity error: %v", err)
+	}
+	other, err := openSession(t, second, header("10.244.0.10"))
+	if err != nil {
+		t.Fatalf("another Pod was blocked: %v", err)
+	}
+	other.Close()
+	held.Close()
+	waitFor(t, 2*time.Second, func() bool { ledger.mu.Lock(); defer ledger.mu.Unlock(); return len(ledger.sessions) == 0 }, "ended sessions were not removed from the ledger")
+}
+
+func TestLedgerOutageRefusesSessions(t *testing.T) {
+	ledger := &fakeLedger{sessions: map[string]string{}, err: errors.New("store down")}
+	if conn, err := openSession(t, fleetBroker(t, ledger, 4), header("10.244.0.9")); err == nil {
+		conn.Close()
+		t.Fatal("a session was admitted without the shared count")
 	}
 }

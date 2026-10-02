@@ -445,6 +445,8 @@ func attachPostgresBrokerIfEnabled(srv *server.Server, host string, postgresPort
 		}
 		opts.Leases = minter
 		srv.AttachDatabaseCleanup(minter)
+		// Per-Pod caps hold across every replica sharing this store.
+		opts.Sessions = server.NewSessionLedger(srv.CleanupStore(), minter)
 	}
 	// Each brokered connection is one real upstream DB connection, so MaxConns
 	// must be tuned below the database's max_connections. Operators set it (and
@@ -561,6 +563,7 @@ func attachHashicorpIfConfigured(srv *server.Server, logger *slog.Logger) {
 			return
 		}
 		srv.AttachHashicorp(r.c)
+		srv.AttachReadiness("vault-login", r.c.Ready)
 	case <-time.After(10 * time.Second):
 		logger.Warn("hashicorp client login exceeded 10s deadline; continuing without external store")
 	}

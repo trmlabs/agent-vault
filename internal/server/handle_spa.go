@@ -48,6 +48,13 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 		unready("database cleanup ownership not fresh")
 		return
 	}
+	// Attached checks (Vault login, pools, catalog) report by name only.
+	for _, c := range s.readiness {
+		if !c.check() {
+			unready(c.name + " not ready")
+			return
+		}
+	}
 	jsonOK(w, map[string]string{"status": "ready"})
 }
 

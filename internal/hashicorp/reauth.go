@@ -401,3 +401,17 @@ func (c *Client) clock() time.Time {
 	}
 	return time.Now()
 }
+
+// Ready reports whether a new database session could be minted now. Token and
+// AppRole modes have no refresh window and report ready.
+func (c *Client) Ready() bool {
+	if c == nil {
+		return false
+	}
+	if c.logins == nil {
+		return true
+	}
+	c.logins.mu.Lock()
+	defer c.logins.mu.Unlock()
+	return c.logins.current != nil && c.clock().Before(c.logins.current.mintUntil(c.logins.opts))
+}
