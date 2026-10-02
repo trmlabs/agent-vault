@@ -415,6 +415,7 @@ var refusalsByReason = map[string]refusal{
 	"authentication": {"28000", notVerifiedMessage},
 	"upstream":       {"08006", "Gatehouse could not reach the database; retry"},
 	"credential":     {"08006", "Gatehouse could not get a database credential; retry shortly"},
+	"restarting":     {"57P01", "Gatehouse is restarting; reconnect"},
 }
 
 // refusalsByCode covers a broker refusal whose reason has no entry of its own:

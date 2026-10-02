@@ -126,6 +126,9 @@ type fakeUpstream struct {
 	forbidParam string // a param key that must never be forwarded upstream
 	forbidSeen  bool
 	accepted    int // upstream connections accepted
+	// transactions makes BEGIN open a transaction (ReadyForQuery 'T') until
+	// COMMIT or ROLLBACK, and SLEEP take 300ms; off, every query is idle.
+	transactions bool
 }
 
 func startFakeUpstream(t *testing.T, mode upstreamAuthMode, password string) *fakeUpstream {
@@ -263,19 +266,33 @@ func (fu *fakeUpstream) handle(conn net.Conn) {
 		return
 	}
 
+	status := byte('I')
 	for {
 		m, err := be.Receive()
 		if err != nil {
 			return
 		}
-		switch m.(type) {
+		switch q := m.(type) {
 		case *pgproto3.Query:
+			fu.mu.Lock()
+			transactions := fu.transactions
+			fu.mu.Unlock()
+			if transactions {
+				switch q.String {
+				case "BEGIN":
+					status = 'T'
+				case "COMMIT", "ROLLBACK":
+					status = 'I'
+				case "SLEEP":
+					time.Sleep(300 * time.Millisecond)
+				}
+			}
 			// Answer any query with a single row echoing the authenticated user,
 			// so the test can prove the upstream saw the Vault username.
 			be.Send(&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{{Name: []byte("current_user"), DataTypeOID: 25, Format: 0}}})
 			be.Send(&pgproto3.DataRow{Values: [][]byte{[]byte(fu.seenUser())}})
 			be.Send(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")})
-			be.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+			be.Send(&pgproto3.ReadyForQuery{TxStatus: status})
 			if err := be.Flush(); err != nil {
 				return
 			}

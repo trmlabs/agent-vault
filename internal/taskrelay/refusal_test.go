@@ -51,6 +51,7 @@ func TestBrokerReasonsBecomeFixedWords(t *testing.T) {
 		"authentication": {"28000", "Gatehouse could not verify this worker"},
 		"upstream":       {"08006", "Gatehouse could not reach the database; retry"},
 		"credential":     {"08006", "Gatehouse could not get a database credential; retry shortly"},
+		"restarting":     {"57P01", "Gatehouse is restarting; reconnect"},
 		"not_entitled":   {"42501", "not authorized for this database"},
 		"no_person":      {"42501", "not authorized for this database"},
 	} {

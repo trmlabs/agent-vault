@@ -496,7 +496,9 @@ func attachPostgresBrokerIfEnabled(srv *server.Server, host string, postgresPort
 	// client sessions; each database's server budget comes from the catalog.
 	if boolEnvValue("AGENT_VAULT_DB_POOLING") {
 		opts.Pool = &pgproxy.PoolOptions{Replicas: intEnvValue("AGENT_VAULT_DB_POOL_REPLICAS"), DefaultBudget: intEnvValue("AGENT_VAULT_DB_POOL_BUDGET"),
-			QueueFactor: intEnvValue("AGENT_VAULT_DB_POOL_QUEUE_FACTOR"), QueueWait: time.Duration(intEnvValue("AGENT_VAULT_DB_POOL_QUEUE_WAIT_MS")) * time.Millisecond}
+			QueueFactor: intEnvValue("AGENT_VAULT_DB_POOL_QUEUE_FACTOR"), QueueWait: time.Duration(intEnvValue("AGENT_VAULT_DB_POOL_QUEUE_WAIT_MS")) * time.Millisecond,
+			// A graceful stop ends each session between transactions.
+			DrainSessions: intEnvValue("AGENT_VAULT_SHUTDOWN_SECONDS") > 0}
 	}
 	srv.AttachPostgresBroker(pgproxy.New(net.JoinHostPort(host, strconv.Itoa(postgresPort)), opts))
 	return nil

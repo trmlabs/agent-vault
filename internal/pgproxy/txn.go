@@ -63,6 +63,8 @@ type pooledSession struct {
 	txnFailed  bool
 	killed     bool
 	dataRows   int
+	draining   bool // Shutdown asked the session to end at its next idle point
+	flushedSeq int  // ReadyForQuery messages written to the client
 }
 
 type clientStatement struct {
@@ -106,6 +108,11 @@ func (b *Broker) servePooled(ctx context.Context, conn net.Conn, backend *pgprot
 			s.params[name] = v
 		}
 	}
+	if !b.trackPooled(conn, s) {
+		writeClientError(backend, "57P01", "restarting", restartingMessage)
+		return
+	}
+	defer b.untrackPooled(conn)
 	unregister, clientKey, err := b.registerPooledCancel(s)
 	if err != nil {
 		writeClientError(backend, "08006", "upstream", "Agent Vault: could not start the session")
@@ -187,9 +194,35 @@ func (s *pooledSession) run(ctx context.Context) {
 	for {
 		msg, err := s.backend.Receive()
 		if err != nil {
-			return
+			var timeout net.Error
+			if !errors.As(err, &timeout) || !timeout.Timeout() {
+				return
+			}
+			// Only a drain wakes a session's read. At an idle point the session
+			// ends; otherwise it keeps serving until the next one.
+			s.mu.Lock()
+			if !s.draining {
+				s.mu.Unlock()
+				return
+			}
+			if s.idleLocked() {
+				s.mu.Unlock()
+				s.restart()
+				return
+			}
+			_ = s.client.SetReadDeadline(time.Time{})
+			s.mu.Unlock()
+			continue
 		}
 		if _, ok := msg.(*pgproto3.Terminate); ok {
+			return
+		}
+		// A statement arriving at an idle point during a drain is not run.
+		s.mu.Lock()
+		stop := s.draining && s.idleLocked()
+		s.mu.Unlock()
+		if stop {
+			s.restart()
 			return
 		}
 		if errorUntilSync {
@@ -561,6 +594,17 @@ func (s *pooledSession) readServer(conn *serverConn, done chan struct{}) {
 		}
 		s.mu.Unlock()
 		s.writeClientMessage(msg, flush)
+		if _, ready := msg.(*pgproto3.ReadyForQuery); ready {
+			// Wake a draining session's read only once the client has this
+			// answer, so the session never ends between a result and its
+			// ReadyForQuery.
+			s.mu.Lock()
+			s.flushedSeq++
+			if s.draining && s.idleLocked() {
+				_ = s.client.SetReadDeadline(time.Now())
+			}
+			s.mu.Unlock()
+		}
 		if txn != nil {
 			_ = s.b.auditRecord(*txn)
 		}
@@ -590,6 +634,33 @@ func (s *pooledSession) writeClientMessage(msg pgproto3.BackendMessage, flush bo
 			go s.kill()
 		}
 	}
+}
+
+// restartingMessage tells a client its session ended for a planned restart,
+// outside any transaction, so it can reconnect at once.
+const restartingMessage = "Agent Vault: restarting; reconnect"
+
+// idleLocked reports an idle point: no transaction open, nothing unanswered,
+// and every ReadyForQuery already written to the client. Caller holds s.mu.
+func (s *pooledSession) idleLocked() bool {
+	return s.pending <= 0 && !s.unsynced && s.flushedSeq == s.recvSeq && (s.conn == nil || s.pinned && s.txStatus == 'I')
+}
+
+// beginDrain marks the session to end at its next idle point, waking its read
+// now if it is idle already.
+func (s *pooledSession) beginDrain() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.draining = true
+	if s.idleLocked() {
+		_ = s.client.SetReadDeadline(time.Now())
+	}
+}
+
+// restart ends an idle session for a planned restart with 57P01.
+func (s *pooledSession) restart() {
+	_ = s.client.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	s.writeClient(brokerError("FATAL", "57P01", "restarting", restartingMessage))
 }
 
 // end returns or closes the session's server connection when the client
