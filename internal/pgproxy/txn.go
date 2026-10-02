@@ -38,7 +38,7 @@ func validSessionParam(name, value string) bool {
 		return false
 	}
 	for i := 0; i < len(value); i++ {
-		if c := value[i]; !(c == '_' || c == '-' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9') {
+		if c := value[i]; c >= 0x80 || c != '_' && c != '-' && !identChar(c) {
 			return false
 		}
 	}
@@ -678,10 +678,7 @@ func (s *pooledSession) verifyClean(conn *serverConn) bool {
 	e.Event, e.Outcome = auditchain.EventStateLeak, "reset"
 	_ = s.b.auditRecord(e)
 	s.b.logger.Warn("pgproxy: session state found at check-in; resetting the connection", slog.String("service", s.svc.Name))
-	if discardAll(conn, s.b.opts.HandshakeTimeout) != nil {
-		return false
-	}
-	return true
+	return discardAll(conn, s.b.opts.HandshakeTimeout) == nil
 }
 
 // queryBool runs a one-row, one-column boolean query on an idle connection.
