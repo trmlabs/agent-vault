@@ -40,6 +40,10 @@ func (p *Proxy) forwardGitHubAPI(w http.ResponseWriter, r *http.Request, target 
 		return
 	}
 	entry := api.Entry
+	if a.GitTokens == nil {
+		deny(http.StatusServiceUnavailable, "token_unavailable")
+		return
+	}
 	expected := hostHeaderForScheme("https", target)
 	if r.URL.IsAbs() || (r.Host != target && r.Host != expected) || r.URL.User != nil || r.URL.Fragment != "" || r.URL.RawPath != "" ||
 		unsafePath(r.URL.Path) || r.Header.Get("Upgrade") != "" || r.Header.Get("Content-Encoding") != "" || len(r.Trailer) > 0 ||

@@ -23,7 +23,9 @@ import (
 // Vault injected into one header, and signed audit rows. Workers send at
 // most a placeholder; the key exists only inside the broker.
 type HeaderAdapter struct {
-	Catalog httpcatalog.Catalog
+	// Catalog is read once per request, so a reloaded catalog applies to the
+	// next request; an httpcatalog.Catalog or a live *httpcatalog.Source.
+	Catalog interface{ Current() httpcatalog.Catalog }
 	Keys    interface {
 		Get(context.Context, httpcatalog.KeyRef) (httpcatalog.Secret, error)
 		Invalidate(httpcatalog.KeyRef)
@@ -32,8 +34,8 @@ type HeaderAdapter struct {
 		Admit() error
 		Record(auditchain.Event) error
 	}
-	// GitTokens mints repository-scoped installation tokens for git entries.
-	// Required when the catalog has any.
+	// GitTokens mints repository-scoped installation tokens for git and
+	// github-api entries. Without it, those requests are refused.
 	GitTokens interface {
 		Token(ctx context.Context, app githubapp.App, repo string, permissions githubapp.Permissions) (githubapp.Token, error)
 		Invalidate(app githubapp.App, repo string, permissions githubapp.Permissions)
@@ -41,15 +43,7 @@ type HeaderAdapter struct {
 }
 
 func (a *HeaderAdapter) valid() bool {
-	if a == nil || len(a.Catalog.Entries()) == 0 || a.Keys == nil || a.Audit == nil {
-		return false
-	}
-	for _, e := range a.Catalog.Entries() {
-		if e.Kind != "" && a.GitTokens == nil {
-			return false
-		}
-	}
-	return true
+	return a != nil && a.Catalog != nil && a.Keys != nil && a.Audit != nil
 }
 
 const placeholderMarker = "__vault_"
@@ -104,15 +98,16 @@ func (p *Proxy) forwardCatalog(w http.ResponseWriter, r *http.Request, target, h
 		deny(http.StatusBadRequest, "plain_http")
 		return
 	}
-	if git, ok, err := a.Catalog.GitMatch(host, port, r.Method, r.URL.Path, r.URL.RawQuery, scope.AgentID); ok {
+	catalog := a.Catalog.Current()
+	if git, ok, err := catalog.GitMatch(host, port, r.Method, r.URL.Path, r.URL.RawQuery, scope.AgentID); ok {
 		p.forwardGit(w, r, target, scope, event, git, err)
 		return
 	}
-	if api, ok, err := a.Catalog.GitHubAPIMatch(host, port, r.Method, r.URL.Path, r.URL.RawQuery, scope.AgentID); ok {
+	if api, ok, err := catalog.GitHubAPIMatch(host, port, r.Method, r.URL.Path, r.URL.RawQuery, scope.AgentID); ok {
 		p.forwardGitHubAPI(w, r, target, scope, event, api, err)
 		return
 	}
-	entry, err := a.Catalog.Match(host, port, r.Method, r.URL.Path, scope.AgentID)
+	entry, err := catalog.Match(host, port, r.Method, r.URL.Path, scope.AgentID)
 	if entry != nil {
 		event.Binding = entry.Name
 	}

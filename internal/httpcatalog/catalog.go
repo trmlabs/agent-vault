@@ -42,8 +42,9 @@ type Entry struct {
 	// GitHub REST binding limited to opening pull requests and commenting on
 	// them. Paths, methods and the credential are derived from the kind; the
 	// key is a GitHub App installation token minted per repository.
-	Kind string      `json:"kind,omitempty"`
-	Git  *GitBinding `json:"git,omitempty"`
+	Kind     string           `json:"kind,omitempty"`
+	Git      *GitBinding      `json:"git,omitempty"`
+	Postgres *PostgresBinding `json:"postgres,omitempty"`
 }
 
 // GitBinding names the GitHub App installation that mints tokens and the
@@ -71,7 +72,31 @@ type KeyRef struct {
 
 type Catalog struct {
 	entries []Entry
+	pools   []Pool
 }
+
+// Pool names a set of workers by their Kubernetes identity. When a catalog
+// defines pools, every entry may grant only defined pool names.
+type Pool struct {
+	Name           string `json:"name"`
+	Namespace      string `json:"namespace"`
+	ServiceAccount string `json:"serviceAccount"`
+}
+
+// PostgresBinding is a database the broker reaches with a Vault dynamic role.
+type PostgresBinding struct {
+	Database string `json:"database"`
+	Mount    string `json:"mount"`
+	Role     string `json:"role"`
+	SSLMode  string `json:"sslmode,omitempty"`  // default verify-full
+	MaxConns int    `json:"maxConns,omitempty"` // 0: the broker's default budget
+}
+
+// Current lets a fixed Catalog stand wherever a live, reloading one can.
+func (c Catalog) Current() Catalog { return c }
+
+// Pools returns the defined pools.
+func (c Catalog) Pools() []Pool { return append([]Pool(nil), c.pools...) }
 
 var (
 	ErrUnlisted  = errors.New("destination not in catalog")
@@ -80,6 +105,9 @@ var (
 	ErrReadOnly  = errors.New("repository binding is read-only")
 	repoPattern  = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,38}/[a-z0-9._-]{1,100}$`)
 	refPattern   = regexp.MustCompile(`^refs/[A-Za-z0-9._/-]+$`)
+	dnsLabel     = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+	pgName       = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,62}$`)
+	vaultSegment = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 	placeholder  = regexp.MustCompile(`^__vault_[A-Z][A-Z0-9_]*__$`)
 	hostPattern  = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$`)
 	tokenPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]*$`)
@@ -115,6 +143,7 @@ func Load(path string) (Catalog, error) {
 
 func Parse(data []byte) (Catalog, error) {
 	var file struct {
+		Pools   []Pool  `json:"pools,omitempty"`
 		Entries []Entry `json:"entries"`
 	}
 	d := json.NewDecoder(bytes.NewReader(data))
@@ -128,6 +157,13 @@ func Parse(data []byte) (Catalog, error) {
 	if len(file.Entries) == 0 {
 		return Catalog{}, errors.New("HTTP catalog has no entries")
 	}
+	poolNames := map[string]bool{}
+	for _, pool := range file.Pools {
+		if !idPattern.MatchString(pool.Name) || poolNames[pool.Name] || !dnsLabel.MatchString(pool.Namespace) || !dnsLabel.MatchString(pool.ServiceAccount) {
+			return Catalog{}, fmt.Errorf("invalid or duplicate pool %q", pool.Name)
+		}
+		poolNames[pool.Name] = true
+	}
 	names := map[string]bool{}
 	routes := map[string]string{}
 	kinds := map[string]string{}
@@ -140,6 +176,11 @@ func Parse(data []byte) (Catalog, error) {
 			return Catalog{}, fmt.Errorf("duplicate HTTP catalog entry %q", e.Name)
 		}
 		names[e.Name] = true
+		for _, pool := range e.Pools {
+			if len(poolNames) > 0 && !poolNames[pool] {
+				return Catalog{}, fmt.Errorf("HTTP catalog entry %q grants undefined pool %q", e.Name, pool)
+			}
+		}
 		hostKey := fmt.Sprintf("%s:%d", e.Host, e.Port)
 		if kind, ok := kinds[hostKey]; ok && kind != e.Kind {
 			return Catalog{}, fmt.Errorf("host %s mixes git and header entries", hostKey)
@@ -162,7 +203,7 @@ func Parse(data []byte) (Catalog, error) {
 			routes[route] = e.Name
 		}
 	}
-	return Catalog{entries: file.Entries}, nil
+	return Catalog{entries: file.Entries, pools: file.Pools}, nil
 }
 
 func (e *Entry) normalize() error {
@@ -176,11 +217,16 @@ func (e *Entry) normalize() error {
 	}
 	if e.Port == 0 {
 		e.Port = 443
+		if e.Kind == "postgres" {
+			e.Port = 5432
+		}
 	}
 	if e.Port < 1 || e.Port > 65535 {
 		return errors.New("invalid port")
 	}
 	switch e.Kind {
+	case "postgres":
+		return e.normalizePostgres()
 	case "git":
 		return e.normalizeGit()
 	case "github-api":
@@ -203,8 +249,8 @@ func (e *Entry) normalize() error {
 		}
 		return nil
 	case "":
-		if e.Git != nil {
-			return errors.New("git settings require kind git")
+		if e.Git != nil || e.Postgres != nil {
+			return errors.New("git or postgres settings require their kind")
 		}
 	default:
 		return fmt.Errorf("unknown kind %q", e.Kind)
@@ -266,7 +312,80 @@ func (e *Entry) normalize() error {
 	return nil
 }
 
+func (e *Entry) normalizePostgres() error {
+	if len(e.PathPrefixes) > 0 || len(e.Methods) > 0 || e.Header != "" || e.Scheme != "" || e.Placeholder != "" || e.Key != (KeyRef{}) ||
+		len(e.ForwardHeaders) > 0 || e.Git != nil || e.MaxRequestBytes != 0 || e.MaxResponseBytes != 0 {
+		return errors.New("postgres entries take only host, port, pools and postgres settings")
+	}
+	p := e.Postgres
+	if p == nil || !pgName.MatchString(p.Database) || !vaultSegment.MatchString(p.Role) {
+		return errors.New("postgres entries need a database name and a Vault role")
+	}
+	for _, segment := range strings.Split(p.Mount, "/") {
+		if !vaultSegment.MatchString(segment) {
+			return errors.New("invalid Vault database mount")
+		}
+	}
+	switch p.SSLMode {
+	case "":
+		p.SSLMode = "verify-full"
+	case "disable", "prefer", "require", "verify-full":
+	default:
+		return fmt.Errorf("invalid sslmode %q", p.SSLMode)
+	}
+	if p.MaxConns < 0 || p.MaxConns > 1000 {
+		return errors.New("maxConns out of range")
+	}
+	if len(e.Pools) == 0 {
+		return errors.New("at least one pool is required")
+	}
+	for _, pool := range e.Pools {
+		if !idPattern.MatchString(pool) {
+			return fmt.Errorf("invalid pool %q", pool)
+		}
+	}
+	return nil
+}
+
+// Database returns the postgres entry a pool asks for by name. An unknown
+// name is ErrUnlisted; a pool without the grant is ErrPool.
+func (c Catalog) Database(name, pool string) (*Entry, error) {
+	for i := range c.entries {
+		e := &c.entries[i]
+		if e.Kind != "postgres" || e.Name != name {
+			continue
+		}
+		if !contains(e.Pools, pool) {
+			return e, ErrPool
+		}
+		return e, nil
+	}
+	return nil, ErrUnlisted
+}
+
+// CheckHosts requires every host to end with one of suffixes (for example
+// ".crunchybridge.com"), so CI can hold the catalog inside the ranges the
+// broker's network policy allows.
+func (c Catalog) CheckHosts(suffixes []string) error {
+	for _, e := range c.entries {
+		ok := false
+		for _, suffix := range suffixes {
+			suffix = strings.ToLower(strings.TrimSpace(suffix))
+			if suffix != "" && (e.Host == strings.TrimPrefix(suffix, ".") || strings.HasSuffix(e.Host, "."+strings.TrimPrefix(suffix, "."))) {
+				ok = true
+			}
+		}
+		if !ok {
+			return fmt.Errorf("entry %q host %s is outside the allowed domains", e.Name, e.Host)
+		}
+	}
+	return nil
+}
+
 func (e *Entry) normalizeGit() error {
+	if e.Postgres != nil {
+		return errors.New("postgres settings require kind postgres")
+	}
 	if len(e.PathPrefixes) > 0 || len(e.Methods) > 0 || e.Header != "" || e.Scheme != "" || e.Placeholder != "" || e.Key != (KeyRef{}) || len(e.ForwardHeaders) > 0 {
 		return errors.New("git entries derive paths, methods and credentials; leave them unset")
 	}
@@ -474,7 +593,7 @@ func (c Catalog) Match(host string, port int, method, path, pool string) (*Entry
 func (c Catalog) HasHost(host string, port int) bool {
 	host = strings.ToLower(host)
 	for _, e := range c.entries {
-		if e.Host == host && e.Port == port {
+		if e.Kind != "postgres" && e.Host == host && e.Port == port {
 			return true
 		}
 	}

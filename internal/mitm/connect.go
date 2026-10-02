@@ -126,7 +126,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	// With a catalog, refuse an unlisted host before minting a certificate
 	// for it or opening a tunnel.
-	if p.strictCredentialProxy && p.adapter.valid() && !p.adapter.Catalog.HasHost(host, port) {
+	if p.strictCredentialProxy && p.adapter.valid() && !p.adapter.Catalog.Current().HasHost(host, port) {
 		p.adapterDeny(w, auditchain.Event{Pool: connectScope.AgentID, PodUID: connectScope.WorkloadID}, http.StatusForbidden, "unlisted")
 		return
 	}

@@ -42,6 +42,10 @@ func (p *Proxy) forwardGit(w http.ResponseWriter, r *http.Request, target string
 		return
 	}
 	entry := git.Entry
+	if a.GitTokens == nil {
+		deny(http.StatusServiceUnavailable, "token_unavailable")
+		return
+	}
 	expected := hostHeaderForScheme("https", target)
 	if r.URL.IsAbs() || (r.Host != target && r.Host != expected) || r.URL.User != nil || r.URL.Fragment != "" || r.URL.RawPath != "" ||
 		unsafePath(r.URL.Path) || r.Header.Get("Upgrade") != "" || strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade") || len(r.Trailer) > 0 ||

@@ -1,6 +1,7 @@
 package netguard
 
 import (
+	"context"
 	"net"
 	"testing"
 )
@@ -229,5 +230,43 @@ func TestParseCIDRList(t *testing.T) {
 	}
 	if !got[2].Contains(net.ParseIP("fd00::1")) || got[2].Contains(net.ParseIP("fd00::2")) {
 		t.Error("range[2] should be fd00::1/128, not a wider IPv6 prefix")
+	}
+}
+
+func TestEgressRangesConfineEveryDestination(t *testing.T) {
+	t.Setenv("AGENT_VAULT_NETWORK_ALLOWLIST", "")
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			c, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+	dial := func(ranges string) error {
+		t.Setenv("AGENT_VAULT_EGRESS_RANGES", ranges)
+		conn, err := SafeDialContext(true)(context.Background(), "tcp", listener.Addr().String())
+		if err == nil {
+			_ = conn.Close()
+		}
+		return err
+	}
+	if err := dial(""); err != nil {
+		t.Fatalf("no ranges must keep the previous behavior: %v", err)
+	}
+	if err := dial("127.0.0.0/8"); err != nil {
+		t.Fatalf("destination inside the ranges refused: %v", err)
+	}
+	if err := dial("10.0.0.0/8,203.0.113.0/24"); err == nil {
+		t.Fatal("destination outside the ranges allowed")
+	}
+	if err := dial("not-a-cidr"); err == nil {
+		t.Fatal("unparseable ranges allowed everything")
 	}
 }

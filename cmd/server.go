@@ -398,6 +398,12 @@ func attachPostgresBrokerIfEnabled(srv *server.Server, host string, postgresPort
 		Dialer:    netguard.SafeDialContext(netguard.AllowPrivateFromEnv()),
 		Logger:    logger,
 	}
+	// With a broker catalog, databases come from it and reload without a restart.
+	if catalog, err := brokerCatalog(context.Background(), client, os.Getenv, logger); err != nil {
+		return fmt.Errorf("postgres broker catalog: %w", err)
+	} else if catalog != nil {
+		opts.Databases = server.NewCatalogDatabaseResolver(catalog)
+	}
 	if chain, err := sharedAuditChain(context.Background(), client, srv.CleanupStore(), os.Getenv); err != nil {
 		return fmt.Errorf("postgres broker audit: %w", err)
 	} else if chain != nil {

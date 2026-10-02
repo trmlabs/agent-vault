@@ -3,7 +3,10 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/Infisical/agent-vault/internal/githubapp"
 	"github.com/Infisical/agent-vault/internal/hashicorp"
@@ -12,25 +15,73 @@ import (
 	"github.com/Infisical/agent-vault/internal/server"
 )
 
-// httpHeaderAdapter builds the catalog-driven HTTP adapter when
-// AGENT_VAULT_HTTP_CATALOG_FILE is set. It requires the strict credential
-// proxy, a Vault client and the signed audit chain, and refuses to start
-// without any of them rather than serve unaudited or unlisted traffic.
+var sharedCatalog struct {
+	sync.Mutex
+	source  *httpcatalog.Source
+	started bool
+}
+
+// brokerCatalog loads the destination catalog once per process, for the HTTP
+// adapter and the PostgreSQL broker alike. AGENT_VAULT_CATALOG_VAULT_PATH
+// (mount/path of a KV version 2 secret whose "catalog" field Terraform
+// writes) is reloaded every 30 seconds without a restart; a version that
+// fails validation is logged and the last good catalog stays in force.
+// AGENT_VAULT_HTTP_CATALOG_FILE is a fixed catalog read at start.
+func brokerCatalog(ctx context.Context, client *hashicorp.Client, getenv func(string) string, logger *slog.Logger) (*httpcatalog.Source, error) {
+	sharedCatalog.Lock()
+	defer sharedCatalog.Unlock()
+	if sharedCatalog.started {
+		return sharedCatalog.source, nil
+	}
+	var source *httpcatalog.Source
+	if location := getenv("AGENT_VAULT_CATALOG_VAULT_PATH"); location != "" {
+		mount, path, ok := strings.Cut(location, "/")
+		if !ok || client == nil {
+			return nil, fmt.Errorf("AGENT_VAULT_CATALOG_VAULT_PATH needs mount/path and a Vault client")
+		}
+		load := httpcatalog.VaultLoader(client.Logical(), mount, path, "catalog")
+		var err error
+		if source, err = httpcatalog.Open(ctx, load); err != nil {
+			return nil, fmt.Errorf("broker catalog: %w", err)
+		}
+		go source.Watch(context.Background(), 30*time.Second, load, func(version int, err error) {
+			logger.Error("broker catalog version rejected; keeping the last good catalog",
+				slog.Int("version", version), slog.Int("in_force", source.Version()), slog.String("error", err.Error()))
+		})
+	} else if path := getenv("AGENT_VAULT_HTTP_CATALOG_FILE"); path != "" {
+		catalog, err := httpcatalog.Load(path)
+		if err != nil {
+			return nil, err
+		}
+		source = httpcatalog.NewSource(catalog, 0)
+	}
+	sharedCatalog.source, sharedCatalog.started = source, true
+	return source, nil
+}
+
+// httpHeaderAdapter builds the catalog-driven HTTP adapter when a broker
+// catalog is configured. It requires the strict credential proxy, a Vault
+// client and the signed audit chain, and refuses to start without any of
+// them rather than serve unaudited or unlisted traffic.
 func httpHeaderAdapter(ctx context.Context, srv *server.Server, getenv func(string) string) (*mitm.HeaderAdapter, error) {
-	path := getenv("AGENT_VAULT_HTTP_CATALOG_FILE")
-	if path == "" {
+	if getenv("AGENT_VAULT_CATALOG_VAULT_PATH") == "" && getenv("AGENT_VAULT_HTTP_CATALOG_FILE") == "" {
 		return nil, nil
 	}
 	if !srv.CredentialProxyEnabled() {
 		return nil, fmt.Errorf("requires AGENT_VAULT_CREDENTIAL_PROXY=true")
 	}
-	catalog, err := httpcatalog.Load(path)
-	if err != nil {
-		return nil, err
-	}
 	client := srv.HashicorpClient()
 	if client == nil {
+		if getenv("AGENT_VAULT_HTTP_CATALOG_FILE") != "" {
+			if _, err := httpcatalog.Load(getenv("AGENT_VAULT_HTTP_CATALOG_FILE")); err != nil {
+				return nil, err
+			}
+		}
 		return nil, fmt.Errorf("requires a HashiCorp Vault client")
+	}
+	source, err := brokerCatalog(ctx, client, getenv, srv.Logger())
+	if err != nil {
+		return nil, err
 	}
 	chain, err := sharedAuditChain(ctx, client, srv.CleanupStore(), getenv)
 	if err != nil {
@@ -39,20 +90,21 @@ func httpHeaderAdapter(ctx context.Context, srv *server.Server, getenv func(stri
 	if chain == nil {
 		return nil, fmt.Errorf("requires AGENT_VAULT_AUDIT_CHAIN")
 	}
-	adapter := &mitm.HeaderAdapter{Catalog: catalog, Keys: &httpcatalog.Keys{Vault: client.Logical()}, Audit: chain}
-	for _, e := range catalog.Entries() {
-		if e.Kind == "git" || e.Kind == "github-api" {
-			signer, err := githubAppSigner(client, getenv)
-			if err != nil {
-				return nil, err
-			}
-			api := getenv("AGENT_VAULT_GITHUB_API_URL")
-			if api != "" && !strings.HasPrefix(api, "https://") {
-				return nil, fmt.Errorf("AGENT_VAULT_GITHUB_API_URL must be https")
-			}
-			adapter.GitTokens = &githubapp.Minter{Signer: signer, API: api}
-			break
+	adapter := &mitm.HeaderAdapter{Catalog: source, Keys: &httpcatalog.Keys{Vault: client.Logical()}, Audit: chain}
+	githubEntries := false
+	for _, e := range source.Current().Entries() {
+		githubEntries = githubEntries || e.Kind == "git" || e.Kind == "github-api"
+	}
+	signer, err := githubAppSigner(client, getenv)
+	switch {
+	case err == nil:
+		api := getenv("AGENT_VAULT_GITHUB_API_URL")
+		if api != "" && !strings.HasPrefix(api, "https://") {
+			return nil, fmt.Errorf("AGENT_VAULT_GITHUB_API_URL must be https")
 		}
+		adapter.GitTokens = &githubapp.Minter{Signer: signer, API: api}
+	case githubEntries:
+		return nil, err
 	}
 	return adapter, nil
 }
