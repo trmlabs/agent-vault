@@ -13,7 +13,9 @@ func checkAuditBoots(t *testing.T, s *SQLStore) {
 	t.Helper()
 	ctx := context.Background()
 	replica := "audit-test-" + time.Now().Format("150405.000000000")
-	t.Cleanup(func() { _, _ = s.db.ExecContext(ctx, s.dialect.Rebind(`DELETE FROM audit_chain_replica WHERE replica = ?`), replica) })
+	t.Cleanup(func() {
+		_, _ = s.db.ExecContext(ctx, s.dialect.Rebind(`DELETE FROM audit_chain_replica WHERE replica = ?`), replica)
+	})
 	boot, previous, err := s.BeginAuditBoot(ctx, replica)
 	if err != nil || boot != 1 || previous != (AuditBoot{}) {
 		t.Fatalf("first boot: %d %+v %v", boot, previous, err)

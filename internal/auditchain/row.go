@@ -29,30 +29,30 @@ const (
 // Row is one audit record. It carries identifiers and fixed outcome codes
 // only: never a credential, token, query text or upstream error message.
 type Row struct {
-	Type       string `json:"type"`
-	Replica    string `json:"replica"`
-	Boot       uint64 `json:"boot"` // per-replica counter persisted in the store
-	Seq        uint64 `json:"seq"`
-	Time       string `json:"ts"`
-	Event      string `json:"event"`
-	Pool       string `json:"pool,omitempty"`      // broker agent ID of the worker pool
-	PodUID     string `json:"podUID,omitempty"`    // verified runtime instance
-	Binding    string `json:"binding,omitempty"`   // vault/service
-	Session    string `json:"session,omitempty"`   // broker-generated session ID
-	Outcome    string `json:"outcome,omitempty"`   // fixed code
-	Requester  string `json:"requester,omitempty"` // developer identity, only from a verified source
-	SignedSeq  uint64 `json:"signedSeq,omitempty"` // checkpoint: the chain head it signs
-	SignedMAC  string `json:"signedMAC,omitempty"`
-	Signature  string `json:"signature,omitempty"` // checkpoint: Transit "vault:vN:..." signature
-	PrevKey    int    `json:"prevKeyVersion,omitempty"`
+	Type      string `json:"type"`
+	Replica   string `json:"replica"`
+	Boot      uint64 `json:"boot"` // per-replica counter persisted in the store
+	Seq       uint64 `json:"seq"`
+	Time      string `json:"ts"`
+	Event     string `json:"event"`
+	Pool      string `json:"pool,omitempty"`      // broker agent ID of the worker pool
+	PodUID    string `json:"podUID,omitempty"`    // verified runtime instance
+	Binding   string `json:"binding,omitempty"`   // vault/service
+	Session   string `json:"session,omitempty"`   // broker-generated session ID
+	Outcome   string `json:"outcome,omitempty"`   // fixed code
+	Requester string `json:"requester,omitempty"` // developer identity, only from a verified source
+	SignedSeq uint64 `json:"signedSeq,omitempty"` // checkpoint: the chain head it signs
+	SignedMAC string `json:"signedMAC,omitempty"`
+	Signature string `json:"signature,omitempty"` // checkpoint: Transit "vault:vN:..." signature
+	PrevKey   int    `json:"prevKeyVersion,omitempty"`
 	// chain_start: the previous boot and its last persisted checkpoint row,
 	// so a deleted boot or a truncated tail is detectable.
 	PrevBoot          uint64 `json:"prevBoot,omitempty"`
 	PrevCheckpointSeq uint64 `json:"prevCheckpointSeq,omitempty"`
 	PrevCheckpointMAC string `json:"prevCheckpointMAC,omitempty"`
-	KeyVersion int    `json:"keyVersion"`
-	Prev       string `json:"prev"`
-	MAC        string `json:"mac"`
+	KeyVersion        int    `json:"keyVersion"`
+	Prev              string `json:"prev"`
+	MAC               string `json:"mac"`
 }
 
 // macInput encodes every field except MAC with explicit lengths, so no two
