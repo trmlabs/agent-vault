@@ -1,9 +1,12 @@
 package pgproxy
 
 import (
+	"net/netip"
+
 	"context"
 	"errors"
 	"fmt"
+	"github.com/Infisical/agent-vault/internal/brokercore"
 	"io"
 	"log/slog"
 	"net"
@@ -34,8 +37,11 @@ type Options struct {
 	MinRenewInterval      time.Duration // floor on the renew cadence (default 5s)
 	MaxConns              int           // cap on concurrent SERVING connections = upstream DB connections (default 50)
 	MaxPendingConns       int           // cap on accepted-but-not-yet-serving connections (default 512)
-	MaxLeasesPerActor     int           // cap on live credentials/connections per agent identity (default 16; clamped to <= MaxConns)
-	Audit                 AuditTrail    // signed audit trail; nil disables it
+	MaxLeasesPerActor     int           // cap on live credentials/connections per workload (Pod), or per agent when no workload is known (default 16; clamped to <= MaxConns)
+	// TrustProxyHeader reads a PROXY v1 header from the in-Pod loopback TLS
+	// terminator on every connection and uses its source as the peer address.
+	TrustProxyHeader bool
+	Audit            AuditTrail // signed audit trail; nil disables it
 }
 
 // Broker is the PostgreSQL credential-brokering TCP listener. It mirrors the
@@ -339,6 +345,19 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	}()
 	defer func() { _ = conn.Close() }()
 
+	peer := netip.Addr{}
+	if b.opts.TrustProxyHeader {
+		_ = conn.SetDeadline(time.Now().Add(b.opts.StartupTimeout))
+		source, err := brokercore.ReadProxyV1(conn, conn.RemoteAddr())
+		if err != nil {
+			b.logger.Debug("pgproxy: PROXY header refused")
+			return
+		}
+		peer = source
+	} else if remote, err := netip.ParseAddrPort(conn.RemoteAddr().String()); err == nil {
+		peer = remote.Addr().Unmap()
+	}
+
 	clientReader := &messageReader{reader: conn, startup: true}
 	backend := pgproto3.NewBackend(clientReader, conn)
 	backend.SetMaxBodyLen(maxAuthMessageBytes)
@@ -366,7 +385,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		requestedDB = startup.Parameters["user"]
 	}
 
-	scope, token, err := authenticateAgent(startupCtx, backend, b.opts.Auth, startup)
+	scope, token, err := authenticateAgent(startupCtx, backend, b.authenticator(peer), startup)
 	startupCancel()
 	if err != nil || scope == nil || scope.VaultID == "" || scope.ActorID == "" {
 		if err == nil {
@@ -400,15 +419,21 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	admissionCtx, admissionCancel := context.WithTimeout(hsCtx, b.opts.AdmissionTimeout)
 	defer admissionCancel()
 	// Cap live credentials per agent identity before minting (fail closed).
-	if !b.acquireLeaseSlot(admissionCtx, scope.ActorID) {
-		b.logger.Warn("pgproxy: per-actor live-credential limit reached",
+	// One pool agent serves many workers, so the cap applies per workload (Pod).
+	capKey := scope.ActorID
+	if scope.WorkloadID != "" {
+		capKey = "workload:" + scope.WorkloadID
+	}
+	if !b.acquireLeaseSlot(admissionCtx, capKey) {
+		b.logger.Warn("pgproxy: per-workload live-credential limit reached",
 			slog.String("vault", scope.VaultID),
 			slog.String("actor", scope.ActorID),
+			slog.String("workload", scope.WorkloadID),
 			slog.Int("limit", b.opts.MaxLeasesPerActor))
 		refuse("actor_limit", "53300", "Agent Vault: too many concurrent database sessions")
 		return
 	}
-	defer b.releaseLeaseSlot(scope.ActorID)
+	defer b.releaseLeaseSlot(capKey)
 
 	// Global backstop: bound the total upstream connections across all databases,
 	// applied only after auth so unauthenticated handshakes cannot consume it.
@@ -427,7 +452,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	// Admission can wait for cleanup. Recheck the original proof before using
 	// its scope to resolve a destination or issue another credential.
 	checkCtx, checkCancel := context.WithTimeout(hsCtx, b.opts.AuthorizationTimeout)
-	current, checkErr := b.opts.Auth.Authenticate(checkCtx, token, startup.Parameters["agent_vault_vault"])
+	current, checkErr := b.authenticator(peer).Authenticate(checkCtx, token, startup.Parameters["agent_vault_vault"])
 	valid := checkErr == nil && checkCtx.Err() == nil && current != nil &&
 		current.ActorID == scope.ActorID && current.VaultID == scope.VaultID && current.WorkloadID == scope.WorkloadID
 	checkCancel()
@@ -560,9 +585,14 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	authorizationDone := make(chan struct{})
 	go func() {
 		defer close(authorizationDone)
-		b.authorizationLoop(relayCtx, token, startup.Parameters["agent_vault_vault"], requestedDB, *scope, *svc, terminate)
+		b.authorizationLoop(relayCtx, token, startup.Parameters["agent_vault_vault"], requestedDB, *scope, *svc, terminate, peer)
 	}()
 	defer func() { relayCancel(); <-authorizationDone }()
+	if !scope.NotAfter.IsZero() {
+		// A pool Pod's session ends at its deadline, independent of any recheck.
+		deadline := time.AfterFunc(time.Until(scope.NotAfter), terminate)
+		defer deadline.Stop()
+	}
 	renewDone := make(chan struct{})
 	go func() { defer close(renewDone); b.renewLoop(relayCtx, lease, svc, terminate) }()
 	defer func() { relayCancel(); <-renewDone }()

@@ -3,6 +3,7 @@ package pgproxy
 import (
 	"context"
 	"errors"
+	"net/netip"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -85,7 +86,7 @@ func TestAuthorizationRecheckFailuresAndCapacityChange(t *testing.T) {
 					case terminated <- struct{}{}:
 					default:
 					}
-				})
+				}, netip.Addr{})
 			}()
 			if mode == "capacity-only" {
 				waitFor(t, time.Second, func() bool { return checks.Load() >= 3 }, "no authorization checks")

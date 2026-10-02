@@ -104,4 +104,3 @@ func writeRateLimitHeaders(w http.ResponseWriter, d Decision) {
 		w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(d.Remaining))
 	}
 }
-

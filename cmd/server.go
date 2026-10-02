@@ -434,6 +434,14 @@ func attachPostgresBrokerIfEnabled(srv *server.Server, host string, postgresPort
 	if v := intEnvValue("AGENT_VAULT_DB_MAX_PENDING_CONNS"); v > 0 {
 		opts.MaxPendingConns = v
 	}
+	// The PROXY header names the worker's address for pool admission. Only the
+	// in-Pod TLS terminator may send it, so it is refused off loopback.
+	if boolEnvValue("AGENT_VAULT_DB_PROXY_PROTOCOL") {
+		if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+			return fmt.Errorf("AGENT_VAULT_DB_PROXY_PROTOCOL requires a loopback PostgreSQL listener")
+		}
+		opts.TrustProxyHeader = true
+	}
 	srv.AttachPostgresBroker(pgproxy.New(net.JoinHostPort(host, strconv.Itoa(postgresPort)), opts))
 	return nil
 }

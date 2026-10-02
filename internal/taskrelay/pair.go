@@ -24,6 +24,9 @@ type pairVerifier struct {
 }
 
 func newPairVerifier(c FixedConfig) (*pairVerifier, error) {
+	if c.Self {
+		return &pairVerifier{config: c}, nil
+	}
 	t, e := clientTLS(c.Kubernetes.CAFile, "")
 	if e != nil {
 		return nil, e
@@ -37,6 +40,10 @@ func newPairVerifier(c FixedConfig) (*pairVerifier, error) {
 // audit write on it. It is not admission: check still performs the live test.
 func (v *pairVerifier) peerMatches(peer string) bool {
 	host, _, e := net.SplitHostPort(peer)
+	if v.config.Self {
+		// Same Pod: only the shared loopback interface reaches the sidecar.
+		return e == nil && net.ParseIP(host) != nil && net.ParseIP(host).IsLoopback()
+	}
 	return e == nil && net.ParseIP(host).Equal(net.ParseIP(v.config.Sandbox.PodIP))
 }
 
@@ -49,6 +56,9 @@ func (v *pairVerifier) check(ctx context.Context, peer string) error {
 	}
 	if peer != "" && !v.peerMatches(peer) {
 		return errDenied
+	}
+	if c.Self {
+		return nil
 	}
 	token, e := readBoundedFile(c.Kubernetes.ReviewerTokenFile, 32<<10)
 	if e != nil || strings.TrimSpace(string(token)) == "" {
