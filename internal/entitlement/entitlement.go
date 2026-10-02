@@ -53,6 +53,31 @@ func (c *Cache) now() time.Time {
 
 // Lookup returns the person and how old the answer is. Errors are never cached.
 func (c *Cache) Lookup(ctx context.Context, subject string, groups []string) (Person, time.Duration, error) {
+	return c.lookup(ctx, subject, groups, false)
+}
+
+// Fresh asks the source now, ignoring any cached answer, and caches the result.
+func (c *Cache) Fresh(ctx context.Context, subject string, groups []string) (Person, time.Duration, error) {
+	return c.lookup(ctx, subject, groups, true)
+}
+
+// Purge forgets every cached answer about subject, so its next lookup of any
+// group set asks the source.
+func (c *Cache) Purge(subject string) {
+	if c == nil {
+		return
+	}
+	prefix := subject + "\x00"
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for key := range c.entries {
+		if strings.HasPrefix(key, prefix) {
+			delete(c.entries, key)
+		}
+	}
+}
+
+func (c *Cache) lookup(ctx context.Context, subject string, groups []string, fresh bool) (Person, time.Duration, error) {
 	if c == nil || c.Source == nil {
 		return Person{}, 0, errors.New("no entitlement source configured")
 	}
@@ -65,7 +90,7 @@ func (c *Cache) Lookup(ctx context.Context, subject string, groups []string) (Pe
 	key := subject + "\x00" + strings.Join(sorted, ",")
 	now := c.now()
 	c.mu.Lock()
-	if e, ok := c.entries[key]; ok && now.Sub(e.fetched) < ttl {
+	if e, ok := c.entries[key]; ok && !fresh && now.Sub(e.fetched) < ttl {
 		c.mu.Unlock()
 		return e.person, now.Sub(e.fetched), nil
 	}
@@ -128,7 +153,19 @@ type Decision struct {
 	CacheAge time.Duration
 }
 
+type recheckKey struct{}
+
+// WithRecheck marks a decision as the periodic recheck of an open session.
+func WithRecheck(ctx context.Context) context.Context {
+	return context.WithValue(ctx, recheckKey{}, true)
+}
+
+func isRecheck(ctx context.Context) bool { v, _ := ctx.Value(recheckKey{}).(bool); return v }
+
 // Decide applies the lesser of the pool ceiling and the requester's entitlements.
+// A T2 admission always asks the directory now; T1 admissions and rechecks
+// may use the cache. A recheck that refuses forgets everything cached about
+// the person, so none of their other sessions or entries rides a stale answer.
 func Decide(ctx context.Context, cache *Cache, pool Pool, entry Entry, who Requester) Decision {
 	tier := entry.Tier
 	if tier == "" {
@@ -170,22 +207,26 @@ func Decide(ctx context.Context, cache *Cache, pool Pool, entry Entry, who Reque
 		d.Outcome = "entitlement_config"
 		return d
 	}
-	person, age, err := cache.Lookup(ctx, who.Subject, entry.Requires)
+	lookup := cache.Lookup
+	if want >= 2 && !isRecheck(ctx) {
+		lookup = cache.Fresh
+	}
+	person, age, err := lookup(ctx, who.Subject, entry.Requires)
 	d.CacheAge = age
-	if err != nil {
+	switch {
+	case err != nil:
 		d.Outcome = "entitlement_unavailable"
+	case !person.Enabled:
+		d.ObjectID, d.Outcome = person.ObjectID, "account_disabled"
+	case !subset(entry.Requires, person.MemberOf):
+		d.ObjectID, d.Outcome = person.ObjectID, "not_entitled"
+	default:
+		d.ObjectID, d.Allowed, d.Outcome = person.ObjectID, true, "entitled"
 		return d
 	}
-	d.ObjectID = person.ObjectID
-	if !person.Enabled {
-		d.Outcome = "account_disabled"
-		return d
+	if isRecheck(ctx) {
+		cache.Purge(who.Subject)
 	}
-	if !subset(entry.Requires, person.MemberOf) {
-		d.Outcome = "not_entitled"
-		return d
-	}
-	d.Allowed, d.Outcome = true, "entitled"
 	return d
 }
 
