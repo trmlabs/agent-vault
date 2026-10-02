@@ -203,7 +203,20 @@ func (p *Proxy) Serve(l net.Listener) error {
 // Shutdown returns; the tunnels will die with it.
 func (p *Proxy) Shutdown(ctx context.Context) error {
 	p.upstream.CloseIdleConnections()
-	return p.httpServer.Shutdown(ctx)
+	err := p.httpServer.Shutdown(ctx)
+	p.revokeGitTokens()
+	return err
+}
+
+// revokeGitTokens revokes every cached GitHub installation token, which GitHub
+// would otherwise honour for up to an hour after the broker stops.
+func (p *Proxy) revokeGitTokens() {
+	if p.adapter == nil {
+		return
+	}
+	if tokens, ok := p.adapter.GitTokens.(interface{ RevokeAll() }); ok {
+		tokens.RevokeAll()
+	}
 }
 
 func (p *Proxy) dispatch(w http.ResponseWriter, r *http.Request) {

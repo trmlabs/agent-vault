@@ -400,3 +400,21 @@ func TestAdapterRefusesAScopeWithoutAPool(t *testing.T) {
 		t.Fatalf("pool-less scope admitted: %d %+v", code, f.audit.last())
 	}
 }
+
+// Paths some backends normalise differently are refused before the prefix
+// match: path parameters and segments that begin with "..".
+func TestUnsafePathRefusesTraversalForms(t *testing.T) {
+	for path, unsafe := range map[string]bool{
+		"/v1/allowed/..;/admin": true,
+		"/v1/allowed;x=1":       true,
+		"/v1/allowed/..x":       true,
+		"/v1/allowed/../admin":  true,
+		"/v1/allowed/./x":       true,
+		"/v1/allowed/a..b":      false,
+		"/v1/allowed/x.json":    false,
+	} {
+		if got := unsafePath(path); got != unsafe {
+			t.Errorf("unsafePath(%q) = %v, want %v", path, got, unsafe)
+		}
+	}
+}

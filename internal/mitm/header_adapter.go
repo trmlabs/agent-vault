@@ -258,11 +258,13 @@ func (p *Proxy) relayScreened(w http.ResponseWriter, out *http.Request, needles 
 }
 
 func unsafePath(path string) bool {
-	if path == "" || !strings.HasPrefix(path, "/") || strings.Contains(path, placeholderMarker) || strings.ContainsAny(path, "\\") || strings.Contains(path, "//") {
+	// ";" carries path parameters that some backends strip before routing, so
+	// "/v1/allowed/..;/admin" would leave the granted prefix there.
+	if path == "" || !strings.HasPrefix(path, "/") || strings.Contains(path, placeholderMarker) || strings.ContainsAny(path, "\\;") || strings.Contains(path, "//") {
 		return true
 	}
 	for _, segment := range strings.Split(path, "/") {
-		if segment == "." || segment == ".." {
+		if segment == "." || strings.HasPrefix(segment, "..") {
 			return true
 		}
 	}
