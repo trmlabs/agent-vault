@@ -372,7 +372,7 @@ func (e *Entry) normalizePostgres() error {
 	case p.SSLMode == "":
 		p.SSLMode = "verify-full"
 	case p.SSLMode == "verify-full":
-	case p.SSLMode == "disable" && PlaintextDatabases.Load() && clusterLocal(e.Host):
+	case p.SSLMode == "disable" && plaintextDatabases.Load() && clusterLocal(e.Host):
 	default:
 		return fmt.Errorf("sslmode %q: catalog databases use verify-full", p.SSLMode)
 	}
@@ -675,10 +675,10 @@ func clusterLocal(host string) bool {
 	return strings.HasSuffix(host, ".svc.cluster.local") || strings.HasSuffix(host, ".svc")
 }
 
-// PlaintextDatabases lets a database entry use sslmode disable. Only a test
-// harness whose fixture database serves no TLS sets it, once at startup
-// (AGENT_VAULT_CATALOG_PLAINTEXT_DATABASES); the catalog validator never does.
-var PlaintextDatabases atomic.Bool
+// plaintextDatabases lets a database entry for a Kubernetes Service host use
+// sslmode disable. Only a binary built with the e2e tag can set it (see
+// plaintext_e2e.go), for the Kind fixture database, which serves no TLS.
+var plaintextDatabases atomic.Bool
 
 func pathWithin(path, prefix string) bool {
 	if !strings.HasPrefix(path, prefix) {

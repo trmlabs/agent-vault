@@ -170,8 +170,8 @@ func TestCatalogDatabasesUseVerifyFull(t *testing.T) {
 			t.Errorf("sslmode %s accepted", m)
 		}
 	}
-	PlaintextDatabases.Store(true)
-	t.Cleanup(func() { PlaintextDatabases.Store(false) })
+	plaintextDatabases.Store(true) // what an e2e build's AllowPlaintextDatabases sets
+	t.Cleanup(func() { plaintextDatabases.Store(false) })
 	if mode("disable") == nil {
 		t.Fatal("the test harness switch allowed plaintext to a public host")
 	}
