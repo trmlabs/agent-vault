@@ -22,6 +22,10 @@ type PoolOptions struct {
 	// Replicas divides each database's budget (the catalog's maxConns, or the
 	// broker's MaxConns) between broker replicas. Default 1.
 	Replicas int
+	// LiveReplicas, when set and positive, replaces Replicas with the fleet's
+	// current size, so budgets follow replicas joining and leaving. The
+	// durable cleanup journal supplies it from live owner rows.
+	LiveReplicas func() int
 	// SessionShare caps, per pool key, the connections pinned to one client
 	// for session state, as a fraction of the budget. Default 0.1, minimum 1.
 	SessionShare float64
@@ -138,7 +142,8 @@ type serverPool struct {
 
 // budget bounds server connections to one upstream address on this replica.
 type budget struct {
-	limit   int
+	base    int // the whole fleet's budget for the database
+	limit   int // this replica's share
 	open    int
 	waiters int
 	changed chan struct{}
@@ -173,14 +178,53 @@ func (p *serverPools) budgetFor(svc *DatabaseService) *budget {
 	if limit <= 0 {
 		limit = p.opts.DefaultBudget
 	}
-	limit = max(1, limit/p.opts.Replicas)
 	bud, ok := p.budgets[svc.Addr]
 	if !ok {
 		bud = &budget{changed: make(chan struct{})}
 		p.budgets[svc.Addr] = bud
 	}
-	bud.limit = limit // budgets follow the live catalog
+	bud.base = limit // budgets follow the live catalog
+	bud.limit = max(1, limit/p.replicas())
 	return bud
+}
+
+func (p *serverPools) replicas() int {
+	if p.opts.LiveReplicas != nil {
+		if n := p.opts.LiveReplicas(); n > 0 {
+			return n
+		}
+	}
+	return p.opts.Replicas
+}
+
+// trimLocked follows a change in fleet size: a smaller share closes idle
+// connections down to it; a larger one wakes waiters.
+func (p *serverPools) trimLocked() {
+	replicas := p.replicas()
+	for addr, bud := range p.budgets {
+		limit := max(1, bud.base/replicas)
+		if limit == bud.limit {
+			continue
+		}
+		grew := limit > bud.limit
+		bud.limit = limit
+		for _, pool := range p.pools {
+			if bud.open <= bud.limit {
+				break
+			}
+			if pool.svc.Addr != addr {
+				continue
+			}
+			for len(pool.idle) > 0 && bud.open > bud.limit {
+				conn := pool.idle[len(pool.idle)-1]
+				pool.idle = pool.idle[:len(pool.idle)-1]
+				p.closeLocked(conn)
+			}
+		}
+		if grew {
+			bud.notify()
+		}
+	}
 }
 
 func (bud *budget) notify() {
@@ -398,13 +442,16 @@ func (p *serverPools) release(conn *serverConn, reusable bool) {
 		conn.pinned = false
 		pool.pinned--
 	}
-	if !reusable || p.closed || conn.cred.retiring || conn.cred.revoked || !conn.cred.usable(time.Now()) {
+	bud := p.budgets[pool.svc.Addr]
+	// Over this replica's share after the fleet grew: give the connection back.
+	over := bud != nil && bud.open > bud.limit
+	if !reusable || over || p.closed || conn.cred.retiring || conn.cred.revoked || !conn.cred.usable(time.Now()) {
 		p.closeLocked(conn)
 		return
 	}
 	conn.idleAt = time.Now()
 	pool.idle = append(pool.idle, conn)
-	if bud := p.budgets[pool.svc.Addr]; bud != nil {
+	if bud != nil {
 		bud.notify()
 	}
 }
@@ -457,6 +504,7 @@ func (p *serverPools) maintain() {
 		now := time.Now()
 		var rotate []*serverPool
 		p.mu.Lock()
+		p.trimLocked()
 		for _, pool := range p.pools {
 			kept := pool.idle[:0]
 			for _, conn := range pool.idle {

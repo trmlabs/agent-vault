@@ -48,8 +48,11 @@ type Broker struct {
 	logger *slog.Logger
 
 	isListening atomic.Bool
-	acceptSem   chan struct{} // bounds accepted (handshaking) connections
-	serveSem    chan struct{} // bounds TOTAL serving connections across all databases
+	// authorityLost records a stop forced by the cleanup journal, so Serve
+	// reports it and the process restarts as a new owner.
+	authorityLost atomic.Bool
+	acceptSem     chan struct{} // bounds accepted (handshaking) connections
+	serveSem      chan struct{} // bounds TOTAL serving connections across all databases
 
 	cancellations  map[string]*cancelTarget
 	serveMu        sync.Mutex
@@ -127,10 +130,18 @@ func New(addr string, opts Options) *Broker {
 		leaseChanged:   make(chan struct{}),
 	}
 	if opts.Pool != nil {
-		b.pools = newServerPools(b, *opts.Pool)
+		pool := *opts.Pool
+		if live, ok := opts.Leases.(interface{ LiveReplicas() int }); ok && pool.LiveReplicas == nil {
+			pool.LiveReplicas = live.LiveReplicas
+		}
+		b.pools = newServerPools(b, pool)
 	}
 	return b
 }
+
+// ErrAuthorityLost reports that the broker stopped because its cleanup
+// authority ended: this replica fenced itself or lost its owner row.
+var ErrAuthorityLost = errors.New("postgres broker stopped: database cleanup authority lost")
 
 // Addr returns the configured listen address.
 func (b *Broker) Addr() string { return b.addr }
@@ -169,6 +180,7 @@ func (b *Broker) Serve(l net.Listener) error {
 					return
 				}
 				b.logger.Error("pgproxy: durable cleanup authority unavailable; stopping broker")
+				b.authorityLost.Store(true)
 				ctx, cancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
 				defer cancel()
 				_ = b.Shutdown(ctx)
@@ -184,6 +196,9 @@ func (b *Broker) Serve(l net.Listener) error {
 			closed := b.closed
 			b.mu.Unlock()
 			if closed {
+				if b.authorityLost.Load() {
+					return ErrAuthorityLost
+				}
 				return nil
 			}
 			return err
@@ -203,6 +218,9 @@ func (b *Broker) Serve(l net.Listener) error {
 			b.mu.Unlock()
 			<-b.acceptSem
 			_ = conn.Close()
+			if b.authorityLost.Load() {
+				return ErrAuthorityLost
+			}
 			return nil
 		}
 		b.conns[conn] = struct{}{}
