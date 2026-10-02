@@ -54,7 +54,7 @@ account and binding `gatehouse-staging-*`.
 **One identity pool for both clusters.** The staging and production clusters
 share `tokendrop-b2b-app`'s Workload Identity pool. A member is named only by
 namespace and service account, never by cluster:
-`serviceAccount:tokendrop-b2b-app.svc.id.goog[gatehouse/gatehouse-real-databases]`.
+`serviceAccount:tokendrop-b2b-app.svc.id.goog[gatehouse/gatehouse]` (the staging chart's service account, from `fullnameOverride: gatehouse` in `broker.values.yaml`; confirm it with `kubectl -n gatehouse get serviceaccount` before writing the binding).
 A production broker must use a different namespace (or project), or it would
 inherit the staging grants.
 
