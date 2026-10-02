@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/Infisical/agent-vault/internal/auditchain"
@@ -14,6 +15,28 @@ const (
 	auditCheckpointInterval = time.Minute
 	auditKeyRefresh         = 5 * time.Minute
 )
+
+var sharedAudit struct {
+	sync.Mutex
+	chain   *auditchain.Chain
+	started bool
+}
+
+// sharedAuditChain gives the PostgreSQL broker and the HTTP header adapter
+// one chain per process, so a replica has a single sequence and boot.
+func sharedAuditChain(ctx context.Context, client *hashicorp.Client, db any, getenv func(string) string) (*auditchain.Chain, error) {
+	sharedAudit.Lock()
+	defer sharedAudit.Unlock()
+	if sharedAudit.started {
+		return sharedAudit.chain, nil
+	}
+	chain, err := brokerAuditChain(ctx, client, db, getenv)
+	if err != nil {
+		return nil, err
+	}
+	sharedAudit.chain, sharedAudit.started = chain, true
+	return chain, nil
+}
 
 // brokerAuditChain starts the signed audit trail when AGENT_VAULT_AUDIT_CHAIN
 // is set. Enabled with incomplete settings, an unreadable key or an unwritable

@@ -60,6 +60,7 @@ type Proxy struct {
 	strictCredentialProxy bool
 	durableAudit          requestlog.Durable
 	strictTunnels         chan struct{}
+	adapter               *HeaderAdapter
 }
 
 // Options carries the dependencies a Proxy needs. BaseURL is the
@@ -71,7 +72,8 @@ type Proxy struct {
 type Options struct {
 	MaxCredentialProxyTunnels int                // <=0 defaults to 128 pending or active CONNECT tunnels
 	StrictCredentialProxy     bool               // bounded header-placeholder release path
-	DurableAudit              requestlog.Durable // mandatory when strict mode is enabled
+	DurableAudit              requestlog.Durable // mandatory when strict mode is enabled, unless HeaderAdapter is set
+	HeaderAdapter             *HeaderAdapter     // strict mode only: catalog destinations with signed audit
 	CA                        ca.Provider
 	Sessions                  brokercore.SessionResolver
 	Credentials               brokercore.CredentialProvider
@@ -116,6 +118,7 @@ func New(addr string, opts Options) *Proxy {
 		ca:                    opts.CA,
 		strictCredentialProxy: opts.StrictCredentialProxy,
 		durableAudit:          opts.DurableAudit,
+		adapter:               opts.HeaderAdapter,
 		strictTunnels:         make(chan struct{}, tunnelLimit),
 		sessions:              opts.Sessions,
 		creds:                 opts.Credentials,

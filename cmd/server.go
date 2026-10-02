@@ -204,7 +204,7 @@ var serverCmd = &cobra.Command{
 // in server.Start: since the MITM proxy is default-on, environments that
 // cannot create ~/.agent-vault/ca/ (read-only FS, containers without HOME,
 // corrupted state) must still be able to run the core HTTP server.
-func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKey []byte, db store.Store, maxRespBytes, maxReqBytes int64, resolver ...brokercore.SessionResolver) error {
+func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKey []byte, db store.Store, maxRespBytes, maxReqBytes int64, adapter *mitm.HeaderAdapter, resolver ...brokercore.SessionResolver) error {
 	if mitmPort <= 0 {
 		return nil
 	}
@@ -236,6 +236,7 @@ func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKe
 			CA:                    caProv,
 			StrictCredentialProxy: srv.CredentialProxyEnabled(),
 			DurableAudit:          requestlog.NewDurable(db),
+			HeaderAdapter:         adapter,
 			Sessions:              sessions,
 			Credentials:           srv.CredentialProvider(),
 			BaseURL:               srv.BaseURL(),
@@ -302,13 +303,19 @@ func attachServerExtensions(srv *server.Server, host string, mitmPort, postgresP
 		sessions = resolver
 		proxyIdentity = config
 	}
-	if err := attachMITMIfEnabled(srv, host, mitmPort, masterKey, db, maxRespBytes, maxReqBytes, sessions); err != nil {
-		return err
-	}
 	attachInfisicalIfConfigured(srv, logger)
 	attachHashicorpIfConfigured(srv, logger)
 	if srv.CredentialProxyEnabled() && srv.HashicorpClient() == nil {
 		return fmt.Errorf("credential proxy requires a working HashiCorp Vault client")
+	}
+	// The HTTP header adapter reads keys through the HashiCorp client, so the
+	// MITM proxy is attached after it.
+	adapter, err := httpHeaderAdapter(context.Background(), srv, os.Getenv)
+	if err != nil {
+		return fmt.Errorf("http header adapter: %w", err)
+	}
+	if err := attachMITMIfEnabled(srv, host, mitmPort, masterKey, db, maxRespBytes, maxReqBytes, adapter, sessions); err != nil {
+		return err
 	}
 	// The postgres broker depends on the HashiCorp client, so attach it after
 	// attachHashicorpIfConfigured has run.
@@ -391,7 +398,7 @@ func attachPostgresBrokerIfEnabled(srv *server.Server, host string, postgresPort
 		Dialer:    netguard.SafeDialContext(netguard.AllowPrivateFromEnv()),
 		Logger:    logger,
 	}
-	if chain, err := brokerAuditChain(context.Background(), client, srv.CleanupStore(), os.Getenv); err != nil {
+	if chain, err := sharedAuditChain(context.Background(), client, srv.CleanupStore(), os.Getenv); err != nil {
 		return fmt.Errorf("postgres broker audit: %w", err)
 	} else if chain != nil {
 		opts.Audit = chain

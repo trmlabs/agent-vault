@@ -24,6 +24,8 @@ const (
 	EventCheckpoint       = "checkpoint"
 	EventCheckpointFailed = "checkpoint_failed"
 	EventKeyRotated       = "key_rotated"
+	EventHTTPRequest      = "http_request"  // admitted, before the upstream call
+	EventHTTPResponse     = "http_response" // outcome and status of that call
 )
 
 // Row is one audit record. It carries identifiers and fixed outcome codes
@@ -41,6 +43,8 @@ type Row struct {
 	Session   string `json:"session,omitempty"`   // broker-generated session ID
 	Outcome   string `json:"outcome,omitempty"`   // fixed code
 	Requester string `json:"requester,omitempty"` // developer identity, only from a verified source
+	Method    string `json:"method,omitempty"`    // HTTP rows only
+	Status    int    `json:"status,omitempty"`    // HTTP response rows: upstream or broker status
 	SignedSeq uint64 `json:"signedSeq,omitempty"` // checkpoint: the chain head it signs
 	SignedMAC string `json:"signedMAC,omitempty"`
 	Signature string `json:"signature,omitempty"` // checkpoint: Transit "vault:vN:..." signature
@@ -60,7 +64,7 @@ type Row struct {
 func (r Row) macInput() []byte {
 	fields := []string{
 		r.Type, r.Replica, strconv.FormatUint(r.Boot, 10), strconv.FormatUint(r.Seq, 10), r.Time, r.Event,
-		r.Pool, r.PodUID, r.Binding, r.Session, r.Outcome, r.Requester,
+		r.Pool, r.PodUID, r.Binding, r.Session, r.Outcome, r.Requester, r.Method, strconv.Itoa(r.Status),
 		strconv.FormatUint(r.SignedSeq, 10), r.SignedMAC, r.Signature,
 		strconv.Itoa(r.PrevKey), strconv.FormatUint(r.PrevBoot, 10), strconv.FormatUint(r.PrevCheckpointSeq, 10), r.PrevCheckpointMAC,
 		strconv.Itoa(r.KeyVersion), r.Prev,

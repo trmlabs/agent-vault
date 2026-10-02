@@ -57,6 +57,8 @@ type Event struct {
 	Session   string
 	Outcome   string
 	Requester string
+	Method    string
+	Status    int
 }
 
 var (
@@ -139,8 +141,16 @@ func (c *Chain) Admit() error {
 // caller must not start or continue the action it describes.
 func (c *Chain) Record(e Event) error {
 	switch e.Event {
-	case EventSessionOpen, EventSessionClose, EventDenied:
+	case EventSessionOpen, EventSessionClose, EventDenied, EventHTTPRequest, EventHTTPResponse:
 	default:
+		return ErrInvalidEvent
+	}
+	switch e.Method {
+	case "", "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "TRACE":
+	default:
+		return ErrInvalidEvent
+	}
+	if e.Status != 0 && (e.Status < 100 || e.Status > 599) {
 		return ErrInvalidEvent
 	}
 	for _, v := range []string{e.Pool, e.PodUID, e.Binding, e.Session, e.Outcome, e.Requester} {
@@ -150,7 +160,7 @@ func (c *Chain) Record(e Event) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	_, err := c.appendLocked(Row{Event: e.Event, Pool: e.Pool, PodUID: e.PodUID, Binding: e.Binding, Session: e.Session, Outcome: e.Outcome, Requester: e.Requester})
+	_, err := c.appendLocked(Row{Event: e.Event, Pool: e.Pool, PodUID: e.PodUID, Binding: e.Binding, Session: e.Session, Outcome: e.Outcome, Requester: e.Requester, Method: e.Method, Status: e.Status})
 	return err
 }
 

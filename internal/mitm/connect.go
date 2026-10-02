@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Infisical/agent-vault/internal/auditchain"
 	"github.com/Infisical/agent-vault/internal/brokercore"
 	"github.com/Infisical/agent-vault/internal/ratelimit"
 )
@@ -112,7 +113,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		writeProxyAuthChallenge(w, "Proxy-Authorization required")
 		return
 	}
-	_, err = p.sessions.ResolveForProxy(r.Context(), token, hint)
+	connectScope, err := p.sessions.ResolveForProxy(r.Context(), token, hint)
 	if err != nil {
 		p.recordAuthFailure(r)
 		if p.strictCredentialProxy {
@@ -120,6 +121,12 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeAuthError(w, err)
+		return
+	}
+	// With a catalog, refuse an unlisted host before minting a certificate
+	// for it or opening a tunnel.
+	if p.strictCredentialProxy && p.adapter.valid() && !p.adapter.Catalog.HasHost(host, port) {
+		p.adapterDeny(w, auditchain.Event{Pool: connectScope.AgentID, PodUID: connectScope.WorkloadID}, http.StatusForbidden, "unlisted")
 		return
 	}
 
