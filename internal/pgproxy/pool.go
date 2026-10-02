@@ -96,6 +96,12 @@ type credential struct {
 	conns    int
 	retiring bool
 	revoked  bool
+	margin   time.Duration // stop opening or reusing connections this long before expiry
+}
+
+// usable reports whether new work may still start on the credential.
+func (c *credential) usable(now time.Time) bool {
+	return now.Before(c.lease.ExpiresAt.Add(-c.margin))
 }
 
 // serverConn is one upstream connection, owned by at most one client at a time.
@@ -317,7 +323,7 @@ func (p *serverPools) credentialFor(ctx context.Context, pool *serverPool, svc D
 		p.mu.Lock()
 		defer p.mu.Unlock()
 		cur := pool.cur
-		if cur != nil && !cur.retiring && !cur.revoked && time.Now().Before(cur.lease.ExpiresAt.Add(-5*time.Second)) {
+		if cur != nil && !cur.retiring && !cur.revoked && cur.usable(time.Now()) {
 			cur.conns++
 			return cur
 		}
@@ -349,7 +355,7 @@ func (p *serverPools) mintLocked(ctx context.Context, pool *serverPool, svc Data
 	if err != nil {
 		return nil, fmt.Errorf("mint pooled credential: %w", err)
 	}
-	if lease == nil || lease.ID == "" || lease.Username == "" || lease.Password == "" || !lease.ExpiresAt.After(time.Now().Add(10*time.Second)) {
+	if lease == nil || lease.ID == "" || lease.Username == "" || lease.Password == "" || !lease.ExpiresAt.After(time.Now().Add(time.Second)) {
 		if lease != nil && lease.ID != "" {
 			p.revoke(lease)
 		}
@@ -360,7 +366,8 @@ func (p *serverPools) mintLocked(ctx context.Context, pool *serverPool, svc Data
 	var jitter [2]byte
 	_, _ = rand.Read(jitter[:])
 	spread := time.Duration(float64(life) * 0.1 * float64(binary.BigEndian.Uint16(jitter[:])) / 65535)
-	cred := &credential{lease: lease, issued: now, rotateAt: now.Add(time.Duration(float64(life)*p.opts.RotateFraction) - spread)}
+	cred := &credential{lease: lease, issued: now, rotateAt: now.Add(time.Duration(float64(life)*p.opts.RotateFraction) - spread),
+		margin: min(5*time.Second, life/4)}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if old := pool.cur; old != nil {
@@ -391,7 +398,7 @@ func (p *serverPools) release(conn *serverConn, reusable bool) {
 		conn.pinned = false
 		pool.pinned--
 	}
-	if !reusable || p.closed || conn.cred.retiring || conn.cred.revoked || !time.Now().Before(conn.cred.lease.ExpiresAt.Add(-5*time.Second)) {
+	if !reusable || p.closed || conn.cred.retiring || conn.cred.revoked || !conn.cred.usable(time.Now()) {
 		p.closeLocked(conn)
 		return
 	}
