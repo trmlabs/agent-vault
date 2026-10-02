@@ -109,7 +109,7 @@ func (p *Proxy) forwardGitHubAPI(w http.ResponseWriter, r *http.Request, target 
 		_ = a.Audit.Record(done)
 	}
 	needles := secretRepresentations(map[string]string{"token": token.Value(), "credential": credential})
-	p.relayScreened(w, out, needles, entry.MaxResponseBytes, finish, func() {
+	p.relayScreened(w, out, needles, entry.MaxResponseBytes, finish, func(*http.Response) {
 		a.GitTokens.Invalidate(app, api.Repo.Repo, githubapp.PullRequestsWrite)
 	}, nil)
 }

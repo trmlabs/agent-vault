@@ -2,8 +2,10 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -95,10 +97,7 @@ func httpHeaderAdapter(ctx context.Context, srv *server.Server, getenv func(stri
 	}
 	keys := &httpcatalog.Keys{Vault: client.Logical()}
 	adapter := &mitm.HeaderAdapter{Catalog: source, Keys: keys, Audit: chain}
-	// Browser-session test users log in through Auth0 from the broker, over
-	// the same guarded dialer as every other upstream.
-	adapter.BrowserTokens = &httpcatalog.Auth0Tokens{Keys: keys, Client: &http.Client{Timeout: 10 * time.Second,
-		Transport: &http.Transport{DialContext: netguard.SafeDialContext(netguard.AllowPrivateFromEnv()), TLSHandshakeTimeout: 5 * time.Second}}}
+	adapter.BrowserTokens = &httpcatalog.Auth0Tokens{Keys: keys, Client: auth0Client(source, netguard.SafeDialContext(netguard.AllowPrivateFromEnv()))}
 	githubEntries := false
 	for _, e := range source.Current().Entries() {
 		githubEntries = githubEntries || e.Kind == "git" || e.Kind == "github-api"
@@ -115,6 +114,24 @@ func httpHeaderAdapter(ctx context.Context, srv *server.Server, getenv func(stri
 		return nil, err
 	}
 	return adapter, nil
+}
+
+// auth0Client is how browser-session test users log in from the broker: over
+// the same guarded dialer as every other upstream, to an Auth0 domain the
+// current catalog names on port 443 and nowhere else, never following a
+// redirect, since the login body holds the user's password and the client
+// secret.
+func auth0Client(catalog interface{ Current() httpcatalog.Catalog }, dial func(context.Context, string, string) (net.Conn, error)) *http.Client {
+	pinned := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil || port != "443" || !catalog.Current().HasAuth0Domain(host) {
+			return nil, errors.New("auth0 login: host not in the catalog")
+		}
+		return dial(ctx, network, addr)
+	}
+	return &http.Client{Timeout: 10 * time.Second,
+		Transport:     &http.Transport{DialContext: pinned, TLSHandshakeTimeout: 5 * time.Second},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 }
 
 // githubAppSigner signs App JWTs with the App key imported into Transit, so

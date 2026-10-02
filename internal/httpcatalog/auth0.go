@@ -33,7 +33,8 @@ func (t BrowserToken) Format(f fmt.State, _ rune) { _, _ = f.Write([]byte(t.Stri
 // Auth0Tokens logs test users in with Auth0's password-realm grant through a
 // confidential client and caches each access token until a quarter of its
 // life remains. The user's password and the client secret come from Vault on
-// each login and are never cached here.
+// each login and are never cached here. The login asks for no refresh token
+// and never follows a redirect: the request body holds both secrets.
 type Auth0Tokens struct {
 	Keys interface {
 		Get(context.Context, KeyRef) (Secret, error)
@@ -47,6 +48,11 @@ type Auth0Tokens struct {
 }
 
 var ErrBrowserLogin = errors.New("browser test-user login failed")
+
+// reloginInterval is the youngest token Invalidate drops. A worker can make
+// the API refuse a request on purpose; this bounds the logins it can force to
+// one per entry per interval.
+const reloginInterval = time.Minute
 
 func (a *Auth0Tokens) now() time.Time {
 	if a.Now != nil {
@@ -99,11 +105,16 @@ func (a *Auth0Tokens) Token(ctx context.Context, e *Entry) (BrowserToken, error)
 	return t, nil
 }
 
-// Invalidate drops an entry's token after the API refused it.
+// Invalidate drops an entry's token after the API refused it, unless the
+// token is younger than reloginInterval.
 func (a *Auth0Tokens) Invalidate(e *Entry) {
+	key := cacheKey(e)
 	a.mu.Lock()
-	delete(a.cache, cacheKey(e))
-	a.mu.Unlock()
+	defer a.mu.Unlock()
+	if t, ok := a.cache[key]; ok && a.now().Sub(t.Expires.Add(-t.life)) < reloginInterval {
+		return
+	}
+	delete(a.cache, key)
 }
 
 func cacheKey(e *Entry) string {
@@ -125,7 +136,7 @@ func (a *Auth0Tokens) login(ctx context.Context, b *BrowserSessionBinding) (Brow
 	}
 	body, _ := json.Marshal(map[string]string{
 		"grant_type": "http://auth0.com/oauth/grant-type/password-realm", "realm": b.Auth0.Realm,
-		"audience": b.Auth0.Audience, "scope": b.Auth0.Scope,
+		"audience": b.Auth0.Audience, "scope": loginScope(b.Auth0.Scope),
 		"username": values["username"], "password": values["password"],
 		"client_id": values["client_id"], "client_secret": values["client_secret"],
 	})
@@ -134,10 +145,13 @@ func (a *Auth0Tokens) login(ctx context.Context, b *BrowserSessionBinding) (Brow
 		return BrowserToken{}, ErrBrowserLogin
 	}
 	req.Header.Set("Content-Type", "application/json")
-	client := a.Client
-	if client == nil {
+	if a.Client == nil {
 		return BrowserToken{}, ErrBrowserLogin
 	}
+	// A 307 or 308 would re-send the body, secrets included, to wherever it
+	// points; the login answers from the Auth0 domain or not at all.
+	client := *a.Client
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	issued := a.now()
 	resp, err := client.Do(req)
 	if err != nil {
@@ -165,6 +179,19 @@ func (a *Auth0Tokens) login(ctx context.Context, b *BrowserSessionBinding) (Brow
 	}
 	life := time.Duration(out.ExpiresIn) * time.Second
 	return BrowserToken{access: out.AccessToken, life: life, Claims: claims, Expires: issued.Add(life)}, nil
+}
+
+// loginScope is the app's scope without offline_access. The broker never
+// uses a refresh token, and each one Auth0 issued would stay live after the
+// access token is dropped.
+func loginScope(scope string) string {
+	var kept []string
+	for _, s := range strings.Fields(scope) {
+		if s != "offline_access" {
+			kept = append(kept, s)
+		}
+	}
+	return strings.Join(kept, " ")
 }
 
 // Claims a browser seed may carry: who the user is, never what proves it.
