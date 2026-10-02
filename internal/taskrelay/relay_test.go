@@ -454,6 +454,9 @@ func TestPostgresDeniesAuthorityAndMalformedFramesBeforeUpstream(t *testing.T) {
 	for key, values := range map[string][]string{
 		"application_name":  {strings.Repeat("a", 64), "injected\nlog", "client\x01", "客户端"},
 		"statement_timeout": {"", "0", "-1", "+1", "30s", " 30000", "2147483648", "99999999999", "30000 -c role=admin"},
+		"client_encoding":   {"SJIS", "GBK", "nonsense", "UTF8'; SET role admin"},
+		"TimeZone":          {"UTC\r\nrole=admin"},
+		"search_path":       {"public\x00; drop table t"},
 	} {
 		for _, value := range values {
 			invalid = append(invalid, map[string]string{"user": "workload", "database": "canary", key: value})

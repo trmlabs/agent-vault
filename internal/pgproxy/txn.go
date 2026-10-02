@@ -20,31 +20,13 @@ import (
 	"github.com/jackc/pgx/v5/pgproto3"
 
 	"github.com/Infisical/agent-vault/internal/auditchain"
+	"github.com/Infisical/agent-vault/internal/brokercore"
 )
 
 // sessionParams are the startup parameters a pooled session may set. The
 // broker applies each client's values to whichever server connection it is
 // given, so they never leak from one client to the next.
 var sessionParams = []string{"DateStyle", "TimeZone", "client_encoding", "extra_float_digits", "search_path", "standard_conforming_strings", "statement_timeout"}
-
-// validSessionParam accepts the values drivers send by default. client_encoding
-// is any encoding name (libpq sends the locale's, such as SQL_ASCII under the C
-// locale); the server rejects a name it does not support. The rest use the
-// same bounds as unpooled sessions.
-func validSessionParam(name, value string) bool {
-	if name != "client_encoding" {
-		return validStartupValue(name, value)
-	}
-	if value == "" || len(value) > 32 {
-		return false
-	}
-	for i := 0; i < len(value); i++ {
-		if c := value[i]; c >= 0x80 || c != '_' && c != '-' && !identChar(c) {
-			return false
-		}
-	}
-	return true
-}
 
 var errRebind = errors.New("server connection released; bind again")
 
@@ -116,8 +98,10 @@ func (b *Broker) servePooled(ctx context.Context, conn net.Conn, backend *pgprot
 	s := &pooledSession{b: b, key: key, vaultID: scope.VaultID, svc: *svc, client: conn, backend: backend, event: event,
 		params: map[string]string{}, txStatus: 'I', statements: map[string]clientStatement{}}
 	for _, name := range sessionParams {
-		if value, ok := startupParams[name]; ok && validSessionParam(name, value) {
-			s.params[name] = value
+		if value, ok := startupParams[name]; ok {
+			if v, valid := brokercore.StartupValue(name, value); valid {
+				s.params[name] = v
+			}
 		}
 	}
 	unregister, clientKey, err := b.registerPooledCancel(s)
