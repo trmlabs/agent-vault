@@ -48,6 +48,8 @@ type Entry struct {
 	Git            *GitBinding            `json:"git,omitempty"`
 	Postgres       *PostgresBinding       `json:"postgres,omitempty"`
 	BrowserSession *BrowserSessionBinding `json:"browserSession,omitempty"`
+	// Kind "gcp" mints a short-lived Google token per entry; see GCPBinding.
+	GCP *GCPBinding `json:"gcp,omitempty"`
 	// Tier is T0 (data every worker allowed on the pool may read; the default),
 	// T1 (a verified person in every Requires group) or T2 (T1 with
 	// time-boxed groups granted through Lumos). Requires lists Entra group
@@ -300,9 +302,11 @@ func (e *Entry) normalize() error {
 		return nil
 	case "browser-session":
 		return e.normalizeBrowser()
+	case "gcp":
+		return e.normalizeGCP()
 	case "":
-		if e.Git != nil || e.Postgres != nil || e.BrowserSession != nil {
-			return errors.New("git, postgres or browserSession settings require their kind")
+		if e.Git != nil || e.Postgres != nil || e.BrowserSession != nil || e.GCP != nil {
+			return errors.New("git, postgres, browserSession or gcp settings require their kind")
 		}
 	default:
 		return fmt.Errorf("unknown kind %q", e.Kind)
@@ -366,7 +370,7 @@ func (e *Entry) normalize() error {
 
 func (e *Entry) normalizePostgres() error {
 	if len(e.PathPrefixes) > 0 || len(e.Methods) > 0 || e.Header != "" || e.Scheme != "" || e.Placeholder != "" || e.Key != (KeyRef{}) ||
-		len(e.ForwardHeaders) > 0 || e.Git != nil || e.BrowserSession != nil || e.MaxRequestBytes != 0 || e.MaxResponseBytes != 0 {
+		len(e.ForwardHeaders) > 0 || e.Git != nil || e.BrowserSession != nil || e.GCP != nil || e.MaxRequestBytes != 0 || e.MaxResponseBytes != 0 {
 		return errors.New("postgres entries take only host, port, pools and postgres settings")
 	}
 	p := e.Postgres
@@ -435,7 +439,7 @@ func (c Catalog) CheckHosts(suffixes []string) error {
 }
 
 func (e *Entry) normalizeGit() error {
-	if e.Postgres != nil || e.BrowserSession != nil {
+	if e.Postgres != nil || e.BrowserSession != nil || e.GCP != nil {
 		return errors.New("postgres settings require kind postgres")
 	}
 	if len(e.PathPrefixes) > 0 || len(e.Methods) > 0 || e.Header != "" || e.Scheme != "" || e.Placeholder != "" || e.Key != (KeyRef{}) || len(e.ForwardHeaders) > 0 {
