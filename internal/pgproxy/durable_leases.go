@@ -524,7 +524,7 @@ func (m *DurableLeaseMinter) Revoke(ctx context.Context, id string) error {
 // deadline, so a planned restart under the same replica name registers at
 // once instead of waiting out the row; records still held become claimable.
 func (m *DurableLeaseMinter) Close(ctx context.Context) error {
-	defer m.release()
+	defer func() { _ = m.release() }()
 	m.cancel()
 	select {
 	case <-m.done:
