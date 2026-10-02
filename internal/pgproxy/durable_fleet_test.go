@@ -1,15 +1,19 @@
 package pgproxy
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -411,4 +415,93 @@ func TestReplicaGuardHelperProcess(t *testing.T) {
 		m.Close(context.Background())
 	}
 	os.Exit(4)
+}
+
+// A planned restart: the broker process gets SIGTERM, revokes its leases and
+// releases its owner row, so a new process under the same replica name
+// registers at once instead of waiting out the row.
+func TestGracefulRestartReRegistersAtOnce(t *testing.T) {
+	if os.Getenv("GH_REPLICA_RESTART_DB") != "" {
+		t.Skip("helper process")
+	}
+	path := filepath.Join(t.TempDir(), "journal.db")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestReplicaRestartHelperProcess$", "-test.count=1") // #nosec G702 -- re-runs this test binary
+	cmd.Env = append(os.Environ(), "GH_REPLICA_RESTART_DB="+path)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	ready := make(chan struct{})
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			if scanner.Text() == "registered" {
+				close(ready)
+			}
+		}
+	}()
+	select {
+	case <-ready:
+	case <-time.After(10 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatal("helper broker never registered")
+	}
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("helper broker did not stop cleanly: %v", err)
+	}
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if records, err := st.ListDatabaseCleanup(context.Background()); err != nil || len(records) != 0 {
+		t.Fatalf("leases left after a graceful stop: %d %v", len(records), err)
+	}
+	client, _, _ := durableFixtureOn(t, st)
+	start := time.Now()
+	restarted, err := NewDurableLeaseMinter(context.Background(), client, st, DurableLeaseOptions{OwnerTTL: 30 * time.Second, Replica: "gatehouse-0"})
+	if err != nil {
+		t.Fatal("restart refused:", err)
+	}
+	defer restarted.Close(context.Background())
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("restart registered after %s, want under 5 s", took)
+	}
+}
+
+// TestReplicaRestartHelperProcess is the broker being restarted: it registers,
+// mints one lease, and on SIGTERM closes as the server does on shutdown.
+func TestReplicaRestartHelperProcess(t *testing.T) {
+	path := os.Getenv("GH_REPLICA_RESTART_DB")
+	if path == "" {
+		t.Skip("run by TestGracefulRestartReRegistersAtOnce")
+	}
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGTERM)
+	st, err := store.Open(path)
+	if err != nil {
+		os.Exit(2)
+	}
+	client, _, _ := durableFixtureOn(t, st)
+	m, err := NewDurableLeaseMinter(context.Background(), client, st, DurableLeaseOptions{OwnerTTL: 30 * time.Second, Replica: "gatehouse-0"})
+	if err != nil {
+		os.Exit(3)
+	}
+	if _, err := m.Mint(context.Background(), AgentScope{VaultID: "vault"}, fleetService); err != nil {
+		os.Exit(4)
+	}
+	fmt.Println("registered")
+	<-signals
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if m.Close(ctx) != nil {
+		os.Exit(5)
+	}
+	os.Exit(0)
 }
