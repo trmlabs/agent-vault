@@ -27,6 +27,7 @@ type ProxyScope struct {
 	VaultID    string
 	VaultName  string
 	VaultRole  string
+	NotAfter   time.Time // zero, or the instant the session must end (a pool Pod's deadline)
 }
 
 // ActorID returns the non-empty principal ID — UserID for user
