@@ -83,7 +83,7 @@ func httpHeaderAdapter(ctx context.Context, srv *server.Server, getenv func(stri
 	if err != nil {
 		return nil, err
 	}
-	chain, err := sharedAuditChain(ctx, client, srv.CleanupStore(), getenv)
+	chain, err := sharedAuditChain(ctx, client, srv.CleanupStore(), getenv, srv.Logger())
 	if err != nil {
 		return nil, err
 	}

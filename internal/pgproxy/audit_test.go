@@ -2,6 +2,8 @@ package pgproxy
 
 import (
 	"errors"
+	"log/slog"
+	"net"
 	"strings"
 	"sync"
 	"testing"
@@ -119,5 +121,73 @@ func TestBrokerAuditsDenials(t *testing.T) {
 	}
 	if got := unauth.recorded(); len(got) != 1 || got[0].Outcome != "authentication" || got[0].Pool != "" || got[0].PodUID != "" {
 		t.Fatalf("authentication denial: %+v", got)
+	}
+}
+
+// failingAudit is a trail whose failure the test triggers.
+type failingAudit struct {
+	recordingAudit
+	failed chan struct{}
+}
+
+func (a *failingAudit) Failed() <-chan struct{} { return a.failed }
+
+// When the trail fails, sessions already open end: nothing they do could be
+// recorded, and Admit only gates new ones.
+func TestBrokerEndsOpenSessionsWhenTheAuditTrailFails(t *testing.T) {
+	lease := newLease()
+	upstream := startFakeUpstream(t, authTrust, lease.Password)
+	audit := &failingAudit{failed: make(chan struct{})}
+	_, addr := startBroker(t, Options{
+		Auth:      &fakeAuth{scope: &AgentScope{VaultID: "vault-1", ActorID: "pool-agent", WorkloadID: "pod-uid-1"}},
+		Databases: &fakeResolver{svc: &DatabaseService{Name: "analytics", Addr: upstream.addr(), Mount: "database", Role: "readonly"}},
+		Leases:    &fakeMinter{lease: lease},
+		Audit:     audit,
+	})
+	session := openAgentSession(t, addr, "agent-vault-token-xyz", "appdb")
+	conn := session.conn
+	t.Cleanup(func() { _ = conn.Close() })
+	close(audit.failed)
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, 256)
+	for {
+		if _, err := conn.Read(buf); err != nil {
+			var timeout net.Error
+			if errors.As(err, &timeout) && timeout.Timeout() {
+				t.Fatal("open session survived the audit trail failing")
+			}
+			return
+		}
+	}
+}
+
+// Pre-authentication denied rows are capped: a burst, then a steady rate,
+// with what was dropped counted in the operational log.
+func TestPreAuthDeniedRowsAreRateLimited(t *testing.T) {
+	var logs strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	var l deniedLimiter
+	now := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
+	allowed := 0
+	for range 100 {
+		if l.allow(now, logger) {
+			allowed++
+		}
+	}
+	if allowed != deniedBurst {
+		t.Fatalf("burst allowed %d rows, want %d", allowed, deniedBurst)
+	}
+	if !strings.Contains(logs.String(), "suppressed") {
+		t.Fatalf("dropped rows not reported: %q", logs.String())
+	}
+	now = now.Add(time.Second)
+	allowed = 0
+	for range 100 {
+		if l.allow(now, logger) {
+			allowed++
+		}
+	}
+	if allowed != deniedPerSecond {
+		t.Fatalf("one second later allowed %d rows, want %d", allowed, deniedPerSecond)
 	}
 }
