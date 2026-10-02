@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"net"
+	"os"
 	"testing"
 	"time"
 
@@ -123,5 +124,90 @@ func TestUnreachableBrokerIsNamed(t *testing.T) {
 	typ, body, e := readPGFrame(c, 4096)
 	if e != nil || typ != 'E' || sqlState(body) != "08001" || !bytes.Contains(body, []byte(unreachableMessage)) {
 		t.Fatalf("unreachable frame %q %q %v", typ, body, e)
+	}
+}
+
+func TestTaskDeadlineMidSessionTellsTheWorker(t *testing.T) {
+	worker, relayClient := tcpPair(t)
+	relayUp, _ := tcpPair(t)
+	deadline := time.Now().Add(200 * time.Millisecond)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	go copyPostgres(ctx, relayClient, relayUp, deadline)
+	_ = worker.SetDeadline(time.Now().Add(5 * time.Second))
+	typ, body, e := readPGFrame(worker, 4096)
+	if e != nil || typ != 'E' || sqlState(body) != "08006" || !bytes.Contains(body, []byte(sessionEndedMessage)) {
+		t.Fatalf("task deadline frame %q %q %v", typ, body, e)
+	}
+}
+
+func TestWithdrawnTaskClosesSilently(t *testing.T) {
+	worker, relayClient := tcpPair(t)
+	relayUp, _ := tcpPair(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	go copyPostgres(ctx, relayClient, relayUp, time.Now().Add(time.Minute))
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	_ = worker.SetDeadline(time.Now().Add(5 * time.Second))
+	if typ, body, e := readPGFrame(worker, 4096); e == nil {
+		t.Fatalf("withdrawn task sent %q %q", typ, body)
+	}
+}
+
+// In session, a broker refusal is rewritten in fixed words with its severity
+// kept; a database server error passes through byte for byte.
+func TestInSessionErrors(t *testing.T) {
+	worker, broker := session(t, time.Now().Add(time.Minute))
+	server := errorBody("42601", `syntax error at or near "SELEC"`)
+	serverFrame := encodePGFrame('E', server)
+	large := encodePGFrame('E', append(errorBody("XX000", "x"), bytes.Repeat([]byte{'z'}, 20<<10)...))
+	go func() {
+		_, _ = broker.Write(encodePGFrame('E', reasonBody("ERROR", "53300", "pool_budget")))
+		_, _ = broker.Write(encodePGFrame('Z', []byte{'I'}))
+		_, _ = broker.Write(serverFrame)
+		_, _ = broker.Write(large)
+		_, _ = broker.Write(encodePGFrame('E', reasonBody("FATAL", "08006", "upstream")))
+	}()
+	typ, body, e := readPGFrame(worker, 4096)
+	if e != nil || typ != 'E' || errorField(body, 'S') != "ERROR" || sqlState(body) != "53300" ||
+		!bytes.Contains(body, []byte("connection budget is full")) || bytes.Contains(body, []byte("must not leak")) {
+		t.Fatalf("pooled budget refusal %q %q %v", typ, body, e)
+	}
+	if typ, _, e := readPGFrame(worker, 16); e != nil || typ != 'Z' {
+		t.Fatal("session did not continue after an ERROR refusal")
+	}
+	got := make([]byte, len(serverFrame))
+	if _, e := readFull(worker, got); e != nil || !bytes.Equal(got, serverFrame) {
+		t.Fatalf("database error changed: %q", got)
+	}
+	got = make([]byte, len(large))
+	if _, e := readFull(worker, got); e != nil || !bytes.Equal(got, large) {
+		t.Fatal("large database error changed")
+	}
+	typ, body, e = readPGFrame(worker, 4096)
+	if e != nil || typ != 'E' || errorField(body, 'S') != "FATAL" || sqlState(body) != "08006" || bytes.Contains(body, []byte("must not leak")) {
+		t.Fatalf("in-session upstream loss %q %q %v", typ, body, e)
+	}
+}
+
+// The sidecar's own proof is unreadable: the worker hears it, not a silent close.
+func TestUnreadableProofIsNamed(t *testing.T) {
+	f := newRelayFixture(t)
+	up := f.upstream(t, freeAddress(t))
+	f.c.Postgres = &PostgresConfig{Listen: freeAddress(t), Upstream: up, Database: "canary", User: "workload", Placeholder: "public-placeholder"}
+	f.start(t)
+	if e := os.Remove(up.ProofFile); e != nil {
+		t.Fatal(e)
+	}
+	c := f.dial(t, f.c.Postgres.Listen)
+	b, _ := (&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber, Parameters: map[string]string{"user": "workload", "database": "canary"}}).Encode(nil)
+	_, _ = c.Write(b)
+	if typ, body, e := readPGFrame(c, 1024); e != nil || typ != 'R' || binary.BigEndian.Uint32(body) != 3 {
+		t.Fatal("startup refused")
+	}
+	_, _ = c.Write(encodePGFrame('p', []byte("public-placeholder\x00")))
+	typ, body, e := readPGFrame(c, 4096)
+	if e != nil || typ != 'E' || sqlState(body) != "28000" || !bytes.Contains(body, []byte(notVerifiedMessage)) {
+		t.Fatalf("unreadable proof frame %q %q %v", typ, body, e)
 	}
 }

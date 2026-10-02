@@ -108,7 +108,7 @@ func (b *Broker) servePooled(ctx context.Context, conn net.Conn, backend *pgprot
 	}
 	unregister, clientKey, err := b.registerPooledCancel(s)
 	if err != nil {
-		writeClientError(backend, "08006", "Agent Vault: could not start the session")
+		writeClientError(backend, "08006", "upstream", "Agent Vault: could not start the session")
 		return
 	}
 	defer unregister()
@@ -117,7 +117,7 @@ func (b *Broker) servePooled(ctx context.Context, conn net.Conn, backend *pgprot
 		b.logger.Warn("pgproxy: pooled session could not start", slog.String("service", svc.Name), slog.String("error", err.Error()))
 		code, message, outcome := poolRefusal(err)
 		b.auditDenied(event, outcome)
-		writeClientError(backend, code, message)
+		writeClientError(backend, code, outcome, message)
 		return
 	}
 	backend.Send(&pgproto3.AuthenticationOk{})
@@ -225,7 +225,7 @@ func (s *pooledSession) run(ctx context.Context) {
 		code, message, outcome := poolRefusal(refusal.err)
 		s.b.auditDenied(s.event, outcome)
 		if _, simple := msg.(*pgproto3.Query); simple {
-			s.writeClient(&pgproto3.ErrorResponse{Severity: "ERROR", Code: code, Message: message}, &pgproto3.ReadyForQuery{TxStatus: s.status()})
+			s.writeClient(brokerError("ERROR", code, outcome, message), &pgproto3.ReadyForQuery{TxStatus: s.status()})
 			continue
 		}
 		s.mu.Lock()
@@ -234,10 +234,10 @@ func (s *pooledSession) run(ctx context.Context) {
 		if midBatch {
 			// Earlier messages of this batch already reached the server; an
 			// error injected here would arrive out of order. End the session.
-			s.writeClient(&pgproto3.ErrorResponse{Severity: "FATAL", Code: code, Message: message})
+			s.writeClient(brokerError("FATAL", code, outcome, message))
 			return
 		}
-		s.writeClient(&pgproto3.ErrorResponse{Severity: "ERROR", Code: code, Message: message})
+		s.writeClient(brokerError("ERROR", code, outcome, message))
 		errorUntilSync = true
 	}
 }
