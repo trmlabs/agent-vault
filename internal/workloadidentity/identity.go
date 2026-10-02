@@ -38,6 +38,9 @@ type Binding struct {
 	ContainerName string   `json:"containerName,omitempty"`
 	MaxPodSeconds int64    `json:"maxPodSeconds,omitempty"`
 	Pool          string   `json:"pool,omitempty"` // catalog pool name reported as ProxyScope.Pool
+	// ListAgents is valid only in observer policy. It lets the admission
+	// controller read every agent's outstanding cleanup by agent and Pod UID.
+	ListAgents bool `json:"listAgents,omitempty"`
 }
 
 // Config selects one Kubernetes trust domain and explicit workload grants.
@@ -149,6 +152,9 @@ func newResolver(c Config, s Store, observer bool) (*Resolver, error) {
 					return nil, errors.New("pool binding owner UID must be non-empty")
 				}
 			}
+		}
+		if !observer && b.ListAgents {
+			return nil, errors.New("proxy policy must not contain observer access")
 		}
 		key := b.Namespace + ":" + b.ServiceAccount
 		if seen[key] {

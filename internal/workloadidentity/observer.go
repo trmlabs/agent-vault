@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/Infisical/agent-vault/internal/brokercore"
+	"github.com/Infisical/agent-vault/internal/runtimestatus"
 )
 
 // Observer verifies live Kubernetes identity for a read-only status surface.
@@ -23,21 +24,22 @@ func NewObserver(c Config) (*Observer, error) {
 	return &Observer{resolver: r}, nil
 }
 
-// Authorize repeats TokenReview and live Pod checks for every observation.
-func (o *Observer) Authorize(ctx context.Context, proof string) error {
+// Authorize repeats TokenReview and live Pod checks for every observation and
+// returns the matched binding's access.
+func (o *Observer) Authorize(ctx context.Context, proof string) (runtimestatus.Access, error) {
 	if o == nil || o.resolver == nil {
-		return brokercore.ErrInvalidSession
+		return runtimestatus.Access{}, brokercore.ErrInvalidSession
 	}
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(o.resolver.config.TimeoutSeconds)*time.Second)
 	defer cancel()
-	_, c, err := o.resolver.verifyProof(ctx, proof)
+	binding, c, err := o.resolver.verifyProof(ctx, proof)
 	if err != nil {
-		return err
+		return runtimestatus.Access{}, err
 	}
-	if ctx.Err() != nil || c.Expires <= o.resolver.now().Unix() {
-		return brokercore.ErrInvalidSession
+	if binding == nil || ctx.Err() != nil || c.Expires <= o.resolver.now().Unix() {
+		return runtimestatus.Access{}, brokercore.ErrInvalidSession
 	}
-	return nil
+	return runtimestatus.Access{ListAgents: binding.ListAgents}, nil
 }
 
 // ValidateObserverSeparation must run before mounting the observer route beside

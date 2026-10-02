@@ -396,7 +396,9 @@ func (p *serverPools) credentialFor(ctx context.Context, pool *serverPool, svc D
 // closes, so a rotation never cuts a running transaction.
 // mintLocked requires pool.mintMu.
 func (p *serverPools) mintLocked(ctx context.Context, pool *serverPool, svc DatabaseService) (*credential, error) {
-	lease, err := p.broker.opts.Leases.Mint(ctx, pool.vault, &svc)
+	// A pooled credential serves the whole pool, so its cleanup record names
+	// the pool, not any one agent or Pod.
+	lease, err := p.broker.opts.Leases.Mint(ctx, AgentScope{VaultID: pool.vault, ActorID: "pool:" + pool.key.pool}, &svc)
 	if err != nil {
 		return nil, fmt.Errorf("mint pooled credential: %w", err)
 	}

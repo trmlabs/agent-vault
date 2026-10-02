@@ -120,7 +120,7 @@ type rotatingMinter struct {
 	revoked []string
 }
 
-func (m *rotatingMinter) Mint(_ context.Context, _ string, _ *DatabaseService) (*Lease, error) {
+func (m *rotatingMinter) Mint(_ context.Context, _ AgentScope, _ *DatabaseService) (*Lease, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	role := m.env.roles[m.mints%len(m.env.roles)]
@@ -672,7 +672,7 @@ type tierMinter struct {
 	n   int
 }
 
-func (m *tierMinter) Mint(_ context.Context, _ string, svc *DatabaseService) (*Lease, error) {
+func (m *tierMinter) Mint(_ context.Context, _ AgentScope, svc *DatabaseService) (*Lease, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.n++

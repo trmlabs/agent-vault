@@ -365,7 +365,7 @@ func TestDatabaseCleanupFleetMigrationKeepsLiveRecords(t *testing.T) {
 			lease_id TEXT NOT NULL DEFAULT '', reconciliation_evidence TEXT NOT NULL DEFAULT '')`,
 		"INSERT INTO database_cleanup (accessor, binding, lease_id) VALUES ('legacy-known', 'vault/db', 'database/creds/r/1'), ('legacy-unknown', 'vault/db', '')",
 		"INSERT INTO database_cleanup_owner (id, owner, expires_ns) VALUES (1, 'old-binary', 0)",
-		"DELETE FROM schema_migrations WHERE name = '20261003120000_database_cleanup_fleet'",
+		"DELETE FROM schema_migrations WHERE name IN ('20261001120000_database_cleanup_actor', '20261001130000_database_cleanup_workload', '20261003120000_database_cleanup_fleet')",
 	} {
 		if _, err := s.db.Exec(statement); err != nil {
 			t.Fatalf("%s: %v", statement, err)
@@ -428,5 +428,90 @@ func TestCheckDatabaseCleanupOwnerDoesNotExtendClaim(t *testing.T) {
 	}
 	if err := s.CheckDatabaseCleanupOwner(ctx, "observer-test"); err == nil {
 		t.Fatal("observation extended ownership")
+	}
+}
+
+func TestDatabaseCleanupRecordsActor(t *testing.T) {
+	checkDatabaseCleanupRecordsActor(t, openTestDB(t))
+}
+
+func checkDatabaseCleanupRecordsActor(t *testing.T, s *SQLStore) {
+	t.Helper()
+	ctx := context.Background()
+	if err := s.ClaimDatabaseCleanupOwner(ctx, "owner", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = s.DeleteDatabaseCleanup(ctx, "actor-a")
+		_ = s.DeleteDatabaseCleanup(ctx, "actor-b")
+		_ = s.ReleaseDatabaseCleanupOwner(ctx, "owner")
+	})
+	for _, record := range []DatabaseCleanup{{Accessor: "actor-a", Binding: "vault/db", ActorID: "agent-one", WorkloadID: "pod-uid-one"}, {Accessor: "actor-b", Binding: "vault/db"}} {
+		if err := s.AddDatabaseCleanup(ctx, "owner", record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, err := s.ListDatabaseCleanup(ctx)
+	if err != nil || len(rows) != 2 || rows[0].ActorID != "agent-one" || rows[0].WorkloadID != "pod-uid-one" || rows[1].ActorID != "" || rows[1].WorkloadID != "" {
+		t.Fatalf("actor attribution not retained: %+v %v", rows, err)
+	}
+}
+
+// The live SQLite store predates actor attribution. Its pending records must
+// survive the upgrade unchanged and read back as unattributed.
+func TestDatabaseCleanupActorMigrationKeepsLegacyRecordsUnattributed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	checkDatabaseCleanupActorMigration(t, func() (*SQLStore, error) { return Open(path) })
+}
+
+// checkDatabaseCleanupActorMigration rewinds the journal to its pre-attribution
+// shape with pending records, then proves reopening upgrades it exactly once.
+func checkDatabaseCleanupActorMigration(t *testing.T, open func() (*SQLStore, error)) {
+	t.Helper()
+	s, err := open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`DROP TABLE database_cleanup`,
+		`CREATE TABLE database_cleanup (accessor TEXT PRIMARY KEY, binding TEXT NOT NULL,
+			lease_id TEXT NOT NULL DEFAULT '', reconciliation_evidence TEXT NOT NULL DEFAULT '')`,
+		`INSERT INTO database_cleanup (accessor, binding, lease_id) VALUES ('legacy-known', 'vault/db', 'database/creds/reader/one'), ('legacy-unknown', 'vault/db', '')`,
+		`DELETE FROM schema_migrations WHERE name IN ('20261001120000_database_cleanup_actor', '20261001130000_database_cleanup_workload',
+			'20261003120000_database_cleanup_fleet')`,
+	} {
+		if _, err := s.db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 { // The second open proves the migration is recorded once.
+		s, err = open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows, err := s.ListDatabaseCleanup(context.Background())
+		if err != nil || len(rows) != 2 {
+			t.Fatalf("legacy records lost: %d %v", len(rows), err)
+		}
+		if rows[0] != (DatabaseCleanup{Accessor: "legacy-known", Binding: "vault/db", LeaseID: "database/creds/reader/one"}) ||
+			rows[1] != (DatabaseCleanup{Accessor: "legacy-unknown", Binding: "vault/db"}) {
+			t.Fatalf("legacy records changed: %+v", rows)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s, err = open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	for _, accessor := range []string{"legacy-known", "legacy-unknown"} {
+		if err := s.DeleteDatabaseCleanup(context.Background(), accessor); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

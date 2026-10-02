@@ -66,7 +66,7 @@ type fakeMinter struct {
 	revoked    []string
 }
 
-func (f *fakeMinter) Mint(_ context.Context, _ string, _ *DatabaseService) (*Lease, error) {
+func (f *fakeMinter) Mint(_ context.Context, _ AgentScope, _ *DatabaseService) (*Lease, error) {
 	f.mu.Lock()
 	f.mintCalls++
 	f.mu.Unlock()
