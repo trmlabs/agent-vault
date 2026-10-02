@@ -173,3 +173,62 @@ func TestCheckDatabaseCleanupOwnerDoesNotExtendClaim(t *testing.T) {
 		t.Fatal("observation extended ownership")
 	}
 }
+
+func TestDatabaseCleanupRecordsActor(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := s.ClaimDatabaseCleanupOwner(ctx, "owner", now, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range []DatabaseCleanup{{Accessor: "a", Binding: "vault/db", ActorID: "agent-one"}, {Accessor: "b", Binding: "vault/db"}} {
+		if err := s.AddDatabaseCleanup(ctx, "owner", record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, err := s.ListDatabaseCleanup(ctx)
+	if err != nil || len(rows) != 2 || rows[0].ActorID != "agent-one" || rows[1].ActorID != "" {
+		t.Fatalf("actor attribution not retained: %+v %v", rows, err)
+	}
+}
+
+// The live SQLite store predates actor attribution. Its pending records must
+// survive the upgrade unchanged and read back as unattributed.
+func TestDatabaseCleanupActorMigrationKeepsLegacyRecordsUnattributed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`DROP TABLE database_cleanup`,
+		`CREATE TABLE database_cleanup (accessor TEXT PRIMARY KEY, binding TEXT NOT NULL,
+			lease_id TEXT NOT NULL DEFAULT '', reconciliation_evidence TEXT NOT NULL DEFAULT '')`,
+		`INSERT INTO database_cleanup (accessor, binding, lease_id) VALUES ('legacy-known', 'vault/db', 'database/creds/reader/one'), ('legacy-unknown', 'vault/db', '')`,
+		`DELETE FROM schema_migrations WHERE name = '20261001120000_database_cleanup_actor'`,
+	} {
+		if _, err := s.db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 { // The second open proves the migration is recorded once.
+		s, err = Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows, err := s.ListDatabaseCleanup(context.Background())
+		if err != nil || len(rows) != 2 {
+			t.Fatalf("legacy records lost: %d %v", len(rows), err)
+		}
+		if rows[0] != (DatabaseCleanup{Accessor: "legacy-known", Binding: "vault/db", LeaseID: "database/creds/reader/one"}) ||
+			rows[1] != (DatabaseCleanup{Accessor: "legacy-unknown", Binding: "vault/db"}) {
+			t.Fatalf("legacy records changed: %+v", rows)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}

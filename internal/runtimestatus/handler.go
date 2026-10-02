@@ -1,4 +1,5 @@
-// Package runtimestatus defines a read-only, broker-wide cleanup observation.
+// Package runtimestatus defines a read-only cleanup observation, broker-wide or
+// for one requested agent.
 // Server exposure is opt-in and requires a dedicated live workload authorizer
 // and a consistent broker/cleanup snapshot. No default observer is installed.
 package runtimestatus
@@ -8,14 +9,17 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
 
-// Observation contains no credential, lease, actor, binding or session identifiers.
-// Consistent must be false if admission changed during the snapshot. Healthy
-// includes current cleanup ownership and provider authorization, not just a
-// running listener. Zero counts do not prove database-side absence.
+// Observation contains no credential, lease, binding or session identifiers.
+// Actor identifiers key Actors only so the handler can answer for one requested
+// actor; they are never serialized. Consistent must be false if admission
+// changed during the snapshot. Healthy includes current cleanup ownership and
+// provider authorization, not just a running listener. Zero counts do not
+// prove database-side absence.
 type Observation struct {
 	Initialized       bool
 	Healthy           bool
@@ -23,6 +27,59 @@ type Observation struct {
 	ActiveConnections int
 	UnfinishedCleanup int
 	UnknownCleanup    int
+	// Actors partitions the totals by the actor that caused them. Unattributed
+	// holds connections not yet authenticated and cleanup records with no actor
+	// (written before attribution existed); they count against every actor.
+	Actors       map[string]Counts
+	Unattributed Counts
+}
+
+// Counts is one actor's share of an Observation.
+type Counts struct {
+	ActiveConnections int
+	UnfinishedCleanup int
+	UnknownCleanup    int
+}
+
+// ForActor returns the counts that gate admission for one actor: its own plus
+// every unattributed connection and record, so unknown ownership fails closed.
+func (o Observation) ForActor(actorID string) Counts {
+	own := o.Actors[actorID]
+	return Counts{
+		ActiveConnections: own.ActiveConnections + o.Unattributed.ActiveConnections,
+		UnfinishedCleanup: own.UnfinishedCleanup + o.Unattributed.UnfinishedCleanup,
+		UnknownCleanup:    own.UnknownCleanup + o.Unattributed.UnknownCleanup,
+	}
+}
+
+// partitioned reports whether the per-actor counts sum exactly to the totals,
+// so a requested actor's answer cannot omit anything the totals include.
+func (o Observation) partitioned() bool {
+	sum := o.Unattributed
+	for _, c := range o.Actors {
+		if !c.valid() {
+			return false
+		}
+		sum.ActiveConnections += c.ActiveConnections
+		sum.UnfinishedCleanup += c.UnfinishedCleanup
+		sum.UnknownCleanup += c.UnknownCleanup
+	}
+	return o.Unattributed.valid() && sum == Counts{o.ActiveConnections, o.UnfinishedCleanup, o.UnknownCleanup}
+}
+
+func (c Counts) valid() bool {
+	return c.ActiveConnections >= 0 && c.UnfinishedCleanup >= 0 && c.UnknownCleanup >= 0 && c.UnknownCleanup <= c.UnfinishedCleanup
+}
+
+func (c Counts) status() string {
+	switch {
+	case c.UnknownCleanup != 0:
+		return "unknown"
+	case c.ActiveConnections == 0 && c.UnfinishedCleanup == 0:
+		return "ready"
+	default:
+		return "pending"
+	}
 }
 
 type Snapshot func(context.Context) (Observation, error)
@@ -47,6 +104,39 @@ type response struct {
 	// is configured, so a caller can refuse to admit a workload the broker
 	// would deny. Omitted otherwise.
 	ProxyGrants string `json:"proxyGrants,omitempty"`
+	// Agent answers for the actor named by the agent query parameter. Omitted
+	// without one, so existing responses are unchanged.
+	Agent *agentResponse `json:"agent,omitempty"`
+}
+
+type agentResponse struct {
+	Status            string `json:"status"`
+	ActiveConnections int    `json:"activeConnections"`
+	UnfinishedCleanup int    `json:"unfinishedCleanup"`
+	UnknownCleanup    int    `json:"unknownCleanup"`
+}
+
+const maxAgentIDLength = 128
+
+// agentQuery accepts no query, or exactly one well-formed agent parameter.
+func agentQuery(raw string) (string, bool) {
+	if raw == "" {
+		return "", true
+	}
+	values, err := url.ParseQuery(raw)
+	if err != nil || len(values) != 1 || len(values["agent"]) != 1 {
+		return "", false
+	}
+	id := values["agent"][0]
+	if id == "" || len(id) > maxAgentIDLength {
+		return "", false
+	}
+	for _, r := range id {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.') {
+			return "", false
+		}
+	}
+	return id, true
 }
 
 // New returns an isolated handler, not a server route. Callers must first stop
@@ -72,7 +162,8 @@ func New(authorize Authorize, snapshot Snapshot, grants ...Grants) (http.Handler
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		if r.URL.RawQuery != "" || r.ContentLength != 0 || len(r.TransferEncoding) != 0 {
+		agentID, ok := agentQuery(r.URL.RawQuery)
+		if !ok || r.ContentLength != 0 || len(r.TransferEncoding) != 0 {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
@@ -95,15 +186,28 @@ func New(authorize Authorize, snapshot Snapshot, grants ...Grants) (http.Handler
 		observation, err := snapshot(ctx)
 		result := response{SchemaVersion: 1, Status: "unknown", ObservedAt: time.Now().UTC().Format(time.RFC3339Nano)}
 		code := http.StatusServiceUnavailable
-		if err == nil && ctx.Err() == nil && observation.Initialized && observation.Healthy && observation.Consistent && observation.ActiveConnections >= 0 && observation.UnfinishedCleanup >= 0 && observation.UnknownCleanup >= 0 && observation.UnknownCleanup <= observation.UnfinishedCleanup {
-			result.ActiveConnections = observation.ActiveConnections
-			result.UnfinishedCleanup = observation.UnfinishedCleanup
-			result.UnknownCleanup = observation.UnknownCleanup
-			if result.UnknownCleanup == 0 {
+		if agentID != "" {
+			result.Agent = &agentResponse{Status: "unknown"}
+		}
+		totals := Counts{observation.ActiveConnections, observation.UnfinishedCleanup, observation.UnknownCleanup}
+		if err == nil && ctx.Err() == nil && observation.Initialized && observation.Healthy && observation.Consistent && totals.valid() {
+			result.ActiveConnections = totals.ActiveConnections
+			result.UnfinishedCleanup = totals.UnfinishedCleanup
+			result.UnknownCleanup = totals.UnknownCleanup
+			result.Status = totals.status()
+			if result.Status != "unknown" {
 				code = http.StatusOK
-				result.Status = "pending"
-				if result.ActiveConnections == 0 && result.UnfinishedCleanup == 0 {
-					result.Status = "ready"
+			}
+			if agentID != "" {
+				// With an agent, the status code answers for that agent alone.
+				// A snapshot whose partition disagrees with its totals cannot.
+				code = http.StatusServiceUnavailable
+				if observation.partitioned() {
+					counts := observation.ForActor(agentID)
+					result.Agent = &agentResponse{Status: counts.status(), ActiveConnections: counts.ActiveConnections, UnfinishedCleanup: counts.UnfinishedCleanup, UnknownCleanup: counts.UnknownCleanup}
+					if result.Agent.Status != "unknown" {
+						code = http.StatusOK
+					}
 				}
 			}
 		}

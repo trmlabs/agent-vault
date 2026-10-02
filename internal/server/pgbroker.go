@@ -231,7 +231,7 @@ func NewVaultLeaseMinter(client *hashicorp.Client) pgproxy.LeaseMinter {
 	return vaultLeaseMinter{client: client}
 }
 
-func (m vaultLeaseMinter) Mint(ctx context.Context, _ string, svc *pgproxy.DatabaseService) (*pgproxy.Lease, error) {
+func (m vaultLeaseMinter) Mint(ctx context.Context, _, _ string, svc *pgproxy.DatabaseService) (*pgproxy.Lease, error) {
 	issuedAt := time.Now()
 	cred, err := m.client.ReadDatabaseCredential(ctx, svc.Mount, svc.Role)
 	if err != nil {

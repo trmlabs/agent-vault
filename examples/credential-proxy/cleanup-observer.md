@@ -12,7 +12,7 @@ Expose only this dedicated loopback observer listener through verified encrypted
 
 ## Read and interpret the result
 
-Send `GET /v1/runtime/cleanup-status` with `Authorization: Bearer <projected observer proof>` over that protected transport. No query, body or mutation is supported. Responses are not cacheable.
+Send `GET /v1/runtime/cleanup-status` with `Authorization: Bearer <projected observer proof>` over that protected transport. The only supported query is a single `agent` parameter, described below; any other query, a body or a mutation is rejected. Responses are not cacheable.
 
 | Field | Meaning |
 | --- | --- |
@@ -25,7 +25,13 @@ Send `GET /v1/runtime/cleanup-status` with `Authorization: Bearer <projected obs
 
 `ready` requires initialized, healthy cleanup authority, valid parent Vault authorization, consistent connection counts and zero records. `pending` means active connections or known cleanup records remain. `unknown` and HTTP 503 mean the manager must not admit a replacement. Authentication failure returns 401 without state. Without configuration, no observer listener opens. The owner listener never serves this route.
 
-Before checking, withdraw the old relay and confirm its Pod is gone so existing connections cannot continue or create new work. Keep new admission stopped through the handover. Fetch a fresh observation from the expected broker after withdrawal; a previous zero-count response cannot authorize a later replacement. This initial scope is the whole dedicated broker, with one admitted worker lease. It provides no per-worker attribution or concurrent handover guarantee.
+Before checking, withdraw the old relay and confirm its Pod is gone so existing connections cannot continue or create new work. Keep new admission stopped through the handover. Fetch a fresh observation from the expected broker after withdrawal; a previous zero-count response cannot authorize a later replacement.
+
+## Check one agent
+
+A manager that owns one worker slot sends `GET /v1/runtime/cleanup-status?agent=<agent ID>`, where the agent ID is the `agentID` of that slot's proxy workload binding. The top-level fields keep their whole-broker meaning, and the response gains an `agent` object with its own `status`, `activeConnections`, `unfinishedCleanup` and `unknownCleanup`. The HTTP status then follows `agent.status`: 200 for `ready` or `pending`, 503 for `unknown`. Admit or replace that slot's worker only when `agent.status` is `ready`.
+
+The agent counts include everything the broker cannot attribute: connections that have not yet authenticated, and cleanup records written before attribution existed. They count against every agent, so a legacy record blocks all slots until it is reconciled. The response never names another agent. A malformed, empty or repeated `agent` parameter returns 400 without reading state.
 
 The observation serializes with issuance/reconciliation, checks the existing cleanup-owner heartbeat without extending it and reads durable records. It neither issues nor revokes credentials, confirms unknown cleanup nor grants authority to modify records. Independent database-side checks remain necessary to establish release acceptance. Unknown issuance requires the existing operator reconciliation procedure.
 

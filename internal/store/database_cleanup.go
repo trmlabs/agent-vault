@@ -9,7 +9,9 @@ import (
 )
 
 // DatabaseCleanup stores only a revocation reference, never a token or password.
-type DatabaseCleanup struct{ Accessor, Binding, LeaseID string }
+// ActorID names the actor whose connection minted the credential; an empty
+// ActorID is unattributed (legacy or unknown) and counts against every actor.
+type DatabaseCleanup struct{ Accessor, Binding, LeaseID, ActorID string }
 
 func (s *SQLStore) databaseCleanupExec(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	var result sql.Result
@@ -68,8 +70,8 @@ func (s *SQLStore) AddDatabaseCleanup(ctx context.Context, owner string, record 
 	if record.Accessor == "" || record.Binding == "" {
 		return fmt.Errorf("incomplete database cleanup record")
 	}
-	result, err := s.databaseCleanupExec(ctx, s.dialect.Rebind(`INSERT INTO database_cleanup (accessor, binding)
-		SELECT ?, ? FROM database_cleanup_owner WHERE id = 1 AND owner = ? AND expires_ns > ?`), record.Accessor, record.Binding, owner, time.Now().UnixNano())
+	result, err := s.databaseCleanupExec(ctx, s.dialect.Rebind(`INSERT INTO database_cleanup (accessor, binding, actor_id)
+		SELECT ?, ?, ? FROM database_cleanup_owner WHERE id = 1 AND owner = ? AND expires_ns > ?`), record.Accessor, record.Binding, record.ActorID, owner, time.Now().UnixNano())
 	if err != nil {
 		return err
 	}
@@ -84,7 +86,7 @@ func (s *SQLStore) AddDatabaseCleanup(ctx context.Context, owner string, record 
 }
 
 func (s *SQLStore) ListDatabaseCleanup(ctx context.Context) ([]DatabaseCleanup, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT accessor, binding, lease_id FROM database_cleanup WHERE reconciliation_evidence = '' ORDER BY accessor`)
+	rows, err := s.db.QueryContext(ctx, `SELECT accessor, binding, lease_id, actor_id FROM database_cleanup WHERE reconciliation_evidence = '' ORDER BY accessor`)
 	if err != nil {
 		return nil, err
 	}
@@ -92,7 +94,7 @@ func (s *SQLStore) ListDatabaseCleanup(ctx context.Context) ([]DatabaseCleanup, 
 	var records []DatabaseCleanup
 	for rows.Next() {
 		var record DatabaseCleanup
-		if err := rows.Scan(&record.Accessor, &record.Binding, &record.LeaseID); err != nil {
+		if err := rows.Scan(&record.Accessor, &record.Binding, &record.LeaseID, &record.ActorID); err != nil {
 			return nil, err
 		}
 		records = append(records, record)

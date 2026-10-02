@@ -54,6 +54,7 @@ type Broker struct {
 	mu                   sync.Mutex
 	listener             net.Listener
 	conns                map[net.Conn]struct{}
+	connActors           map[net.Conn]string // authenticated actor per connection; absent means unattributed
 	connectionGeneration uint64
 	leaseCounts          map[string]int // live leases per actor id
 	leaseChanged         chan struct{}  // wakes bounded admissions after cleanup
@@ -118,6 +119,7 @@ func New(addr string, opts Options) *Broker {
 		cancel:         cancel,
 		shutdownDone:   make(chan struct{}),
 		conns:          make(map[net.Conn]struct{}),
+		connActors:     make(map[net.Conn]string),
 		leaseCounts:    make(map[string]int),
 		leaseChanged:   make(chan struct{}),
 	}
@@ -238,8 +240,17 @@ func (b *Broker) Shutdown(ctx context.Context) error {
 func (b *Broker) unregister(conn net.Conn) {
 	b.mu.Lock()
 	delete(b.conns, conn)
+	delete(b.connActors, conn)
 	b.connectionGeneration++
 	b.mu.Unlock()
+}
+
+func (b *Broker) attribute(conn net.Conn, actorID string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if _, ok := b.conns[conn]; ok {
+		b.connActors[conn] = actorID
+	}
 }
 
 // acquireLeaseSlot preserves the actor credential cap while waiting for cleanup.
@@ -373,6 +384,8 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		writeClientError(backend, "28000", "Agent Vault: authentication failed")
 		return
 	}
+	// Until now this connection counted against every actor's cleanup status.
+	b.attribute(conn, scope.ActorID)
 
 	// Authenticated: a longer budget for the mint + upstream-connect phase, which
 	// can be slow when role DDL serializes at scale.
@@ -443,7 +456,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	}
 	defer b.releaseUpstreamSlot(svc)
 
-	lease, err := b.opts.Leases.Mint(hsCtx, scope.VaultID, svc)
+	lease, err := b.opts.Leases.Mint(hsCtx, scope.VaultID, scope.ActorID, svc)
 	if err != nil {
 		b.logger.Error("pgproxy: credential minting failed",
 			slog.String("vault", scope.VaultID),

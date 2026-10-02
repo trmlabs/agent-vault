@@ -69,8 +69,9 @@ type Lease struct {
 // must honor context cancellation. Production uses DurableLeaseMinter to retain
 // revocation accessors across restarts; passwords remain memory-only.
 type LeaseMinter interface {
-	// Mint issues a fresh credential for svc within vaultID.
-	Mint(ctx context.Context, vaultID string, svc *DatabaseService) (*Lease, error)
+	// Mint issues a fresh credential for svc within vaultID on behalf of
+	// actorID, which durable cleanup records for per-actor accounting.
+	Mint(ctx context.Context, vaultID, actorID string, svc *DatabaseService) (*Lease, error)
 	// Renew extends a lease and returns its new expiry. minRemaining is a hint
 	// for how much additional lifetime the caller wants.
 	Renew(ctx context.Context, leaseID string, minRemaining time.Duration) (time.Time, error)

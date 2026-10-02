@@ -53,7 +53,7 @@ func TestDurableLeaseUnrelatedCleanupDoesNotDelayRenewal(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Close(context.Background())
-	lease, err := m.Mint(context.Background(), "vault", &DatabaseService{Name: "healthy", Mount: "database", Role: "reader"})
+	lease, err := m.Mint(context.Background(), "vault", "", &DatabaseService{Name: "healthy", Mount: "database", Role: "reader"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,7 @@ func TestDurableLeaseRevokeTimeoutRetiresSessionAndQuarantinesBinding(t *testing
 	client, st, f := durableFixture(t)
 	m := newDurableForTest(t, client, st)
 	svc := &DatabaseService{Name: "db", Mount: "database", Role: "reader"}
-	lease, err := m.Mint(context.Background(), "vault", svc)
+	lease, err := m.Mint(context.Background(), "vault", "", svc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,7 @@ func TestDurableLeaseRevokeTimeoutRetiresSessionAndQuarantinesBinding(t *testing
 	if active {
 		t.Fatal("disconnected session remained active after cleanup timeout")
 	}
-	if _, err = m.Mint(context.Background(), "vault", svc); err == nil {
+	if _, err = m.Mint(context.Background(), "vault", "", svc); err == nil {
 		t.Fatal("binding admitted while retired lease cleanup failed")
 	}
 	records, err := st.ListDatabaseCleanup(context.Background())
@@ -139,7 +139,7 @@ func TestDurableLeaseRevokeTimeoutRetiresSessionAndQuarantinesBinding(t *testing
 	f.mu.Lock()
 	f.failRevoke = false
 	f.mu.Unlock()
-	fresh, err := m.Mint(context.Background(), "vault", svc)
+	fresh, err := m.Mint(context.Background(), "vault", "", svc)
 	if err != nil {
 		t.Fatal(err)
 	}

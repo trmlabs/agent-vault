@@ -27,9 +27,25 @@ func CleanupSnapshot(b *Broker, m *DurableLeaseMinter) runtimestatus.Snapshot {
 		if m.closed || m.ctx.Err() != nil {
 			return result, fmt.Errorf("cleanup authority unavailable")
 		}
+		// An empty actor (unauthenticated connection, legacy record) is
+		// unattributed and counts against every actor.
+		actors := make(map[string]runtimestatus.Counts)
+		var unattributed runtimestatus.Counts
+		tally := func(actor string, change func(*runtimestatus.Counts)) {
+			if actor == "" {
+				change(&unattributed)
+				return
+			}
+			counts := actors[actor]
+			change(&counts)
+			actors[actor] = counts
+		}
 		b.mu.Lock()
 		before := b.connectionGeneration
 		active := len(b.conns)
+		for conn := range b.conns {
+			tally(b.connActors[conn], func(c *runtimestatus.Counts) { c.ActiveConnections++ })
+		}
 		closed := b.closed
 		b.mu.Unlock()
 		if closed || !b.IsListening() {
@@ -50,9 +66,16 @@ func CleanupSnapshot(b *Broker, m *DurableLeaseMinter) runtimestatus.Snapshot {
 		}
 		unknown := 0
 		for _, record := range records {
-			if record.LeaseID == "" {
+			known := record.LeaseID != ""
+			if !known {
 				unknown++
 			}
+			tally(record.ActorID, func(c *runtimestatus.Counts) {
+				c.UnfinishedCleanup++
+				if !known {
+					c.UnknownCleanup++
+				}
+			})
 		}
 		if err := m.journal.CheckDatabaseCleanupOwner(ctx, m.owner, time.Now()); err != nil {
 			return result, err
@@ -63,6 +86,7 @@ func CleanupSnapshot(b *Broker, m *DurableLeaseMinter) runtimestatus.Snapshot {
 		if ctx.Err() != nil || m.ctx.Err() != nil {
 			return result, fmt.Errorf("cleanup authority unavailable")
 		}
-		return runtimestatus.Observation{Initialized: true, Healthy: true, Consistent: consistent, ActiveConnections: active, UnfinishedCleanup: len(records), UnknownCleanup: unknown}, nil
+		return runtimestatus.Observation{Initialized: true, Healthy: true, Consistent: consistent, ActiveConnections: active, UnfinishedCleanup: len(records), UnknownCleanup: unknown,
+			Actors: actors, Unattributed: unattributed}, nil
 	}
 }
