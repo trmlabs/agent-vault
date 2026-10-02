@@ -79,6 +79,9 @@ type DurableLeaseMinter struct {
 	closed   bool
 	closeErr error
 
+	releaseOnce sync.Once
+	releaseErr  error
+
 	renewMu   sync.Mutex
 	lastRenew time.Time // send time of the last successful renewal
 	fenced    atomic.Bool
@@ -517,7 +520,11 @@ func (m *DurableLeaseMinter) Revoke(ctx context.Context, id string) error {
 
 // Close runs after the broker stops sessions. Failed records remain durable for
 // the next owner. Caller context bounds waiting and all shutdown cleanup.
+// However that goes, the owner row is released last, on its own short
+// deadline, so a planned restart under the same replica name registers at
+// once instead of waiting out the row; records still held become claimable.
 func (m *DurableLeaseMinter) Close(ctx context.Context) error {
+	defer m.release()
 	m.cancel()
 	select {
 	case <-m.done:
@@ -536,9 +543,19 @@ func (m *DurableLeaseMinter) Close(ctx context.Context) error {
 	m.active = make(map[string]durableLease)
 	m.activeMu.Unlock()
 	err := m.reconcile(ctx, "")
-	if releaseErr := m.journal.ReleaseDatabaseCleanupOwner(ctx, m.owner); err == nil {
+	if releaseErr := m.release(); err == nil {
 		err = releaseErr
 	}
 	m.closeErr = err
 	return err
+}
+
+// release gives up the owner row once, even after the caller's deadline.
+func (m *DurableLeaseMinter) release() error {
+	m.releaseOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
+		defer cancel()
+		m.releaseErr = m.journal.ReleaseDatabaseCleanupOwner(ctx, m.owner)
+	})
+	return m.releaseErr
 }

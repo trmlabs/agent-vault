@@ -518,7 +518,9 @@ func checkDatabaseCleanupActorMigration(t *testing.T, open func() (*SQLStore, er
 
 // One replica name, two live processes: the second is refused, and if a race
 // ever registered both, neither renews (both fence).
-func TestDatabaseCleanupReplicaNameIsExclusive(t *testing.T) { checkReplicaNameExclusive(t, openTestDB(t)) }
+func TestDatabaseCleanupReplicaNameIsExclusive(t *testing.T) {
+	checkReplicaNameExclusive(t, openTestDB(t))
+}
 
 func checkReplicaNameExclusive(t *testing.T, s *SQLStore) {
 	t.Helper()
