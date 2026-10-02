@@ -213,7 +213,7 @@ func objectID(s string) bool {
 		return false
 	}
 	for i := 0; i < len(s); i++ {
-		if !(s[i] >= '0' && s[i] <= '9' || s[i] >= 'a' && s[i] <= 'f') {
+		if c := s[i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return false
 		}
 	}

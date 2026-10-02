@@ -277,7 +277,7 @@ func tokenShape(t string) bool {
 	}
 	for i := 0; i < len(t); i++ {
 		c := t[i]
-		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-') {
+		if alnum := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'; !alnum && c != '_' && c != '-' {
 			return false
 		}
 	}
