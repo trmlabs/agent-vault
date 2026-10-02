@@ -15,6 +15,8 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -30,6 +32,8 @@ type poolFixture struct {
 	pod        map[string]any
 	podStatus  int
 	jwksCalls  atomic.Int64
+	jwksFail   atomic.Bool
+	jwksGate   atomic.Pointer[chan struct{}] // when set, a key fetch waits for it
 	reviewSeen atomic.Bool
 	start      time.Time
 }
@@ -65,6 +69,13 @@ func setupPool(t *testing.T) *poolFixture {
 		switch r.URL.Path {
 		case "/openid/v1/jwks":
 			f.jwksCalls.Add(1)
+			if gate := f.jwksGate.Load(); gate != nil {
+				<-*gate
+			}
+			if f.jwksFail.Load() {
+				w.WriteHeader(503)
+				return
+			}
 			e := big.NewInt(int64(f.key.E)).Bytes()
 			json.NewEncoder(w).Encode(map[string]any{"keys": []any{map[string]any{"kty": "RSA", "kid": f.kid, "alg": "RS256", "use": "sig",
 				"n": base64.RawURLEncoding.EncodeToString(f.key.N.Bytes()), "e": base64.RawURLEncoding.EncodeToString(e)}}})
@@ -95,8 +106,10 @@ func setupPool(t *testing.T) *poolFixture {
 	return f
 }
 
-func (f *poolFixture) token(c claims) string {
-	header, _ := json.Marshal(map[string]any{"alg": "RS256", "kid": f.kid, "typ": "JWT"})
+func (f *poolFixture) token(c claims) string { return f.tokenWithKid(c, f.kid) }
+
+func (f *poolFixture) tokenWithKid(c claims, kid string) string {
+	header, _ := json.Marshal(map[string]any{"alg": "RS256", "kid": kid, "typ": "JWT"})
 	payload, _ := json.Marshal(c)
 	input := base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(payload)
 	digest := sha256.Sum256([]byte(input))
@@ -232,5 +245,79 @@ func TestPoolBindingValidation(t *testing.T) {
 		if _, err := New(c, &fakeStore{status: "active", role: "proxy"}); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
+	}
+}
+
+// A failed key fetch keeps the last good keys: an API outage or a refetch for
+// an unknown kid does not fail admissions the cached keys verify.
+func TestSigningKeysSurviveAFailedFetch(t *testing.T) {
+	f := setupPool(t)
+	if _, err := f.r.Attest(context.Background(), f.token(f.c), workerIP); err != nil {
+		t.Fatal(err)
+	}
+	f.jwksFail.Store(true)
+	later := time.Now().Add(jwksRefetchBackoff + time.Second)
+	f.r.now = func() time.Time { return later }
+	if _, err := f.r.Attest(context.Background(), f.tokenWithKid(f.c, "unknown-kid"), workerIP); err == nil || f.jwksCalls.Load() != 2 {
+		t.Fatalf("unknown kid: err %v, key fetches %d", err, f.jwksCalls.Load())
+	}
+	if _, err := f.r.Attest(context.Background(), f.token(f.c), workerIP); err != nil {
+		t.Fatalf("known key lost after a failed fetch: %v", err)
+	}
+	// The set is old: refetch, fail, keep it. (Moving the clock an hour on
+	// would expire the token first.)
+	f.r.jwks.mu.Lock()
+	f.r.jwks.fetched, f.r.jwks.attempted = later.Add(-jwksMaxAge), later.Add(-jwksRefetchBackoff)
+	f.r.jwks.mu.Unlock()
+	if _, err := f.r.Attest(context.Background(), f.token(f.c), workerIP); err != nil || f.jwksCalls.Load() != 3 {
+		t.Fatalf("old set after a failed refetch: err %v, key fetches %d", err, f.jwksCalls.Load())
+	}
+}
+
+// A slow refetch for an unknown kid runs outside the lock: admissions with a
+// cached key go on, concurrent misses share the one fetch, and a caller that
+// gives up does not end it for the others.
+func TestSigningKeyFetchIsSingleFlightOutsideTheLock(t *testing.T) {
+	f := setupPool(t)
+	if _, err := f.r.Attest(context.Background(), f.token(f.c), workerIP); err != nil {
+		t.Fatal(err)
+	}
+	gate := make(chan struct{})
+	var release sync.Once
+	open := func() { release.Do(func() { close(gate) }) }
+	t.Cleanup(open) // before the server closes, so a held fetch ends
+	f.jwksGate.Store(&gate)
+	later := time.Now().Add(jwksRefetchBackoff + time.Second)
+	f.r.now = func() time.Time { return later }
+	unknown := f.tokenWithKid(f.c, "unknown-kid")
+	cancelled, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 9)
+	go func() { _, err := f.r.Attest(cancelled, unknown, workerIP); done <- err }()
+	for f.jwksCalls.Load() < 2 {
+		runtime.Gosched()
+	}
+	for i := 0; i < 8; i++ {
+		go func() { _, err := f.r.Attest(context.Background(), unknown, workerIP); done <- err }()
+	}
+	known := make(chan error, 1)
+	go func() { _, err := f.r.Attest(context.Background(), f.token(f.c), workerIP); known <- err }()
+	select {
+	case err := <-known:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a cached key waited on the refetch")
+	}
+	cancel()
+	if err := <-done; err == nil {
+		t.Fatal("cancelled caller admitted")
+	}
+	open()
+	for i := 0; i < 8; i++ {
+		<-done
+	}
+	if n := f.jwksCalls.Load(); n != 2 {
+		t.Fatalf("key fetches %d, want 2", n)
 	}
 }
