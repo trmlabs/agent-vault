@@ -19,3 +19,10 @@ import (
 type Attestor interface {
 	Attest(ctx context.Context, token string, peer netip.Addr) (*ProxyScope, error)
 }
+
+// Reattestor rechecks an open session: the same Pod checks as Attest, but the
+// original token's expiry is accepted, because a session or tunnel outlives
+// its ten-minute token. Adapters use it for rechecks when the Attestor has it.
+type Reattestor interface {
+	Reattest(ctx context.Context, token string, peer netip.Addr) (*ProxyScope, error)
+}

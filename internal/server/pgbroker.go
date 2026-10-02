@@ -40,7 +40,7 @@ func (a agentAuthAdapter) Authenticate(ctx context.Context, token, vaultHint str
 	if err != nil {
 		return nil, err
 	}
-	return &pgproxy.AgentScope{VaultID: scope.VaultID, VaultName: scope.VaultName, ActorID: scope.ActorID(), WorkloadID: scope.WorkloadID}, nil
+	return &pgproxy.AgentScope{VaultID: scope.VaultID, VaultName: scope.VaultName, ActorID: scope.ActorID(), WorkloadID: scope.WorkloadID, Pool: scope.Pool}, nil
 }
 
 // DatabaseServiceConfig is one configured upstream database within a vault, as
