@@ -292,16 +292,21 @@ func TestDurableLeaseConfirmationCannotRaceIssuance(t *testing.T) {
 	}
 }
 
-func TestDurableLeaseSingletonAndAuthorityLoss(t *testing.T) {
+// Replicas share the journal; each loses authority on its own.
+func TestDurableLeaseReplicasCoexistAndAuthorityLoss(t *testing.T) {
 	client, st, _ := durableFixture(t)
 	m, err := NewDurableLeaseMinter(context.Background(), client, st, DurableLeaseOptions{OwnerTTL: 3 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer m.Close(context.Background())
-	if other, err := NewDurableLeaseMinter(context.Background(), client, st, DurableLeaseOptions{}); err == nil {
-		_ = other.Close(context.Background())
-		t.Fatal("two brokers acquired journal")
+	other, err := NewDurableLeaseMinter(context.Background(), client, st, DurableLeaseOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close(context.Background())
+	if m.owner == other.owner {
+		t.Fatal("replicas share an owner ID")
 	}
 	if err := st.ReleaseDatabaseCleanupOwner(context.Background(), m.owner); err != nil {
 		t.Fatal(err)
@@ -310,6 +315,14 @@ func TestDurableLeaseSingletonAndAuthorityLoss(t *testing.T) {
 	case <-m.AuthorityDone():
 	case <-time.After(2 * time.Second):
 		t.Fatal("owner loss did not stop authority")
+	}
+	if !m.Fenced() || other.Fenced() || other.AuthorityDone() == nil {
+		t.Fatal("authority loss crossed replicas")
+	}
+	select {
+	case <-other.AuthorityDone():
+		t.Fatal("other replica lost authority")
+	default:
 	}
 	if _, err = m.Mint(context.Background(), "vault", &DatabaseService{Name: "db", Mount: "database", Role: "reader"}); err == nil {
 		t.Fatal("minted after authority lost")

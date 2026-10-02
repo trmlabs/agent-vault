@@ -3,7 +3,6 @@ package pgproxy
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/Infisical/agent-vault/internal/runtimestatus"
 )
@@ -38,7 +37,7 @@ func CleanupSnapshot(b *Broker, m *DurableLeaseMinter) runtimestatus.Snapshot {
 		if err := m.client.CheckAuthorization(ctx); err != nil {
 			return result, err
 		}
-		records, err := m.journal.ListDatabaseCleanup(ctx)
+		records, err := m.journal.ListOwnedDatabaseCleanup(ctx, m.owner)
 		if err != nil {
 			return result, err
 		}
@@ -54,7 +53,7 @@ func CleanupSnapshot(b *Broker, m *DurableLeaseMinter) runtimestatus.Snapshot {
 				unknown++
 			}
 		}
-		if err := m.journal.CheckDatabaseCleanupOwner(ctx, m.owner, time.Now()); err != nil {
+		if err := m.journal.CheckDatabaseCleanupOwner(ctx, m.owner); err != nil {
 			return result, err
 		}
 		b.mu.Lock()

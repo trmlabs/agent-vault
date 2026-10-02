@@ -361,9 +361,17 @@ func TestRealVault_DurableProcessCrash(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	if early, err := NewDurableLeaseMinter(context.Background(), client, st, DurableLeaseOptions{}); err == nil {
-		_ = early.Close(context.Background())
-		t.Fatal("unexpired broker ownership stolen")
+	// Another replica starts while the crashed owner's row is live. It must
+	// leave the crashed owner's records alone until the row expires.
+	early, err := NewDurableLeaseMinter(context.Background(), client, st, DurableLeaseOptions{RetryInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owned, err := st.ListOwnedDatabaseCleanup(context.Background(), early.owner); err != nil || len(owned) != 0 {
+		t.Fatalf("unexpired broker records stolen: %d %v", len(owned), err)
+	}
+	if err = early.Close(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 	time.Sleep(3200 * time.Millisecond)
 	started := time.Now()

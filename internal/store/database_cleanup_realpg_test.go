@@ -16,6 +16,6 @@ func TestRealPostgres_DatabaseCleanupJournal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	t.Cleanup(func() { _ = s.Close() }) // after the journal's own cleanup
 	checkDatabaseCleanupJournal(t, s)
 }

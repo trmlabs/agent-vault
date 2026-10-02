@@ -16,14 +16,14 @@ type observationJournal struct {
 	fail   bool
 }
 
-func (j observationJournal) ListDatabaseCleanup(ctx context.Context) ([]store.DatabaseCleanup, error) {
+func (j observationJournal) ListOwnedDatabaseCleanup(ctx context.Context, owner string) ([]store.DatabaseCleanup, error) {
 	if j.onRead != nil {
 		j.onRead()
 	}
 	if j.fail {
 		return nil, errors.New("synthetic private journal error")
 	}
-	return j.CleanupJournal.ListDatabaseCleanup(ctx)
+	return j.CleanupJournal.ListOwnedDatabaseCleanup(ctx, owner)
 }
 
 func TestCleanupSnapshotTransitions(t *testing.T) {
