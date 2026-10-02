@@ -44,17 +44,19 @@ func splitStatements(sql string) ([]string, bool) {
 			cur.WriteByte(' ')
 		case c == '/' && i+1 < n && sql[i+1] == '*':
 			depth := 0
+		comment:
 			for i < n {
-				if i+1 < n && sql[i] == '/' && sql[i+1] == '*' {
+				switch {
+				case i+1 < n && sql[i] == '/' && sql[i+1] == '*':
 					depth++
 					i += 2
-				} else if i+1 < n && sql[i] == '*' && sql[i+1] == '/' {
+				case i+1 < n && sql[i] == '*' && sql[i+1] == '/':
 					depth--
 					i += 2
 					if depth == 0 {
-						break
+						break comment
 					}
-				} else {
+				default:
 					i++
 				}
 			}
@@ -108,7 +110,7 @@ func splitStatements(sql string) ([]string, bool) {
 			cur.WriteString(`"x"`)
 		case c == '$' && (i == 0 || !identChar(sql[i-1])):
 			end := i + 1
-			for end < n && identChar(sql[end]) && !(end == i+1 && sql[end] >= '0' && sql[end] <= '9') {
+			for end < n && identChar(sql[end]) && (end != i+1 || sql[end] < '0' || sql[end] > '9') {
 				end++
 			}
 			if end >= n || sql[end] != '$' {
@@ -145,7 +147,7 @@ var sessionFunctions = []string{"set_config", "pg_advisory_lock", "pg_try_adviso
 
 func transactionSafe(statement string) bool {
 	lower := strings.ToLower(statement)
-	words := strings.FieldsFunc(lower, func(r rune) bool { return !(r == '_' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9') })
+	words := strings.FieldsFunc(lower, func(r rune) bool { return r > 0x7f || !identChar(byte(r)) })
 	if len(words) == 0 {
 		return true // empty statement
 	}
