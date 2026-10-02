@@ -63,7 +63,23 @@ type pooledSession struct {
 	txnFailed  bool
 	killed     bool
 	dataRows   int
+	// statementBytes is the query text held in statements, which with the
+	// statement count is capped so one session cannot exhaust broker memory.
+	statementBytes int
 }
+
+const (
+	maxSessionStatements     = 1000
+	maxSessionStatementBytes = 16 << 20
+	// clientWriteTimeout ends a session whose client stops reading, so a
+	// full socket cannot hold a server connection.
+	clientWriteTimeout = 30 * time.Second
+)
+
+var (
+	errRoleChange     = errors.New("role change on a pooled connection")
+	errStatementLimit = errors.New("prepared statement limit reached")
+)
 
 type clientStatement struct {
 	query  string
@@ -177,6 +193,10 @@ func poolRefusal(err error) (code, message, outcome string) {
 		return "53300", "Agent Vault: database connection budget exhausted; retry shortly", "pool_budget"
 	case errors.Is(err, errPinnedShare):
 		return "53300", "Agent Vault: no session-mode connection available for session state (SET, temp tables, LISTEN, advisory locks)", "pinned_share"
+	case errors.Is(err, errRoleChange):
+		return "42501", "Agent Vault: ALTER ROLE, ALTER USER and ALTER DATABASE are refused on a pooled connection", "role_change"
+	case errors.Is(err, errStatementLimit):
+		return "54000", "Agent Vault: this session holds too many prepared statements; deallocate some", "statement_limit"
 	default:
 		return "08006", "Agent Vault: could not reach the database", "upstream"
 	}
@@ -206,13 +226,17 @@ func (s *pooledSession) run(ctx context.Context) {
 		case *pgproto3.Parse:
 			sql = m.Query
 		}
-		pin := sql != "" && needsSession(sql)
-		for {
-			if err = s.bind(ctx, pin); err == nil {
-				err = s.forward(msg)
-			}
-			if !errors.Is(err, errRebind) {
-				break
+		if refused := s.refuse(msg, sql); refused != nil {
+			err = &refusalError{refused}
+		} else {
+			pin := sql != "" && needsSession(sql)
+			for {
+				if err = s.bind(ctx, pin); err == nil {
+					err = s.forward(msg)
+				}
+				if !errors.Is(err, errRebind) {
+					break
+				}
 			}
 		}
 		if err == nil {
@@ -240,6 +264,28 @@ func (s *pooledSession) run(ctx context.Context) {
 		s.writeClient(&pgproto3.ErrorResponse{Severity: "ERROR", Code: code, Message: message})
 		errorUntilSync = true
 	}
+}
+
+// refuse reports a statement the session must not send at all: a change to
+// the shared login, or a prepared statement beyond the session's cap.
+func (s *pooledSession) refuse(msg pgproto3.FrontendMessage, sql string) error {
+	if sql != "" && changesRole(sql) {
+		return errRoleChange
+	}
+	if parse, ok := msg.(*pgproto3.Parse); ok && parse.Name != "" {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		old, replaces := s.statements[parse.Name]
+		count, bytes := len(s.statements), s.statementBytes+len(parse.Query)
+		if replaces {
+			count--
+			bytes -= len(old.query)
+		}
+		if count >= maxSessionStatements || bytes > maxSessionStatementBytes {
+			return errStatementLimit
+		}
+	}
+	return nil
 }
 
 type refusalError struct{ err error }
@@ -428,6 +474,10 @@ func (s *pooledSession) forward(msg pgproto3.FrontendMessage) error {
 			break
 		}
 		server := serverStatementName(m.Query, m.ParameterOIDs)
+		if old, ok := s.statements[m.Name]; ok {
+			s.statementBytes -= len(old.query)
+		}
+		s.statementBytes += len(m.Query)
 		s.statements[m.Name] = clientStatement{query: m.Query, types: append([]uint32(nil), m.ParameterOIDs...), server: server}
 		// Close first: the statement may already exist on this connection
 		// from another client. Closing a missing statement is not an error.
@@ -452,6 +502,9 @@ func (s *pooledSession) forward(msg pgproto3.FrontendMessage) error {
 		if m.ObjectType == 'S' && m.Name != "" {
 			// Other clients may share the server statement: forget the name
 			// and answer with a Close the server completes as a no-op.
+			if old, ok := s.statements[m.Name]; ok {
+				s.statementBytes -= len(old.query)
+			}
 			delete(s.statements, m.Name)
 			f.Send(&pgproto3.Close{ObjectType: 'S', Name: "gatehouse_closed"})
 			break
@@ -578,6 +631,7 @@ func (s *pooledSession) writeClient(msgs ...pgproto3.BackendMessage) {
 	for _, m := range msgs {
 		s.backend.Send(m)
 	}
+	_ = s.client.SetWriteDeadline(time.Now().Add(clientWriteTimeout))
 	_ = s.backend.Flush()
 }
 
@@ -586,6 +640,7 @@ func (s *pooledSession) writeClientMessage(msg pgproto3.BackendMessage, flush bo
 	defer s.writeMu.Unlock()
 	s.backend.Send(msg)
 	if flush {
+		_ = s.client.SetWriteDeadline(time.Now().Add(clientWriteTimeout))
 		if err := s.backend.Flush(); err != nil {
 			go s.kill()
 		}
@@ -630,11 +685,21 @@ func (s *pooledSession) end() {
 func leakCheck(conn *serverConn) string {
 	names := make([]string, 0, len(conn.actual))
 	var check strings.Builder
-	check.WriteString("SELECT EXISTS (SELECT 1 FROM pg_class WHERE relnamespace = pg_my_temp_schema())" +
+	// DISCARD SEQUENCES drops currval and lastval state, which no catalog
+	// shows; it runs in the same round trip as the check. Role-level defaults
+	// ('role') survive DISCARD ALL and reach every connection on the login;
+	// anything else ('state') is reset with DISCARD ALL.
+	check.WriteString("DISCARD SEQUENCES; SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_db_role_setting" +
+		" WHERE setrole = (SELECT oid FROM pg_roles WHERE rolname = session_user)) THEN 'role' WHEN" +
+		" EXISTS (SELECT 1 FROM pg_class WHERE relnamespace = pg_my_temp_schema())" +
+		" OR EXISTS (SELECT 1 FROM pg_type WHERE typnamespace = pg_my_temp_schema())" +
+		" OR EXISTS (SELECT 1 FROM pg_proc WHERE pronamespace = pg_my_temp_schema())" +
+		" OR EXISTS (SELECT 1 FROM pg_operator WHERE oprnamespace = pg_my_temp_schema())" +
 		" OR EXISTS (SELECT 1 FROM pg_listening_channels())" +
 		" OR EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid())" +
 		" OR EXISTS (SELECT 1 FROM pg_cursors WHERE is_holdable)" +
-		" OR EXISTS (SELECT 1 FROM pg_prepared_statements WHERE from_sql)")
+		" OR EXISTS (SELECT 1 FROM pg_prepared_statements WHERE from_sql)" +
+		" OR current_user <> session_user")
 	for _, name := range sessionParams { // fixed names only, never client text
 		value, ok := conn.actual[name]
 		if !ok {
@@ -644,6 +709,7 @@ func leakCheck(conn *serverConn) string {
 		check.WriteString(" OR current_setting('" + name + "') IS DISTINCT FROM " + dollarQuote(value))
 	}
 	check.WriteString(" OR EXISTS (SELECT 1 FROM pg_settings WHERE source = 'session' AND name <> ALL ('{" + strings.Join(names, ",") + "}'::text[]))")
+	check.WriteString(" THEN 'state' ELSE 'clean' END")
 	return check.String()
 }
 
@@ -663,11 +729,20 @@ func (s *pooledSession) verifyClean(conn *serverConn) bool {
 	}
 	clear(conn.seen)
 	if !leaked {
-		dirty, err := queryBool(conn, leakCheck(conn), s.b.opts.HandshakeTimeout)
-		if err != nil {
+		state, err := queryValue(conn, leakCheck(conn), s.b.opts.HandshakeTimeout)
+		if err != nil || state != "clean" && state != "state" && state != "role" {
 			return false
 		}
-		leaked = dirty
+		if state == "role" {
+			// The login itself changed: no connection on it is safe to reuse.
+			e := s.event
+			e.Event, e.Outcome = auditchain.EventStateLeak, "role_defaults"
+			_ = s.b.auditRecord(e)
+			s.b.logger.Warn("pgproxy: role-level defaults found at check-in; retiring the credential", slog.String("service", s.svc.Name))
+			s.b.pools.retire(conn.cred)
+			return false
+		}
+		leaked = state == "state"
 	}
 	if !leaked {
 		return true
@@ -679,11 +754,12 @@ func (s *pooledSession) verifyClean(conn *serverConn) bool {
 	return discardAll(conn, s.b.opts.HandshakeTimeout) == nil
 }
 
-// queryBool runs a one-row, one-column boolean query on an idle connection.
-func queryBool(conn *serverConn, sql string, timeout time.Duration) (bool, error) {
+// queryValue runs a query on an idle connection and returns the last row's
+// single text value.
+func queryValue(conn *serverConn, sql string, timeout time.Duration) (string, error) {
 	conn.frontend.Send(&pgproto3.Query{String: sql})
 	if err := conn.frontend.Flush(); err != nil {
-		return false, err
+		return "", err
 	}
 	_ = conn.sess.conn.SetReadDeadline(time.Now().Add(timeout))
 	defer func() { _ = conn.sess.conn.SetReadDeadline(time.Time{}) }()
@@ -692,7 +768,7 @@ func queryBool(conn *serverConn, sql string, timeout time.Duration) (bool, error
 	for {
 		msg, err := conn.frontend.Receive()
 		if err != nil {
-			return false, err
+			return "", err
 		}
 		switch m := msg.(type) {
 		case *pgproto3.DataRow:
@@ -703,9 +779,9 @@ func queryBool(conn *serverConn, sql string, timeout time.Duration) (bool, error
 			failed = true
 		case *pgproto3.ReadyForQuery:
 			if failed || m.TxStatus != 'I' {
-				return false, errors.New("check query failed")
+				return "", errors.New("check query failed")
 			}
-			return value == "t", nil
+			return value, nil
 		}
 	}
 }
@@ -769,6 +845,8 @@ func discardAll(conn *serverConn, timeout time.Duration) error {
 
 // kill ends the session now: the client is disconnected, and a running
 // statement on its server connection is cancelled and the connection closed.
+// The connection is detached first, under the session lock, so it cannot
+// have gone back to the pool and to another client when the cancel lands.
 func (s *pooledSession) kill() {
 	s.mu.Lock()
 	if s.killed {
@@ -777,14 +855,22 @@ func (s *pooledSession) kill() {
 	}
 	s.killed = true
 	conn := s.conn
+	s.conn = nil
+	if conn != nil {
+		s.unbindCancel()
+	}
 	s.mu.Unlock()
 	_ = s.client.Close()
-	if conn != nil && conn.sess.backendKey != nil {
+	if conn == nil {
+		return
+	}
+	if conn.sess.backendKey != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
 		s.b.cancelUpstream(ctx, conn.sess.conn.RemoteAddr().String(), &s.svc,
 			&pgproto3.CancelRequest{ProcessID: conn.sess.backendKey.ProcessID, SecretKey: conn.sess.backendKey.SecretKey})
 		cancel()
 	}
+	s.b.pools.release(conn, false)
 }
 
 // registerPooledCancel gives the client a cancel key that reaches whichever

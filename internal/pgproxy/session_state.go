@@ -137,6 +137,25 @@ func splitStatements(sql string) ([]string, bool) {
 	return append(statements, cur.String()), true
 }
 
+// changesRole reports whether SQL text alters a role or a database's
+// defaults. On a pooled connection that would persist for every later client
+// of the shared login (ALTER ROLE CURRENT_USER SET search_path survives
+// DISCARD ALL) or lock them all out (a new password), so it is refused.
+// Unterminated text is refused too.
+func changesRole(sql string) bool {
+	statements, ok := splitStatements(sql)
+	if !ok {
+		return true
+	}
+	for _, statement := range statements {
+		words := strings.FieldsFunc(strings.ToLower(statement), func(r rune) bool { return r > 0x7f || !identChar(byte(r)) })
+		if len(words) >= 2 && words[0] == "alter" && (words[1] == "role" || words[1] == "user" || words[1] == "group" || words[1] == "database") {
+			return true
+		}
+	}
+	return false
+}
+
 func identChar(c byte) bool {
 	return c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c >= 0x80
 }
@@ -161,6 +180,11 @@ func transactionSafe(statement string) bool {
 	for i, w := range words {
 		// SELECT ... INTO TEMP creates a temporary table.
 		if w == "into" && i+1 < len(words) && (words[i+1] == "temp" || words[i+1] == "temporary") {
+			return false
+		}
+		// Anything naming the temporary schema (CREATE DOMAIN pg_temp.uuid)
+		// can plant an object later clients would resolve first.
+		if strings.HasPrefix(w, "pg_temp") {
 			return false
 		}
 	}
