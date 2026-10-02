@@ -1,0 +1,254 @@
+package auditchain
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"sync"
+	"time"
+)
+
+// Key is one version of the chain's HMAC key. Its bytes never leave this
+// package: Key prints and logs as its version only.
+type Key struct {
+	Version int
+	secret  []byte
+}
+
+// NewKey copies secret. Keys shorter than 32 bytes are rejected.
+func NewKey(version int, secret []byte) (Key, error) {
+	if version < 1 || len(secret) < 32 {
+		return Key{}, errors.New("audit HMAC key must have a positive version and at least 32 bytes")
+	}
+	return Key{Version: version, secret: append([]byte(nil), secret...)}, nil
+}
+
+func (k Key) String() string   { return fmt.Sprintf("audit-hmac-key(v%d)", k.Version) }
+func (k Key) GoString() string { return k.String() }
+
+// KeySource returns the newest HMAC key version.
+type KeySource interface {
+	Current(context.Context) (Key, error)
+}
+
+// Signer signs a checkpoint input with a key that never leaves the signer
+// and returns a Transit-format "vault:vN:<base64>" signature.
+type Signer interface {
+	Sign(context.Context, []byte) (string, error)
+}
+
+// Event is what a caller records; the chain fills in everything else.
+type Event struct {
+	Event     string
+	Pool      string
+	PodUID    string
+	Binding   string
+	Session   string
+	Outcome   string
+	Requester string
+}
+
+var (
+	ErrAuditFailed       = errors.New("audit trail unavailable")
+	ErrCheckpointOverdue = errors.New("audit checkpoint overdue")
+	ErrInvalidEvent      = errors.New("invalid audit event")
+)
+
+type Options struct {
+	Out     io.Writer // one JSON row per line; os.Stdout in production
+	Replica string    // stable replica name, such as the Pod name
+	Keys    KeySource
+	Signer  Signer
+	// Grace is how long the chain may go without a signed checkpoint before
+	// Admit refuses new sessions. Default 5 minutes.
+	Grace time.Duration
+	Now   func() time.Time
+}
+
+// Chain is one replica boot's audit chain. All methods are safe for
+// concurrent use; rows are written whole and in sequence order.
+type Chain struct {
+	opts Options
+	boot string
+
+	mu             sync.Mutex
+	seq            uint64
+	prev           string
+	key            Key
+	lastCheckpoint time.Time
+	failed         bool
+}
+
+// New fetches the current key and writes the chain_start row. Without a key
+// or a writable output there is no chain, and the caller must not serve.
+func New(ctx context.Context, opts Options) (*Chain, error) {
+	if opts.Out == nil || opts.Keys == nil || opts.Signer == nil || !identifier(opts.Replica, false) {
+		return nil, errors.New("audit chain requires output, replica name, key source and signer")
+	}
+	if opts.Grace <= 0 {
+		opts.Grace = 5 * time.Minute
+	}
+	if opts.Now == nil {
+		opts.Now = time.Now
+	}
+	key, err := opts.Keys.Current(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("audit HMAC key unavailable: %w", err)
+	}
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return nil, err
+	}
+	c := &Chain{opts: opts, boot: hex.EncodeToString(b[:]), key: key, lastCheckpoint: opts.Now()}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, err := c.appendLocked(Row{Event: EventChainStart}); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// Admit reports whether a new session may start: the output is writable and
+// a checkpoint has been signed within the grace period.
+func (c *Chain) Admit() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.failed {
+		return ErrAuditFailed
+	}
+	if c.opts.Now().Sub(c.lastCheckpoint) > c.opts.Grace {
+		return ErrCheckpointOverdue
+	}
+	return nil
+}
+
+// Record appends a caller event. An error means the row may not exist, so the
+// caller must not start or continue the action it describes.
+func (c *Chain) Record(e Event) error {
+	switch e.Event {
+	case EventSessionOpen, EventSessionClose, EventDenied:
+	default:
+		return ErrInvalidEvent
+	}
+	for _, v := range []string{e.Pool, e.PodUID, e.Binding, e.Session, e.Outcome, e.Requester} {
+		if !identifier(v, true) {
+			return ErrInvalidEvent
+		}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, err := c.appendLocked(Row{Event: e.Event, Pool: e.Pool, PodUID: e.PodUID, Binding: e.Binding, Session: e.Session, Outcome: e.Outcome, Requester: e.Requester})
+	return err
+}
+
+// Checkpoint signs the current head outside the lock, then appends the
+// signature as a row. A signing failure is itself recorded in the chain.
+func (c *Chain) Checkpoint(ctx context.Context) error {
+	c.mu.Lock()
+	if c.failed {
+		c.mu.Unlock()
+		return ErrAuditFailed
+	}
+	seq, mac := c.seq-1, c.prev
+	c.mu.Unlock()
+	signature, err := c.opts.Signer.Sign(ctx, checkpointInput(c.opts.Replica, c.boot, seq, mac))
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err != nil || !identifier(signature, false) {
+		if _, appendErr := c.appendLocked(Row{Event: EventCheckpointFailed, Outcome: "signer_unavailable"}); appendErr != nil {
+			return appendErr
+		}
+		return fmt.Errorf("audit checkpoint not signed: %w", ErrCheckpointOverdue)
+	}
+	if _, err := c.appendLocked(Row{Event: EventCheckpoint, SignedSeq: seq, SignedMAC: mac, Signature: signature}); err != nil {
+		return err
+	}
+	c.lastCheckpoint = c.opts.Now()
+	return nil
+}
+
+// RefreshKey switches to a newer key version and records the rotation. The
+// rotation row is the first row under the new key.
+func (c *Chain) RefreshKey(ctx context.Context) error {
+	key, err := c.opts.Keys.Current(ctx)
+	if err != nil {
+		return fmt.Errorf("audit HMAC key unavailable: %w", err)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if key.Version <= c.key.Version {
+		return nil
+	}
+	previous := c.key.Version
+	c.key = key
+	_, err = c.appendLocked(Row{Event: EventKeyRotated, PrevKey: previous})
+	return err
+}
+
+// Run checkpoints every interval and polls for a rotated key every refresh
+// until ctx ends. Failures are recorded in the chain and enforced by Admit.
+func (c *Chain) Run(ctx context.Context, interval, refresh time.Duration) {
+	checkpoint := time.NewTicker(interval)
+	defer checkpoint.Stop()
+	rotate := time.NewTicker(refresh)
+	defer rotate.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-checkpoint.C:
+			signCtx, cancel := context.WithTimeout(ctx, interval/2)
+			_ = c.Checkpoint(signCtx)
+			cancel()
+		case <-rotate.C:
+			keyCtx, cancel := context.WithTimeout(ctx, refresh/2)
+			_ = c.RefreshKey(keyCtx)
+			cancel()
+		}
+	}
+}
+
+func (c *Chain) appendLocked(r Row) (Row, error) {
+	if c.failed {
+		return Row{}, ErrAuditFailed
+	}
+	r.Type, r.Replica, r.Boot, r.Seq = RowType, c.opts.Replica, c.boot, c.seq
+	r.Time = c.opts.Now().UTC().Format(time.RFC3339Nano)
+	r.KeyVersion, r.Prev = c.key.Version, c.prev
+	r.MAC = r.computeMAC(c.key.secret)
+	line, err := json.Marshal(r)
+	if err != nil {
+		c.failed = true
+		return Row{}, ErrAuditFailed
+	}
+	if _, err := c.opts.Out.Write(append(line, '\n')); err != nil {
+		// A partial line may exist. Stop the chain rather than continue past
+		// a row whose presence is unknown.
+		c.failed = true
+		return Row{}, ErrAuditFailed
+	}
+	c.seq++
+	c.prev = r.MAC
+	return r, nil
+}
+
+// identifier admits bounded printable ASCII without spaces or quotes, which
+// keeps rows free of free-form text that could carry a secret or forge a line.
+func identifier(s string, optional bool) bool {
+	if s == "" {
+		return optional
+	}
+	if len(s) > 512 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] <= ' ' || s[i] > '~' || s[i] == '"' || s[i] == '\\' {
+			return false
+		}
+	}
+	return true
+}

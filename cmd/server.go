@@ -391,6 +391,11 @@ func attachPostgresBrokerIfEnabled(srv *server.Server, host string, postgresPort
 		Dialer:    netguard.SafeDialContext(netguard.AllowPrivateFromEnv()),
 		Logger:    logger,
 	}
+	if chain, err := brokerAuditChain(context.Background(), client, os.Getenv); err != nil {
+		return fmt.Errorf("postgres broker audit: %w", err)
+	} else if chain != nil {
+		opts.Audit = chain
+	}
 	if srv.CredentialProxyEnabled() {
 		minter, err := server.NewDurableVaultLeaseMinter(context.Background(), client, srv.CleanupStore())
 		if err != nil {
