@@ -125,6 +125,7 @@ type fakeUpstream struct {
 	lastTimeout string
 	forbidParam string // a param key that must never be forwarded upstream
 	forbidSeen  bool
+	accepted    int // upstream connections accepted
 }
 
 func startFakeUpstream(t *testing.T, mode upstreamAuthMode, password string) *fakeUpstream {
@@ -179,6 +180,9 @@ func (fu *fakeUpstream) acceptLoop() {
 		if err != nil {
 			return
 		}
+		fu.mu.Lock()
+		fu.accepted++
+		fu.mu.Unlock()
 		go fu.handle(conn)
 	}
 }

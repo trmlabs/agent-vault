@@ -1,0 +1,526 @@
+package pgproxy
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"log/slog"
+	"math"
+	"sync"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgproto3"
+)
+
+// PoolOptions turns on transaction-mode multiplexing: client sessions share a
+// small set of server connections per (worker pool, database binding) on this
+// replica, each set using one Vault credential that rotates in the background.
+// Nil keeps one upstream connection and credential per client session.
+type PoolOptions struct {
+	// Replicas divides each database's budget (the catalog's maxConns, or the
+	// broker's MaxConns) between broker replicas. Default 1.
+	Replicas int
+	// SessionShare caps, per pool key, the connections pinned to one client
+	// for session state, as a fraction of the budget. Default 0.1, minimum 1.
+	SessionShare float64
+	// QueueFactor bounds waiting checkouts at this multiple of the budget;
+	// QueueWait bounds how long one waits. Defaults 2 and 2 seconds. Overflow
+	// and timeouts are refused with SQLSTATE 53300.
+	QueueFactor int
+	QueueWait   time.Duration
+	// RotateFraction of a credential's lifetime passes before its successor
+	// is minted. Default 0.5, with up to 10% jitter per key.
+	RotateFraction float64
+	// IdleTimeout closes server connections unused for this long. Default 5m.
+	IdleTimeout time.Duration
+}
+
+func (o *PoolOptions) withDefaults() PoolOptions {
+	p := *o
+	if p.Replicas < 1 {
+		p.Replicas = 1
+	}
+	if p.SessionShare <= 0 || p.SessionShare > 1 {
+		p.SessionShare = 0.1
+	}
+	if p.QueueFactor < 1 {
+		p.QueueFactor = 2
+	}
+	if p.QueueWait <= 0 {
+		p.QueueWait = 2 * time.Second
+	}
+	if p.RotateFraction <= 0 || p.RotateFraction >= 1 {
+		p.RotateFraction = 0.5
+	}
+	if p.IdleTimeout <= 0 {
+		p.IdleTimeout = 5 * time.Minute
+	}
+	return p
+}
+
+var (
+	errPoolBudget  = errors.New("database connection budget exhausted")
+	errPinnedShare = errors.New("session-mode share exhausted")
+	errPoolClosed  = errors.New("connection pool closed")
+)
+
+// poolKey names one credential's server connections. The replica is implicit:
+// each broker process has its own pools.
+type poolKey struct {
+	pool    string // catalog pool name, or the actor when there is none
+	binding string // vault/service, the identity the cleanup journal uses
+}
+
+// credential is one Vault-issued database login shared by a pool key's
+// server connections. A retiring credential opens no new connections and is
+// revoked once its last connection closes, or at its expiry.
+type credential struct {
+	lease    *Lease
+	issued   time.Time
+	rotateAt time.Time
+	conns    int
+	retiring bool
+	revoked  bool
+}
+
+// serverConn is one upstream connection, owned by at most one client at a time.
+type serverConn struct {
+	sess     *upstreamSession
+	frontend *pgproto3.Frontend
+	cred     *credential
+	pool     *serverPool
+	prepared map[string]bool   // broker-named prepared statements on this connection
+	params   map[string]string // session parameters applied by the broker
+	pinned   bool
+	idleAt   time.Time
+}
+
+type serverPool struct {
+	key     poolKey
+	svc     DatabaseService
+	vault   string
+	cur     *credential
+	minting bool          // a background rotation is in flight
+	mintMu  sync.Mutex    // one mint at a time per key
+	creds   []*credential // every live credential, current included
+	idle    []*serverConn
+	pinned  int
+	// parameters are the server's startup statuses, replayed to clients.
+	parameters []pgproto3.ParameterStatus
+}
+
+// budget bounds server connections to one upstream address on this replica.
+type budget struct {
+	limit   int
+	open    int
+	waiters int
+	changed chan struct{}
+}
+
+type serverPools struct {
+	opts   PoolOptions
+	broker *Broker
+	logger *slog.Logger
+
+	mu       sync.Mutex
+	pools    map[poolKey]*serverPool
+	budgets  map[string]*budget
+	learning map[poolKey]*sync.Mutex // one parameter discovery per key
+	closed   bool
+	stop     chan struct{}
+	done     chan struct{}
+}
+
+func newServerPools(b *Broker, opts PoolOptions) *serverPools {
+	p := &serverPools{opts: opts.withDefaults(), broker: b, logger: b.logger, pools: map[poolKey]*serverPool{},
+		budgets: map[string]*budget{}, learning: map[poolKey]*sync.Mutex{}, stop: make(chan struct{}), done: make(chan struct{})}
+	go p.maintain()
+	return p
+}
+
+func (p *serverPools) budgetFor(svc *DatabaseService) *budget {
+	// The catalog's maxConns is the database's whole Gatehouse budget. In
+	// pooled mode MaxConns caps client sessions instead, so an unset budget
+	// falls back to the conservative default, not to that cap.
+	limit := svc.MaxConns
+	if limit <= 0 {
+		limit = defaultMaxConns
+	}
+	limit = max(1, limit/p.opts.Replicas)
+	bud, ok := p.budgets[svc.Addr]
+	if !ok {
+		bud = &budget{changed: make(chan struct{})}
+		p.budgets[svc.Addr] = bud
+	}
+	bud.limit = limit // budgets follow the live catalog
+	return bud
+}
+
+func (bud *budget) notify() {
+	close(bud.changed)
+	bud.changed = make(chan struct{})
+}
+
+// acquire returns a server connection for key, reusing an idle one, opening a
+// new one within the database's budget, or waiting in a bounded queue. A
+// pinned checkout also counts against the key's session-mode share.
+func (p *serverPools) acquire(ctx context.Context, key poolKey, vaultID string, svc *DatabaseService, pinned bool) (*serverConn, error) {
+	deadline := time.Now().Add(p.opts.QueueWait)
+	waiting := false
+	p.mu.Lock()
+	defer func() {
+		if waiting {
+			p.budgets[svc.Addr].waiters--
+		}
+		p.mu.Unlock()
+	}()
+	for {
+		if p.closed {
+			return nil, errPoolClosed
+		}
+		pool := p.pools[key]
+		if pool == nil {
+			pool = &serverPool{key: key, svc: *svc, vault: vaultID}
+			p.pools[key] = pool
+		}
+		pool.svc = *svc
+		bud := p.budgetFor(svc)
+		share := max(1, int(math.Floor(float64(bud.limit)*p.opts.SessionShare)))
+		if pinned && pool.pinned >= share {
+			return nil, errPinnedShare
+		}
+		// Reuse an idle connection on a current credential.
+		for len(pool.idle) > 0 {
+			conn := pool.idle[len(pool.idle)-1]
+			pool.idle = pool.idle[:len(pool.idle)-1]
+			if conn.cred.retiring {
+				p.closeLocked(conn)
+				continue
+			}
+			conn.pinned = pinned
+			if pinned {
+				pool.pinned++
+			}
+			return conn, nil
+		}
+		// Open a new one within budget, evicting another key's idle
+		// connection on the same database if that is the only room.
+		if bud.open >= bud.limit {
+			p.evictIdleLocked(svc.Addr, key)
+		}
+		if bud.open < bud.limit {
+			bud.open++
+			p.mu.Unlock()
+			conn, err := p.open(ctx, pool, *svc)
+			p.mu.Lock()
+			if err != nil {
+				bud.open--
+				bud.notify()
+				return nil, err
+			}
+			conn.pinned = pinned
+			if pinned {
+				pool.pinned++
+			}
+			return conn, nil
+		}
+		if !waiting {
+			if bud.waiters >= bud.limit*p.opts.QueueFactor {
+				return nil, errPoolBudget
+			}
+			bud.waiters++
+			waiting = true
+		}
+		changed := bud.changed
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, errPoolBudget
+		}
+		p.mu.Unlock()
+		timer := time.NewTimer(remaining)
+		select {
+		case <-changed:
+		case <-timer.C:
+		case <-ctx.Done():
+		}
+		timer.Stop()
+		p.mu.Lock()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+	}
+}
+
+func (p *serverPools) evictIdleLocked(addr string, except poolKey) {
+	for key, pool := range p.pools {
+		if key == except || pool.svc.Addr != addr || len(pool.idle) == 0 {
+			continue
+		}
+		conn := pool.idle[0]
+		pool.idle = pool.idle[1:]
+		p.closeLocked(conn)
+		return
+	}
+}
+
+// open dials one server connection with the key's current credential,
+// minting the first credential if there is none yet.
+func (p *serverPools) open(ctx context.Context, pool *serverPool, svc DatabaseService) (*serverConn, error) {
+	cred, err := p.credentialFor(ctx, pool, svc)
+	if err != nil {
+		return nil, err
+	}
+	connectCtx, cancel := context.WithTimeout(ctx, p.broker.opts.HandshakeTimeout)
+	defer cancel()
+	sess, err := connectUpstream(connectCtx, p.broker.opts.Dialer, &svc, cred.lease, nil)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err != nil {
+		cred.conns--
+		p.retireIfDrainedLocked(pool, cred)
+		return nil, fmt.Errorf("connect upstream: %w", err)
+	}
+	frontend := pgproto3.NewFrontend(sess.conn, sess.conn)
+	return &serverConn{sess: sess, frontend: frontend, cred: cred, pool: pool, prepared: map[string]bool{}, params: map[string]string{}}, nil
+}
+
+// credentialFor reserves a connection on the key's current credential,
+// minting one when the key has none or its only one has expired.
+func (p *serverPools) credentialFor(ctx context.Context, pool *serverPool, svc DatabaseService) (*credential, error) {
+	usable := func() *credential {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		cur := pool.cur
+		if cur != nil && !cur.retiring && !cur.revoked && time.Now().Before(cur.lease.ExpiresAt.Add(-5*time.Second)) {
+			cur.conns++
+			return cur
+		}
+		return nil
+	}
+	if cred := usable(); cred != nil {
+		return cred, nil
+	}
+	pool.mintMu.Lock()
+	defer pool.mintMu.Unlock()
+	if cred := usable(); cred != nil {
+		return cred, nil // another checkout minted while this one waited
+	}
+	if _, err := p.mintLocked(ctx, pool, svc); err != nil {
+		return nil, err
+	}
+	if cred := usable(); cred != nil {
+		return cred, nil
+	}
+	return nil, errors.New("pooled credential unavailable")
+}
+
+// mint issues a new credential for the key and makes it current. The previous
+// one retires: it opens nothing more and is revoked when its last connection
+// closes, so a rotation never cuts a running transaction.
+// mintLocked requires pool.mintMu.
+func (p *serverPools) mintLocked(ctx context.Context, pool *serverPool, svc DatabaseService) (*credential, error) {
+	lease, err := p.broker.opts.Leases.Mint(ctx, pool.vault, &svc)
+	if err != nil {
+		return nil, fmt.Errorf("mint pooled credential: %w", err)
+	}
+	if lease == nil || lease.ID == "" || lease.Username == "" || lease.Password == "" || !lease.ExpiresAt.After(time.Now().Add(10*time.Second)) {
+		if lease != nil && lease.ID != "" {
+			p.revoke(lease)
+		}
+		return nil, errors.New("invalid pooled database lease")
+	}
+	now := time.Now()
+	life := lease.ExpiresAt.Sub(now)
+	var jitter [2]byte
+	_, _ = rand.Read(jitter[:])
+	spread := time.Duration(float64(life) * 0.1 * float64(binary.BigEndian.Uint16(jitter[:])) / 65535)
+	cred := &credential{lease: lease, issued: now, rotateAt: now.Add(time.Duration(float64(life)*p.opts.RotateFraction) - spread)}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if old := pool.cur; old != nil {
+		old.retiring = true
+		kept := pool.idle[:0]
+		for _, conn := range pool.idle {
+			if conn.cred == old {
+				p.closeLocked(conn)
+				continue
+			}
+			kept = append(kept, conn)
+		}
+		pool.idle = kept
+		p.retireIfDrainedLocked(pool, old)
+	}
+	pool.cur = cred
+	pool.creds = append(pool.creds, cred)
+	return cred, nil
+}
+
+// release returns a connection after its client's transaction ended, or
+// closes it when it cannot be reused safely.
+func (p *serverPools) release(conn *serverConn, reusable bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	pool := conn.pool
+	if conn.pinned {
+		conn.pinned = false
+		pool.pinned--
+	}
+	if !reusable || p.closed || conn.cred.retiring || conn.cred.revoked || !time.Now().Before(conn.cred.lease.ExpiresAt.Add(-5*time.Second)) {
+		p.closeLocked(conn)
+		return
+	}
+	conn.idleAt = time.Now()
+	pool.idle = append(pool.idle, conn)
+	if bud := p.budgets[pool.svc.Addr]; bud != nil {
+		bud.notify()
+	}
+}
+
+func (p *serverPools) closeLocked(conn *serverConn) {
+	_ = conn.sess.conn.Close()
+	conn.cred.conns--
+	if bud := p.budgets[conn.pool.svc.Addr]; bud != nil {
+		bud.open--
+		bud.notify()
+	}
+	p.retireIfDrainedLocked(conn.pool, conn.cred)
+}
+
+func (p *serverPools) retireIfDrainedLocked(pool *serverPool, cred *credential) {
+	if !cred.retiring || cred.revoked || cred.conns > 0 {
+		return
+	}
+	cred.revoked = true
+	kept := pool.creds[:0]
+	for _, c := range pool.creds {
+		if c != cred {
+			kept = append(kept, c)
+		}
+	}
+	pool.creds = kept
+	go p.revoke(cred.lease)
+}
+
+func (p *serverPools) revoke(lease *Lease) {
+	ctx, cancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
+	defer cancel()
+	if err := p.broker.opts.Leases.Revoke(ctx, lease.ID); err != nil {
+		p.logger.Warn("pgproxy: pooled credential revoke failed", slog.String("error", err.Error()))
+	}
+}
+
+// maintain rotates credentials ahead of expiry, forces out credentials that
+// reached expiry with connections still open, and closes idle connections.
+func (p *serverPools) maintain() {
+	defer close(p.done)
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-p.stop:
+			return
+		case <-ticker.C:
+		}
+		now := time.Now()
+		var rotate []*serverPool
+		p.mu.Lock()
+		for _, pool := range p.pools {
+			kept := pool.idle[:0]
+			for _, conn := range pool.idle {
+				if now.Sub(conn.idleAt) > p.opts.IdleTimeout {
+					p.closeLocked(conn)
+					continue
+				}
+				kept = append(kept, conn)
+			}
+			pool.idle = kept
+			if cur := pool.cur; cur != nil && !pool.minting && !now.Before(cur.rotateAt) && (cur.conns > 0 || len(pool.idle) > 0) {
+				pool.minting = true
+				rotate = append(rotate, pool)
+			}
+			if cur := pool.cur; cur != nil && cur.conns == 0 && !now.Before(cur.rotateAt) {
+				// Nothing uses it: retire now rather than renew an idle login.
+				cur.retiring = true
+				pool.cur = nil
+				p.retireIfDrainedLocked(pool, cur)
+			}
+			live := pool.creds[:0]
+			for _, cred := range pool.creds {
+				if cred.revoked {
+					continue
+				}
+				live = append(live, cred)
+				if !now.Before(cred.lease.ExpiresAt) {
+					// Expired with connections open: revocation ends them.
+					cred.retiring, cred.revoked = true, true
+					if pool.cur == cred {
+						pool.cur = nil
+					}
+					go p.revoke(cred.lease)
+				}
+			}
+			pool.creds = live
+		}
+		p.mu.Unlock()
+		for _, pool := range rotate {
+			go func(pool *serverPool) {
+				ctx, cancel := context.WithTimeout(context.Background(), p.broker.opts.HandshakeTimeout)
+				defer cancel()
+				p.mu.Lock()
+				svc := pool.svc
+				p.mu.Unlock()
+				pool.mintMu.Lock()
+				_, err := p.mintLocked(ctx, pool, svc)
+				pool.mintMu.Unlock()
+				if err != nil {
+					p.logger.Warn("pgproxy: pooled credential rotation failed; retrying", slog.String("error", err.Error()))
+				}
+				p.mu.Lock()
+				pool.minting = false
+				p.mu.Unlock()
+			}(pool)
+		}
+	}
+}
+
+// close ends every idle connection and revokes every credential. Connections
+// still owned by sessions close when those sessions end.
+func (p *serverPools) close() {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return
+	}
+	p.closed = true
+	close(p.stop)
+	for _, pool := range p.pools {
+		for _, conn := range pool.idle {
+			p.closeLocked(conn)
+		}
+		pool.idle = nil
+		for _, cred := range pool.creds {
+			cred.retiring = true
+			p.retireIfDrainedLocked(pool, cred)
+		}
+		pool.cur = nil
+	}
+	p.mu.Unlock()
+	<-p.done
+}
+
+// stats reports open server connections per upstream, for tests and status.
+func (p *serverPools) stats(addr string) (open, idle int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if bud := p.budgets[addr]; bud != nil {
+		open = bud.open
+	}
+	for _, pool := range p.pools {
+		if pool.svc.Addr == addr {
+			idle += len(pool.idle)
+		}
+	}
+	return open, idle
+}

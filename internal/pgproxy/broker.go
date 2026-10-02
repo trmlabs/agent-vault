@@ -35,6 +35,7 @@ type Options struct {
 	MaxConns              int           // cap on concurrent SERVING connections = upstream DB connections (default 50)
 	MaxPendingConns       int           // cap on accepted-but-not-yet-serving connections (default 512)
 	MaxLeasesPerActor     int           // cap on live credentials/connections per agent identity (default 16; clamped to <= MaxConns)
+	Pool                  *PoolOptions  // transaction-mode multiplexing; nil keeps one upstream connection per session
 	Audit                 AuditTrail    // signed audit trail; nil disables it
 }
 
@@ -65,6 +66,7 @@ type Broker struct {
 	cancel               context.CancelFunc
 	shutdownDone         chan struct{}
 	wg                   sync.WaitGroup
+	pools                *serverPools // nil unless Options.Pool is set
 }
 
 // New builds a Broker bound to addr (host:port). It does not listen until Serve
@@ -109,7 +111,7 @@ func New(addr string, opts Options) *Broker {
 		opts.MaxLeasesPerActor = opts.MaxConns
 	}
 	ctx, cancel := context.WithCancel(context.Background()) // #nosec G118 -- Broker.Shutdown owns cancellation.
-	return &Broker{
+	b := &Broker{
 		addr:           addr,
 		cancellations:  make(map[string]*cancelTarget),
 		opts:           opts,
@@ -124,6 +126,10 @@ func New(addr string, opts Options) *Broker {
 		leaseCounts:    make(map[string]int),
 		leaseChanged:   make(chan struct{}),
 	}
+	if opts.Pool != nil {
+		b.pools = newServerPools(b, *opts.Pool)
+	}
+	return b
 }
 
 // Addr returns the configured listen address.
@@ -227,7 +233,15 @@ func (b *Broker) Shutdown(ctx context.Context) error {
 		for conn := range b.conns {
 			_ = conn.Close()
 		}
-		go func() { b.wg.Wait(); close(b.shutdownDone) }()
+		go func() {
+			b.wg.Wait()
+			// Sessions are gone: close idle server connections and revoke
+			// pooled credentials.
+			if b.pools != nil {
+				b.pools.close()
+			}
+			close(b.shutdownDone)
+		}()
 	}
 	b.mu.Unlock()
 	select {
@@ -446,6 +460,12 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		return
 	}
 	event.Binding = databaseBinding(scope.VaultID, svc)
+	if b.pools != nil {
+		// Multiplexed: the pool owns the database budget, credentials and
+		// server connections, so this session takes none of its own.
+		b.servePooled(hsCtx, conn, backend, *scope, svc, token, startup.Parameters["agent_vault_vault"], requestedDB, startup.Parameters, event)
+		return
+	}
 
 	// Per-database budget: bound the connections to THIS upstream so a burst to
 	// one database cannot starve the others behind the same broker. Applied

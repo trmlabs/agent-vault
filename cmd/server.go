@@ -434,6 +434,12 @@ func attachPostgresBrokerIfEnabled(srv *server.Server, host string, postgresPort
 	if v := intEnvValue("AGENT_VAULT_DB_MAX_PENDING_CONNS"); v > 0 {
 		opts.MaxPendingConns = v
 	}
+	// Transaction-mode multiplexing: client sessions share server connections
+	// and one rotating credential per pool and database. MaxConns then caps
+	// client sessions; each database's server budget comes from the catalog.
+	if boolEnvValue("AGENT_VAULT_DB_POOLING") {
+		opts.Pool = &pgproxy.PoolOptions{Replicas: intEnvValue("AGENT_VAULT_DB_POOL_REPLICAS")}
+	}
 	srv.AttachPostgresBroker(pgproxy.New(net.JoinHostPort(host, strconv.Itoa(postgresPort)), opts))
 	return nil
 }
