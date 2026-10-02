@@ -32,6 +32,12 @@ type Binding struct {
 	PodUID            string `json:"podUID"`
 	AgentID           string `json:"agentID"`
 	VaultID           string `json:"vaultID"`
+	// Pool bindings (OwnerUIDs set) admit any live Pod of this account owned by
+	// one of these controllers, by local token verification plus its address.
+	OwnerUIDs     []string `json:"ownerUIDs,omitempty"`
+	ContainerName string   `json:"containerName,omitempty"`
+	MaxPodSeconds int64    `json:"maxPodSeconds,omitempty"`
+	Pool          string   `json:"pool,omitempty"` // catalog pool name reported as ProxyScope.Pool
 }
 
 // Config selects one Kubernetes trust domain and explicit workload grants.
@@ -60,6 +66,7 @@ type Resolver struct {
 	client *http.Client
 	store  Store
 	now    func() time.Time
+	jwks   *signingKeys
 }
 
 var _ brokercore.SessionResolver = (*Resolver)(nil)
@@ -130,6 +137,19 @@ func newResolver(c Config, s Store, observer bool) (*Resolver, error) {
 		if observer && (b.AgentID != "" || b.VaultID != "") {
 			return nil, errors.New("observer policy must not contain proxy grants")
 		}
+		if len(b.OwnerUIDs) != 0 || b.ContainerName != "" || b.MaxPodSeconds != 0 || b.Pool != "" {
+			if b.Pool != "" && !pathSegment(b.Pool) {
+				return nil, errors.New("pool binding name must be a lowercase DNS-style name")
+			}
+			if observer || len(b.OwnerUIDs) == 0 || len(b.OwnerUIDs) > 16 || b.PodUID != "" || b.MaxPodSeconds < 60 || b.MaxPodSeconds > 8*3600 || (b.ContainerName != "" && !pathSegment(b.ContainerName)) {
+				return nil, errors.New("pool binding requires 1 to 16 owner UIDs, no Pod UID and a 60 s to 8 h Pod lifetime")
+			}
+			for _, owner := range b.OwnerUIDs {
+				if owner == "" {
+					return nil, errors.New("pool binding owner UID must be non-empty")
+				}
+			}
+		}
 		key := b.Namespace + ":" + b.ServiceAccount
 		if seen[key] {
 			return nil, errors.New("ambiguous workload identity binding")
@@ -147,7 +167,7 @@ func newResolver(c Config, s Store, observer bool) (*Resolver, error) {
 	c.APIServer = strings.TrimSuffix(c.APIServer, "/")
 	c.Bindings = append([]Binding(nil), c.Bindings...)
 	transport := &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool}}
-	return &Resolver{config: c, store: s, now: time.Now, client: &http.Client{
+	return &Resolver{config: c, store: s, now: time.Now, jwks: &signingKeys{}, client: &http.Client{
 		Timeout: time.Duration(c.TimeoutSeconds) * time.Second, Transport: transport,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}}, nil
@@ -288,10 +308,28 @@ func (r *Resolver) ResolveForProxy(ctx context.Context, token, vaultHint string)
 		return nil, err
 	}
 	deny := brokercore.ErrInvalidSession
-	k := c.Kubernetes
+	if len(binding.OwnerUIDs) != 0 {
+		// A pool binding is admitted only with the connection's peer address.
+		return nil, deny
+	}
+	scope, err := r.grant(ctx, binding, vaultHint)
+	if err != nil {
+		return nil, err
+	}
+	// Store calls may consume the remainder of the proof lifetime or timeout.
+	// Never return an authorized scope after either deadline elapsed.
+	if ctx.Err() != nil || c.Expires <= r.now().Unix() {
+		return nil, deny
+	}
+	scope.WorkloadID = c.Kubernetes.Pod.UID
+	return scope, nil
+}
+
+// grant reads the binding's current agent, vault and role from the store.
+func (r *Resolver) grant(ctx context.Context, binding *Binding, vaultHint string) (*brokercore.ProxyScope, error) {
 	a, err := r.store.GetAgentByID(ctx, binding.AgentID)
 	if err != nil || a == nil || a.ID != binding.AgentID || a.Status != "active" || a.RevokedAt != nil {
-		return nil, deny
+		return nil, brokercore.ErrInvalidSession
 	}
 	v, err := r.store.GetVaultByID(ctx, binding.VaultID)
 	if err != nil || v == nil || v.ID != binding.VaultID {
@@ -304,12 +342,7 @@ func (r *Resolver) ResolveForProxy(ctx context.Context, token, vaultHint string)
 	if err != nil || (role != "proxy" && role != "member" && role != "admin") {
 		return nil, brokercore.ErrVaultAccessDenied
 	}
-	// Store calls may consume the remainder of the proof lifetime or timeout.
-	// Never return an authorized scope after either deadline elapsed.
-	if ctx.Err() != nil || c.Expires <= r.now().Unix() {
-		return nil, deny
-	}
-	return &brokercore.ProxyScope{AgentID: a.ID, WorkloadID: k.Pod.UID, VaultID: v.ID, VaultName: v.Name, VaultRole: role}, nil
+	return &brokercore.ProxyScope{AgentID: a.ID, VaultID: v.ID, VaultName: v.Name, VaultRole: role}, nil
 }
 
 func exactly(values []string, value string) bool { return len(values) == 1 && values[0] == value }

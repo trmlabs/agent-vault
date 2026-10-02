@@ -103,6 +103,9 @@ network isolation or support for other hosted-agent runtimes.
     | `VAULT_ROLE_ID` | HashiCorp Vault AppRole RoleID. Set together with `VAULT_SECRET_ID`; selected over `VAULT_TOKEN` when both are present. |
     | `VAULT_SECRET_ID` | HashiCorp Vault AppRole SecretID. Set together with `VAULT_ROLE_ID`. |
     | `VAULT_APPROLE_MOUNT` | HashiCorp Vault AppRole auth mount path (default `approle`). Override for non-default Enterprise/HCP mounts. |
+    | `VAULT_JWT_ROLE` | HashiCorp Vault JWT auth role. Set together with `VAULT_JWT_TOKEN_FILE`; selected over `VAULT_TOKEN`. The server logs in again on a schedule instead of restarting. |
+    | `VAULT_JWT_TOKEN_FILE` | Path to the projected service-account token for JWT auth, read fresh at every login. |
+    | `VAULT_JWT_MOUNT` | HashiCorp Vault JWT auth mount path (default `jwt`). |
     | `AGENT_VAULT_TELEMETRY` | Set to `false` to disable anonymous usage telemetry. No credential values or request payloads are ever included. |
   </Accordion>
 

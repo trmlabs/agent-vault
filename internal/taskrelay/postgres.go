@@ -1,6 +1,7 @@
 package taskrelay
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -64,6 +65,8 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig) {
 	c := &binding
 	if startup.Decode(packet[4:]) != nil || startup.ProtocolVersion != pgproto3.ProtocolVersionNumber || !validStartup(startup.Parameters, c) {
 		_ = r.record("postgres", "denied:bad-startup")
+		_, _ = conn.Write(errorFrame("08004", "Gatehouse: connection refused: use this binding's database and user, and only the "+
+			"application_name, statement_timeout and client_encoding startup parameters (set others with SET after connecting)"))
 		return
 	}
 	// Preserve validated client behavior while fixing connection authority to the
@@ -92,6 +95,7 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig) {
 	}
 	if typ != 'p' || string(password) != c.Placeholder+"\x00" {
 		_ = r.record("postgres", "denied:placeholder")
+		_, _ = conn.Write(errorFrame("28P01", "Gatehouse: wrong placeholder password for this binding"))
 		return
 	}
 	// Everything the sandbox can influence has been validated. Admit: live pair
@@ -171,6 +175,11 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig) {
 			if !authenticated || len(body) != 1 {
 				return
 			}
+		case 'E':
+			// Tell the client why, in the relay's own words: a known capacity
+			// refusal by code, anything else as one generic refusal.
+			_, _ = conn.Write(refusalFrame(sqlState(body)))
+			return
 		default:
 			return
 		}
@@ -340,4 +349,41 @@ func (r *relay) cancelPostgres(peer string, packet []byte, binding PostgresConfi
 	if _, e = up.Write(target.packet); e == nil {
 		_, _ = io.Copy(io.Discard, up)
 	}
+}
+
+// sqlState returns the SQLSTATE field of a PostgreSQL ErrorResponse body.
+func sqlState(body []byte) string {
+	for len(body) > 0 && body[0] != 0 {
+		field := body[0]
+		end := bytes.IndexByte(body[1:], 0)
+		if end < 0 {
+			return ""
+		}
+		if field == 'C' {
+			return string(body[1 : 1+end])
+		}
+		body = body[2+end:]
+	}
+	return ""
+}
+
+// refusalFrame is a relay-authored FATAL error. Broker message text is never
+// forwarded; only a capacity refusal keeps its code and a fixed explanation.
+func refusalFrame(code string) []byte {
+	if code == "53300" {
+		return errorFrame(code, "Gatehouse: too many concurrent database sessions for this worker; close one and retry")
+	}
+	return errorFrame("08004", "Gatehouse: the broker refused this connection")
+}
+
+// errorFrame builds a FATAL ErrorResponse with relay-authored text only.
+func errorFrame(code, message string) []byte {
+	var body []byte
+	for _, f := range []struct {
+		t byte
+		v string
+	}{{'S', "FATAL"}, {'V', "FATAL"}, {'C', code}, {'M', message}} {
+		body = append(append(append(body, f.t), f.v...), 0)
+	}
+	return encodePGFrame('E', append(body, 0))
 }

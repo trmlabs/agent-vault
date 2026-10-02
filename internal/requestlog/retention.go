@@ -24,8 +24,8 @@ const (
 	// SettingKey is the instance_settings key holding the JSON payload.
 	SettingKey = "logs_retention"
 
-	envMaxAgeHours  = "AGENT_VAULT_LOGS_MAX_AGE_HOURS"
-	envMaxRows      = "AGENT_VAULT_LOGS_MAX_ROWS_PER_VAULT"
+	envMaxAgeHours   = "AGENT_VAULT_LOGS_MAX_AGE_HOURS"
+	envMaxRows       = "AGENT_VAULT_LOGS_MAX_ROWS_PER_VAULT"
 	envRetentionLock = "AGENT_VAULT_LOGS_RETENTION_LOCK"
 )
 

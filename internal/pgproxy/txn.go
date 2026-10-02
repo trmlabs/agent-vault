@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
@@ -106,7 +107,7 @@ func serverStatementName(query string, types []uint32) string {
 
 // servePooled runs a client session on the shared pool. It returns when the
 // client leaves, the session is terminated, or the pool fails it.
-func (b *Broker) servePooled(ctx context.Context, conn net.Conn, backend *pgproto3.Backend, scope AgentScope, svc *DatabaseService, token, hint, requested string,
+func (b *Broker) servePooled(ctx context.Context, conn net.Conn, backend *pgproto3.Backend, scope AgentScope, svc *DatabaseService, token, hint, requested string, peer netip.Addr,
 	startupParams map[string]string, event auditchain.Event) {
 	key := poolKey{pool: scope.Pool, binding: databaseBinding(scope.VaultID, svc), mount: svc.Mount, role: svc.Role, addr: svc.Addr, database: svc.Database}
 	if key.pool == "" {
@@ -169,9 +170,14 @@ func (b *Broker) servePooled(ctx context.Context, conn net.Conn, backend *pgprot
 	authorizationDone := make(chan struct{})
 	go func() {
 		defer close(authorizationDone)
-		b.authorizationLoop(relayCtx, token, hint, requested, scope, *svc, s.kill)
+		b.authorizationLoop(relayCtx, token, hint, requested, scope, *svc, s.kill, peer)
 	}()
 	defer func() { relayCancel(); <-authorizationDone }()
+	if !scope.NotAfter.IsZero() {
+		// A pool Pod's session ends at its deadline, as on the unpooled path.
+		deadline := time.AfterFunc(time.Until(scope.NotAfter), s.kill)
+		defer deadline.Stop()
+	}
 	defer s.end()
 	s.run(relayCtx)
 }

@@ -1,6 +1,7 @@
 package pgproxy
 
 import (
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -99,5 +100,38 @@ func TestPooledBudgetFollowsLiveReplicas(t *testing.T) {
 	}
 	if open, _ := b.pools.stats(svc.Addr); open > 1 {
 		t.Fatalf("opened %d beyond the share of 1", open)
+	}
+}
+
+// A pooled session ends at its Pod's deadline, as an unpooled one does.
+func TestPooledSessionEndsAtTheDeadline(t *testing.T) {
+	lease := newLease()
+	upstream := startFakeUpstream(t, authTrust, lease.Password)
+	_, addr := startBroker(t, Options{
+		Auth: &fakeAuth{scope: &AgentScope{VaultID: "vault-1", ActorID: "agent-uuid-1", WorkloadID: "pod-1", Pool: "cursor",
+			NotAfter: time.Now().Add(700 * time.Millisecond)}},
+		Databases: &fakeResolver{svc: &DatabaseService{Name: "analytics", Addr: upstream.addr(), Mount: "database", Role: "readonly", SSLMode: "disable"}},
+		Leases:    &fakeMinter{lease: lease},
+		Pool:      &PoolOptions{},
+	})
+	conn, err := openSession(t, addr, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	started := time.Now()
+	buf := make([]byte, 512)
+	for {
+		if _, err := conn.Read(buf); err != nil {
+			var timeout interface{ Timeout() bool }
+			if errors.As(err, &timeout) && timeout.Timeout() {
+				t.Fatal("pooled session outlived its deadline")
+			}
+			break
+		}
+	}
+	if time.Since(started) > 2500*time.Millisecond {
+		t.Fatal("session ended late")
 	}
 }

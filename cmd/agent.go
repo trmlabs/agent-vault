@@ -79,15 +79,15 @@ var agentInfoCmd = &cobra.Command{
 		}
 
 		var info struct {
-			Name           string `json:"name"`
-			Role           string `json:"role"`
-			Status         string `json:"status"`
-			CreatedBy      string `json:"created_by"`
-			CreatedAt      string `json:"created_at"`
-			UpdatedAt      string `json:"updated_at"`
-			RevokedAt      *string `json:"revoked_at,omitempty"`
+			Name         string  `json:"name"`
+			Role         string  `json:"role"`
+			Status       string  `json:"status"`
+			CreatedBy    string  `json:"created_by"`
+			CreatedAt    string  `json:"created_at"`
+			UpdatedAt    string  `json:"updated_at"`
+			RevokedAt    *string `json:"revoked_at,omitempty"`
 			ActiveTokens int     `json:"active_tokens"`
-			Vaults         []struct {
+			Vaults       []struct {
 				VaultName string `json:"vault_name"`
 				VaultRole string `json:"vault_role"`
 			} `json:"vaults"`
