@@ -133,7 +133,7 @@ func newAdapterFixture(t *testing.T, options ...func(*Options)) *adapterFixture 
 		case "/v1/chat/completions":
 			body, _ := io.ReadAll(r.Body)
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintf(w, `{"method":%q,"bytes":%d}`, r.Method, len(body))
+			fmt.Fprintf(w, `{"method":%q,"bytes":%d}`, r.Method, len(body)) // #nosec G705 -- test upstream; JSON response
 		case "/v1/stream":
 			w.Header().Set("Content-Type", "text/event-stream")
 			fmt.Fprint(w, "data: first\n\n")
@@ -255,7 +255,11 @@ func TestAdapterRefusesOutsideTheCatalog(t *testing.T) {
 	}
 	// An unlisted host is refused before the tunnel opens.
 	r, _ := http.NewRequest("GET", "https://other.example.net:"+strconv.Itoa(f.port)+"/v1/chat", nil)
-	if _, err := f.client.Do(r); err == nil || f.audit.last().Outcome != "unlisted" || f.calls.Load() != 0 {
+	resp, err := f.client.Do(r)
+	if err == nil {
+		_ = resp.Body.Close()
+	}
+	if err == nil || f.audit.last().Outcome != "unlisted" || f.calls.Load() != 0 {
 		t.Fatalf("unlisted host tunnelled: %v %+v", err, f.audit.last())
 	}
 	// A pool without the grant matches the route but is refused.
