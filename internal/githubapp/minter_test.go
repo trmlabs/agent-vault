@@ -249,3 +249,45 @@ func TestMinterRefusesUnsupportedPermissions(t *testing.T) {
 		t.Fatal("GitHub called for an unsupported permission set")
 	}
 }
+
+// Installation tokens live up to an hour at GitHub, so the broker revokes one
+// when GitHub rejects it, when the catalog stops granting it, and when the
+// broker stops.
+func TestMinterRevokesTokensItNoLongerUses(t *testing.T) {
+	g, srv := newFakeGitHub(t)
+	m := newMinter(g, srv, nil)
+	ctx := context.Background()
+	revokes := func(want int32, what string) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for g.revokes.Load() < want && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if got := g.revokes.Load(); got != want {
+			t.Fatalf("%s: %d revocations, want %d", what, got, want)
+		}
+	}
+	if _, err := m.Token(ctx, app, "trmlabs/a", ContentsRead); err != nil {
+		t.Fatal(err)
+	}
+	m.Invalidate(app, "trmlabs/a", ContentsRead)
+	revokes(1, "rejected token")
+
+	for _, repo := range []string{"trmlabs/a", "trmlabs/b"} {
+		if _, err := m.Token(ctx, app, repo, ContentsRead); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m.Prune(func(_ int64, repo string, _ Permissions) bool { return repo == "trmlabs/a" })
+	revokes(2, "repository removed from the catalog")
+	before := g.mints.Load()
+	if _, err := m.Token(ctx, app, "trmlabs/a", ContentsRead); err != nil || g.mints.Load() != before {
+		t.Fatalf("a still-granted token was dropped: %v", err)
+	}
+
+	m.RevokeAll()
+	revokes(3, "broker stopping")
+	if _, err := m.Token(ctx, app, "trmlabs/a", ContentsRead); err != nil || g.mints.Load() != before+1 {
+		t.Fatalf("a revoked token was reused: %v", err)
+	}
+}

@@ -221,6 +221,8 @@ func (p *Proxy) Serve(l net.Listener) error {
 // remains when ctx ends.
 func (p *Proxy) Shutdown(ctx context.Context) error {
 	p.upstream.CloseIdleConnections()
+	// Cached GitHub installation tokens are revoked however the stop goes.
+	defer p.revokeGitTokens()
 	if !p.drainTunnels {
 		return p.httpServer.Shutdown(ctx)
 	}
@@ -277,6 +279,17 @@ func (p *Proxy) trackTunnel(srv *http.Server) (untrack func()) {
 		p.tunnelsMu.Lock()
 		delete(p.tunnels, srv)
 		p.tunnelsMu.Unlock()
+	}
+}
+
+// revokeGitTokens revokes every cached GitHub installation token, which GitHub
+// would otherwise honour for up to an hour after the broker stops.
+func (p *Proxy) revokeGitTokens() {
+	if p.adapter == nil {
+		return
+	}
+	if tokens, ok := p.adapter.GitTokens.(interface{ RevokeAll() }); ok {
+		tokens.RevokeAll()
 	}
 }
 

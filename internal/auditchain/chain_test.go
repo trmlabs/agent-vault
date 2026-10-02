@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -559,7 +560,9 @@ func TestVerifierDetectsTruncatedTailAcrossBoots(t *testing.T) {
 	f, boots := threeBoots(t)
 	truncated := boots[0][:len(boots[0])-1] // drop boot 1's final checkpoint
 	report := verify(t, f.verifier(), joinBoots(truncated, boots[1], boots[2]))
-	if len(report.Findings) != 1 || report.Findings[0].Kind != FindingTruncatedTail || report.Findings[0].Boot != 1 {
+	// Boot 1 is also left with no checkpoint at all, which is unsigned.
+	if len(report.Findings) != 2 || report.Findings[1].Kind != FindingTruncatedTail || report.Findings[1].Boot != 1 ||
+		report.Findings[0].Kind != FindingUnsigned || report.Findings[0].Boot != 1 {
 		t.Fatalf("truncated tail not reported: %v", report.Findings)
 	}
 }
@@ -602,5 +605,106 @@ func TestCheckpointPersistenceFailureCountsAsMissed(t *testing.T) {
 	got := rows(t, f.out.String())
 	if last := got[len(got)-1]; last.Event != EventCheckpointFailed || last.Outcome != "store_unavailable" {
 		t.Fatalf("failure not recorded: %+v", last)
+	}
+}
+
+func (f *fixture) heads() []Head {
+	f.boots.mu.Lock()
+	defer f.boots.mu.Unlock()
+	var heads []Head
+	for replica, b := range f.boots.replicas {
+		heads = append(heads, Head{Replica: replica, Boot: b.Boot, CheckpointSeq: b.CheckpointSeq, CheckpointMAC: b.CheckpointMAC})
+	}
+	return heads
+}
+
+// The newest boot has no successor to link to it, so only the store's head
+// shows that it was deleted or cut back to an earlier checkpoint.
+func TestVerifierChecksEachReplicaAgainstTheStoreHead(t *testing.T) {
+	f, boots := threeBoots(t)
+	checked := f.verifier()
+	checked.Heads = f.heads()
+	if got := kinds(verify(t, checked, joinBoots(boots...))); len(got) != 0 {
+		t.Fatalf("complete export rejected: %v", got)
+	}
+	report := verify(t, checked, joinBoots(boots[0], boots[1]))
+	if len(report.Findings) != 1 || report.Findings[0].Kind != FindingMissingHead || report.Findings[0].Boot != 3 {
+		t.Fatalf("deleted newest boot not reported: %v", report.Findings)
+	}
+	// Cut boot 3 back to before its checkpoint: what remains still chains.
+	cut := boots[2][:len(boots[2])-1]
+	if got := kinds(verify(t, checked, joinBoots(boots[0], boots[1], cut))); !slices.Contains(got, FindingMissingHead) {
+		t.Fatalf("tail cut back past the head checkpoint not reported: %v", got)
+	}
+	// Without the store's heads, the deleted newest boot goes unnoticed.
+	if got := kinds(verify(t, f.verifier(), joinBoots(boots[0], boots[1]))); len(got) != 0 {
+		t.Fatalf("control: expected no findings without heads, got %v", got)
+	}
+	// A boot or replica the store never issued is not trusted.
+	stale := checked
+	stale.Heads = []Head{{Replica: "broker-0", Boot: 2, CheckpointSeq: f.heads()[0].CheckpointSeq}}
+	if got := kinds(verify(t, stale, joinBoots(boots...))); !slices.Contains(got, FindingUnknownBoot) {
+		t.Fatalf("boot newer than the store's head not reported: %v", got)
+	}
+}
+
+// Every boot signs a checkpoint as it starts, so a chain with none is
+// unsigned however short, and even with the duration check off.
+func TestVerifierReportsABootWithNoCheckpoint(t *testing.T) {
+	f := newFixture(t)
+	f.session(t, 1)
+	v := f.verifier()
+	v.MaxUnsigned = 0
+	report := verify(t, v, f.out.String())
+	if len(report.Findings) != 1 || report.Findings[0].Kind != FindingUnsigned {
+		t.Fatalf("uncheckpointed boot not reported: %v", report.Findings)
+	}
+}
+
+// A boot that starts under an older key than its predecessor ended on is
+// what a holder of a retired key would write.
+func TestVerifierRejectsAKeyDowngradeAcrossBoots(t *testing.T) {
+	f := newFixture(t)
+	f.session(t, 1)
+	f.keys.rotate()
+	if err := f.chain.RefreshKey(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.checkpoint(t)
+	f.keys.mu.Lock()
+	f.keys.current = 1 // the retired key
+	f.keys.mu.Unlock()
+	f.restart(t)
+	f.session(t, 2)
+	f.checkpoint(t)
+	if got := kinds(verify(t, f.verifier(), f.out.String())); !slices.Contains(got, FindingKeyDowngrade) {
+		t.Fatalf("key downgrade across boots not reported: %v", got)
+	}
+}
+
+type brokenWriter struct{}
+
+func (brokenWriter) Write([]byte) (int, error) { return 0, errors.New("sink gone") }
+
+// A failed write stops the chain for good and says so, so open sessions can
+// be ended rather than run unaudited.
+func TestChainSignalsFailure(t *testing.T) {
+	f := newFixture(t)
+	select {
+	case <-f.chain.Failed():
+		t.Fatal("healthy chain reports failure")
+	default:
+	}
+	f.chain.opts.Out = brokenWriter{}
+	if err := f.chain.Record(Event{Event: EventSessionOpen, Session: "s1", Outcome: "admitted"}); !errors.Is(err, ErrAuditFailed) {
+		t.Fatalf("write failure not reported: %v", err)
+	}
+	select {
+	case <-f.chain.Failed():
+	case <-time.After(time.Second):
+		t.Fatal("failed chain did not signal")
+	}
+	if err := f.chain.Admit(); !errors.Is(err, ErrAuditFailed) {
+		t.Fatalf("failed chain still admits: %v", err)
 	}
 }

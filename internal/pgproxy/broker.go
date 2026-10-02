@@ -86,6 +86,7 @@ type Broker struct {
 	wg                   sync.WaitGroup
 	pools                *serverPools // nil unless Options.Pool is set
 	pooled               map[net.Conn]*pooledSession
+	denied               deniedLimiter
 }
 
 // New builds a Broker bound to addr (host:port). It does not listen until Serve
@@ -195,6 +196,7 @@ func (b *Broker) Serve(l net.Listener) error {
 
 	b.isListening.Store(true)
 	defer b.isListening.Store(false)
+	b.watchAudit()
 	if leases, ok := b.opts.Leases.(interface{ AuthorityDone() <-chan struct{} }); ok {
 		go func() {
 			select {
@@ -513,7 +515,10 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 			err = fmt.Errorf("incomplete agent scope")
 		}
 		b.logger.Warn("pgproxy: agent authentication failed", slog.String("error", err.Error()))
-		b.auditDenied(auditchain.Event{}, "authentication")
+		// Anyone can reach this point, so these rows are rate-limited.
+		if b.denied.allow(time.Now(), b.logger) {
+			b.auditDenied(auditchain.Event{}, "authentication")
+		}
 		writeClientError(backend, "28000", "authentication", "Agent Vault: authentication failed")
 		return
 	}
