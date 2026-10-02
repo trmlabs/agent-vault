@@ -740,3 +740,75 @@ func TestRealPostgres_PoolNodePgDefaultStartup(t *testing.T) {
 		t.Fatalf("node pg answered %s", got)
 	}
 }
+
+// State a function plants behind a plain SELECT, which the classifier cannot
+// see: a temporary domain, a SQL-level prepared statement, sequence state and
+// role-level defaults. Check-in resets the first three and retires the
+// credential for the last, whose effect DISCARD ALL cannot undo.
+func TestRealPostgres_PoolCheckInCatchesTheReviewedLeaks(t *testing.T) {
+	f := newPoolFixture(t, 1, time.Hour, PoolOptions{})
+	ctx := context.Background()
+	suffix := strings.TrimPrefix(f.env.roles[0], "pool_a_")
+	schema := "other_" + suffix
+	f.env.exec(fmt.Sprintf("CREATE FUNCTION %s.plant_domain() RETURNS void LANGUAGE plpgsql AS $$ BEGIN EXECUTE 'CREATE DOMAIN pg_temp.planted AS text'; END $$", schema))
+	f.env.exec(fmt.Sprintf("CREATE FUNCTION %s.plant_prepare() RETURNS void LANGUAGE plpgsql AS $$ BEGIN EXECUTE 'PREPARE planted AS SELECT 1'; END $$", schema))
+	f.env.exec(fmt.Sprintf("CREATE FUNCTION %s.plant_defaults() RETURNS void LANGUAGE plpgsql AS $$ BEGIN EXECUTE 'ALTER ROLE CURRENT_USER SET work_mem = ''7MB'''; END $$", schema))
+	f.env.exec(fmt.Sprintf("CREATE SEQUENCE %s.planted_seq", schema))
+	for _, role := range f.env.roles {
+		f.env.exec(fmt.Sprintf("GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA %s TO %s", schema, role))
+		f.env.exec(fmt.Sprintf("GRANT USAGE, SELECT, UPDATE ON SEQUENCE %s.planted_seq TO %s", schema, role))
+	}
+	outcomes := func(outcome string) int {
+		n := 0
+		for _, e := range f.audit.recorded() {
+			if e.Event == auditchain.EventStateLeak && e.Outcome == outcome {
+				n++
+			}
+		}
+		return n
+	}
+	for i, call := range []string{"plant_domain()", "plant_prepare()"} {
+		a := f.connect(t, nil)
+		if _, err := a.Exec(ctx, "SELECT "+schema+"."+call); err != nil {
+			t.Fatalf("%s: %v", call, err)
+		}
+		waitFor(t, 3*time.Second, func() bool { return outcomes("reset") == i+1 }, "state leak caught for "+call)
+		_ = a.Close(ctx)
+	}
+	b := f.connect(t, nil) // budget 1: the same server connection
+	var n int
+	if err := b.QueryRow(ctx, "SELECT count(*) FROM pg_type WHERE typnamespace = pg_my_temp_schema()").Scan(&n); err != nil || n != 0 {
+		t.Fatalf("temporary type survived check-in: %d %v", n, err)
+	}
+	if err := b.QueryRow(ctx, "SELECT count(*) FROM pg_prepared_statements WHERE from_sql").Scan(&n); err != nil || n != 0 {
+		t.Fatalf("SQL prepared statement survived check-in: %d %v", n, err)
+	}
+	if _, err := b.Exec(ctx, "SELECT nextval('"+schema+".planted_seq')"); err != nil {
+		t.Fatal(err)
+	}
+	_ = b.Close(ctx)
+	c := f.connect(t, nil)
+	if _, err := c.Exec(ctx, "SELECT currval('"+schema+".planted_seq')"); err == nil {
+		t.Fatal("sequence state reached the next client")
+	}
+	_ = c.Close(ctx)
+
+	mints, _ := f.minter.counts()
+	d := f.connect(t, nil)
+	if _, err := d.Exec(ctx, "SELECT "+schema+".plant_defaults()"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 3*time.Second, func() bool { return outcomes("role_defaults") == 1 }, "role-level defaults caught")
+	_ = d.Close(ctx)
+	e := f.connect(t, nil)
+	var user string
+	if err := e.QueryRow(ctx, "SELECT current_user").Scan(&user); err != nil {
+		t.Fatal(err)
+	}
+	if now, _ := f.minter.counts(); now != mints+1 {
+		t.Fatalf("credential with changed role defaults kept in use: %d mints, want %d", now, mints+1)
+	}
+	f.env.exec("ALTER ROLE " + f.env.roles[0] + " RESET ALL")
+	f.env.exec("ALTER ROLE " + f.env.roles[1] + " RESET ALL")
+	_ = user
+}

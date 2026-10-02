@@ -69,3 +69,42 @@ func TestDollarQuoteClosesOnlyAtTheEnd(t *testing.T) {
 		}
 	}
 }
+
+// A change to the shared login or a database default is refused outright on
+// a pooled connection; it would reach every later client of that login.
+func TestChangesRole(t *testing.T) {
+	for sql, want := range map[string]bool{
+		"ALTER ROLE CURRENT_USER SET search_path = evil":       true,
+		"alter user current_user password 'x'":                 true,
+		"SELECT 1; ALTER GROUP g ADD USER u":                   true,
+		"ALTER DATABASE appdb SET search_path = evil":          true,
+		"/* c */ Alter\nRole x SET work_mem = '1GB'":           true,
+		"ALTER TABLE t ADD COLUMN c int":                       false,
+		"SELECT 'ALTER ROLE x'":                                false,
+		"SELECT 1 -- ALTER ROLE x":                             false,
+		"SELECT $$ unterminated":                               true,
+		"ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO r": false,
+	} {
+		if got := changesRole(sql); got != want {
+			t.Errorf("changesRole(%q) = %v, want %v", sql, got, want)
+		}
+	}
+}
+
+// Anything naming the temporary schema pins: a planted temporary domain,
+// function or operator would otherwise resolve first for the next client.
+func TestNeedsSessionPinsTheTemporarySchema(t *testing.T) {
+	for _, sql := range []string{
+		"CREATE DOMAIN pg_temp.uuid AS text CHECK (pg_notify('x', VALUE) IS NULL)",
+		"CREATE FUNCTION pg_temp.lower(text) RETURNS text AS 'SELECT $1' LANGUAGE sql",
+		"CREATE OPERATOR pg_temp.= (LEFTARG = int, RIGHTARG = int, FUNCTION = int4eq)",
+		"SELECT * FROM pg_temp_3.t",
+	} {
+		if !needsSession(sql) {
+			t.Errorf("%q did not pin", sql)
+		}
+	}
+	if needsSession("SELECT 1") {
+		t.Error("plain select pinned")
+	}
+}

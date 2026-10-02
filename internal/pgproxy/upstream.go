@@ -30,6 +30,12 @@ type upstreamSession struct {
 // upstream session mirrors what the agent asked for. On any failure the dialed
 // connection is closed.
 func connectUpstream(ctx context.Context, dial DialFunc, svc *DatabaseService, lease *Lease, clientParams map[string]string) (*upstreamSession, error) {
+	return connectUpstreamWith(ctx, dial, svc, lease, clientParams, nil)
+}
+
+// connectUpstreamWith also sends serverParams, settings the broker itself
+// chooses for the connection, as startup parameters.
+func connectUpstreamWith(ctx context.Context, dial DialFunc, svc *DatabaseService, lease *Lease, clientParams, serverParams map[string]string) (*upstreamSession, error) {
 	rawConn, err := dial(ctx, "tcp", svc.Addr)
 	if err != nil {
 		return nil, fmt.Errorf("dial upstream %s: %w", svc.Addr, err)
@@ -69,6 +75,9 @@ func connectUpstream(ctx context.Context, dial DialFunc, svc *DatabaseService, l
 		if forwardableStartupParam(key) && validStartupValue(key, value) {
 			params[key] = value
 		}
+	}
+	for key, value := range serverParams {
+		params[key] = value
 	}
 
 	frontend.Send(&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber, Parameters: params})
