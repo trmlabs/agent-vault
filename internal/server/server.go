@@ -1490,7 +1490,7 @@ func isSecureRequest(r *http.Request, baseURL string) bool {
 // sessionCookie builds an av_session cookie with all hardening flags set.
 // Secure is set based on TLS state or the server's configured baseURL.
 func sessionCookie(r *http.Request, baseURL, value string, maxAge int) *http.Cookie {
-	return &http.Cookie{
+	return &http.Cookie{ //nolint:gosec // G124: HttpOnly and SameSite are fixed; Secure follows TLS, as a plain-HTTP local server cannot set it
 		Name:     "av_session",
 		Value:    value,
 		Path:     "/",
