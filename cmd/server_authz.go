@@ -87,3 +87,12 @@ func loadAuthorization(getenv func(string) string) (authorization, error) {
 	}
 	return a, nil
 }
+
+// sessionBinder is the store's runner-session pin table, or nil when the
+// store cannot hold one (claude-session pools then refuse every session).
+func sessionBinder(st any) authorize.Binder {
+	if b, ok := st.(authorize.Binder); ok {
+		return b
+	}
+	return nil
+}

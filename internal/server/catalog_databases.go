@@ -25,12 +25,14 @@ type catalogDatabaseResolver struct {
 	catalog      interface{ Current() httpcatalog.Catalog }
 	runner       authorize.Verifier
 	entitlements *entitlement.Cache
+	sessions     authorize.Binder
 }
 
 // NewCatalogDatabaseResolver builds a resolver over a live catalog source.
-// runner and entitlements may be nil; entries that need them are then refused.
-func NewCatalogDatabaseResolver(catalog interface{ Current() httpcatalog.Catalog }, runner authorize.Verifier, entitlements *entitlement.Cache) pgproxy.DatabaseResolver {
-	return catalogDatabaseResolver{catalog: catalog, runner: runner, entitlements: entitlements}
+// runner, entitlements and sessions may be nil; entries that need them are
+// then refused.
+func NewCatalogDatabaseResolver(catalog interface{ Current() httpcatalog.Catalog }, runner authorize.Verifier, entitlements *entitlement.Cache, sessions authorize.Binder) pgproxy.DatabaseResolver {
+	return catalogDatabaseResolver{catalog: catalog, runner: runner, entitlements: entitlements, sessions: sessions}
 }
 
 func (r catalogDatabaseResolver) ResolveDatabase(ctx context.Context, scope pgproxy.AgentScope, requestedDatabase string) (*pgproxy.DatabaseService, error) {
@@ -43,7 +45,7 @@ func (r catalogDatabaseResolver) ResolveDatabase(ctx context.Context, scope pgpr
 		return nil, fmt.Errorf("no database %q in the catalog", requestedDatabase)
 	}
 	pool, _ := catalog.Pool(scope.Pool) // undefined pools: no identity, ceiling T0
-	who, refusal := authorize.Resolve(ctx, pool, pgproxy.Session(ctx), r.runner)
+	who, refusal := authorize.Resolve(ctx, pool, pgproxy.Session(ctx), scope.WorkloadID, r.runner, r.sessions)
 	record := pgproxy.Requester{Kind: who.Kind, Subject: who.Subject, TokenSHA256: who.TokenSHA256}
 	if refusal == "" {
 		d := authorize.Decide(ctx, r.entitlements, pool, *entry, who)

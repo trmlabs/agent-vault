@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/Infisical/agent-vault/internal/authorize/authorizetest"
 	"github.com/Infisical/agent-vault/internal/entitlement"
 	"github.com/Infisical/agent-vault/internal/httpcatalog"
 	"github.com/Infisical/agent-vault/internal/pgproxy"
@@ -62,7 +63,7 @@ func TestCatalogDatabaseResolverAppliesTheAuthorizationModel(t *testing.T) {
 		"other": {Kind: runnerid.KindPerson, Subject: "sso|alice", Pools: []string{"ccpool_zzz"}},
 	}
 	cache := &entitlement.Cache{Source: directory{"sso|alice": {t1Group}, "sso|carol": {t1Group, t2Group}, "sso|bob": {}}}
-	r := NewCatalogDatabaseResolver(httpcatalog.NewSource(catalog, 1), runner, cache)
+	r := NewCatalogDatabaseResolver(httpcatalog.NewSource(catalog, 1), runner, cache, &authorizetest.MemBinder{})
 	cases := []struct{ name, pool, token, database, want string }{
 		{"Cursor pool, T0", "cursor", "", "open", ""},
 		{"Claude pool, T0, no session", "claude", "", "open", ""},
@@ -79,7 +80,7 @@ func TestCatalogDatabaseResolverAppliesTheAuthorizationModel(t *testing.T) {
 	}
 	for _, c := range cases {
 		ctx := pgproxy.WithSession(context.Background(), c.token)
-		_, err := r.ResolveDatabase(ctx, pgproxy.AgentScope{ActorID: "a", Pool: c.pool}, c.database)
+		_, err := r.ResolveDatabase(ctx, pgproxy.AgentScope{ActorID: "a", Pool: c.pool, WorkloadID: "pod-a"}, c.database)
 		var refused *pgproxy.RefusedError
 		got := ""
 		if errors.As(err, &refused) {
@@ -92,7 +93,7 @@ func TestCatalogDatabaseResolverAppliesTheAuthorizationModel(t *testing.T) {
 		}
 	}
 	// The catalog itself never grants a T1 database to the Cursor pool.
-	if _, err := r.ResolveDatabase(pgproxy.WithSession(context.Background(), "alice"), pgproxy.AgentScope{ActorID: "a", Pool: "cursor"}, "t1db"); err == nil {
+	if _, err := r.ResolveDatabase(pgproxy.WithSession(context.Background(), "alice"), pgproxy.AgentScope{ActorID: "a", Pool: "cursor", WorkloadID: "pod-a"}, "t1db"); err == nil {
 		t.Fatal("Cursor pool resolved a T1 database")
 	}
 }

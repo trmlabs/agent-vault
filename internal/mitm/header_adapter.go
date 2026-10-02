@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"github.com/Infisical/agent-vault/internal/authorize"
 	"io"
 	"net/http"
 	"net/url"
@@ -35,7 +36,10 @@ type HeaderAdapter struct {
 		Verify(context.Context, string) (runnerid.Session, error)
 	}
 	Entitlements *entitlement.Cache
-	Keys         interface {
+	// Sessions pins each runner session to the first Pod presenting it.
+	// Without it, claude-session pools refuse every session.
+	Sessions authorize.Binder
+	Keys     interface {
 		Get(context.Context, httpcatalog.KeyRef) (httpcatalog.Secret, error)
 		Invalidate(httpcatalog.KeyRef)
 	}

@@ -5,6 +5,7 @@ package authorize
 
 import (
 	"context"
+	"time"
 
 	"github.com/Infisical/agent-vault/internal/entitlement"
 	"github.com/Infisical/agent-vault/internal/httpcatalog"
@@ -14,6 +15,13 @@ import (
 // Verifier checks a Claude runner session token.
 type Verifier interface {
 	Verify(context.Context, string) (runnerid.Session, error)
+}
+
+// Binder pins a runner session to the first Pod that presents it, across
+// every broker replica, and returns the Pod it is pinned to. The pin lasts
+// until the token expires.
+type Binder interface {
+	BindRunnerSession(ctx context.Context, tokenSHA256, pod string, expires time.Time) (string, error)
 }
 
 // Requester is who stands behind a request. TokenSHA256 identifies the runner
@@ -29,7 +37,12 @@ type Requester struct {
 // is invalid, was issued for another runner pool, or arrives on a pool that
 // takes no session: a bad token is refused even for T0, never silently
 // ignored. A Claude-session pool with no session has no person: T0 only.
-func Resolve(ctx context.Context, pool httpcatalog.Pool, session string, v Verifier) (Requester, string) {
+//
+// A session token is a bearer credential, so it is pinned to the first Pod
+// that presents it: the same token from another Pod is refused
+// (session_pod_mismatch), and without a binder or a Pod the session is
+// refused (session_unbindable).
+func Resolve(ctx context.Context, pool httpcatalog.Pool, session, pod string, v Verifier, b Binder) (Requester, string) {
 	who := Requester{Kind: "none"}
 	// Only a Claude-session pool's sidecar relays a session. One arriving on
 	// any other pool is a misconfigured or forged channel, never ignored.
@@ -53,6 +66,16 @@ func Resolve(ctx context.Context, pool httpcatalog.Pool, session string, v Verif
 		who.TokenSHA256 = s.TokenSHA256
 		if !s.InPool(pool.CCPoolID) {
 			return who, "session_pool"
+		}
+		if b == nil || pod == "" {
+			return who, "session_unbindable"
+		}
+		bound, err := b.BindRunnerSession(ctx, s.TokenSHA256, pod, s.Expires)
+		if err != nil {
+			return who, "session_unbindable"
+		}
+		if bound != pod {
+			return who, "session_pod_mismatch"
 		}
 		who.Kind, who.Subject = string(s.Kind), s.Subject
 	}
