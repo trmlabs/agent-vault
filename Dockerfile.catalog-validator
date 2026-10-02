@@ -1,0 +1,27 @@
+# Catalog validator: the broker's own catalog parser as a small image, so
+# trm-infra CI can check a catalog without access to this repository. Build
+# it at the same reviewed commit as the broker image and pin it by digest.
+FROM --platform=$BUILDPLATFORM golang:1.26.8-alpine@sha256:ce864e7223ac17b1775e6fd0b4c0db580c2eb50e7953a427916379e4b92a1628 AS builder
+
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /src
+COPY go.mod go.sum ./
+# Optional build-only trust for dependency registries behind a private CA.
+RUN --mount=type=secret,id=build_ca \
+    if [ -s /run/secrets/build_ca ]; then \
+      cat /etc/ssl/certs/ca-certificates.crt /run/secrets/build_ca > /tmp/build-ca.pem \
+      && SSL_CERT_FILE=/tmp/build-ca.pem go mod download \
+      && rm /tmp/build-ca.pem; \
+    else go mod download; fi
+COPY . .
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /agent-vault .
+
+# glibc base with a shell, so a CI container job can run steps (and the
+# runner's JavaScript actions) in it. The validator needs no network.
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
+COPY --from=builder /agent-vault /usr/local/bin/agent-vault
+ENV AGENT_VAULT_TELEMETRY=false
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/agent-vault", "broker-catalog", "validate"]

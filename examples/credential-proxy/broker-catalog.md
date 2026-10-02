@@ -33,7 +33,7 @@ Entry kinds: `postgres` (defaults: port 5432, `sslmode: verify-full`), HTTP (no 
 
 ## Validation
 
-`agent-vault broker-catalog validate catalog.yaml --require-pools --allowed-host-suffix .postgresbridge.com --allowed-host-suffix serpapi.com` runs the broker's own parser. It checks the schema, exact hosts with no wildcards or IP addresses, unique routes, methods, key locations and pool grants, and keeps every host inside the allowed domains. Run it in CI before Atlantis applies.
+`agent-vault broker-catalog validate catalog.yaml --require-pools --allowed-host-suffix .postgresbridge.com --allowed-host-suffix serpapi.com` runs the broker's own parser. It checks the schema, exact hosts with no wildcards or IP addresses, unique routes, methods, key locations and pool grants, and keeps every host inside the allowed domains. Run it in CI before Atlantis applies. For CI without access to this repository, `Dockerfile.catalog-validator` builds the same command into a small image (glibc base with a shell, so it can serve as a CI job container), at the broker's reviewed commit, through the same build, review, publish and Artifact Registry mirror path as the broker image; pin it by digest.
 
 ## Egress
 
