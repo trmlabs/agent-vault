@@ -32,13 +32,9 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "unready", "error": reason})
 	}
-	if s.store.DialectName() == "postgres" {
-		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-		defer cancel()
-		if err := s.store.Ping(ctx); err != nil {
-			unready("database unreachable")
-			return
-		}
+	if s.store.DialectName() == "postgres" && !s.storeReachable(time.Now()) {
+		unready("database unreachable")
+		return
 	}
 	if s.pgBroker != nil && !s.pgBroker.IsListening() {
 		unready("database broker not listening")
