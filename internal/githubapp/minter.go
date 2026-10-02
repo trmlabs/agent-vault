@@ -31,16 +31,48 @@ type JWTSigner interface {
 	SignRS256(ctx context.Context, input []byte) ([]byte, error)
 }
 
-// Token is an installation token. It prints as its scope only.
-type Token struct {
-	value   string
-	Repo    string
-	Write   bool
-	Expires time.Time
+// Permissions is the scope a token is minted with, beyond metadata read,
+// which every token has. Only these two permissions can ever be requested.
+type Permissions struct {
+	Contents     string // "", "read" or "write"
+	PullRequests string // "" or "write"
 }
 
-func (t Token) Value() string              { return t.value }
-func (t Token) String() string             { return fmt.Sprintf("github-token(%s write=%t)", t.Repo, t.Write) }
+// ContentsRead and ContentsWrite are the git fetch and push scopes;
+// PullRequestsWrite opens pull requests and comments on them.
+var (
+	ContentsRead      = Permissions{Contents: "read"}
+	ContentsWrite     = Permissions{Contents: "write"}
+	PullRequestsWrite = Permissions{PullRequests: "write"}
+)
+
+func (p Permissions) valid() bool {
+	return (p.Contents == "" || p.Contents == "read" || p.Contents == "write") && (p.PullRequests == "" || p.PullRequests == "write") && p != Permissions{}
+}
+
+func (p Permissions) request() map[string]string {
+	out := map[string]string{"metadata": "read"}
+	if p.Contents != "" {
+		out["contents"] = p.Contents
+	}
+	if p.PullRequests != "" {
+		out["pull_requests"] = p.PullRequests
+	}
+	return out
+}
+
+// Token is an installation token. It prints as its scope only.
+type Token struct {
+	value       string
+	Repo        string
+	Permissions Permissions
+	Expires     time.Time
+}
+
+func (t Token) Value() string { return t.value }
+func (t Token) String() string {
+	return fmt.Sprintf("github-token(%s contents=%s pull_requests=%s)", t.Repo, t.Permissions.Contents, t.Permissions.PullRequests)
+}
 func (t Token) GoString() string           { return t.String() }
 func (t Token) Format(f fmt.State, _ rune) { _, _ = f.Write([]byte(t.String())) }
 
@@ -66,7 +98,7 @@ type Minter struct {
 type tokenKey struct {
 	installation int64
 	repo         string
-	write        bool
+	permissions  Permissions
 }
 
 const (
@@ -82,10 +114,13 @@ func (m *Minter) now() time.Time {
 	return time.Now()
 }
 
-// Token returns a token for repo ("owner/name") with contents read, or write
-// when write is true, plus metadata read. Nothing else is ever requested.
-func (m *Minter) Token(ctx context.Context, app App, repo string, write bool) (Token, error) {
-	key := tokenKey{app.InstallationID, strings.ToLower(repo), write}
+// Token returns a token for repo ("owner/name") with exactly permissions plus
+// metadata read. Nothing else is ever requested.
+func (m *Minter) Token(ctx context.Context, app App, repo string, permissions Permissions) (Token, error) {
+	if !permissions.valid() {
+		return Token{}, ErrUnavailable
+	}
+	key := tokenKey{app.InstallationID, strings.ToLower(repo), permissions}
 	m.mu.Lock()
 	if m.cache == nil {
 		m.cache, m.failed, m.flight, m.invalidated = map[tokenKey]Token{}, map[tokenKey]time.Time{}, map[tokenKey]*sync.Mutex{}, map[tokenKey]time.Time{}
@@ -127,8 +162,8 @@ func (m *Minter) Token(ctx context.Context, app App, repo string, write bool) (T
 
 // Invalidate drops a cached token after GitHub rejects it, at most once per
 // key every 30 seconds.
-func (m *Minter) Invalidate(app App, repo string, write bool) {
-	key := tokenKey{app.InstallationID, strings.ToLower(repo), write}
+func (m *Minter) Invalidate(app App, repo string, permissions Permissions) {
+	key := tokenKey{app.InstallationID, strings.ToLower(repo), permissions}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.invalidated == nil {
@@ -164,11 +199,8 @@ func (m *Minter) mint(ctx context.Context, app App, key tokenKey) (Token, error)
 	if err != nil {
 		return Token{}, err
 	}
-	access := "read"
-	if key.write {
-		access = "write"
-	}
-	body, _ := json.Marshal(map[string]any{"repositories": []string{name}, "permissions": map[string]string{"contents": access, "metadata": "read"}})
+	requested := key.permissions.request()
+	body, _ := json.Marshal(map[string]any{"repositories": []string{name}, "permissions": requested})
 	api := strings.TrimSuffix(m.API, "/")
 	if api == "" {
 		api = "https://api.github.com"
@@ -207,18 +239,22 @@ func (m *Minter) mint(ctx context.Context, app App, key tokenKey) (Token, error)
 	}
 	// Refuse a token broader than requested: more repositories or any other
 	// permission. It is revoked rather than left valid.
-	wide := len(granted.Repositories) != 1 || !strings.EqualFold(granted.Repositories[0].FullName, key.repo) || len(granted.Permissions) > 2 ||
-		granted.Permissions["contents"] != access || (granted.Permissions["metadata"] != "" && granted.Permissions["metadata"] != "read")
-	for name := range granted.Permissions {
-		if name != "contents" && name != "metadata" {
+	wide := len(granted.Repositories) != 1 || !strings.EqualFold(granted.Repositories[0].FullName, key.repo)
+	for name, level := range granted.Permissions {
+		if want, ok := requested[name]; !ok || level != want {
 			wide = true
+		}
+	}
+	for name, want := range requested {
+		if name != "metadata" && granted.Permissions[name] != want {
+			wide = true // a requested permission is missing: refuse now rather than fail later
 		}
 	}
 	if wide {
 		m.revoke(api, client, granted.Token)
 		return Token{}, ErrUnavailable
 	}
-	return Token{value: granted.Token, Repo: key.repo, Write: key.write, Expires: granted.ExpiresAt}, nil
+	return Token{value: granted.Token, Repo: key.repo, Permissions: key.permissions, Expires: granted.ExpiresAt}, nil
 }
 
 func (m *Minter) revoke(api string, client *http.Client, token string) {

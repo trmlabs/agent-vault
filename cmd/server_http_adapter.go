@@ -41,7 +41,7 @@ func httpHeaderAdapter(ctx context.Context, srv *server.Server, getenv func(stri
 	}
 	adapter := &mitm.HeaderAdapter{Catalog: catalog, Keys: &httpcatalog.Keys{Vault: client.Logical()}, Audit: chain}
 	for _, e := range catalog.Entries() {
-		if e.Kind == "git" {
+		if e.Kind == "git" || e.Kind == "github-api" {
 			signer, err := githubAppSigner(client, getenv)
 			if err != nil {
 				return nil, err

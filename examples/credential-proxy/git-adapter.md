@@ -46,3 +46,14 @@ The App acts as itself on GitHub, so branch protection and rulesets govern its p
 - Route `github.com` through the worker's sidecar (`HTTPS_PROXY`) and trust the broker CA (`GIT_SSL_CAINFO` or `http.sslCAInfo`).
 - Use `https://github.com/<owner>/<repo>.git` remotes, and remove any credential helper, `http.extraHeader` or `url.<token URL>.insteadOf` rewrite.
 - Open risk: the Cursor README says runs fail to clone without the minting toggle. How Cursor's worker applies its token is not visible in our repositories, so confirm a run clones with the toggle off before relying on this.
+
+## Opening pull requests (GitHub REST)
+
+A `github-api` entry lets agents open pull requests and comment on them, and nothing else:
+
+```json
+{"name": "github-api", "host": "api.github.com", "kind": "github-api", "pools": ["<pool agent ID>"],
+ "git": {"appID": 0, "installationID": 0, "repos": [{"repo": "trmlabs/trm-b2b", "access": "write"}]}}
+```
+
+Only `POST` to these paths is served, for a listed repository: `/repos/{owner}/{repo}/pulls`, `/repos/{owner}/{repo}/issues/{n}/comments`, `/repos/{owner}/{repo}/pulls/{n}/comments` and `.../comments/{id}/replies`. Reviews, approvals, merges, reads and every other path are refused, so an agent can never approve or merge its own change. The broker mints a token for that one repository with `pull_requests: write` and `metadata: read` only. The request body is JSON and limited to 1 MiB; a placeholder anywhere in it is refused. The worker sends no token, or the placeholder `__vault_GITHUB_TOKEN__`, so `gh` works with `GH_TOKEN=__vault_GITHUB_TOKEN__`. A worker's own token is refused.

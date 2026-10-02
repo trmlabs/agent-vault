@@ -38,9 +38,10 @@ type Entry struct {
 	ForwardHeaders   []string `json:"forwardHeaders,omitempty"`
 	MaxRequestBytes  int64    `json:"maxRequestBytes,omitempty"`  // default 1 MiB; git 1 GiB (a push)
 	MaxResponseBytes int64    `json:"maxResponseBytes,omitempty"` // default 32 MiB; git 4 GiB
-	// Kind "git" makes the entry a git smart-HTTP binding: paths, methods
-	// and the credential are derived from Git, and the key is a GitHub App
-	// installation token minted per repository instead of a stored key.
+	// Kind "git" makes the entry a git smart-HTTP binding, and "github-api" a
+	// GitHub REST binding limited to opening pull requests and commenting on
+	// them. Paths, methods and the credential are derived from the kind; the
+	// key is a GitHub App installation token minted per repository.
 	Kind string      `json:"kind,omitempty"`
 	Git  *GitBinding `json:"git,omitempty"`
 }
@@ -146,7 +147,7 @@ func Parse(data []byte) (Catalog, error) {
 		kinds[hostKey] = e.Kind
 		if e.Git != nil {
 			for _, repo := range e.Git.Repos {
-				route := hostKey + " git " + repo.Repo
+				route := hostKey + " " + e.Kind + " " + repo.Repo
 				if other, ok := routes[route]; ok {
 					return Catalog{}, fmt.Errorf("HTTP catalog entries %q and %q share repository %s", other, e.Name, repo.Repo)
 				}
@@ -182,6 +183,25 @@ func (e *Entry) normalize() error {
 	switch e.Kind {
 	case "git":
 		return e.normalizeGit()
+	case "github-api":
+		if err := e.normalizeGit(); err != nil {
+			return err
+		}
+		for _, r := range e.Git.Repos {
+			if r.Access != "write" || len(r.RefPrefixes) > 0 {
+				return fmt.Errorf("github-api repository %s must have access write (open pull requests) and no ref prefixes", r.Repo)
+			}
+		}
+		if e.MaxRequestBytes == 1<<30 {
+			e.MaxRequestBytes = 1 << 20
+		}
+		if e.MaxResponseBytes == 4<<30 {
+			e.MaxResponseBytes = 8 << 20
+		}
+		if e.MaxRequestBytes > 16<<20 {
+			return errors.New("github-api request limit is at most 16 MiB")
+		}
+		return nil
 	case "":
 		if e.Git != nil {
 			return errors.New("git settings require kind git")
@@ -353,6 +373,69 @@ func (c Catalog) GitMatch(host string, port int, method, path, rawQuery, pool st
 		}
 	}
 	return GitRequest{}, true, ErrUnlisted
+}
+
+// GitHubAPIMatch routes a request to a github-api entry. ok is false when the
+// host has none. Only POST to these paths exists, for a listed repository:
+// /repos/{owner}/{repo}/pulls (open a pull request),
+// /repos/{owner}/{repo}/issues/{n}/comments (comment on one),
+// /repos/{owner}/{repo}/pulls/{n}/comments and .../comments/{id}/replies
+// (review comments). Reviews, merges and everything else are unlisted.
+func (c Catalog) GitHubAPIMatch(host string, port int, method, path, rawQuery, pool string) (GitRequest, bool, error) {
+	host = strings.ToLower(host)
+	var hostEntries []*Entry
+	for i := range c.entries {
+		if e := &c.entries[i]; e.Kind == "github-api" && e.Host == host && e.Port == port {
+			hostEntries = append(hostEntries, e)
+		}
+	}
+	if len(hostEntries) == 0 {
+		return GitRequest{}, false, nil
+	}
+	parts := strings.Split(path, "/")
+	if rawQuery != "" || len(parts) < 5 || parts[0] != "" || parts[1] != "repos" || !githubAPIEndpoint(parts[4:]) {
+		return GitRequest{}, true, ErrUnlisted
+	}
+	repo := strings.ToLower(parts[2] + "/" + parts[3])
+	for _, e := range hostEntries {
+		for _, r := range e.Git.Repos {
+			if r.Repo != repo {
+				continue
+			}
+			matched := GitRequest{Entry: e, Repo: r, Write: true}
+			switch {
+			case method != "POST":
+				return matched, true, ErrMethod
+			case !contains(e.Pools, pool):
+				return matched, true, ErrPool
+			}
+			return matched, true, nil
+		}
+	}
+	return GitRequest{}, true, ErrUnlisted
+}
+
+func githubAPIEndpoint(rest []string) bool {
+	number := func(s string) bool {
+		if s == "" || len(s) > 12 {
+			return false
+		}
+		for _, c := range s {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+		return true
+	}
+	switch len(rest) {
+	case 1:
+		return rest[0] == "pulls"
+	case 3:
+		return (rest[0] == "issues" || rest[0] == "pulls") && number(rest[1]) && rest[2] == "comments"
+	case 5:
+		return rest[0] == "pulls" && number(rest[1]) && rest[2] == "comments" && number(rest[3]) && rest[4] == "replies"
+	}
+	return false
 }
 
 // Match returns the entry for a request, choosing the longest path prefix

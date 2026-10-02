@@ -82,3 +82,50 @@ func TestGitMatchEndpointsAndAccess(t *testing.T) {
 		t.Fatal("git entry matched as a header entry")
 	}
 }
+
+const apiEntry = `{"name":"github-api","host":"api.github.com","kind":"github-api","pools":["pool-a"],
+	"git":{"appID":7,"installationID":42,"repos":[{"repo":"trmlabs/trm-b2b","access":"write"}]}}`
+
+func TestGitHubAPIEntries(t *testing.T) {
+	c, err := Parse([]byte(`{"entries":[` + gitEntry + `,` + apiEntry + `]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e := c.Entries()[1]; e.MaxRequestBytes != 1<<20 || e.MaxResponseBytes != 8<<20 {
+		t.Fatalf("api limits: %d %d", e.MaxRequestBytes, e.MaxResponseBytes)
+	}
+	for name, doc := range map[string]string{
+		"read access":  strings.Replace(apiEntry, `"access":"write"`, `"access":"read"`, 1),
+		"ref prefixes": strings.Replace(apiEntry, `"access":"write"`, `"access":"write","refPrefixes":["refs/heads/x/"]`, 1),
+		"large body":   strings.Replace(apiEntry, `"pools"`, `"maxRequestBytes":33554432,"pools"`, 1),
+	} {
+		if _, err := Parse([]byte(`{"entries":[` + doc + `]}`)); err == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+	for _, tc := range []struct {
+		method, path, query, pool string
+		err                       error
+	}{
+		{"POST", "/repos/trmlabs/trm-b2b/pulls", "", "pool-a", nil},
+		{"POST", "/repos/TRMLabs/trm-b2b/issues/12/comments", "", "pool-a", nil},
+		{"POST", "/repos/trmlabs/trm-b2b/pulls/12/comments", "", "pool-a", nil},
+		{"POST", "/repos/trmlabs/trm-b2b/pulls/12/comments/99/replies", "", "pool-a", nil},
+		{"POST", "/repos/trmlabs/trm-b2b/pulls/12/reviews", "", "pool-a", ErrUnlisted},
+		{"PUT", "/repos/trmlabs/trm-b2b/pulls/12/merge", "", "pool-a", ErrUnlisted},
+		{"POST", "/repos/trmlabs/trm-b2b/issues/abc/comments", "", "pool-a", ErrUnlisted},
+		{"POST", "/repos/trmlabs/trm-b2b/git/refs", "", "pool-a", ErrUnlisted},
+		{"POST", "/repos/trmlabs/other/pulls", "", "pool-a", ErrUnlisted},
+		{"POST", "/repos/trmlabs/trm-b2b/pulls", "per_page=1", "pool-a", ErrUnlisted},
+		{"GET", "/repos/trmlabs/trm-b2b/pulls", "", "pool-a", ErrMethod},
+		{"POST", "/repos/trmlabs/trm-b2b/pulls", "", "pool-b", ErrPool},
+		{"POST", "/user/repos", "", "pool-a", ErrUnlisted},
+	} {
+		if _, ok, err := c.GitHubAPIMatch("api.github.com", 443, tc.method, tc.path, tc.query, tc.pool); !ok || !errors.Is(err, tc.err) {
+			t.Errorf("%s %s: ok=%v err=%v", tc.method, tc.path, ok, err)
+		}
+	}
+	if _, ok, _ := c.GitHubAPIMatch("github.com", 443, "POST", "/repos/trmlabs/trm-b2b/pulls", "", "pool-a"); ok {
+		t.Fatal("git host routed to the API")
+	}
+}

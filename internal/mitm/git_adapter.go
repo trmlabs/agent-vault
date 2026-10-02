@@ -83,7 +83,11 @@ func (p *Proxy) forwardGit(w http.ResponseWriter, r *http.Request, target string
 	}
 	defer enf.Release()
 	app := githubapp.App{AppID: entry.Git.AppID, InstallationID: entry.Git.InstallationID}
-	token, err := a.GitTokens.Token(r.Context(), app, git.Repo.Repo, git.Write)
+	permissions := githubapp.ContentsRead
+	if git.Write {
+		permissions = githubapp.ContentsWrite
+	}
+	token, err := a.GitTokens.Token(r.Context(), app, git.Repo.Repo, permissions)
 	if err != nil {
 		deny(http.StatusServiceUnavailable, "token_unavailable")
 		return
@@ -124,7 +128,7 @@ func (p *Proxy) forwardGit(w http.ResponseWriter, r *http.Request, target string
 	}
 	needles := secretRepresentations(map[string]string{"token": token.Value(), "basic": payload, "credential": credential})
 	p.relayScreened(w, out, needles, entry.MaxResponseBytes, finish, func() {
-		a.GitTokens.Invalidate(app, git.Repo.Repo, git.Write)
+		a.GitTokens.Invalidate(app, git.Repo.Repo, permissions)
 	}, body.exceeded.Load)
 }
 

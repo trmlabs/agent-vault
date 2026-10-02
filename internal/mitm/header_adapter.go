@@ -35,8 +35,8 @@ type HeaderAdapter struct {
 	// GitTokens mints repository-scoped installation tokens for git entries.
 	// Required when the catalog has any.
 	GitTokens interface {
-		Token(ctx context.Context, app githubapp.App, repo string, write bool) (githubapp.Token, error)
-		Invalidate(app githubapp.App, repo string, write bool)
+		Token(ctx context.Context, app githubapp.App, repo string, permissions githubapp.Permissions) (githubapp.Token, error)
+		Invalidate(app githubapp.App, repo string, permissions githubapp.Permissions)
 	}
 }
 
@@ -45,7 +45,7 @@ func (a *HeaderAdapter) valid() bool {
 		return false
 	}
 	for _, e := range a.Catalog.Entries() {
-		if e.Kind == "git" && a.GitTokens == nil {
+		if e.Kind != "" && a.GitTokens == nil {
 			return false
 		}
 	}
@@ -106,6 +106,10 @@ func (p *Proxy) forwardCatalog(w http.ResponseWriter, r *http.Request, target, h
 	}
 	if git, ok, err := a.Catalog.GitMatch(host, port, r.Method, r.URL.Path, r.URL.RawQuery, scope.AgentID); ok {
 		p.forwardGit(w, r, target, scope, event, git, err)
+		return
+	}
+	if api, ok, err := a.Catalog.GitHubAPIMatch(host, port, r.Method, r.URL.Path, r.URL.RawQuery, scope.AgentID); ok {
+		p.forwardGitHubAPI(w, r, target, scope, event, api, err)
 		return
 	}
 	entry, err := a.Catalog.Match(host, port, r.Method, r.URL.Path, scope.AgentID)

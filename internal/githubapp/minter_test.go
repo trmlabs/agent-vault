@@ -113,12 +113,15 @@ var app = App{AppID: 7, InstallationID: 42}
 func TestMinterRequestsOnlyOneRepoAndMinimumPermissions(t *testing.T) {
 	g, srv := newFakeGitHub(t)
 	m := newMinter(g, srv, nil)
-	for _, write := range []bool{false, true} {
-		token, err := m.Token(context.Background(), app, "trmlabs/trm-b2b", write)
+	for permissions, want := range map[Permissions]map[string]any{
+		ContentsRead:      {"contents": "read", "metadata": "read"},
+		ContentsWrite:     {"contents": "write", "metadata": "read"},
+		PullRequestsWrite: {"pull_requests": "write", "metadata": "read"},
+	} {
+		token, err := m.Token(context.Background(), app, "trmlabs/trm-b2b", permissions)
 		if err != nil || !strings.HasPrefix(token.Value(), "ghs_") {
-			t.Fatalf("mint write=%v: %v", write, err)
+			t.Fatalf("mint %+v: %v", permissions, err)
 		}
-		want := map[string]any{"contents": map[bool]string{false: "read", true: "write"}[write], "metadata": "read"}
 		g.mu.Lock()
 		body := g.lastBody
 		g.mu.Unlock()
@@ -135,20 +138,20 @@ func TestMinterCachesSharesAndRefreshes(t *testing.T) {
 	var wg sync.WaitGroup
 	for range 20 {
 		wg.Add(1)
-		go func() { defer wg.Done(); _, _ = m.Token(context.Background(), app, "trmlabs/trm-b2b", true) }()
+		go func() { defer wg.Done(); _, _ = m.Token(context.Background(), app, "trmlabs/trm-b2b", ContentsWrite) }()
 	}
 	wg.Wait()
 	if g.mints.Load() != 1 {
 		t.Fatalf("20 concurrent requests minted %d tokens", g.mints.Load())
 	}
-	if _, err := m.Token(context.Background(), app, "TRMLABS/trm-b2b", false); err != nil || g.mints.Load() != 2 {
+	if _, err := m.Token(context.Background(), app, "TRMLABS/trm-b2b", ContentsRead); err != nil || g.mints.Load() != 2 {
 		t.Fatal("read and write tokens must be separate")
 	}
 	now = now.Add(51 * time.Minute)
 	g.mu.Lock()
 	g.expires = now.Add(time.Hour)
 	g.mu.Unlock()
-	if _, err := m.Token(context.Background(), app, "trmlabs/trm-b2b", true); err != nil || g.mints.Load() != 3 {
+	if _, err := m.Token(context.Background(), app, "trmlabs/trm-b2b", ContentsWrite); err != nil || g.mints.Load() != 3 {
 		t.Fatalf("token not refreshed ten minutes before expiry: mints=%d", g.mints.Load())
 	}
 }
@@ -157,7 +160,7 @@ func TestMinterRefusesAndRevokesAWiderToken(t *testing.T) {
 	g, srv := newFakeGitHub(t)
 	g.extraPerm = true
 	m := newMinter(g, srv, nil)
-	if _, err := m.Token(context.Background(), app, "trmlabs/trm-b2b", false); !errors.Is(err, ErrUnavailable) || g.revokes.Load() != 1 {
+	if _, err := m.Token(context.Background(), app, "trmlabs/trm-b2b", ContentsRead); !errors.Is(err, ErrUnavailable) || g.revokes.Load() != 1 {
 		t.Fatalf("wide token: err=%v revokes=%d", err, g.revokes.Load())
 	}
 }
@@ -168,7 +171,7 @@ func TestMinterBacksOffAndInvalidatesSparingly(t *testing.T) {
 	m := newMinter(g, srv, &now)
 	g.status = http.StatusInternalServerError
 	for range 10 {
-		if _, err := m.Token(context.Background(), app, "trmlabs/a", false); err == nil || strings.Contains(err.Error(), "ghs_") {
+		if _, err := m.Token(context.Background(), app, "trmlabs/a", ContentsRead); err == nil || strings.Contains(err.Error(), "ghs_") {
 			t.Fatalf("failed mint: %v", err)
 		}
 	}
@@ -179,12 +182,12 @@ func TestMinterBacksOffAndInvalidatesSparingly(t *testing.T) {
 	g.status = http.StatusCreated
 	g.mu.Unlock()
 	now = now.Add(failureBackoff)
-	if _, err := m.Token(context.Background(), app, "trmlabs/a", false); err != nil {
+	if _, err := m.Token(context.Background(), app, "trmlabs/a", ContentsRead); err != nil {
 		t.Fatal(err)
 	}
 	for range 50 {
-		m.Invalidate(app, "trmlabs/a", false)
-		_, _ = m.Token(context.Background(), app, "trmlabs/a", false)
+		m.Invalidate(app, "trmlabs/a", ContentsRead)
+		_, _ = m.Token(context.Background(), app, "trmlabs/a", ContentsRead)
 	}
 	if g.mints.Load() != 3 {
 		t.Fatalf("50 rejections inside 30s caused %d mints, want 3", g.mints.Load())
@@ -228,8 +231,21 @@ func TestTransitAndKVSignersMintAcceptedJWTs(t *testing.T) {
 		"kv":      KVSigner{Vault: vault, Mount: "gatehouse", Path: "github-app", Field: "key"},
 	} {
 		m := &Minter{Signer: signer, API: srv.URL, Client: srv.Client()}
-		if _, err := m.Token(context.Background(), app, "trmlabs/"+name, false); err != nil {
+		if _, err := m.Token(context.Background(), app, "trmlabs/"+name, ContentsRead); err != nil {
 			t.Fatalf("%s signer: %v", name, err)
 		}
+	}
+}
+
+func TestMinterRefusesUnsupportedPermissions(t *testing.T) {
+	g, srv := newFakeGitHub(t)
+	m := newMinter(g, srv, nil)
+	for _, p := range []Permissions{{}, {Contents: "admin"}, {PullRequests: "read"}} {
+		if _, err := m.Token(context.Background(), app, "trmlabs/a", p); err == nil {
+			t.Fatalf("minted %+v", p)
+		}
+	}
+	if g.mints.Load() != 0 {
+		t.Fatal("GitHub called for an unsupported permission set")
 	}
 }
