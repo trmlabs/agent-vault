@@ -103,6 +103,7 @@ type Server struct {
 	pgBroker              *pgproxy.Broker
 	readiness             []readinessCheck
 	pgLeaseCloser         interface{ Close(context.Context) error }
+	shutdownTimeout       time.Duration // 0: the default 5s
 }
 
 // lockVaultServices acquires the per-vault mutation lock via the store's
@@ -141,6 +142,17 @@ func (s *Server) HashicorpClient() *hashicorp.Client { return s.hashicorpClient 
 // SIGINT/SIGTERM/Shutdown stops it alongside the HTTP server. Must be called
 // before Start.
 func (s *Server) AttachPostgresBroker(b *pgproxy.Broker) { s.pgBroker = b }
+
+// SetShutdownTimeout sets how long a graceful stop waits for in-flight work,
+// such as tunnel requests the proxy drains. Zero keeps the default 5s.
+func (s *Server) SetShutdownTimeout(d time.Duration) { s.shutdownTimeout = d }
+
+func (s *Server) shutdownBudget() time.Duration {
+	if s.shutdownTimeout > 0 {
+		return s.shutdownTimeout
+	}
+	return 5 * time.Second
+}
 
 // AttachReadiness adds a named check to GET /readyz. Every check must pass for
 // the replica to receive traffic; names, never values, appear in the response.
@@ -1229,7 +1241,7 @@ func (s *Server) Start() error {
 	case <-stop:
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), s.shutdownBudget())
 	defer cancel()
 
 	fmt.Println("shutting down server...")

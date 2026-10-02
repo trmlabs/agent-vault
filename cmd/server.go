@@ -249,6 +249,12 @@ func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKe
 		fmt.Fprintf(os.Stderr, "warning: transparent proxy disabled (CA init failed: %v); pass --mitm-port 0 to suppress\n", err)
 		return nil
 	}
+	// A fleet replica drains its tunnels on SIGTERM; unset keeps the 5s stop
+	// and leaves open tunnels to end with the process.
+	drainSeconds := min(intEnvValue("AGENT_VAULT_SHUTDOWN_SECONDS"), 300)
+	if drainSeconds > 0 {
+		srv.SetShutdownTimeout(time.Duration(drainSeconds) * time.Second)
+	}
 	srv.AttachMITM(mitm.New(
 		net.JoinHostPort(host, strconv.Itoa(mitmPort)),
 		mitm.Options{
@@ -266,6 +272,7 @@ func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKe
 			LogSink:               srv.LogSink(),
 			MaxResponseBytes:      maxRespBytes,
 			MaxRequestBytes:       maxReqBytes,
+			DrainTunnels:          drainSeconds > 0,
 		},
 	))
 	return nil
