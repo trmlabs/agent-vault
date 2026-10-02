@@ -99,6 +99,9 @@ var serverCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+		if err := checkShutdownSeconds(os.Getenv); err != nil {
+			return err
+		}
 		logger := buildLogger(logLevel)
 
 		// --- Detached child path: read master key + initialized flag from stdin pipe ---
@@ -251,7 +254,7 @@ func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKe
 	}
 	// A fleet replica drains its tunnels on SIGTERM; unset keeps the 5s stop
 	// and leaves open tunnels to end with the process.
-	drainSeconds := min(intEnvValue("AGENT_VAULT_SHUTDOWN_SECONDS"), 300)
+	drainSeconds := min(intEnvValue("AGENT_VAULT_SHUTDOWN_SECONDS"), maxShutdownSeconds)
 	if drainSeconds > 0 {
 		srv.SetShutdownTimeout(time.Duration(drainSeconds) * time.Second)
 	}
@@ -523,6 +526,25 @@ func boolEnvValue(key string) bool {
 
 // intEnvValue reads a positive integer from the named environment variable,
 // returning 0 when unset or invalid.
+// maxShutdownSeconds keeps a drain, the 5 s database cleanup and the 5 s
+// Vault login revoke inside a 75 s termination grace. It is a ceiling only: a
+// preStop pause spends the same grace before SIGTERM, so a render with one
+// must set a shorter drain.
+const maxShutdownSeconds = 65
+
+// checkShutdownSeconds refuses a drain the Pod's grace cannot hold: past it,
+// the kubelet kills the broker before the Vault logins are revoked.
+func checkShutdownSeconds(getenv func(string) string) error {
+	raw := getenv("AGENT_VAULT_SHUTDOWN_SECONDS")
+	if raw == "" {
+		return nil
+	}
+	if n, err := strconv.Atoi(raw); err != nil || n < 0 || n > maxShutdownSeconds {
+		return fmt.Errorf("AGENT_VAULT_SHUTDOWN_SECONDS must be 0 to %d", maxShutdownSeconds)
+	}
+	return nil
+}
+
 func intEnvValue(key string) int {
 	if raw := os.Getenv(key); raw != "" {
 		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
