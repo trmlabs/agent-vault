@@ -10,7 +10,7 @@ import (
 )
 
 const plaintextCatalog = `{"entries":[{"name":"fixture","kind":"postgres","host":"fixture-db.gatehouse.svc.cluster.local","pools":["pool-a"],
-	"postgres":{"database":"appdb","mount":"database","role":"readonly","sslmode":"disable"}}]}`
+	"postgres":{"database":"appdb","mount":"database","role":"staging.us.fixture.appdb-readonly","sslmode":"disable"}}]}`
 
 // The e2e build, and only it, lets the Kind fixture's TLS-less database be
 // reached in plaintext.

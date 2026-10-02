@@ -294,9 +294,19 @@ func TestCatalogDatabaseRolesAndAccess(t *testing.T) {
 			}
 		}
 	}
-	// Without an environment, test roles such as "readonly" still load.
+	// Without an environment, a database entry is refused: an optional rule
+	// fails closed. Only the e2e build keeps plain roles such as "readonly".
 	Environment.Store("")
+	rolesWithoutEnvironment = false
+	t.Cleanup(func() { rolesWithoutEnvironment = true })
+	if _, err := Parse([]byte(doc("database", "staging.us.crunchy.core-readonly", ""))); err == nil || !strings.Contains(err.Error(), "AGENT_VAULT_CATALOG_ENVIRONMENT") {
+		t.Fatalf("database entry loaded with no environment set: %v", err)
+	}
+	if _, err := Parse([]byte(`{"entries":[` + validEntry + `]}`)); err != nil {
+		t.Fatalf("a catalog with no database entries needs no environment: %v", err)
+	}
+	rolesWithoutEnvironment = true
 	if _, err := Parse([]byte(doc("database", "readonly", ""))); err != nil {
-		t.Fatalf("plain role refused without an environment: %v", err)
+		t.Fatalf("e2e build refused its plain fixture role: %v", err)
 	}
 }
