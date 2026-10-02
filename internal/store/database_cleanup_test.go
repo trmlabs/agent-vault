@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -182,9 +183,15 @@ func checkPodSessionCap(t *testing.T, s *SQLStore) {
 	t.Helper()
 	ctx := context.Background()
 	const limit, attempts = 5, 20
+	// survivor-2 holds one session for certain, so its release below always
+	// lowers the count, however the race spreads the rest.
+	if err := s.AddBrokerSession(ctx, "survivor-2", "session-first", "pod-uid-1", limit); err != nil {
+		t.Fatal(err)
+	}
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	admitted, refused := 0, 0
+	byOwner := map[string]int{"survivor-2": 1}
 	for i := range attempts {
 		wg.Add(1)
 		go func() {
@@ -196,6 +203,7 @@ func checkPodSessionCap(t *testing.T, s *SQLStore) {
 				switch {
 				case err == nil:
 					admitted++
+					byOwner[owner]++
 				case errors.Is(err, ErrPodSessionLimit):
 					refused++
 				default:
@@ -208,8 +216,8 @@ func checkPodSessionCap(t *testing.T, s *SQLStore) {
 		}()
 	}
 	wg.Wait()
-	if admitted != limit || refused != attempts-limit {
-		t.Fatalf("admitted %d refused %d, want %d and %d", admitted, refused, limit, attempts-limit)
+	if admitted != limit-1 || refused != attempts-limit+1 {
+		t.Fatalf("admitted %d refused %d, want %d and %d", admitted, refused, limit-1, attempts-limit+1)
 	}
 	if n, err := s.CountPodSessions(ctx, "pod-uid-1"); err != nil || n != limit {
 		t.Fatalf("count = %d, %v", n, err)
@@ -219,8 +227,8 @@ func checkPodSessionCap(t *testing.T, s *SQLStore) {
 		t.Fatal(err)
 	}
 	n, err := s.CountPodSessions(ctx, "pod-uid-1")
-	if err != nil || n >= limit {
-		t.Fatalf("dead replica's sessions still count: %d, %v", n, err)
+	if err != nil || n != limit-byOwner["survivor-2"] {
+		t.Fatalf("dead replica's sessions still count: %d, want %d, %v", n, limit-byOwner["survivor-2"], err)
 	}
 	if _, err := s.ClaimOrphanedDatabaseCleanup(ctx, "survivor-1"); err != nil {
 		t.Fatal(err)
@@ -567,3 +575,34 @@ func checkReplicaNameExclusive(t *testing.T, s *SQLStore) {
 		t.Fatalf("name not reusable after release: %v", err)
 	}
 }
+
+// Boots that start at the same moment under one replica name: exactly one
+// registers, however the claims interleave.
+func checkConcurrentReplicaClaims(t *testing.T, s *SQLStore) {
+	t.Helper()
+	ctx := context.Background()
+	replica := "race-" + time.Now().Format("150405.000000000")
+	const boots = 16
+	var wg sync.WaitGroup
+	var won atomic.Int32
+	for i := range boots {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if s.ClaimDatabaseCleanupOwner(ctx, fmt.Sprintf("%s/boot-%02d", replica, i), time.Minute) == nil {
+				won.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	t.Cleanup(func() {
+		for i := range boots {
+			_ = s.ReleaseDatabaseCleanupOwner(ctx, fmt.Sprintf("%s/boot-%02d", replica, i))
+		}
+	})
+	if n := won.Load(); n != 1 {
+		t.Fatalf("%d concurrent boots registered one replica name, want 1", n)
+	}
+}
+
+func TestConcurrentReplicaClaims(t *testing.T) { checkConcurrentReplicaClaims(t, openTestDB(t)) }

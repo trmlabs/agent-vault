@@ -177,3 +177,46 @@ func TestPooledShutdownWithoutDrainClosesAtOnce(t *testing.T) {
 		t.Fatalf("Shutdown: %v", err)
 	}
 }
+
+// authorityMinter is a lease minter whose cleanup authority the test ends.
+type authorityMinter struct {
+	fakeMinter
+	done chan struct{}
+}
+
+func (m *authorityMinter) AuthorityDone() <-chan struct{} { return m.done }
+
+// Losing cleanup authority during a drain ends the busy sessions at once: the
+// drain would otherwise keep them on credentials other replicas may already
+// have claimed and revoked.
+func TestPooledDrainStopsWhenCleanupAuthorityIsLost(t *testing.T) {
+	lease := newLease()
+	upstream := startFakeUpstream(t, authTrust, lease.Password)
+	upstream.mu.Lock()
+	upstream.transactions = true
+	upstream.mu.Unlock()
+	minter := &authorityMinter{fakeMinter: fakeMinter{lease: lease}, done: make(chan struct{})}
+	b, addr := startBroker(t, Options{
+		Auth:      &fakeAuth{scope: &AgentScope{VaultID: "vault-1", ActorID: "agent-uuid-1", WorkloadID: "pod-1", Pool: "cursor"}},
+		Databases: &fakeResolver{svc: &DatabaseService{Name: "analytics", Addr: upstream.addr(), Mount: "database", Role: "readonly", SSLMode: "disable", MaxConns: 4}},
+		Leases:    minter,
+		Pool:      &PoolOptions{QueueFactor: 20, DrainSessions: true},
+	})
+	c := openDrainClient(t, addr)
+	c.query("BEGIN")
+	done := shutdownBroker(b, 30*time.Second)
+	time.Sleep(200 * time.Millisecond)
+	started := time.Now()
+	close(minter.done)
+	if code := c.ending(); code != "" {
+		t.Fatalf("session ended with %q; a lost-authority stop is not a clean restart", code)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("busy session outlived lost authority by %v", elapsed)
+	}
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Shutdown did not finish after authority was lost")
+	}
+}

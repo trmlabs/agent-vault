@@ -58,6 +58,7 @@ func (f *gcpFake) handler(w http.ResponseWriter, r *http.Request) {
 	bearer := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	switch host {
 	case "sts.googleapis.com":
+		r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
 		_ = r.ParseForm()
 		var options struct {
 			AccessBoundary struct {

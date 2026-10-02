@@ -208,6 +208,9 @@ func (b *Broker) Serve(l net.Listener) error {
 				b.authorityLost.Store(true)
 				ctx, cancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
 				defer cancel()
+				// A drain already under way would keep serving on credentials
+				// other replicas may have claimed and revoked: end it now.
+				b.forceClose()
 				_ = b.Shutdown(ctx)
 			case <-b.ctx.Done():
 			}
@@ -292,12 +295,13 @@ func (b *Broker) Shutdown(ctx context.Context) error {
 			_ = conn.Close()
 		}
 		if drain {
-			force, cancel := ctx, context.CancelFunc(func() {})
-			if deadline, ok := ctx.Deadline(); ok {
-				force, cancel = context.WithDeadline(ctx, deadline.Add(-drainReserve))
-			}
 			go func() {
-				defer cancel()
+				force := ctx
+				if deadline, ok := ctx.Deadline(); ok {
+					var cancel context.CancelFunc
+					force, cancel = context.WithDeadline(ctx, deadline.Add(-drainReserve))
+					defer cancel()
+				}
 				select {
 				case <-force.Done():
 					b.logger.Warn("pgproxy: drain deadline reached; closing busy sessions")
@@ -331,6 +335,17 @@ func (b *Broker) Shutdown(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// forceClose ends every connection now, for a stop that must not drain, such
+// as lost cleanup authority while a graceful drain is running. Shutdown, if
+// not yet called, then finds nothing left to drain.
+func (b *Broker) forceClose() {
+	b.mu.Lock()
+	for conn := range b.conns {
+		_ = conn.Close()
+	}
+	b.mu.Unlock()
 }
 
 // trackPooled lists a pooled session for draining; false once Shutdown has

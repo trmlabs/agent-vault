@@ -98,6 +98,7 @@ func TestGCPTokensDownscopeAndImpersonate(t *testing.T) {
 		switch {
 		case r.URL.Path == "/v1/token":
 			sts.Add(1)
+			r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
 			_ = r.ParseForm()
 			if r.Form.Get("subject_token") != "root-token" || r.Form.Get("grant_type") != "urn:ietf:params:oauth:grant-type:token-exchange" {
 				w.WriteHeader(http.StatusBadRequest)
