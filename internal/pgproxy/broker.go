@@ -562,6 +562,8 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	}
 	var refused *RefusedError
 	if errors.As(err, &refused) {
+		// A refusal names an entry that exists and is granted to the pool.
+		event.Binding = databaseBinding(scope.VaultID, &DatabaseService{Name: requestedDB})
 		b.logger.Warn("pgproxy: database refused by the authorization model",
 			slog.String("vault", scope.VaultID), slog.String("database", requestedDB), slog.String("decision", refused.Outcome))
 		refuse(refused.Outcome, "42501", fmt.Sprintf("Agent Vault: not authorized for database %q (%s)", requestedDB, refused.Outcome))

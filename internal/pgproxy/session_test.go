@@ -86,7 +86,7 @@ func TestSessionRefusalIsAnAuthorizationError(t *testing.T) {
 	if len(events) != 1 {
 		t.Fatalf("audit events %+v", events)
 	}
-	if e := events[0]; e.Outcome != "not_entitled" || e.Requester != "user_1" || e.RequesterKind != "person" || e.Tier != "T1" || e.Decision != "not_entitled" {
+	if e := events[0]; e.Outcome != "not_entitled" || e.Binding != "vault/appdb" || e.Requester != "user_1" || e.RequesterKind != "person" || e.Tier != "T1" || e.Decision != "not_entitled" {
 		t.Fatalf("refusal audit %+v", e)
 	}
 }
