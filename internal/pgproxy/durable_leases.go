@@ -138,6 +138,9 @@ func NewDurableLeaseMinter(ctx context.Context, client *hashicorp.Client, journa
 // then stops accepting and closes every session.
 func (m *DurableLeaseMinter) AuthorityDone() <-chan struct{} { return m.ctx.Done() }
 
+// Owner is this process's owner ID in the journal, for session rows.
+func (m *DurableLeaseMinter) Owner() string { return m.owner }
+
 // Fenced reports that this replica lost or could not renew its owner row.
 func (m *DurableLeaseMinter) Fenced() bool { return m.fenced.Load() }
 
