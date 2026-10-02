@@ -7,7 +7,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-
 func TestIsolationFlagsRegistered(t *testing.T) {
 	vCmd := findSubcommand(rootCmd, "vault")
 	if vCmd == nil {

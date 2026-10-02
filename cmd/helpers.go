@@ -13,12 +13,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/charmbracelet/huh"
 	"github.com/Infisical/agent-vault/internal/auth"
 	"github.com/Infisical/agent-vault/internal/pidfile"
 	"github.com/Infisical/agent-vault/internal/session"
 	"github.com/Infisical/agent-vault/internal/store"
 	"github.com/Infisical/agent-vault/internal/telemetry"
+	"github.com/charmbracelet/huh"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -747,4 +747,3 @@ func validInstanceRole(s string) bool {
 	}
 	return false
 }
-

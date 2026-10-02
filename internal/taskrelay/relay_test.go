@@ -463,7 +463,7 @@ func TestPostgresDeniesAuthorityAndMalformedFramesBeforeUpstream(t *testing.T) {
 		c := f.dial(t, f.c.Postgres.Listen)
 		b, _ := (&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber, Parameters: parameters}).Encode(nil)
 		c.Write(b)
-		if _, e := c.Read(make([]byte, 1)); e == nil {
+		if !refusedWithError(c) {
 			t.Fatal("accepted invalid startup")
 		}
 		c.Close()
@@ -481,7 +481,7 @@ func TestPostgresDeniesAuthorityAndMalformedFramesBeforeUpstream(t *testing.T) {
 		t.Fatal("compatible startup not accepted")
 	}
 	c.Write(encodePGFrame('p', []byte("attacker-proof\x00")))
-	if _, e = c.Read(make([]byte, 1)); e == nil {
+	if !refusedWithError(c) {
 		t.Fatal("accepted nonplaceholder")
 	}
 	c.Close()

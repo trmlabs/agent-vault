@@ -1,0 +1,403 @@
+package hashicorp
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	vaultapi "github.com/hashicorp/vault/api"
+)
+
+// Database session child tokens die with the parent login that created them,
+// and a JWT login has a fixed maximum lifetime. Instead of restarting the
+// broker to replace that login, JWT mode logs in again on a schedule, mints
+// new sessions only under a young login, and keeps each older login until its
+// last session ends. Token and AppRole modes keep their single login.
+const (
+	defaultReauthInterval     = 20 * time.Minute
+	defaultMinSessionLifetime = 35 * time.Minute
+	defaultMintGrace          = 2 * time.Minute
+	defaultMaxRetiredLogins   = 3
+	defaultReauthTick         = 15 * time.Second
+	reauthCallTimeout         = 10 * time.Second
+	maxJWTBytes               = 64 << 10
+)
+
+var errStaleLogin = errors.New("vault login refresh pending; no new database sessions")
+
+type reauthOptions struct {
+	interval           time.Duration // log in again this long after the current login
+	minSessionLifetime time.Duration // a login stops minting once less than this remains
+	mintGrace          time.Duration // a failed refresh stops minting this long after it was due
+	maxRetired         int           // older logins held at most; a refresh waits beyond this
+	tick               time.Duration
+}
+
+func defaultReauthOptions() reauthOptions {
+	return reauthOptions{defaultReauthInterval, defaultMinSessionLifetime, defaultMintGrace, defaultMaxRetiredLogins, defaultReauthTick}
+}
+
+// heldLogin is one parent token. Its children are this process's live sessions.
+type heldLogin struct {
+	token      string
+	issued     time.Time
+	hardExpiry time.Time
+	ttl        time.Duration
+	renewedAt  time.Time
+	pending    int
+	children   map[string]time.Time
+}
+
+// mintUntil is the end of the window in which new sessions may use this login.
+func (l *heldLogin) mintUntil(o reauthOptions) time.Time {
+	until := l.issued.Add(o.interval + o.mintGrace)
+	if last := l.hardExpiry.Add(-o.minSessionLifetime); last.Before(until) {
+		until = last
+	}
+	// A login whose renewal is overdue may lapse before Vault's maximum.
+	if renewal := l.renewedAt.Add(l.ttl * 3 / 4); renewal.Before(until) {
+		until = renewal
+	}
+	return until
+}
+
+type loginSet struct {
+	mu      sync.Mutex
+	current *heldLogin
+	retired []*heldLogin
+	opts    reauthOptions
+}
+
+// acquire reserves the current login for one session mint. The returned
+// function records the session's accessor, or "" when no session was created.
+// Vault reports a session's own TTL, but the session dies with its parent, so
+// the parent's fixed maximum is also returned as the session's real ceiling.
+func (s *loginSet) acquire(now time.Time) (string, time.Time, func(string, time.Time), error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	l := s.current
+	if l == nil || !now.Before(l.mintUntil(s.opts)) {
+		return "", time.Time{}, nil, errStaleLogin
+	}
+	l.pending++
+	var once sync.Once
+	return l.token, l.hardExpiry, func(accessor string, expiry time.Time) {
+		once.Do(func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			l.pending--
+			if accessor != "" {
+				l.children[accessor] = expiry
+			}
+		})
+	}, nil
+}
+
+// forget removes an ended session from whichever login created it.
+func (s *loginSet) forget(accessor string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, l := range append([]*heldLogin{s.current}, s.retired...) {
+		if l != nil {
+			delete(l.children, accessor)
+		}
+	}
+}
+
+// idle removes older logins that need no further custody and returns those
+// that must be revoked: no live session and no mint in flight. A login past
+// its maximum lifetime is already gone in Vault and is only dropped.
+func (s *loginSet) idle(now time.Time) []*heldLogin {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var revoke []*heldLogin
+	kept := s.retired[:0]
+	for _, l := range s.retired {
+		for accessor, expiry := range l.children {
+			if !now.Before(expiry) {
+				delete(l.children, accessor)
+			}
+		}
+		switch {
+		case !now.Before(l.hardExpiry):
+		case len(l.children) == 0 && l.pending == 0:
+			revoke = append(revoke, l)
+		default:
+			kept = append(kept, l)
+		}
+	}
+	s.retired = kept
+	return revoke
+}
+
+func (s *loginSet) rotationDue(now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.current == nil || !now.Before(s.current.issued.Add(s.opts.interval))
+}
+
+func (s *loginSet) atCeiling() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.retired) >= s.opts.maxRetired
+}
+
+// rotate makes next current and retires the previous login. It refuses when
+// another older login would exceed the ceiling.
+func (s *loginSet) rotate(next *heldLogin) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.current != nil {
+		if len(s.retired) >= s.opts.maxRetired {
+			return fmt.Errorf("vault login ceiling reached")
+		}
+		s.retired = append(s.retired, s.current)
+	}
+	s.current = next
+	return nil
+}
+
+func (s *loginSet) all() []*heldLogin {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := append([]*heldLogin(nil), s.retired...)
+	if s.current != nil {
+		out = append(out, s.current)
+	}
+	return out
+}
+
+func (s *loginSet) counts() (retired, sessions int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, l := range append([]*heldLogin{s.current}, s.retired...) {
+		if l != nil {
+			sessions += len(l.children)
+		}
+	}
+	return len(s.retired), sessions
+}
+
+type jwtConfig struct{ mount, role, tokenFile string }
+
+func jwtConfigFromEnv(getenv func(string) string) (jwtConfig, error) {
+	c := jwtConfig{
+		mount:     strings.Trim(strings.TrimSpace(getenv("VAULT_JWT_MOUNT")), "/"),
+		role:      strings.TrimSpace(getenv("VAULT_JWT_ROLE")),
+		tokenFile: strings.TrimSpace(getenv("VAULT_JWT_TOKEN_FILE")),
+	}
+	if c.mount == "" {
+		c.mount = "jwt"
+	}
+	if c.role == "" || c.tokenFile == "" || !databasePathSegment.MatchString(c.role) {
+		return c, fmt.Errorf("jwt login requires VAULT_JWT_ROLE and VAULT_JWT_TOKEN_FILE")
+	}
+	for _, part := range strings.Split(c.mount, "/") {
+		if !databasePathSegment.MatchString(part) {
+			return c, fmt.Errorf("invalid VAULT_JWT_MOUNT")
+		}
+	}
+	return c, nil
+}
+
+func readJWT(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("cannot read login token file")
+	}
+	defer func() { _ = f.Close() }()
+	b, err := io.ReadAll(io.LimitReader(f, maxJWTBytes+1))
+	if err != nil || len(b) > maxJWTBytes {
+		return "", fmt.Errorf("cannot read login token file")
+	}
+	jwt := strings.TrimSpace(string(b))
+	if strings.Count(jwt, ".") != 2 || strings.ContainsAny(jwt, " \t\r\n") {
+		return "", fmt.Errorf("login token file is not a JWT")
+	}
+	return jwt, nil
+}
+
+// jwtLogin reads the projected token fresh, because the kubelet rotates it in
+// place. The maximum lifetime is measured from before the request, so the
+// broker's view of expiry is never later than Vault's.
+func jwtLogin(ctx context.Context, base *vaultapi.Client, c jwtConfig, now func() time.Time) (*heldLogin, error) {
+	jwt, err := readJWT(c.tokenFile)
+	if err != nil {
+		return nil, err
+	}
+	api, err := base.CloneWithHeaders()
+	if err != nil {
+		return nil, fmt.Errorf("prepare vault login failed")
+	}
+	api.ClearToken()
+	api.SetMaxRetries(0)
+	started := now()
+	secret, err := api.Logical().WriteWithContext(ctx, "auth/"+c.mount+"/login", map[string]interface{}{"role": c.role, "jwt": jwt})
+	if err != nil || secret == nil || secret.Auth == nil || secret.Auth.ClientToken == "" || secret.Auth.LeaseDuration <= 0 {
+		return nil, fmt.Errorf("vault jwt login failed")
+	}
+	api.SetToken(secret.Auth.ClientToken)
+	self, err := api.Auth().Token().LookupSelfWithContext(ctx)
+	if err != nil || self == nil || self.Data == nil {
+		revokeToken(base, secret.Auth.ClientToken)
+		return nil, fmt.Errorf("vault jwt login lookup failed")
+	}
+	maxTTL, err := durationField(self.Data["explicit_max_ttl"])
+	if err != nil || maxTTL <= 0 {
+		revokeToken(base, secret.Auth.ClientToken)
+		return nil, fmt.Errorf("vault jwt login has no fixed maximum lifetime")
+	}
+	return &heldLogin{token: secret.Auth.ClientToken, issued: started, hardExpiry: started.Add(maxTTL),
+		ttl: time.Duration(secret.Auth.LeaseDuration) * time.Second, renewedAt: started, children: map[string]time.Time{}}, nil
+}
+
+func durationField(v interface{}) (time.Duration, error) {
+	var seconds int64
+	switch n := v.(type) {
+	case json.Number:
+		i, err := n.Int64()
+		if err != nil {
+			return 0, err
+		}
+		seconds = i
+	case float64:
+		seconds = int64(n)
+	default:
+		return 0, fmt.Errorf("missing duration")
+	}
+	return time.Duration(seconds) * time.Second, nil
+}
+
+func tokenAPI(base *vaultapi.Client, token string) (*vaultapi.Client, error) {
+	api, err := base.CloneWithHeaders()
+	if err != nil {
+		return nil, err
+	}
+	api.SetToken(token)
+	api.SetMaxRetries(0)
+	return api, nil
+}
+
+func revokeToken(base *vaultapi.Client, token string) {
+	api, err := tokenAPI(base, token)
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), reauthCallTimeout)
+	defer cancel()
+	_ = api.Auth().Token().RevokeSelfWithContext(ctx, "")
+}
+
+// reauthLoop renews every held login, replaces the current one when due and
+// revokes older logins whose sessions have all ended.
+func (c *Client) reauthLoop(ctx context.Context) {
+	defer close(c.reauthDone)
+	ticker := time.NewTicker(c.logins.opts.tick)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.reauthTick(ctx)
+		}
+	}
+}
+
+func (c *Client) reauthTick(ctx context.Context) {
+	now := c.clock()
+	for _, l := range c.logins.all() {
+		c.renewLogin(ctx, l, now)
+	}
+	c.revokeIdle(ctx)
+	if !c.logins.rotationDue(now) {
+		return
+	}
+	if c.logins.atCeiling() {
+		c.logger.Warn("vault login refresh deferred: older-login ceiling reached; new database sessions stop when the current login ages out")
+		return
+	}
+	callCtx, cancel := context.WithTimeout(ctx, reauthCallTimeout)
+	next, err := jwtLogin(callCtx, c.api, c.jwt, c.clock)
+	cancel()
+	if err != nil {
+		c.logger.Warn("vault login refresh failed; existing sessions continue, new sessions stop when the current login ages out",
+			slog.String("err", err.Error()))
+		return
+	}
+	if err := c.logins.rotate(next); err != nil {
+		revokeToken(c.api, next.token)
+		c.logger.Warn("vault login refresh discarded", slog.String("err", err.Error()))
+		return
+	}
+	c.api.SetToken(next.token)
+	retired, sessions := c.logins.counts()
+	c.logger.Info("vault login refreshed", slog.Int("older_logins", retired), slog.Int("live_sessions", sessions))
+}
+
+func (c *Client) renewLogin(ctx context.Context, l *heldLogin, now time.Time) {
+	c.logins.mu.Lock()
+	due := !now.Before(l.renewedAt.Add(l.ttl/2)) && now.Before(l.hardExpiry)
+	token, ttl := l.token, l.ttl
+	c.logins.mu.Unlock()
+	if !due {
+		return
+	}
+	api, err := tokenAPI(c.api, token)
+	if err != nil {
+		return
+	}
+	callCtx, cancel := context.WithTimeout(ctx, reauthCallTimeout)
+	defer cancel()
+	secret, err := api.Auth().Token().RenewSelfWithContext(callCtx, int(ttl/time.Second))
+	if err != nil || secret == nil || secret.Auth == nil || secret.Auth.LeaseDuration <= 0 {
+		c.logger.Warn("vault login renewal failed")
+		return
+	}
+	c.logins.mu.Lock()
+	l.renewedAt = now
+	l.ttl = time.Duration(secret.Auth.LeaseDuration) * time.Second
+	c.logins.mu.Unlock()
+}
+
+// revokeIdle revokes each older login as soon as its last session has ended.
+func (c *Client) revokeIdle(ctx context.Context) {
+	for _, l := range c.logins.idle(c.clock()) {
+		api, err := tokenAPI(c.api, l.token)
+		if err != nil {
+			continue
+		}
+		callCtx, cancel := context.WithTimeout(ctx, reauthCallTimeout)
+		err = api.Auth().Token().RevokeSelfWithContext(callCtx, "")
+		cancel()
+		if err != nil {
+			// Vault still ends it at its fixed maximum lifetime.
+			c.logger.Warn("vault older login revoke failed")
+			continue
+		}
+		c.logger.Info("vault older login revoked")
+	}
+}
+
+// Close stops login refresh. Held logins end at their Vault maximum lifetime.
+func (c *Client) Close() {
+	if c == nil || c.stopReauth == nil {
+		return
+	}
+	c.stopReauth()
+	<-c.reauthDone
+}
+
+func (c *Client) clock() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}

@@ -47,16 +47,15 @@ func actionMarker(action string) string {
 
 // Lipgloss styles for structured output.
 var (
-	fieldLabelStyle   = lipgloss.NewStyle().Bold(true).Width(12)
+	fieldLabelStyle    = lipgloss.NewStyle().Bold(true).Width(12)
 	sectionHeaderStyle = lipgloss.NewStyle().Bold(true)
 )
 
-func fieldLabel(s string) string   { return fieldLabelStyle.Render(s) }
+func fieldLabel(s string) string    { return fieldLabelStyle.Render(s) }
 func sectionHeader(s string) string { return sectionHeaderStyle.Render(s) }
-func tagText(s string) string      { return mutedText(s) }
+func tagText(s string) string       { return mutedText(s) }
 
 // truncateText shortens s to width using "..." as the tail.
 func truncateText(s string, width uint) string {
 	return truncate.StringWithTail(s, width, "...")
 }
-

@@ -46,4 +46,3 @@ var whoamiCmd = &cobra.Command{
 		return nil
 	},
 }
-

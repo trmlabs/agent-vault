@@ -6,7 +6,6 @@ import (
 	_ "embed"
 	"encoding/json"
 	"errors"
-	"time"
 	"fmt"
 	"net"
 	"net/http"
@@ -17,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/Infisical/agent-vault/internal/isolation"
 	"github.com/Infisical/agent-vault/internal/session"
@@ -580,7 +580,6 @@ func augmentEnvWithMITM(env []string, addr, token, vault, caPath string) ([]stri
 	if err := os.WriteFile(caPath, pem, 0o600); err != nil { //nolint:gosec
 		return env, 0, false, fmt.Errorf("write CA: %w", err)
 	}
-
 
 	env = stripEnvKeys(env, mitmInjectedKeys)
 	env = append(env, isolation.BuildProxyEnv(isolation.ProxyEnvParams{

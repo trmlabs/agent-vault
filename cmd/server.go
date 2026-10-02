@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -212,6 +213,23 @@ func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKe
 	if len(resolver) > 0 {
 		sessions = resolver[0]
 	}
+	// Pool workers are admitted by Attest by default. The fallback keeps every
+	// caller on online TokenReview; hiding Attest makes pool bindings refuse.
+	switch mode := os.Getenv("AGENT_VAULT_WORKLOAD_ATTESTATION"); mode {
+	case "":
+	case "tokenreview":
+		sessions = tokenReviewOnly{sessions}
+	default:
+		return fmt.Errorf("AGENT_VAULT_WORKLOAD_ATTESTATION must be unset or tokenreview")
+	}
+	// Pool workers need a real peer address, which behind the in-Pod TLS
+	// terminator only a PROXY header supplies; without it, keep token review.
+	var attestor brokercore.Attestor
+	var peerReader mitm.PeerReader
+	if boolEnvValue("AGENT_VAULT_MITM_PROXY_PROTOCOL") {
+		attestor, _ = sessions.(brokercore.Attestor)
+		peerReader = func(c net.Conn) (netip.Addr, error) { return brokercore.ReadProxyV1(c, c.RemoteAddr()) }
+	}
 	var extraSANs []string
 	if u, err := url.Parse(srv.BaseURL()); err == nil {
 		if h := u.Hostname(); h != "" {
@@ -238,6 +256,8 @@ func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKe
 			DurableAudit:          requestlog.NewDurable(db),
 			HeaderAdapter:         adapter,
 			Sessions:              sessions,
+			Attestor:              attestor,
+			PeerReader:            peerReader,
 			Credentials:           srv.CredentialProvider(),
 			BaseURL:               srv.BaseURL(),
 			Logger:                srv.Logger(),
@@ -391,6 +411,15 @@ func attachPostgresBrokerIfEnabled(srv *server.Server, host string, postgresPort
 	if len(resolver) > 0 {
 		sessions = resolver[0]
 	}
+	// Pool workers are admitted by Attest by default. The fallback keeps every
+	// caller on online TokenReview; hiding Attest makes pool bindings refuse.
+	switch mode := os.Getenv("AGENT_VAULT_WORKLOAD_ATTESTATION"); mode {
+	case "":
+	case "tokenreview":
+		sessions = tokenReviewOnly{sessions}
+	default:
+		return fmt.Errorf("AGENT_VAULT_WORKLOAD_ATTESTATION must be unset or tokenreview")
+	}
 	opts := pgproxy.Options{
 		Auth:      server.NewAgentAuthAdapter(sessions),
 		Databases: srv.DatabaseResolver(),
@@ -434,6 +463,14 @@ func attachPostgresBrokerIfEnabled(srv *server.Server, host string, postgresPort
 	if v := intEnvValue("AGENT_VAULT_DB_MAX_PENDING_CONNS"); v > 0 {
 		opts.MaxPendingConns = v
 	}
+	// The PROXY header names the worker's address for pool admission. Only the
+	// in-Pod TLS terminator may send it, so it is refused off loopback.
+	if boolEnvValue("AGENT_VAULT_DB_PROXY_PROTOCOL") {
+		if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+			return fmt.Errorf("AGENT_VAULT_DB_PROXY_PROTOCOL requires a loopback PostgreSQL listener")
+		}
+		opts.TrustProxyHeader = true
+	}
 	// Transaction-mode multiplexing: client sessions share server connections
 	// and one rotating credential per pool and database. MaxConns then caps
 	// client sessions; each database's server budget comes from the catalog.
@@ -443,6 +480,9 @@ func attachPostgresBrokerIfEnabled(srv *server.Server, host string, postgresPort
 	srv.AttachPostgresBroker(pgproxy.New(net.JoinHostPort(host, strconv.Itoa(postgresPort)), opts))
 	return nil
 }
+
+// tokenReviewOnly exposes only ResolveForProxy, hiding a resolver's Attest.
+type tokenReviewOnly struct{ brokercore.SessionResolver }
 
 // boolEnvValue reports whether the named environment variable is set to a
 // truthy value (per strconv.ParseBool). Unset or unparseable is false.

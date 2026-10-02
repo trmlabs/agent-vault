@@ -341,9 +341,9 @@ func TestIsPermanentError(t *testing.T) {
 		{401, true},
 		{403, true},
 		{404, true},
-		{408, false},  // Request Timeout — transient
+		{408, false}, // Request Timeout — transient
 		{422, true},
-		{429, false},  // Too Many Requests — transient
+		{429, false}, // Too Many Requests — transient
 		{500, false},
 		{502, false},
 		{503, false},

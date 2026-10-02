@@ -2,13 +2,14 @@ package pgproxy
 
 import (
 	"context"
+	"net/netip"
 	"time"
 )
 
 // authorizationLoop bounds the lifetime of an already-open session after token
 // revocation/expiry, grant removal, or a binding change. Store unavailability
 // fails closed. Capacity changes alone affect admission, not existing sessions.
-func (b *Broker) authorizationLoop(ctx context.Context, token, hint, requested string, scope AgentScope, svc DatabaseService, terminate func()) {
+func (b *Broker) authorizationLoop(ctx context.Context, token, hint, requested string, scope AgentScope, svc DatabaseService, terminate func(), peer netip.Addr) {
 	defer func() {
 		if recover() != nil {
 			terminate()
@@ -26,7 +27,7 @@ func (b *Broker) authorizationLoop(ctx context.Context, token, hint, requested s
 		// A dependency must honor context, but cannot postpone terminating access
 		// simply by returning late. A fired watchdog cannot revive the session.
 		watchdog := time.AfterFunc(b.opts.AuthorizationTimeout, terminate)
-		current, err := b.opts.Auth.Authenticate(checkCtx, token, hint)
+		current, err := b.renewalAuthenticator(peer).Authenticate(checkCtx, token, hint)
 		valid := err == nil && current != nil && current.ActorID == scope.ActorID && current.VaultID == scope.VaultID && current.WorkloadID == scope.WorkloadID
 		if valid {
 			next, resolveErr := b.opts.Databases.ResolveDatabase(checkCtx, *current, requested)
@@ -48,4 +49,31 @@ func (b *Broker) authorizationLoop(ctx context.Context, token, hint, requested s
 func sameBinding(a, b DatabaseService) bool {
 	a.MaxConns, b.MaxConns = 0, 0
 	return a == b
+}
+
+// peerAuth adapts a PeerAuthenticator to the plain interface for one connection.
+type peerAuth struct {
+	auth    PeerAuthenticator
+	peer    netip.Addr
+	renewal bool
+}
+
+func (p peerAuth) Authenticate(ctx context.Context, token, hint string) (*AgentScope, error) {
+	return p.auth.AuthenticatePeer(ctx, token, hint, p.peer, p.renewal)
+}
+
+// authenticator binds admission to the connection's peer when the configured
+// authenticator supports it; otherwise it is the plain token check.
+func (b *Broker) authenticator(peer netip.Addr) AgentAuthenticator {
+	if auth, ok := b.opts.Auth.(PeerAuthenticator); ok && peer.IsValid() {
+		return peerAuth{auth: auth, peer: peer}
+	}
+	return b.opts.Auth
+}
+
+func (b *Broker) renewalAuthenticator(peer netip.Addr) AgentAuthenticator {
+	if auth, ok := b.opts.Auth.(PeerAuthenticator); ok && peer.IsValid() {
+		return peerAuth{auth: auth, peer: peer, renewal: true}
+	}
+	return b.opts.Auth
 }
