@@ -297,3 +297,46 @@ func TestTunnelRechecksUseReattest(t *testing.T) {
 		t.Fatalf("in-tunnel requests used Reattest %d times", attestor.reattests)
 	}
 }
+
+// Reading the PROXY header restores the HTTP server's read deadline instead
+// of clearing it, so a client behind the terminator cannot hold a connection
+// open forever before authenticating.
+func TestProxyHeaderKeepsTheServerReadDeadline(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = l.Close() }()
+	client, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = client.Close() }()
+	accepted, err := (peerListener{Listener: l, reader: readTestProxyV1}).Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = accepted.Close() }()
+	if _, err := client.Write([]byte("PROXY TCP4 10.0.0.9 10.0.0.1 40000 14443\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	// As net/http does: a header deadline, then the first read.
+	_ = accepted.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	done := make(chan error, 1)
+	go func() {
+		_, err := accepted.Read(make([]byte, 64))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		var timeout net.Error
+		if !errors.As(err, &timeout) || !timeout.Timeout() {
+			t.Fatalf("read after the PROXY header: %v, want the server's deadline to expire", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the PROXY header read cleared the server's read deadline")
+	}
+	if peer, err := accepted.(*peerConn).Peer(); err != nil || peer.String() != "10.0.0.9" {
+		t.Fatalf("peer %v %v", peer, err)
+	}
+}

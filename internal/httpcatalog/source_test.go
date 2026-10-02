@@ -172,10 +172,17 @@ func TestCatalogDatabasesUseVerifyFull(t *testing.T) {
 	}
 	PlaintextDatabases.Store(true)
 	t.Cleanup(func() { PlaintextDatabases.Store(false) })
-	if err := mode("disable"); err != nil {
-		t.Fatalf("test harness switch did not allow disable: %v", err)
+	if mode("disable") == nil {
+		t.Fatal("the test harness switch allowed plaintext to a public host")
 	}
-	if mode("require") == nil {
+	local := func(m string) error {
+		_, err := Parse([]byte(strings.Replace(strings.Replace(doc, "MODE", m, 1), "p.abc.db.postgresbridge.com", "fixture-db.gatehouse.svc.cluster.local", 1)))
+		return err
+	}
+	if err := local("disable"); err != nil {
+		t.Fatalf("test harness switch did not allow disable to a cluster Service: %v", err)
+	}
+	if local("require") == nil {
 		t.Fatal("the test harness switch allowed require")
 	}
 }

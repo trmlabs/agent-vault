@@ -333,7 +333,7 @@ func (e *Entry) normalizePostgres() error {
 	case p.SSLMode == "":
 		p.SSLMode = "verify-full"
 	case p.SSLMode == "verify-full":
-	case p.SSLMode == "disable" && PlaintextDatabases.Load():
+	case p.SSLMode == "disable" && PlaintextDatabases.Load() && clusterLocal(e.Host):
 	default:
 		return fmt.Errorf("sslmode %q: catalog databases use verify-full", p.SSLMode)
 	}
@@ -628,6 +628,12 @@ func (c Catalog) GitGranted(installation int64, repo, scope string) bool {
 		}
 	}
 	return false
+}
+
+// clusterLocal reports whether host is a Kubernetes Service name, the only
+// kind of host a plaintext database entry may name.
+func clusterLocal(host string) bool {
+	return strings.HasSuffix(host, ".svc.cluster.local") || strings.HasSuffix(host, ".svc")
 }
 
 // PlaintextDatabases lets a database entry use sslmode disable. Only a test
