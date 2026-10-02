@@ -58,3 +58,26 @@ func TestAuditBootSurvivesReopen(t *testing.T) {
 		}
 	}
 }
+
+// The store's heads are what an export is checked against: each replica's
+// current boot and its newest persisted checkpoint.
+func TestAuditHeadsListEveryReplica(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+	for _, replica := range []string{"broker-1", "broker-0"} {
+		if _, _, err := s.BeginAuditBoot(ctx, replica); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := s.BeginAuditBoot(ctx, "broker-0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordAuditCheckpoint(ctx, "broker-0", 2, 7, "mac-seven"); err != nil {
+		t.Fatal(err)
+	}
+	heads, err := s.ListAuditHeads(ctx)
+	want := []AuditHead{{Replica: "broker-0", Boot: 2, CheckpointSeq: 7, CheckpointMAC: "mac-seven"}, {Replica: "broker-1", Boot: 1}}
+	if err != nil || len(heads) != 2 || heads[0] != want[0] || heads[1] != want[1] {
+		t.Fatalf("heads %+v %v, want %+v", heads, err, want)
+	}
+}

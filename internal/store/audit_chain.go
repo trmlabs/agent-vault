@@ -66,3 +66,32 @@ func (s *SQLStore) RecordAuditCheckpoint(ctx context.Context, replica string, bo
 		return nil
 	})
 }
+
+// AuditHead is a replica's current boot and the newest checkpoint row it
+// persisted: where its exported chain must reach.
+type AuditHead struct {
+	Replica       string `json:"replica"`
+	Boot          uint64 `json:"boot"`
+	CheckpointSeq uint64 `json:"checkpointSeq"`
+	CheckpointMAC string `json:"checkpointMac"`
+}
+
+// ListAuditHeads returns every replica's head, ordered by replica name.
+func (s *SQLStore) ListAuditHeads(ctx context.Context) ([]AuditHead, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT replica, boot, checkpoint_seq, checkpoint_mac FROM audit_chain_replica ORDER BY replica`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var heads []AuditHead
+	for rows.Next() {
+		var head AuditHead
+		var boot, seq int64
+		if err := rows.Scan(&head.Replica, &boot, &seq, &head.CheckpointMAC); err != nil {
+			return nil, err
+		}
+		head.Boot, head.CheckpointSeq = uint64(boot), uint64(seq)
+		heads = append(heads, head)
+	}
+	return heads, rows.Err()
+}
