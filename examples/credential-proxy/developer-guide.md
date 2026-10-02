@@ -138,9 +138,10 @@ end-to-end test harness's.
 ## Every refusal names its cause
 
 HTTP refusals carry an `X-Request-Id` header. Give it to Security to find the
-exact audit row. Database refusals reach the client from the sidecar with the
-fixed text below; Gatehouse's own message is never passed on. For anything
-unclear, give Security the pool and the time to find the audit row.
+exact audit row. A database refusal at connect time reaches the client from
+the sidecar with the fixed text below. An error on a query inside an open
+session comes from Gatehouse itself, in its own words. For anything unclear,
+give Security the pool and the time to find the audit row.
 
 | You see | Usually means | Fix |
 |---|---|---|
@@ -155,10 +156,13 @@ unclear, give Security the pool and the time to find the audit row.
 | Postgres 3D000 "this database isn't in the Gatehouse catalog for your pool" | No catalog entry for that database, or it is not granted to your pool | Add the entry or the grant |
 | Postgres 28000 "Gatehouse could not verify this worker" | Gatehouse refused the worker's Pod identity | Retry; tell Security if it persists |
 | Postgres 42501 "Gatehouse: this session's person is not authorized for this database" | The tier check refused this database for this session | Request the group, or use a pool with a person behind it |
-| Postgres 53300 "Gatehouse: too many concurrent database sessions for this worker; close one and retry" | This worker has reached its session cap | Close idle sessions, or retry |
+| Postgres 53300 "Gatehouse: too many concurrent database sessions for this worker; close one and retry" | This worker reached its session cap, or the database's connection budget is full for now | Close idle sessions, or retry |
+| Postgres 53300 "Agent Vault: database connection budget exhausted; retry shortly", on a query | The database's connection budget is full for now; the session stays open | Retry the query |
+| Postgres 53300 "Agent Vault: no session-mode connection available for session state ...", on a query | The query needs session state (`SET`, temporary tables, `LISTEN`, advisory locks) and no dedicated connection is free | Retry, or avoid session state |
+| Postgres 08006 "Agent Vault: could not reach the database", on a query | The database is unreachable | Retry; tell Security if it persists |
 | Postgres 28P01 "Gatehouse: wrong placeholder password for this binding" | Wrong placeholder password | Use the binding's placeholder |
 | Postgres 08001 "cannot reach Gatehouse" | The sidecar could not reach Gatehouse | Retry; tell Security if it persists |
 | Postgres 08006 "Gatehouse ended the session (deadline or revocation)" | Gatehouse ended a running session at its deadline, on revocation, or after a failed recheck | Reconnect; a worker past its deadline is not admitted again |
 | Postgres 08004 "Gatehouse: connection refused: use this binding's database and user, and only the ... startup parameters" | A database or user other than the binding's, or a startup setting outside the accepted list | Use the binding's database and user; set other settings with `SET` |
 | Postgres 08004 "Gatehouse: the broker refused this connection" | Any other refusal, such as no credential or the audit trail down | Retry; tell Security the pool and time if it persists |
-| Connection closed with no error | The sidecar itself is stopping because its task was withdrawn | Start a new task |
+| Connection closed with no error | The sidecar stopped or could not start the session: its task was withdrawn, its deadline passed, or it could not read its identity proof | Start a new task; tell Security if a new task does the same |
