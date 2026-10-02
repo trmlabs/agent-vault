@@ -39,6 +39,25 @@ type peerConn struct {
 	once   sync.Once
 	peer   netip.Addr
 	err    error
+
+	mu       sync.Mutex
+	deadline time.Time // the read deadline the HTTP server last set
+}
+
+// SetReadDeadline and SetDeadline record the server's read deadline, so
+// reading the PROXY header can put it back instead of clearing it.
+func (c *peerConn) SetReadDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.deadline = t
+	c.mu.Unlock()
+	return c.Conn.SetReadDeadline(t)
+}
+
+func (c *peerConn) SetDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.deadline = t
+	c.mu.Unlock()
+	return c.Conn.SetDeadline(t)
 }
 
 func (c *peerConn) resolve() {
@@ -57,9 +76,19 @@ func (c *peerConn) resolve() {
 			c.err = errNoPeer
 			return
 		}
-		_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		// The header gets at most 5 seconds, and never more than the server's
+		// own header timeout; the server's deadline is restored afterwards, so
+		// its header and read timeouts keep applying to the request.
+		c.mu.Lock()
+		restore := c.deadline
+		c.mu.Unlock()
+		header := time.Now().Add(5 * time.Second)
+		if !restore.IsZero() && restore.Before(header) {
+			header = restore
+		}
+		_ = c.Conn.SetReadDeadline(header)
 		c.peer, c.err = c.reader(c.Conn)
-		_ = c.SetReadDeadline(time.Time{})
+		_ = c.Conn.SetReadDeadline(restore)
 		if c.err != nil {
 			c.err = errNoPeer
 		}

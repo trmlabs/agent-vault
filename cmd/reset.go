@@ -22,7 +22,7 @@ Requires an active login session with owner role. If the server is running,
 it will be stopped automatically before the reset.`,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if os.Getenv("DATABASE_URL") != "" {
+		if sharedStoreConfigured() {
 			fmt.Fprintln(cmd.ErrOrStderr(),
 				"This command removes local files and does not affect the shared database.",
 				"To reset a shared deployment: drop and recreate the database",
