@@ -48,6 +48,6 @@ func brokerAuditChain(ctx context.Context, client *hashicorp.Client, db any, get
 	signCtx, cancel := context.WithTimeout(ctx, auditCheckpointInterval/2)
 	_ = chain.Checkpoint(signCtx)
 	cancel()
-	go chain.Run(context.Background(), auditCheckpointInterval, auditKeyRefresh)
+	go chain.Run(ctx, auditCheckpointInterval, auditKeyRefresh) // ctx is the server's lifetime context
 	return chain, nil
 }

@@ -145,10 +145,14 @@ func vaultPath(p string) bool {
 			return false
 		}
 		for _, r := range part {
-			if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.') {
+			if !pathRune(r) {
 				return false
 			}
 		}
 	}
 	return true
+}
+
+func pathRune(r rune) bool {
+	return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.'
 }
