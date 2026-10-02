@@ -118,7 +118,10 @@ var serverCmd = &cobra.Command{
 			_ = pidfile.Remove()
 		}
 
-		dbURL := os.Getenv("DATABASE_URL")
+		dbURL, err := databaseURL()
+		if err != nil {
+			return err
+		}
 		if flagURL, _ := cmd.Flags().GetString("database-url"); flagURL != "" {
 			dbURL = flagURL
 		}
@@ -920,7 +923,10 @@ func runDetachedChild(host, addr string, mitmPort, postgresPort int, logger *slo
 	key := buf[:32]
 	initialized := buf[32] == 1
 
-	dbURL := os.Getenv("DATABASE_URL")
+	dbURL, err := databaseURL()
+	if err != nil {
+		return err
+	}
 	dbPath, err := store.DefaultDBPath()
 	if err != nil && dbURL == "" {
 		return fmt.Errorf("resolving db path: %w", err)

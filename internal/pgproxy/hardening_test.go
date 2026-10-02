@@ -160,3 +160,33 @@ func TestSCRAM_RejectsUnboundedWorkAndAmbiguousMessages(t *testing.T) {
 		})
 	}
 }
+
+// Plaintext is never sent to a public address, whatever the sslmode says.
+func TestPlaintextOnlyToPrivateAddresses(t *testing.T) {
+	for addr, want := range map[string]bool{
+		"127.0.0.1:5432":   true,
+		"10.96.0.12:5432":  true,
+		"192.168.1.4:5432": true,
+		"[fd00::1]:5432":   true,
+		"8.8.8.8:5432":     false,
+		"34.1.2.3:5432":    false,
+	} {
+		tcp, err := net.ResolveTCPAddr("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := privatePeer(fakeRemote{remote: tcp}); got != want {
+			t.Errorf("privatePeer(%s) = %v, want %v", addr, got, want)
+		}
+	}
+	if _, _, err := negotiateUpstreamTLS(context.Background(), fakeRemote{remote: &net.TCPAddr{IP: net.ParseIP("34.1.2.3"), Port: 5432}}, &DatabaseService{SSLMode: "disable"}); err == nil {
+		t.Fatal("sslmode disable to a public address accepted")
+	}
+}
+
+type fakeRemote struct {
+	net.Conn
+	remote net.Addr
+}
+
+func (f fakeRemote) RemoteAddr() net.Addr { return f.remote }
