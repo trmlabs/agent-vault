@@ -56,7 +56,7 @@ func attachAuthorization(adapter *mitm.HeaderAdapter, getenv func(string) string
 // that would need them.
 func loadAuthorization(getenv func(string) string) (authorization, error) {
 	var a authorization
-	client := &http.Client{Timeout: 5 * time.Second,
+	client := &http.Client{Timeout: 5 * time.Second, CheckRedirect: runnerid.RefuseRedirects,
 		Transport: &http.Transport{DialContext: netguard.SafeDialContext(netguard.AllowPrivateFromEnv()), TLSHandshakeTimeout: 5 * time.Second}}
 	if url := getenv("AGENT_VAULT_RUNNER_JWKS_URL"); url != "" {
 		if !strings.HasPrefix(url, "https://") {
@@ -86,4 +86,13 @@ func loadAuthorization(getenv func(string) string) (authorization, error) {
 		return a, fmt.Errorf("AGENT_VAULT_ENTITLEMENTS must be unset or file:/absolute/path")
 	}
 	return a, nil
+}
+
+// sessionBinder is the store's runner-session pin table, or nil when the
+// store cannot hold one (claude-session pools then refuse every session).
+func sessionBinder(st any) authorize.Binder {
+	if b, ok := st.(authorize.Binder); ok {
+		return b
+	}
+	return nil
 }

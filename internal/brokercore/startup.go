@@ -56,6 +56,10 @@ var canonicalKeys = func() map[string]string {
 //     backslash, so the broker's SQL lexer and the server could split a
 //     string literal differently. PostgreSQL refuses them as server encodings
 //     for the same reason.
+//   - standard_conforming_strings: "on" only, forwarded lowercase. Off, the
+//     server reads backslash escapes inside string literals and the broker's
+//     SQL lexer does not, so a statement hidden in a literal would pass the
+//     classifier and run.
 //   - the rest: at most 256 bytes of printable ASCII. These settings are
 //     bounded in effect; the server parses them and rejects invalid values.
 func StartupValue(key, value string) (string, bool) {
@@ -81,7 +85,12 @@ func StartupValue(key, value string) (string, bool) {
 	case "client_encoding":
 		canonical, ok := encodings[cleanEncoding(value)]
 		return canonical, ok
-	case "DateStyle", "extra_float_digits", "search_path", "standard_conforming_strings", "TimeZone":
+	case "standard_conforming_strings":
+		if !strings.EqualFold(value, "on") {
+			return "", false
+		}
+		return "on", true
+	case "DateStyle", "extra_float_digits", "search_path", "TimeZone":
 		if len(value) > 256 || !printable(value) {
 			return "", false
 		}

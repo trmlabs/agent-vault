@@ -230,6 +230,15 @@ func (v Verifier) verifyChain(k chainKey, rows []Row, keys map[int][]byte) ([]Fi
 			add(FindingKeyUnavailable, row.Seq)
 		case !hmac.Equal([]byte(row.computeMAC(key)), []byte(row.MAC)):
 			add(FindingEdit, row.Seq)
+		case row.MACVersion != 0 && row.MACVersion != MACVersionCurrent:
+			// An unknown version is never trusted.
+			add(FindingEdit, row.Seq)
+		case row.MACVersion < 2 && row.v2Only():
+			// Fields a v1 MAC does not cover cannot be trusted on a v1 row.
+			add(FindingEdit, row.Seq)
+		case prev != nil && row.MACVersion < prev.MACVersion:
+			// A chain never steps down to a weaker MAC.
+			add(FindingEdit, row.Seq)
 		}
 		if prev == nil {
 			if row.Seq != 0 || row.Event != EventChainStart || row.Prev != "" {

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Infisical/agent-vault/internal/auditchain"
@@ -136,11 +137,27 @@ func (p *Proxy) forwardBrowser(w http.ResponseWriter, r *http.Request, target st
 	}
 	out.Header.Set("Accept-Encoding", "identity")
 	needles := secretRepresentations(map[string]string{"token": token.Value(), "credential": real})
-	p.relayScreened(noCookieWriter{w}, out, needles, entry.MaxResponseBytes, finish, func() {
-		if !b.App {
+	p.relayScreened(noCookieWriter{w}, out, needles, entry.MaxResponseBytes, finish, func(resp *http.Response) {
+		if !b.App && invalidToken(resp) {
 			a.BrowserTokens.Invalidate(entry)
 		}
 	}, nil)
+}
+
+// invalidToken reports whether the API refused the token itself: a 401 that
+// names no error, or names invalid_token. A 403, or a 401 for another reason
+// such as insufficient_scope, says nothing about the token, and a worker
+// could otherwise force a fresh login per request by calling such a path.
+func invalidToken(resp *http.Response) bool {
+	if resp.StatusCode != http.StatusUnauthorized {
+		return false
+	}
+	for _, challenge := range resp.Header.Values("WWW-Authenticate") {
+		if i := strings.Index(challenge, "error="); i >= 0 && !strings.HasPrefix(strings.Trim(challenge[i+len("error="):], `" `), "invalid_token") {
+			return false
+		}
+	}
+	return true
 }
 
 func containsPlaceholder(s string) bool { return bytes.Contains([]byte(s), []byte(placeholderMarker)) }

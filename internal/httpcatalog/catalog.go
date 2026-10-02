@@ -659,6 +659,18 @@ func (c Catalog) HasHost(host string, port int) bool {
 	return false
 }
 
+// HasAuth0Domain reports whether host is the Auth0 domain of a
+// browser-session entry: the only hosts the broker's own logins may reach.
+func (c Catalog) HasAuth0Domain(host string) bool {
+	host = strings.ToLower(host)
+	for _, e := range c.entries {
+		if e.BrowserSession != nil && e.BrowserSession.Auth0.Domain == host {
+			return true
+		}
+	}
+	return false
+}
+
 // Entries returns a copy of the catalog, for wiring and diagnostics.
 func (c Catalog) Entries() []Entry { return append([]Entry(nil), c.entries...) }
 
@@ -733,6 +745,11 @@ func (e *Entry) validateTier() error {
 	if rank > 0 && len(e.Requires) == 0 {
 		return fmt.Errorf("a %s entry must name its required groups", e.Tier)
 	}
+	// The audit row records the groups checked within its 512-byte identifier
+	// limit; more groups would make every request on the entry fail closed.
+	if len(e.Requires) > maxRequiredGroups {
+		return fmt.Errorf("an entry requires at most %d groups", maxRequiredGroups)
+	}
 	for _, g := range e.Requires {
 		if !groupID.MatchString(g) {
 			return fmt.Errorf("required groups must be Entra object IDs")
@@ -740,6 +757,8 @@ func (e *Entry) validateTier() error {
 	}
 	return nil
 }
+
+const maxRequiredGroups = 8
 
 // grantable is the CI rule: an entry above T0 is never granted to a pool that
 // cannot carry it. Without defined pools only T0 entries may be granted.

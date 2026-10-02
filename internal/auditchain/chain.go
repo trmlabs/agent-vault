@@ -267,7 +267,7 @@ func (c *Chain) appendLocked(r Row) (Row, error) {
 	}
 	r.Type, r.Replica, r.Boot, r.Seq = RowType, c.opts.Replica, c.boot, c.seq
 	r.Time = c.opts.Now().UTC().Format(time.RFC3339Nano)
-	r.KeyVersion, r.Prev = c.key.Version, c.prev
+	r.KeyVersion, r.Prev, r.MACVersion = c.key.Version, c.prev, MACVersionCurrent
 	r.MAC = r.computeMAC(c.key.secret)
 	line, err := json.Marshal(r)
 	if err != nil {

@@ -68,11 +68,20 @@ type Row struct {
 	PrevCheckpointMAC string `json:"prevCheckpointMAC,omitempty"`
 	KeyVersion        int    `json:"keyVersion"`
 	Prev              string `json:"prev"`
-	MAC               string `json:"mac"`
+	// MACVersion selects the MAC input: absent (0) is v1, written before the
+	// authorization fields existed; MACVersionCurrent covers every field.
+	MACVersion int    `json:"macVersion,omitempty"`
+	MAC        string `json:"mac"`
 }
 
+// MACVersionCurrent is the MAC input every new row uses.
+const MACVersionCurrent = 2
+
 // macInput encodes every field except MAC with explicit lengths, so no two
-// distinct rows share an input regardless of field contents.
+// distinct rows share an input regardless of field contents. Version 2 adds
+// the authorization fields and the version itself; version 1 is kept only to
+// verify rows written before it, and a v1 row that carries any v2-only field
+// fails verification (see v2Only).
 func (r Row) macInput() []byte {
 	fields := []string{
 		r.Type, r.Replica, strconv.FormatUint(r.Boot, 10), strconv.FormatUint(r.Seq, 10), r.Time, r.Event,
@@ -81,7 +90,18 @@ func (r Row) macInput() []byte {
 		strconv.Itoa(r.PrevKey), strconv.FormatUint(r.PrevBoot, 10), strconv.FormatUint(r.PrevCheckpointSeq, 10), r.PrevCheckpointMAC,
 		strconv.Itoa(r.KeyVersion), r.Prev,
 	}
-	return lengthPrefixed("gatehouse-audit-v1", fields...)
+	if r.MACVersion < 2 {
+		return lengthPrefixed("gatehouse-audit-v1", fields...)
+	}
+	fields = append(fields, strconv.Itoa(r.MACVersion),
+		r.RequesterKind, r.RequesterOID, r.TokenSHA256, r.Tier, r.Decision, r.Groups, strconv.FormatInt(r.CacheAgeSec, 10))
+	return lengthPrefixed("gatehouse-audit-v2", fields...)
+}
+
+// v2Only reports whether a row sets a field that only the v2 MAC covers.
+func (r Row) v2Only() bool {
+	return r.RequesterKind != "" || r.RequesterOID != "" || r.TokenSHA256 != "" || r.Tier != "" ||
+		r.Decision != "" || r.Groups != "" || r.CacheAgeSec != 0
 }
 
 func (r Row) computeMAC(key []byte) string {

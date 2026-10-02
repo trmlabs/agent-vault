@@ -693,8 +693,9 @@ func (s *pooledSession) end() {
 
 // leakCheck finds session state on a connection that left transaction mode
 // unnoticed: temporary tables, listened channels, session advisory locks,
-// holdable cursors, or settings changed for the session other than the
-// startup parameters the broker applies itself.
+// holdable cursors, SQL-level prepared statements, or settings changed for the
+// session other than the startup parameters the broker applies itself. The
+// broker's own protocol-level statements are not from_sql, so they pass.
 // The parameters the broker applied must still hold exactly its values; any
 // other setting changed for the session is a leak.
 func leakCheck(conn *serverConn) string {
@@ -703,7 +704,8 @@ func leakCheck(conn *serverConn) string {
 	check.WriteString("SELECT EXISTS (SELECT 1 FROM pg_class WHERE relnamespace = pg_my_temp_schema())" +
 		" OR EXISTS (SELECT 1 FROM pg_listening_channels())" +
 		" OR EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid())" +
-		" OR EXISTS (SELECT 1 FROM pg_cursors WHERE is_holdable)")
+		" OR EXISTS (SELECT 1 FROM pg_cursors WHERE is_holdable)" +
+		" OR EXISTS (SELECT 1 FROM pg_prepared_statements WHERE from_sql)")
 	for _, name := range sessionParams { // fixed names only, never client text
 		value, ok := conn.actual[name]
 		if !ok {

@@ -99,5 +99,5 @@ func (p *Proxy) forwardGCP(w http.ResponseWriter, r *http.Request, target string
 		_ = a.Audit.Record(done)
 	}
 	needles := secretRepresentations(map[string]string{"token": token.Value(), "credential": credential})
-	p.relayScreened(w, out, needles, entry.MaxResponseBytes, finish, func() { a.GCPTokens.Invalidate(entry) }, nil)
+	p.relayScreened(w, out, needles, entry.MaxResponseBytes, finish, func(*http.Response) { a.GCPTokens.Invalidate(entry) }, nil)
 }

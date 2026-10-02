@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"fmt"
+	"github.com/Infisical/agent-vault/internal/authorize/authorizetest"
 	"io"
 	"math/big"
 	"net"
@@ -152,6 +153,7 @@ func newGCPFixture(t *testing.T) *gcpFixture {
 	proxyURL, roots, p := setupProxy(t, f.sessions, &fakeCredProvider{}, func(o *Options) {
 		o.StrictCredentialProxy = true
 		o.HeaderAdapter = &HeaderAdapter{Catalog: catalog, Keys: &adapterKeys{value: "unused"}, Audit: f.audit, Runner: runner,
+			Sessions:     &authorizetest.MemBinder{},
 			Entitlements: &entitlement.Cache{Source: directory{"sso|alice": {authzGroup}, "sso|bob": {}}},
 			GCPTokens: &httpcatalog.GCPTokens{Root: gcpRoot{}, Client: client, STSURL: "https://sts.googleapis.com/v1/token",
 				IAMCredentialsURL: "https://iamcredentials.googleapis.com"}}

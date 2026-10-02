@@ -3,11 +3,14 @@ package cmd
 import (
 	"context"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/Infisical/agent-vault/internal/httpcatalog"
 	"github.com/Infisical/agent-vault/internal/server"
 )
 
@@ -42,5 +45,39 @@ func TestHTTPHeaderAdapterStartupRefusals(t *testing.T) {
 func TestGitHubAppSignerRequiresAKeyLocation(t *testing.T) {
 	if _, err := githubAppSigner(nil, func(string) string { return "" }); err == nil || !strings.Contains(err.Error(), "GITHUB_APP") {
 		t.Fatalf("git entries without an App key location: %v", err)
+	}
+}
+
+// The broker's Auth0 logins reach only an Auth0 domain the catalog names, on
+// 443, and never follow a redirect.
+func TestAuth0ClientDialsOnlyCatalogDomains(t *testing.T) {
+	catalog, err := httpcatalog.Parse([]byte(`{"entries":[{"name":"staging-app","kind":"browser-session","host":"api.example.com",
+		"placeholder":"__vault_STAGING_APP__","pools":["pool-a"],"browserSession":{"appHost":"app.example.com",
+		"auth0":{"domain":"auth.example.com","clientID":"spaClient1","audience":"https://api.example.com","realm":"Username-Password-Authentication",
+		"tokenClient":{"mount":"gatehouse","path":"browser/client"}},"user":{"mount":"gatehouse","path":"browser/qa-user"}}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dialed []string
+	client := auth0Client(catalog, func(_ context.Context, _, addr string) (net.Conn, error) {
+		dialed = append(dialed, addr)
+		return nil, net.ErrClosed
+	})
+	dial := client.Transport.(*http.Transport).DialContext
+	for _, addr := range []string{"auth.example.com:443", "AUTH.example.com:443"} {
+		if _, err := dial(context.Background(), "tcp", addr); err != net.ErrClosed {
+			t.Errorf("%s refused: %v", addr, err)
+		}
+	}
+	for _, addr := range []string{"api.example.com:443", "collector.example.net:443", "auth.example.com:80", "auth.example.com"} {
+		if _, err := dial(context.Background(), "tcp", addr); err == nil || err == net.ErrClosed {
+			t.Errorf("%s dialed", addr)
+		}
+	}
+	if len(dialed) != 2 {
+		t.Fatalf("dialed %v", dialed)
+	}
+	if client.CheckRedirect == nil || client.CheckRedirect(nil, nil) != http.ErrUseLastResponse {
+		t.Fatal("redirects followed")
 	}
 }

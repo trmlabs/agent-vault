@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/Infisical/agent-vault/internal/auditchain"
+	"github.com/Infisical/agent-vault/internal/authorize/authorizetest"
 	"github.com/Infisical/agent-vault/internal/brokercore"
 	"github.com/Infisical/agent-vault/internal/entitlement"
 	"github.com/Infisical/agent-vault/internal/httpcatalog"
@@ -58,7 +59,7 @@ func authzProxy(t *testing.T) (*Proxy, *httpcatalog.Entry, *httpcatalog.Entry) {
 		"slack": {Kind: runnerid.KindAgent, Subject: "agent:1", Pools: []string{"ccpool_abc"}},
 		"other": {Kind: runnerid.KindPerson, Subject: "sso|alice", Pools: []string{"ccpool_zzz"}},
 	}
-	p := &Proxy{adapter: &HeaderAdapter{Catalog: catalog, Runner: runner,
+	p := &Proxy{adapter: &HeaderAdapter{Catalog: catalog, Runner: runner, Sessions: &authorizetest.MemBinder{},
 		Entitlements: &entitlement.Cache{Source: directory{"sso|alice": {authzGroup}, "sso|bob": {}}}}}
 	open, _ := catalog.Match("api.vendor.example", 443, "GET", "/open/x", "claude")
 	gated, _ := catalog.Match("api.vendor.example", 443, "GET", "/gated/x", "claude")
@@ -87,7 +88,7 @@ func TestAuthorizeModel(t *testing.T) {
 	for _, c := range cases {
 		event := auditchain.Event{}
 		ctx := withSessionToken(context.Background(), c.token)
-		got := p.authorize(ctx, &brokercore.ProxyScope{Pool: c.pool, AgentID: "a"}, c.entry, &event)
+		got := p.authorize(ctx, &brokercore.ProxyScope{Pool: c.pool, AgentID: "a", WorkloadID: "pod-a"}, c.entry, &event)
 		if got != c.want {
 			t.Errorf("%s: got %q want %q", c.name, got, c.want)
 		}
