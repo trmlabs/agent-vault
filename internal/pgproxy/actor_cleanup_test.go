@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Infisical/agent-vault/internal/hashicorp"
 	"github.com/Infisical/agent-vault/internal/runtimestatus"
 	"github.com/Infisical/agent-vault/internal/store"
 )
@@ -87,6 +88,11 @@ func TestBrokerAttributesConnectionToAuthenticatedActor(t *testing.T) {
 
 func TestCleanupSnapshotPartitionsByActor(t *testing.T) {
 	client, st, _ := durableFixture(t)
+	checkCleanupSnapshotPartition(t, client, st)
+}
+
+func checkCleanupSnapshotPartition(t *testing.T, client *hashicorp.Client, st *store.SQLStore) {
+	t.Helper()
 	m, err := NewDurableLeaseMinter(context.Background(), client, st, DurableLeaseOptions{RetryInterval: time.Hour, OwnerTTL: time.Hour})
 	if err != nil {
 		t.Fatal(err)

@@ -174,14 +174,21 @@ func TestCheckDatabaseCleanupOwnerDoesNotExtendClaim(t *testing.T) {
 	}
 }
 
-func TestDatabaseCleanupRecordsActor(t *testing.T) {
-	s := openTestDB(t)
+func TestDatabaseCleanupRecordsActor(t *testing.T) { checkDatabaseCleanupRecordsActor(t, openTestDB(t)) }
+
+func checkDatabaseCleanupRecordsActor(t *testing.T, s *SQLStore) {
+	t.Helper()
 	ctx := context.Background()
 	now := time.Now()
 	if err := s.ClaimDatabaseCleanupOwner(ctx, "owner", now, now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	for _, record := range []DatabaseCleanup{{Accessor: "a", Binding: "vault/db", ActorID: "agent-one"}, {Accessor: "b", Binding: "vault/db"}} {
+	t.Cleanup(func() {
+		_ = s.DeleteDatabaseCleanup(ctx, "actor-a")
+		_ = s.DeleteDatabaseCleanup(ctx, "actor-b")
+		_ = s.ReleaseDatabaseCleanupOwner(ctx, "owner")
+	})
+	for _, record := range []DatabaseCleanup{{Accessor: "actor-a", Binding: "vault/db", ActorID: "agent-one"}, {Accessor: "actor-b", Binding: "vault/db"}} {
 		if err := s.AddDatabaseCleanup(ctx, "owner", record); err != nil {
 			t.Fatal(err)
 		}
@@ -196,7 +203,14 @@ func TestDatabaseCleanupRecordsActor(t *testing.T) {
 // survive the upgrade unchanged and read back as unattributed.
 func TestDatabaseCleanupActorMigrationKeepsLegacyRecordsUnattributed(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy.db")
-	s, err := Open(path)
+	checkDatabaseCleanupActorMigration(t, func() (*SQLStore, error) { return Open(path) })
+}
+
+// checkDatabaseCleanupActorMigration rewinds the journal to its pre-attribution
+// shape with pending records, then proves reopening upgrades it exactly once.
+func checkDatabaseCleanupActorMigration(t *testing.T, open func() (*SQLStore, error)) {
+	t.Helper()
+	s, err := open()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +229,7 @@ func TestDatabaseCleanupActorMigrationKeepsLegacyRecordsUnattributed(t *testing.
 		t.Fatal(err)
 	}
 	for range 2 { // The second open proves the migration is recorded once.
-		s, err = Open(path)
+		s, err = open()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -228,6 +242,16 @@ func TestDatabaseCleanupActorMigrationKeepsLegacyRecordsUnattributed(t *testing.
 			t.Fatalf("legacy records changed: %+v", rows)
 		}
 		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s, err = open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	for _, accessor := range []string{"legacy-known", "legacy-unknown"} {
+		if err := s.DeleteDatabaseCleanup(context.Background(), accessor); err != nil {
 			t.Fatal(err)
 		}
 	}

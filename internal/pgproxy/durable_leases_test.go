@@ -37,6 +37,11 @@ func durableFixture(t *testing.T) (*hashicorp.Client, *store.SQLStore, *durableV
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
+	return durableFixtureOn(t, st)
+}
+
+func durableFixtureOn(t *testing.T, st *store.SQLStore) (*hashicorp.Client, *store.SQLStore, *durableVaultFixture) {
+	t.Helper()
 	f := &durableVaultFixture{live: make(map[string]bool), journal: st}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
