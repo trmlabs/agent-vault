@@ -205,7 +205,9 @@ func (p *livePod) deadline(b *Binding, c claims, peer netip.Addr, now time.Time)
 	// ownerReferences are written by whoever creates the Pod, so this is not
 	// proof the controller made it: anyone who may create Pods under this
 	// service account in this namespace can name an approved controller.
-	// That right, restricted by RBAC or an admission policy, is the boundary.
+	// That right is the boundary. Today it is namespace RBAC: only the pool
+	// controller's service account may create Pods in the worker namespace.
+	// An admission policy pinning the controller reference would harden it.
 	// Controllers always set blockOwnerDeletion, and with the
 	// OwnerReferencesPermissionEnforcement admission plugin setting it needs
 	// update rights on the owner's finalizers, so it is required.
