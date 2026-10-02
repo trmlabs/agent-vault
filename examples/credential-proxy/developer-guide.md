@@ -141,7 +141,8 @@ HTTP refusals carry an `X-Request-Id` header. Give it to Security to find the
 exact audit row. Database refusals reach the client from the sidecar with the
 fixed text below, at connect time and inside a session; Gatehouse's own text
 never reaches the worker. Refusing one query inside a session leaves the
-session open. Errors from PostgreSQL itself, such as a syntax error or a
+session open, unless earlier messages of the same batch had already reached
+the database; then the session ends. Errors from PostgreSQL itself, such as a syntax error or a
 PostgreSQL permission error, pass through unchanged. For anything unclear,
 give Security the pool and the time to find the audit row.
 
