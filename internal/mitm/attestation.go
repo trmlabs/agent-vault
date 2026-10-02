@@ -100,15 +100,23 @@ func peerFromContext(ctx context.Context) (netip.Addr, error) {
 
 // resolveScope admits a worker. With an Attestor it uses the projected token
 // and the connection's real peer; the token-review SessionResolver is used
-// only when no Attestor is configured. A scope past its NotAfter is refused.
-func (p *Proxy) resolveScope(ctx context.Context, token, hint string, peer netip.Addr, peerErr error) (*brokercore.ProxyScope, error) {
+// only when no Attestor is configured. A recheck inside an open tunnel uses
+// Reattest when the Attestor has it, because the tunnel outlives its token.
+// A scope past its NotAfter is refused.
+func (p *Proxy) resolveScope(ctx context.Context, token, hint string, peer netip.Addr, peerErr error, recheck bool) (*brokercore.ProxyScope, error) {
 	if p.attestor == nil {
 		return p.sessions.ResolveForProxy(ctx, token, hint)
 	}
 	if peerErr != nil || !peer.IsValid() {
 		return nil, brokercore.ErrInvalidSession
 	}
-	scope, err := p.attestor.Attest(ctx, token, peer)
+	var scope *brokercore.ProxyScope
+	var err error
+	if again, ok := p.attestor.(brokercore.Reattestor); ok && recheck {
+		scope, err = again.Reattest(ctx, token, peer)
+	} else {
+		scope, err = p.attestor.Attest(ctx, token, peer)
+	}
 	if err != nil || scope == nil {
 		return nil, brokercore.ErrInvalidSession
 	}

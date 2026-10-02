@@ -38,7 +38,7 @@ func (a *recordingAudit) recorded() []auditchain.Event {
 func auditedBroker(t *testing.T, audit *recordingAudit, minter *fakeMinter, upstreamAddr string, authErr error) string {
 	t.Helper()
 	_, addr := startBroker(t, Options{
-		Auth:      &fakeAuth{scope: &AgentScope{VaultID: "vault-1", ActorID: "pool-agent", WorkloadID: "pod-uid-1"}, err: authErr},
+		Auth:      &fakeAuth{scope: &AgentScope{VaultID: "vault-1", ActorID: "agent-uuid-1", Pool: "pool-agent", WorkloadID: "pod-uid-1"}, err: authErr},
 		Databases: &fakeResolver{svc: &DatabaseService{Name: "analytics", Addr: upstreamAddr, Mount: "database", Role: "readonly"}},
 		Leases:    minter,
 		Audit:     audit,
@@ -62,7 +62,7 @@ func TestBrokerAuditsSessionLifecycle(t *testing.T) {
 		t.Fatalf("lifecycle rows: %+v", got)
 	}
 	for _, e := range got {
-		if e.Pool != "pool-agent" || e.PodUID != "pod-uid-1" || e.Binding != "vault-1/analytics" {
+		if e.Pool != "pool-agent" || e.Agent != "agent-uuid-1" || e.PodUID != "pod-uid-1" || e.Binding != "vault-1/analytics" {
 			t.Fatalf("attribution: %+v", e)
 		}
 		for _, secret := range []string{lease.Password, lease.Username, lease.ID, "agent-vault-token-xyz"} {
@@ -84,7 +84,7 @@ func TestBrokerRefusesSessionWhenAuditUnavailable(t *testing.T) {
 	if minter.mintCallCount() != 0 {
 		t.Fatal("credential minted while audit unavailable")
 	}
-	if got := audit.recorded(); len(got) != 1 || got[0].Event != auditchain.EventDenied || got[0].Outcome != "audit_unavailable" || got[0].Pool != "pool-agent" {
+	if got := audit.recorded(); len(got) != 1 || got[0].Event != auditchain.EventDenied || got[0].Outcome != "audit_unavailable" || got[0].Agent != "agent-uuid-1" {
 		t.Fatalf("refusal rows: %+v", got)
 	}
 }

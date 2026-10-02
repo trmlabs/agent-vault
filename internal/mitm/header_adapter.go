@@ -61,7 +61,7 @@ func (p *Proxy) adapterDeny(w http.ResponseWriter, event auditchain.Event, statu
 // adapterUnauthenticatedDeny replaces the SQL audit for refusals that happen
 // before identity is known, so every refusal lands in the signed trail.
 func (p *Proxy) adapterUnauthenticatedDeny(w http.ResponseWriter, r *http.Request, a requestlog.Attempt, status int) {
-	p.adapterDeny(w, auditchain.Event{Pool: a.ActorID, PodUID: a.WorkloadID, Method: auditMethod(r.Method)}, status, "refused")
+	p.adapterDeny(w, auditchain.Event{Agent: a.ActorID, PodUID: a.WorkloadID, Method: auditMethod(r.Method)}, status, "refused")
 }
 
 func auditMethod(m string) string {
@@ -82,7 +82,7 @@ func (p *Proxy) forwardCatalog(w http.ResponseWriter, r *http.Request, target, h
 	a := p.adapter
 	event := auditchain.Event{Session: newRequestID(), Method: auditMethod(r.Method)}
 	if scope != nil {
-		event.Pool, event.PodUID = scope.AgentID, scope.WorkloadID
+		event.Pool, event.Agent, event.PodUID = scope.Pool, scope.AgentID, scope.WorkloadID
 	}
 	w.Header().Set("X-Request-Id", event.Session)
 	deny := func(status int, outcome string) { p.adapterDeny(w, event, status, outcome) }
@@ -99,15 +99,15 @@ func (p *Proxy) forwardCatalog(w http.ResponseWriter, r *http.Request, target, h
 		return
 	}
 	catalog := a.Catalog.Current()
-	if git, ok, err := catalog.GitMatch(host, port, r.Method, r.URL.Path, r.URL.RawQuery, scope.AgentID); ok {
+	if git, ok, err := catalog.GitMatch(host, port, r.Method, r.URL.Path, r.URL.RawQuery, scope.Pool); ok {
 		p.forwardGit(w, r, target, scope, event, git, err)
 		return
 	}
-	if api, ok, err := catalog.GitHubAPIMatch(host, port, r.Method, r.URL.Path, r.URL.RawQuery, scope.AgentID); ok {
+	if api, ok, err := catalog.GitHubAPIMatch(host, port, r.Method, r.URL.Path, r.URL.RawQuery, scope.Pool); ok {
 		p.forwardGitHubAPI(w, r, target, scope, event, api, err)
 		return
 	}
-	entry, err := catalog.Match(host, port, r.Method, r.URL.Path, scope.AgentID)
+	entry, err := catalog.Match(host, port, r.Method, r.URL.Path, scope.Pool)
 	if entry != nil {
 		event.Binding = entry.Name
 	}

@@ -164,7 +164,7 @@ func newAdapterFixture(t *testing.T, options ...func(*Options)) *adapterFixture 
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.sessions = &scopeResolver{scope: &brokercore.ProxyScope{VaultID: "vault-1", AgentID: "pool-agent", WorkloadID: "pod-uid-1", VaultRole: "proxy"}}
+	f.sessions = &scopeResolver{scope: &brokercore.ProxyScope{VaultID: "vault-1", AgentID: "agent-uuid-1", Pool: "pool-agent", WorkloadID: "pod-uid-1", VaultRole: "proxy"}}
 	proxyURL, roots, p := setupProxy(t, f.sessions, &fakeCredProvider{}, func(o *Options) {
 		o.StrictCredentialProxy = true
 		o.HeaderAdapter = &HeaderAdapter{Catalog: catalog, Keys: f.keys, Audit: f.audit}
@@ -230,7 +230,7 @@ func TestAdapterInjectsKeyForPlaceholderOrOmittedHeader(t *testing.T) {
 		t.Fatalf("audit: %+v", events)
 	}
 	for _, e := range events {
-		if e.Pool != "pool-agent" || e.PodUID != "pod-uid-1" || e.Binding != "llm" || e.Method != "POST" || e.Session == "" {
+		if e.Pool != "pool-agent" || e.Agent != "agent-uuid-1" || e.PodUID != "pod-uid-1" || e.Binding != "llm" || e.Method != "POST" || e.Session == "" {
 			t.Fatalf("attribution: %+v", e)
 		}
 	}
@@ -259,7 +259,7 @@ func TestAdapterRefusesOutsideTheCatalog(t *testing.T) {
 		t.Fatalf("unlisted host tunnelled: %v %+v", err, f.audit.last())
 	}
 	// A pool without the grant matches the route but is refused.
-	other := &brokercore.ProxyScope{VaultID: "vault-1", AgentID: "other-pool", WorkloadID: "pod-9"}
+	other := &brokercore.ProxyScope{VaultID: "vault-1", AgentID: "agent-uuid-9", Pool: "other-pool", WorkloadID: "pod-9"}
 	f.sessions.set(other)
 	if code, _, _ := f.do(t, "POST", "/v1/chat/completions", "{}", nil); code != 403 || f.audit.last().Outcome != "pool" || f.calls.Load() != 0 {
 		t.Fatalf("ungranted pool: %d %+v", code, f.audit.last())
@@ -385,5 +385,14 @@ func TestAdapterFailsClosed(t *testing.T) {
 	invalid.forwardStrict(rec, httptest.NewRequest("GET", "https://example.com/", nil), "example.com:443", "example.com", 443, true, nil)
 	if rec.Code != 503 {
 		t.Fatalf("incomplete adapter served: %d", rec.Code)
+	}
+}
+
+// A verified agent whose scope carries no catalog pool reaches nothing.
+func TestAdapterRefusesAScopeWithoutAPool(t *testing.T) {
+	f := newAdapterFixture(t)
+	f.sessions.set(&brokercore.ProxyScope{VaultID: "vault-1", AgentID: "agent-uuid-1", WorkloadID: "pod-uid-1"})
+	if code, _, _ := f.do(t, "POST", "/v1/chat/completions", "{}", nil); code != 403 || f.audit.last().Outcome != "pool" || f.calls.Load() != 0 {
+		t.Fatalf("pool-less scope admitted: %d %+v", code, f.audit.last())
 	}
 }

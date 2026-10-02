@@ -34,7 +34,7 @@ func (a *fakeAttestor) Attest(_ context.Context, token string, peer netip.Addr) 
 	if a.err != nil {
 		return nil, a.err
 	}
-	return &brokercore.ProxyScope{VaultID: "vault-1", AgentID: "pool-agent", WorkloadID: "pod-uid-1", NotAfter: a.notAfter}, nil
+	return &brokercore.ProxyScope{VaultID: "vault-1", AgentID: "agent-uuid-1", Pool: "pool-agent", WorkloadID: "pod-uid-1", NotAfter: a.notAfter}, nil
 }
 
 func (a *fakeAttestor) seen() []netip.Addr {
@@ -248,5 +248,52 @@ func TestProxyHeaderRequiresLoopbackListener(t *testing.T) {
 	}
 	if _, err := l.Accept(); err == nil {
 		t.Fatal("listener left open")
+	}
+}
+
+// reattestingAttestor refuses Attest once its token has "expired" but keeps
+// passing Reattest, like the real pool attestor for a tunnel older than its token.
+type reattestingAttestor struct {
+	fakeAttestor
+	mu        sync.Mutex
+	expired   bool
+	reattests int
+}
+
+func (a *reattestingAttestor) Attest(ctx context.Context, token string, peer netip.Addr) (*brokercore.ProxyScope, error) {
+	a.mu.Lock()
+	expired := a.expired
+	a.mu.Unlock()
+	if expired {
+		return nil, errors.New("token expired")
+	}
+	return a.fakeAttestor.Attest(ctx, token, peer)
+}
+
+func (a *reattestingAttestor) Reattest(ctx context.Context, token string, peer netip.Addr) (*brokercore.ProxyScope, error) {
+	a.mu.Lock()
+	a.reattests++
+	a.mu.Unlock()
+	return a.fakeAttestor.Attest(ctx, token, peer)
+}
+
+// A tunnel opened with a valid token keeps working after the token expires:
+// requests inside it are rechecked with Reattest, which keeps the Pod checks.
+func TestTunnelRechecksUseReattest(t *testing.T) {
+	attestor := &reattestingAttestor{}
+	f := newAdapterFixture(t, func(o *Options) { o.Attestor = attestor })
+	if code, _, err := f.do(t, "POST", "/v1/chat/completions", "{}", nil); err != nil || code != 200 {
+		t.Fatalf("first request: %d %v", code, err)
+	}
+	attestor.mu.Lock()
+	attestor.expired = true
+	attestor.mu.Unlock()
+	if code, _, err := f.do(t, "POST", "/v1/chat/completions", "{}", nil); err != nil || code != 200 {
+		t.Fatalf("request in the open tunnel after token expiry: %d %v", code, err)
+	}
+	attestor.mu.Lock()
+	defer attestor.mu.Unlock()
+	if attestor.reattests < 2 {
+		t.Fatalf("in-tunnel requests used Reattest %d times", attestor.reattests)
 	}
 }

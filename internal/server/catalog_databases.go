@@ -26,7 +26,7 @@ func NewCatalogDatabaseResolver(catalog interface{ Current() httpcatalog.Catalog
 
 func (r catalogDatabaseResolver) ResolveDatabase(_ context.Context, scope pgproxy.AgentScope, requestedDatabase string) (*pgproxy.DatabaseService, error) {
 	catalog := r.catalog.Current()
-	entry, err := catalog.Database(requestedDatabase, scope.ActorID)
+	entry, err := catalog.Database(requestedDatabase, scope.Pool)
 	switch {
 	case errors.Is(err, httpcatalog.ErrPool):
 		return nil, fmt.Errorf("database %q is not granted to this pool", requestedDatabase)

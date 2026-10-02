@@ -24,14 +24,17 @@ func TestCatalogDatabaseResolverFollowsTheLiveCatalog(t *testing.T) {
 	}
 	source := httpcatalog.NewSource(first, 1)
 	r := NewCatalogDatabaseResolver(source)
-	svc, err := r.ResolveDatabase(context.Background(), pgproxy.AgentScope{ActorID: "cursor"}, "b2bcore")
+	svc, err := r.ResolveDatabase(context.Background(), pgproxy.AgentScope{ActorID: "agent-uuid-1", Pool: "cursor"}, "b2bcore")
 	if err != nil || svc.Addr != "p.abc.db.postgresbridge.com:5432" || svc.Database != "core" || svc.SSLMode != "verify-full" || svc.MaxConns != 5 {
 		t.Fatalf("resolved %+v %v", svc, err)
 	}
-	if _, err := r.ResolveDatabase(context.Background(), pgproxy.AgentScope{ActorID: "ci"}, "b2bcore"); err == nil || !strings.Contains(err.Error(), "not granted") {
+	if _, err := r.ResolveDatabase(context.Background(), pgproxy.AgentScope{ActorID: "agent-uuid-2", Pool: "ci"}, "b2bcore"); err == nil || !strings.Contains(err.Error(), "not granted") {
 		t.Fatalf("ungranted pool: %v", err)
 	}
-	if _, err := r.ResolveDatabase(context.Background(), pgproxy.AgentScope{ActorID: "cursor"}, "detect"); err == nil {
+	if _, err := r.ResolveDatabase(context.Background(), pgproxy.AgentScope{ActorID: "agent-uuid-1"}, "b2bcore"); err == nil {
+		t.Fatal("a scope without a catalog pool resolved a database")
+	}
+	if _, err := r.ResolveDatabase(context.Background(), pgproxy.AgentScope{ActorID: "agent-uuid-1", Pool: "cursor"}, "detect"); err == nil {
 		t.Fatal("unknown database resolved")
 	}
 	// A reload that adds a database makes it reachable with no restart.
@@ -51,7 +54,7 @@ func TestCatalogDatabaseResolverFollowsTheLiveCatalog(t *testing.T) {
 			t.Fatal("catalog not reloaded")
 		}
 	}
-	if svc, err := r.ResolveDatabase(context.Background(), pgproxy.AgentScope{ActorID: "cursor"}, "detect"); err != nil || svc.Database != "detect" {
+	if svc, err := r.ResolveDatabase(context.Background(), pgproxy.AgentScope{ActorID: "agent-uuid-1", Pool: "cursor"}, "detect"); err != nil || svc.Database != "detect" {
 		t.Fatalf("reloaded database: %+v %v", svc, err)
 	}
 }

@@ -52,6 +52,7 @@ type BootStore interface {
 type Event struct {
 	Event     string
 	Pool      string
+	Agent     string
 	PodUID    string
 	Binding   string
 	Session   string
@@ -153,14 +154,14 @@ func (c *Chain) Record(e Event) error {
 	if e.Status != 0 && (e.Status < 100 || e.Status > 599) {
 		return ErrInvalidEvent
 	}
-	for _, v := range []string{e.Pool, e.PodUID, e.Binding, e.Session, e.Outcome, e.Requester} {
+	for _, v := range []string{e.Pool, e.Agent, e.PodUID, e.Binding, e.Session, e.Outcome, e.Requester} {
 		if !identifier(v, true) {
 			return ErrInvalidEvent
 		}
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	_, err := c.appendLocked(Row{Event: e.Event, Pool: e.Pool, PodUID: e.PodUID, Binding: e.Binding, Session: e.Session, Outcome: e.Outcome, Requester: e.Requester, Method: e.Method, Status: e.Status})
+	_, err := c.appendLocked(Row{Event: e.Event, Pool: e.Pool, Agent: e.Agent, PodUID: e.PodUID, Binding: e.Binding, Session: e.Session, Outcome: e.Outcome, Requester: e.Requester, Method: e.Method, Status: e.Status})
 	return err
 }
 

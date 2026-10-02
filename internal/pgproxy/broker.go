@@ -379,7 +379,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	}
 	// Audit identity comes only from the verified scope. The binding is added
 	// once the database resolves.
-	event := auditchain.Event{Pool: scope.ActorID, PodUID: scope.WorkloadID, Session: newSessionID()}
+	event := auditchain.Event{Pool: scope.Pool, Agent: scope.ActorID, PodUID: scope.WorkloadID, Session: newSessionID()}
 	refuse := func(outcome, code, message string) {
 		b.auditDenied(event, outcome)
 		writeClientError(backend, code, message)

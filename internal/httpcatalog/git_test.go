@@ -129,3 +129,26 @@ func TestGitHubAPIEntries(t *testing.T) {
 		t.Fatal("git host routed to the API")
 	}
 }
+
+// A scope with no catalog pool (a non-pool agent, or an Attestor that set
+// none) matches no grant of any kind, even on a listed route.
+func TestEmptyPoolMatchesNoGrant(t *testing.T) {
+	doc := `{"pools":[{"name":"pool-a","namespace":"agents","serviceAccount":"worker"}],"entries":[` + validEntry + `,` + gitEntry + `,` + apiEntry + `,
+		{"name":"core","kind":"postgres","host":"p.abc.db.postgresbridge.com","pools":["pool-a"],"postgres":{"database":"core","mount":"database","role":"r-readonly"}}]}`
+	c, err := Parse([]byte(doc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Match("serpapi.com", 443, "GET", "/search", ""); !errors.Is(err, ErrPool) {
+		t.Errorf("header entry: %v", err)
+	}
+	if _, _, err := c.GitMatch("github.com", 443, "POST", "/trmlabs/trm-b2b.git/git-upload-pack", "", ""); !errors.Is(err, ErrPool) {
+		t.Errorf("git entry: %v", err)
+	}
+	if _, _, err := c.GitHubAPIMatch("api.github.com", 443, "POST", "/repos/trmlabs/trm-b2b/pulls", "", ""); !errors.Is(err, ErrPool) {
+		t.Errorf("github-api entry: %v", err)
+	}
+	if _, err := c.Database("core", ""); !errors.Is(err, ErrPool) {
+		t.Errorf("postgres entry: %v", err)
+	}
+}

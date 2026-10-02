@@ -37,7 +37,8 @@ type Row struct {
 	Seq       uint64 `json:"seq"`
 	Time      string `json:"ts"`
 	Event     string `json:"event"`
-	Pool      string `json:"pool,omitempty"`      // broker agent ID of the worker pool
+	Pool      string `json:"pool,omitempty"`      // catalog pool name of the worker
+	Agent     string `json:"agent,omitempty"`     // broker agent ID (store UUID)
 	PodUID    string `json:"podUID,omitempty"`    // verified runtime instance
 	Binding   string `json:"binding,omitempty"`   // vault/service
 	Session   string `json:"session,omitempty"`   // broker-generated session ID
@@ -64,7 +65,7 @@ type Row struct {
 func (r Row) macInput() []byte {
 	fields := []string{
 		r.Type, r.Replica, strconv.FormatUint(r.Boot, 10), strconv.FormatUint(r.Seq, 10), r.Time, r.Event,
-		r.Pool, r.PodUID, r.Binding, r.Session, r.Outcome, r.Requester, r.Method, strconv.Itoa(r.Status),
+		r.Pool, r.Agent, r.PodUID, r.Binding, r.Session, r.Outcome, r.Requester, r.Method, strconv.Itoa(r.Status),
 		strconv.FormatUint(r.SignedSeq, 10), r.SignedMAC, r.Signature,
 		strconv.Itoa(r.PrevKey), strconv.FormatUint(r.PrevBoot, 10), strconv.FormatUint(r.PrevCheckpointSeq, 10), r.PrevCheckpointMAC,
 		strconv.Itoa(r.KeyVersion), r.Prev,

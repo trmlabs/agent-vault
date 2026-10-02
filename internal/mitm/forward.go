@@ -149,7 +149,7 @@ func (p *Proxy) handleForward(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	peer, peerErr := peerFromContext(r.Context())
-	scope, err := p.resolveScope(r.Context(), token, hint, peer, peerErr)
+	scope, err := p.resolveScope(r.Context(), token, hint, peer, peerErr, false)
 	if err != nil {
 		p.recordAuthFailure(r)
 		if p.strictCredentialProxy {
