@@ -41,19 +41,21 @@ func reasonBody(severity, code, reason string) []byte {
 // Each broker reason reaches the worker as its code and fixed words.
 func TestBrokerReasonsBecomeFixedWords(t *testing.T) {
 	for reason, want := range map[string][2]string{
-		"actor_limit":    {"53300", "this worker reached its session cap"},
-		"database_limit": {"53300", "the database's Gatehouse connection budget is full; retry shortly"},
-		"pool_budget":    {"53300", "the database's Gatehouse connection budget is full; retry shortly"},
-		"capacity":       {"53300", "Gatehouse is at capacity; retry shortly"},
-		"pinned_share":   {"53300", "no session-mode database connection is free"},
-		"not_ready":      {"57P03", "Gatehouse is starting; retry in a few seconds"},
-		"no_database":    {"3D000", "this database isn't in the Gatehouse catalog for your pool"},
-		"authentication": {"28000", "Gatehouse could not verify this worker"},
-		"upstream":       {"08006", "Gatehouse could not reach the database; retry"},
-		"credential":     {"08006", "Gatehouse could not get a database credential; retry shortly"},
-		"restarting":     {"57P01", "Gatehouse is restarting; reconnect"},
-		"not_entitled":   {"42501", "not authorized for this database"},
-		"no_person":      {"42501", "not authorized for this database"},
+		"actor_limit":     {"53300", "this worker reached its session cap"},
+		"database_limit":  {"53300", "the database's Gatehouse connection budget is full; retry shortly"},
+		"pool_budget":     {"53300", "the database's Gatehouse connection budget is full; retry shortly"},
+		"capacity":        {"53300", "Gatehouse is at capacity; retry shortly"},
+		"pinned_share":    {"53300", "no session-mode database connection is free"},
+		"not_ready":       {"57P03", "Gatehouse is starting; retry in a few seconds"},
+		"no_database":     {"3D000", "this database isn't in the Gatehouse catalog for your pool"},
+		"authentication":  {"28000", "Gatehouse could not verify this worker"},
+		"upstream":        {"08006", "Gatehouse could not reach the database; retry"},
+		"credential":      {"08006", "Gatehouse could not get a database credential; retry shortly"},
+		"restarting":      {"57P01", "Gatehouse is restarting; reconnect"},
+		"role_change":     {"42501", "Gatehouse refuses ALTER ROLE, ALTER USER and ALTER DATABASE"},
+		"statement_limit": {"54000", "too many prepared statements"},
+		"not_entitled":    {"42501", "not authorized for this database"},
+		"no_person":       {"42501", "not authorized for this database"},
 	} {
 		// Authorization decisions have many reasons and one code, 42501.
 		frame := refusalFrame(reasonBody("FATAL", want[0], reason))
