@@ -5,11 +5,11 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
 	"strings"
-	"log/slog"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -177,7 +177,9 @@ type spoofedListener struct{ net.Listener }
 
 type spoofedConn struct{ net.Conn }
 
-func (spoofedConn) RemoteAddr() net.Addr { return &net.TCPAddr{IP: net.ParseIP("10.9.8.7"), Port: 40000} }
+func (spoofedConn) RemoteAddr() net.Addr {
+	return &net.TCPAddr{IP: net.ParseIP("10.9.8.7"), Port: 40000}
+}
 
 func (l spoofedListener) Accept() (net.Conn, error) {
 	c, err := l.Listener.Accept()
@@ -219,7 +221,7 @@ func TestForgedProxyHeaderFromNonLoopbackPeerIsRefused(t *testing.T) {
 		defer c.Close()
 		_ = c.SetDeadline(time.Now().Add(3 * time.Second))
 		_, _ = io.WriteString(c, "PROXY TCP4 10.20.30.40 10.0.0.1 51000 14443\r\nCONNECT example.com:443 HTTP/1.1\r\n"+
-			"Host: example.com:443\r\nProxy-Authorization: Basic d29ya2xvYWQtdG9rZW46\r\n\r\n")
+			"Host: example.com:443\r\nConnection: close\r\nProxy-Authorization: Basic d29ya2xvYWQtdG9rZW46\r\n\r\n")
 		response, _ := io.ReadAll(c)
 		return parsed.Load(), attestor.seen(), string(response)
 	}
