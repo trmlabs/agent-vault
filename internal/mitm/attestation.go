@@ -57,9 +57,9 @@ func (c *peerConn) resolve() {
 			c.err = errNoPeer
 			return
 		}
-		_ = c.Conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
 		c.peer, c.err = c.reader(c.Conn)
-		_ = c.Conn.SetReadDeadline(time.Time{})
+		_ = c.SetReadDeadline(time.Time{})
 		if c.err != nil {
 			c.err = errNoPeer
 		}
