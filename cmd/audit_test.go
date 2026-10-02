@@ -5,7 +5,10 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -70,18 +73,53 @@ func TestAuditVerifyExitStatus(t *testing.T) {
 
 func TestBrokerAuditChainSettings(t *testing.T) {
 	t.Setenv("AGENT_VAULT_AUDIT_CHAIN", "")
-	if chain, err := brokerAuditChain(context.Background(), nil, nil, func(string) string { return "" }); chain != nil || err != nil {
+	var logs bytes.Buffer
+	if chain, err := brokerAuditChain(context.Background(), nil, nil, func(string) string { return "" }, slog.New(slog.NewTextHandler(&logs, nil))); chain != nil || err != nil {
 		t.Fatalf("disabled chain started: %v", err)
+	}
+	if !strings.Contains(logs.String(), "audit trail is off") {
+		t.Fatalf("disabled chain started without a warning: %q", logs.String())
 	}
 	t.Setenv("AGENT_VAULT_AUDIT_CHAIN", "1")
 	for _, env := range []map[string]string{
 		{},
 		{"AGENT_VAULT_AUDIT_HMAC_PATH": "gatehouse/audit-hmac"},
 		{"AGENT_VAULT_AUDIT_TRANSIT_KEY": "gatehouse-audit"},
-		{"AGENT_VAULT_AUDIT_HMAC_PATH": "gatehouse/audit-hmac", "AGENT_VAULT_AUDIT_TRANSIT_KEY": "gatehouse-audit"}, // no Vault client
+		{"AGENT_VAULT_AUDIT_HMAC_PATH": "gatehouse/audit-hmac", "AGENT_VAULT_AUDIT_TRANSIT_KEY": "gatehouse-audit"},                                          // no replica name
+		{"AGENT_VAULT_AUDIT_HMAC_PATH": "gatehouse/audit-hmac", "AGENT_VAULT_AUDIT_TRANSIT_KEY": "gatehouse-audit", "AGENT_VAULT_AUDIT_REPLICA": "broker-0"}, // no Vault client
 	} {
-		if _, err := brokerAuditChain(context.Background(), nil, nil, func(k string) string { return env[k] }); err == nil {
+		if _, err := brokerAuditChain(context.Background(), nil, nil, func(k string) string { return env[k] }, slog.New(slog.DiscardHandler)); err == nil {
 			t.Fatalf("incomplete audit settings accepted: %v", env)
 		}
+	}
+}
+
+// audit heads output is what audit verify --heads reads back.
+func TestAuditHeadsRoundTrip(t *testing.T) {
+	var out bytes.Buffer
+	for _, head := range []store.AuditHead{{Replica: "broker-0", Boot: 3, CheckpointSeq: 9, CheckpointMAC: "mac-nine"}, {Replica: "broker-1", Boot: 1}} {
+		data, err := json.Marshal(head)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out.Write(append(data, '\n'))
+	}
+	path := filepath.Join(t.TempDir(), "heads.jsonl")
+	if err := os.WriteFile(path, out.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	heads, err := readAuditHeads(path)
+	want := []auditchain.Head{{Replica: "broker-0", Boot: 3, CheckpointSeq: 9, CheckpointMAC: "mac-nine"}, {Replica: "broker-1", Boot: 1}}
+	if err != nil || len(heads) != 2 || heads[0] != want[0] || heads[1] != want[1] {
+		t.Fatalf("heads %+v %v", heads, err)
+	}
+	if err := os.WriteFile(path, []byte(`{"replica":"broker-0","boot":1,"extra":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readAuditHeads(path); err == nil {
+		t.Fatal("heads file with an unknown field accepted")
+	}
+	if heads, err := readAuditHeads(""); heads != nil || err != nil {
+		t.Fatal("no heads file must mean no head check")
 	}
 }

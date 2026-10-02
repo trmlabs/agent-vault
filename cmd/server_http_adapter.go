@@ -37,6 +37,11 @@ func brokerCatalog(ctx context.Context, client *hashicorp.Client, getenv func(st
 	if sharedCatalog.started {
 		return sharedCatalog.source, nil
 	}
+	// Test harnesses whose fixture database serves no TLS only.
+	if v := getenv("AGENT_VAULT_CATALOG_PLAINTEXT_DATABASES"); v == "1" || v == "true" {
+		httpcatalog.PlaintextDatabases.Store(true)
+		logger.Warn("broker catalog: plaintext database entries allowed (AGENT_VAULT_CATALOG_PLAINTEXT_DATABASES); never set this outside a test harness")
+	}
 	var source *httpcatalog.Source
 	if location := getenv("AGENT_VAULT_CATALOG_VAULT_PATH"); location != "" {
 		mount, path, ok := strings.Cut(location, "/")
@@ -88,7 +93,7 @@ func httpHeaderAdapter(ctx context.Context, srv *server.Server, getenv func(stri
 	if err != nil {
 		return nil, err
 	}
-	chain, err := sharedAuditChain(ctx, client, srv.CleanupStore(), getenv)
+	chain, err := sharedAuditChain(ctx, client, srv.CleanupStore(), getenv, srv.Logger())
 	if err != nil {
 		return nil, err
 	}
@@ -109,7 +114,15 @@ func httpHeaderAdapter(ctx context.Context, srv *server.Server, getenv func(stri
 		if api != "" && !strings.HasPrefix(api, "https://") {
 			return nil, fmt.Errorf("AGENT_VAULT_GITHUB_API_URL must be https")
 		}
-		adapter.GitTokens = &githubapp.Minter{Signer: signer, API: api}
+		minter := &githubapp.Minter{Signer: signer, API: api}
+		adapter.GitTokens = minter
+		// A catalog change that removes or narrows a repository revokes the
+		// tokens it no longer grants instead of letting them run out.
+		source.OnChange(func(c httpcatalog.Catalog) {
+			minter.Prune(func(installation int64, repo string, p githubapp.Permissions) bool {
+				return c.GitGranted(installation, repo, gitScope(p))
+			})
+		})
 	case githubEntries:
 		return nil, err
 	}
@@ -132,6 +145,18 @@ func auth0Client(catalog interface{ Current() httpcatalog.Catalog }, dial func(c
 	return &http.Client{Timeout: 10 * time.Second,
 		Transport:     &http.Transport{DialContext: pinned, TLSHandshakeTimeout: 5 * time.Second},
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+}
+
+// gitScope names a token's permissions as the catalog grants them.
+func gitScope(p githubapp.Permissions) string {
+	switch {
+	case p.PullRequests == "write":
+		return "pull-requests"
+	case p.Contents == "write":
+		return "contents-write"
+	default:
+		return "contents-read"
+	}
 }
 
 // githubAppSigner signs App JWTs with the App key imported into Transit, so

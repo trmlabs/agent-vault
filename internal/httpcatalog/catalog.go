@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync/atomic"
 )
 
 // Entry is one binding: an exact host, the paths and methods allowed on it,
@@ -272,7 +273,7 @@ func (e *Entry) normalize() error {
 		return errors.New("at least one path prefix is required")
 	}
 	for _, p := range e.PathPrefixes {
-		if !strings.HasPrefix(p, "/") || strings.ContainsAny(p, "?#%*{} \\") || strings.Contains(p, "//") || strings.Contains(p, "/..") || strings.Contains(p, "/./") || strings.Contains(p, "__") {
+		if !strings.HasPrefix(p, "/") || strings.ContainsAny(p, "?#%*{} \\;") || strings.Contains(p, "//") || strings.Contains(p, "/..") || strings.Contains(p, "/./") || strings.Contains(p, "__") {
 			return fmt.Errorf("invalid path prefix %q", p)
 		}
 	}
@@ -339,12 +340,15 @@ func (e *Entry) normalizePostgres() error {
 			return errors.New("invalid Vault database mount")
 		}
 	}
-	switch p.SSLMode {
-	case "":
+	// Modes that skip the certificate check let anyone on the network path
+	// relay SCRAM and hold a session as the minted user.
+	switch {
+	case p.SSLMode == "":
 		p.SSLMode = "verify-full"
-	case "disable", "prefer", "require", "verify-full":
+	case p.SSLMode == "verify-full":
+	case p.SSLMode == "disable" && PlaintextDatabases.Load():
 	default:
-		return fmt.Errorf("invalid sslmode %q", p.SSLMode)
+		return fmt.Errorf("sslmode %q: catalog databases use verify-full", p.SSLMode)
 	}
 	if p.MaxConns < 0 || p.MaxConns > 1000 {
 		return errors.New("maxConns out of range")
@@ -630,6 +634,34 @@ func (c Catalog) HasAuth0Domain(host string) bool {
 
 // Entries returns a copy of the catalog, for wiring and diagnostics.
 func (c Catalog) Entries() []Entry { return append([]Entry(nil), c.entries...) }
+
+// GitGranted reports whether some entry still lets the installation's tokens
+// reach repo at a scope: "contents-read" (a git entry), "contents-write" (a git
+// entry with write access) or "pull-requests" (a github-api entry).
+func (c Catalog) GitGranted(installation int64, repo, scope string) bool {
+	for _, e := range c.entries {
+		if e.Git == nil || e.Git.InstallationID != installation {
+			continue
+		}
+		for _, r := range e.Git.Repos {
+			if !strings.EqualFold(r.Repo, repo) {
+				continue
+			}
+			switch {
+			case e.Kind == "git" && scope == "contents-read",
+				e.Kind == "git" && scope == "contents-write" && r.Access == "write",
+				e.Kind == "github-api" && scope == "pull-requests":
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// PlaintextDatabases lets a database entry use sslmode disable. Only a test
+// harness whose fixture database serves no TLS sets it, once at startup
+// (AGENT_VAULT_CATALOG_PLAINTEXT_DATABASES); the catalog validator never does.
+var PlaintextDatabases atomic.Bool
 
 func pathWithin(path, prefix string) bool {
 	if !strings.HasPrefix(path, prefix) {

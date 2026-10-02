@@ -15,7 +15,7 @@ const databaseCatalog = `{"pools":[{"name":"cursor","namespace":"agents","servic
  {"name":"b2bcore","kind":"postgres","host":"p.abc.db.postgresbridge.com","pools":["cursor"],
   "postgres":{"database":"core","mount":"database","role":"staging.us.crunchy.core-readonly","maxConns":20}},
  {"name":"auditlog","kind":"postgres","host":"p.abc.db.postgresbridge.com","pools":["cursor","ci"],
-  "postgres":{"database":"auditlog","mount":"database","role":"staging.us.crunchy.auditlog-readonly","sslmode":"require","maxConns":5}}]}`
+  "postgres":{"database":"auditlog","mount":"database","role":"staging.us.crunchy.auditlog-readonly","sslmode":"verify-full","maxConns":5}}]}`
 
 func TestCatalogDatabaseResolverFollowsTheLiveCatalog(t *testing.T) {
 	first, err := httpcatalog.Parse([]byte(databaseCatalog))
