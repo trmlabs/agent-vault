@@ -55,6 +55,12 @@ type HeaderAdapter struct {
 		Token(context.Context, *httpcatalog.Entry) (httpcatalog.BrowserToken, error)
 		Invalidate(*httpcatalog.Entry)
 	}
+	// GCPTokens mints per-entry Google tokens for gcp entries. Without it,
+	// those requests are refused.
+	GCPTokens interface {
+		Token(context.Context, *httpcatalog.Entry) (httpcatalog.GCPToken, error)
+		Invalidate(*httpcatalog.Entry)
+	}
 }
 
 func (a *HeaderAdapter) valid() bool {
@@ -142,6 +148,12 @@ func (p *Proxy) forwardCatalog(w http.ResponseWriter, r *http.Request, target, h
 	if browser, ok, err := catalog.BrowserMatch(host, port, r.Method, r.URL.Path, scope.Pool); ok {
 		if !refused(browser.Entry, err) {
 			p.forwardBrowser(w, r, target, scope, event, browser, err)
+		}
+		return
+	}
+	if gcp, ok, err := catalog.GCPMatch(host, port, r.Method, r.URL.Path, scope.Pool); ok {
+		if !refused(gcp, err) {
+			p.forwardGCP(w, r, target, scope, event, gcp, err)
 		}
 		return
 	}

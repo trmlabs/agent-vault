@@ -15,6 +15,7 @@ import (
 	"github.com/Infisical/agent-vault/internal/mitm"
 	"github.com/Infisical/agent-vault/internal/netguard"
 	"github.com/Infisical/agent-vault/internal/server"
+	"golang.org/x/oauth2/google"
 )
 
 var sharedCatalog struct {
@@ -102,9 +103,20 @@ func httpHeaderAdapter(ctx context.Context, srv *server.Server, getenv func(stri
 	// the same guarded dialer as every other upstream.
 	adapter.BrowserTokens = &httpcatalog.Auth0Tokens{Keys: keys, Client: &http.Client{Timeout: 10 * time.Second,
 		Transport: &http.Transport{DialContext: netguard.SafeDialContext(netguard.AllowPrivateFromEnv()), TLSHandshakeTimeout: 5 * time.Second}}}
-	githubEntries := false
+	githubEntries, gcpEntries := false, false
 	for _, e := range source.Current().Entries() {
 		githubEntries = githubEntries || e.Kind == "git" || e.Kind == "github-api"
+		gcpEntries = gcpEntries || e.Kind == "gcp"
+	}
+	if gcpEntries {
+		// The broker's own Workload Identity is the root; per-entry tokens are
+		// downscoped from it or minted for the entry's service account.
+		root, err := google.DefaultTokenSource(ctx, "https://www.googleapis.com/auth/cloud-platform")
+		if err != nil {
+			return nil, fmt.Errorf("gcp catalog entries need the broker's Google identity: %w", err)
+		}
+		adapter.GCPTokens = &httpcatalog.GCPTokens{Root: root, Client: &http.Client{Timeout: 10 * time.Second,
+			Transport: &http.Transport{DialContext: netguard.SafeDialContext(netguard.AllowPrivateFromEnv()), TLSHandshakeTimeout: 5 * time.Second}}}
 	}
 	signer, err := githubAppSigner(client, getenv)
 	switch {
