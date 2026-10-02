@@ -329,7 +329,16 @@ func TestRealPostgres_PoolStartupParametersFollowTheClient(t *testing.T) {
 	f := newPoolFixture(t, 1, time.Hour, PoolOptions{})
 	ctx := context.Background()
 	tokyo := f.connect(t, map[string]string{"TimeZone": "Asia/Tokyo"})
+	// libpq sends PGTZ and PGDATESTYLE under lowercase keys.
+	libpq := f.connect(t, map[string]string{"timezone": "Europe/Berlin", "datestyle": "SQL, DMY"})
 	plain := f.connect(t, nil)
+	for range 3 {
+		var tz, style string
+		if err := libpq.QueryRow(ctx, "SELECT current_setting('TimeZone'), current_setting('DateStyle')").Scan(&tz, &style); err != nil ||
+			tz != "Europe/Berlin" || style != "SQL, DMY" {
+			t.Fatalf("lowercase startup keys not applied: %q %q %v", tz, style, err)
+		}
+	}
 	for range 3 {
 		var tz string
 		if err := tokyo.QueryRow(ctx, "SHOW TimeZone").Scan(&tz); err != nil || tz != "Asia/Tokyo" {
