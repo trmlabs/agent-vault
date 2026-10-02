@@ -30,18 +30,24 @@ func (s Secret) Format(f fmt.State, _ rune) { _, _ = f.Write([]byte(s.String()))
 
 // Keys caches each key for TTL, so the broker reads Vault about once a
 // minute per key instead of once per request. A new KV version is picked up
-// within TTL, or at once after Invalidate. If Vault is unreachable, a cached
+// within TTL, or sooner after Invalidate. If Vault is unreachable, a cached
 // key is served for up to MaxStale past its TTL, then requests fail.
 type Keys struct {
 	Vault    Logical
-	TTL      time.Duration // default 1 minute
+	TTL      time.Duration // default and maximum 1 minute
 	MaxStale time.Duration // default 5 minutes
 	Now      func() time.Time
 
-	mu     sync.Mutex
-	cache  map[KeyRef]cachedKey
-	flight map[KeyRef]*sync.Mutex
+	mu          sync.Mutex
+	cache       map[KeyRef]cachedKey
+	flight      map[KeyRef]*sync.Mutex
+	invalidated map[KeyRef]time.Time
 }
+
+// invalidateInterval bounds vendor-triggered refetches: a vendor or attacker
+// answering 401 to every call can cause at most one extra Vault read per key
+// per interval.
+const invalidateInterval = 30 * time.Second
 
 type cachedKey struct {
 	secret  Secret
@@ -52,7 +58,7 @@ var ErrKeyUnavailable = errors.New("destination key unavailable")
 
 func (k *Keys) settings() (time.Duration, time.Duration, time.Time) {
 	ttl, stale, now := k.TTL, k.MaxStale, time.Now()
-	if ttl <= 0 {
+	if ttl <= 0 || ttl > time.Minute {
 		ttl = time.Minute
 	}
 	if stale < 0 {
@@ -106,11 +112,20 @@ func (k *Keys) Get(ctx context.Context, ref KeyRef) (Secret, error) {
 	return secret, nil
 }
 
-// Invalidate drops a cached key, for example after the vendor rejects it, so
-// the next request reads the newest version.
+// Invalidate drops a cached key after the vendor rejects it, so the next
+// request reads the newest version. It acts at most once per key every 30
+// seconds; further calls in that window are ignored.
 func (k *Keys) Invalidate(ref KeyRef) {
+	_, _, now := k.settings()
 	k.mu.Lock()
 	defer k.mu.Unlock()
+	if k.invalidated == nil {
+		k.invalidated = map[KeyRef]time.Time{}
+	}
+	if last, ok := k.invalidated[ref]; ok && now.Sub(last) < invalidateInterval {
+		return
+	}
+	k.invalidated[ref] = now
 	delete(k.cache, ref)
 }
 

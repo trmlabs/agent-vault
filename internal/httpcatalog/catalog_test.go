@@ -138,6 +138,7 @@ func TestKeysCacheRotateAndFailClosed(t *testing.T) {
 	if s, _ := get(); s.Version != 3 {
 		t.Fatal("invalidate did not force a read")
 	}
+	now = now.Add(invalidateInterval)
 	vault.set("synthetic-key-three", 3, errors.New("sealed"))
 	now = now.Add(2 * time.Minute)
 	if s, err := get(); err != nil || s.Version != 3 {
@@ -149,6 +150,7 @@ func TestKeysCacheRotateAndFailClosed(t *testing.T) {
 	}
 	for _, bad := range []string{"", "has space", "line\nbreak", strings.Repeat("k", 8193)} {
 		vault.set(bad, 4, nil)
+		now = now.Add(invalidateInterval)
 		keys.Invalidate(ref)
 		if _, err := get(); err == nil {
 			t.Fatalf("unsafe key value accepted: %q", bad[:min(len(bad), 10)])
@@ -166,5 +168,49 @@ func TestSecretNeverPrints(t *testing.T) {
 		if strings.Contains(out, "synthetic") || !strings.Contains(out, "http-key(v7)") {
 			t.Fatalf("secret rendering %q", out)
 		}
+	}
+}
+
+// A vendor answering 401 to every call cannot turn each call into a Vault read.
+func TestInvalidateIsRateLimitedPerKey(t *testing.T) {
+	ref := KeyRef{Mount: "gatehouse", Path: "vendors/a", Field: "key"}
+	other := KeyRef{Mount: "gatehouse", Path: "vendors/b", Field: "key"}
+	vault := &fakeVault{value: "synthetic-key-limit", version: 1}
+	now := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
+	keys := &Keys{Vault: vault, Now: func() time.Time { return now }}
+	if _, err := keys.Get(context.Background(), ref); err != nil {
+		t.Fatal(err)
+	}
+	for range 100 { // a burst of rejected calls
+		keys.Invalidate(ref)
+		if _, err := keys.Get(context.Background(), ref); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(100 * time.Millisecond)
+	}
+	if got := vault.reads.Load(); got != 2 {
+		t.Fatalf("100 rejections inside 10s caused %d Vault reads, want 2", got)
+	}
+	keys.Invalidate(other) // limits are per key
+	if _, err := keys.Get(context.Background(), other); err != nil || vault.reads.Load() != 3 {
+		t.Fatalf("another key was throttled: reads=%d", vault.reads.Load())
+	}
+	now = now.Add(invalidateInterval)
+	keys.Invalidate(ref)
+	if _, err := keys.Get(context.Background(), ref); err != nil || vault.reads.Load() != 4 {
+		t.Fatalf("refetch not allowed after the interval: reads=%d", vault.reads.Load())
+	}
+}
+
+func TestTTLIsCappedAtOneMinute(t *testing.T) {
+	ref := KeyRef{Mount: "gatehouse", Path: "vendors/a", Field: "key"}
+	vault := &fakeVault{value: "synthetic-key-ttl", version: 1}
+	now := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
+	keys := &Keys{Vault: vault, TTL: time.Hour, Now: func() time.Time { return now }}
+	_, _ = keys.Get(context.Background(), ref)
+	now = now.Add(61 * time.Second)
+	_, _ = keys.Get(context.Background(), ref)
+	if vault.reads.Load() != 2 {
+		t.Fatal("a TTL above one minute was honored")
 	}
 }
