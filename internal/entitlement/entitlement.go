@@ -34,14 +34,43 @@ type cached struct {
 	fetched time.Time
 }
 
-// Cache wraps a Source with a short per-person, per-group-set cache.
+// ErrLookupLimited refuses a directory lookup over the per-person budget.
+var ErrLookupLimited = errors.New("entitlement lookups over budget")
+
+const (
+	// DefaultLookupsPerMinute is each person's directory budget. A worker
+	// looping on a T2 entry asks once per request; past the budget it is
+	// refused before the directory is asked, so it cannot get the tenant
+	// throttled and fail every decision in the fleet.
+	DefaultLookupsPerMinute = 60
+	// DefaultRecentAnswer is how old an answer a fresh lookup over budget
+	// still accepts instead of refusing.
+	DefaultRecentAnswer = 5 * time.Second
+	lookupTimeout       = 10 * time.Second
+)
+
+// flight is one directory lookup that concurrent askers share.
+type flight struct {
+	done   chan struct{}
+	person Person
+	err    error
+}
+
+// Cache wraps a Source with a short per-person, per-group-set cache. Lookups
+// of one person and group set in flight together share one directory call,
+// and each person has a directory budget.
 type Cache struct {
-	Source Source
-	TTL    time.Duration
-	Now    func() time.Time
+	Source           Source
+	TTL              time.Duration
+	Now              func() time.Time
+	LookupsPerMinute int           // per person; default DefaultLookupsPerMinute
+	RecentAnswer     time.Duration // default DefaultRecentAnswer
 
 	mu      sync.Mutex
 	entries map[string]cached
+	flights map[string]*flight
+	spent   map[string][]time.Time // per person: directory calls in the last minute
+	purges  uint64                 // bumped by every Purge, so an older lookup cannot refill the cache
 }
 
 func (c *Cache) now() time.Time {
@@ -57,12 +86,15 @@ func (c *Cache) Lookup(ctx context.Context, subject string, groups []string) (Pe
 }
 
 // Fresh asks the source now, ignoring any cached answer, and caches the result.
+// It joins a lookup of the same question already in flight, and over the
+// person's budget it accepts an answer at most RecentAnswer old or refuses.
 func (c *Cache) Fresh(ctx context.Context, subject string, groups []string) (Person, time.Duration, error) {
 	return c.lookup(ctx, subject, groups, true)
 }
 
 // Purge forgets every cached answer about subject, so its next lookup of any
-// group set asks the source.
+// group set asks the source. A lookup already in flight neither refills the
+// cache nor serves anyone who asks after the purge.
 func (c *Cache) Purge(subject string) {
 	if c == nil {
 		return
@@ -70,11 +102,41 @@ func (c *Cache) Purge(subject string) {
 	prefix := subject + "\x00"
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.purges++
 	for key := range c.entries {
 		if strings.HasPrefix(key, prefix) {
 			delete(c.entries, key)
 		}
 	}
+	for key := range c.flights {
+		if strings.HasPrefix(key, prefix) {
+			delete(c.flights, key)
+		}
+	}
+}
+
+// spend records one directory call for subject if its budget allows. The
+// caller holds c.mu.
+func (c *Cache) spend(subject string, now time.Time) bool {
+	limit := c.LookupsPerMinute
+	if limit <= 0 {
+		limit = DefaultLookupsPerMinute
+	}
+	if c.spent == nil || len(c.spent) > 10000 {
+		c.spent = map[string][]time.Time{}
+	}
+	recent := c.spent[subject][:0]
+	for _, t := range c.spent[subject] {
+		if now.Sub(t) < time.Minute {
+			recent = append(recent, t)
+		}
+	}
+	if len(recent) >= limit {
+		c.spent[subject] = recent
+		return false
+	}
+	c.spent[subject] = append(recent, now)
+	return true
 }
 
 func (c *Cache) lookup(ctx context.Context, subject string, groups []string, fresh bool) (Person, time.Duration, error) {
@@ -90,25 +152,58 @@ func (c *Cache) lookup(ctx context.Context, subject string, groups []string, fre
 	key := subject + "\x00" + strings.Join(sorted, ",")
 	now := c.now()
 	c.mu.Lock()
-	if e, ok := c.entries[key]; ok && !fresh && now.Sub(e.fetched) < ttl {
+	e, ok := c.entries[key]
+	if ok && !fresh && now.Sub(e.fetched) < ttl {
 		c.mu.Unlock()
 		return e.person, now.Sub(e.fetched), nil
 	}
-	c.mu.Unlock()
-	person, err := c.Source.Lookup(ctx, subject, sorted)
-	if err != nil {
-		return Person{}, 0, err
+	if f := c.flights[key]; f != nil {
+		c.mu.Unlock()
+		select {
+		case <-f.done:
+			return f.person, 0, f.err
+		case <-ctx.Done():
+			return Person{}, 0, ctx.Err()
+		}
 	}
+	if !c.spend(subject, now) {
+		recent := c.RecentAnswer
+		if recent <= 0 {
+			recent = DefaultRecentAnswer
+		}
+		c.mu.Unlock()
+		if ok && now.Sub(e.fetched) < min(recent, ttl) {
+			return e.person, now.Sub(e.fetched), nil
+		}
+		return Person{}, 0, ErrLookupLimited
+	}
+	f := &flight{done: make(chan struct{})}
+	if c.flights == nil {
+		c.flights = map[string]*flight{}
+	}
+	c.flights[key] = f
+	generation := c.purges
+	c.mu.Unlock()
+	// The answer serves every asker, so one asker giving up does not end it.
+	callCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), lookupTimeout)
+	f.person, f.err = c.Source.Lookup(callCtx, subject, sorted)
+	cancel()
 	c.mu.Lock()
-	if c.entries == nil {
-		c.entries = map[string]cached{}
+	if c.flights[key] == f {
+		delete(c.flights, key)
 	}
-	if len(c.entries) > 10000 {
-		c.entries = map[string]cached{}
+	if f.err == nil && c.purges == generation {
+		if c.entries == nil || len(c.entries) > 10000 {
+			c.entries = map[string]cached{}
+		}
+		c.entries[key] = cached{person: f.person, fetched: now}
 	}
-	c.entries[key] = cached{person: person, fetched: now}
 	c.mu.Unlock()
-	return person, 0, nil
+	close(f.done)
+	if f.err != nil {
+		return Person{}, 0, f.err
+	}
+	return f.person, 0, nil
 }
 
 // Tier ranks catalog tiers. T0 is readable by everyone allowed on the pool.
@@ -163,9 +258,10 @@ func WithRecheck(ctx context.Context) context.Context {
 func isRecheck(ctx context.Context) bool { v, _ := ctx.Value(recheckKey{}).(bool); return v }
 
 // Decide applies the lesser of the pool ceiling and the requester's entitlements.
-// A T2 admission always asks the directory now; T1 admissions and rechecks
-// may use the cache. A recheck that refuses forgets everything cached about
-// the person, so none of their other sessions or entries rides a stale answer.
+// A T2 admission always asks the directory now, within the person's lookup
+// budget; T1 admissions and rechecks may use the cache. A refusal on a recheck
+// or a fresh answer forgets everything cached about the person, so none of
+// their other sessions or entries rides a stale answer.
 func Decide(ctx context.Context, cache *Cache, pool Pool, entry Entry, who Requester) Decision {
 	tier := entry.Tier
 	if tier == "" {
@@ -208,12 +304,16 @@ func Decide(ctx context.Context, cache *Cache, pool Pool, entry Entry, who Reque
 		return d
 	}
 	lookup := cache.Lookup
-	if want >= 2 && !isRecheck(ctx) {
+	fresh := want >= 2 && !isRecheck(ctx)
+	if fresh {
 		lookup = cache.Fresh
 	}
 	person, age, err := lookup(ctx, who.Subject, entry.Requires)
 	d.CacheAge = age
 	switch {
+	case errors.Is(err, ErrLookupLimited):
+		d.Outcome = "entitlement_rate_limited"
+		return d
 	case err != nil:
 		d.Outcome = "entitlement_unavailable"
 	case !person.Enabled:
@@ -224,7 +324,9 @@ func Decide(ctx context.Context, cache *Cache, pool Pool, entry Entry, who Reque
 		d.ObjectID, d.Allowed, d.Outcome = person.ObjectID, true, "entitled"
 		return d
 	}
-	if isRecheck(ctx) {
+	// A recheck that refuses, or a fresh answer that refuses, forgets the
+	// person: none of their other sessions or entries rides an older answer.
+	if isRecheck(ctx) || (fresh && err == nil) {
 		cache.Purge(who.Subject)
 	}
 	return d

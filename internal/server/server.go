@@ -1063,6 +1063,16 @@ func (s *Server) requireInitialized(next http.HandlerFunc) http.HandlerFunc {
 // Start starts the server and blocks until shutdown.
 // It listens for SIGINT/SIGTERM to shut down gracefully.
 func (s *Server) Start() error {
+	// Vault logins are revoked last, after the database cleanup below has
+	// revoked its sessions with them, on a short budget inside the Pod's
+	// termination grace.
+	if s.hashicorpClient != nil {
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), vaultCloseTimeout)
+			defer cancel()
+			s.hashicorpClient.CloseContext(ctx)
+		}()
+	}
 	// Release journal ownership on every exit, including startup failures.
 	if s.pgLeaseCloser != nil {
 		defer func() {
@@ -1298,6 +1308,11 @@ func (s *Server) Start() error {
 }
 
 var errTooManyPendingCodes = errors.New("too many pending verification codes")
+
+// vaultCloseTimeout bounds revoking the Vault logins at shutdown. A drain of
+// AGENT_VAULT_SHUTDOWN_SECONDS, the 5 s database cleanup and this must fit in
+// the Pod's termination grace.
+const vaultCloseTimeout = 5 * time.Second
 
 const passwordResetTTL = 15 * time.Minute
 
