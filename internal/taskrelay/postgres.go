@@ -65,6 +65,8 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig) {
 	c := &binding
 	if startup.Decode(packet[4:]) != nil || startup.ProtocolVersion != pgproto3.ProtocolVersionNumber || !validStartup(startup.Parameters, c) {
 		_ = r.record("postgres", "denied:bad-startup")
+		_, _ = conn.Write(errorFrame("08004", "Gatehouse: connection refused: use this binding's database and user, and only the "+
+			"application_name, statement_timeout and client_encoding startup parameters (set others with SET after connecting)"))
 		return
 	}
 	// Preserve validated client behavior while fixing connection authority to the
@@ -93,6 +95,7 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig) {
 	}
 	if typ != 'p' || string(password) != c.Placeholder+"\x00" {
 		_ = r.record("postgres", "denied:placeholder")
+		_, _ = conn.Write(errorFrame("28P01", "Gatehouse: wrong placeholder password for this binding"))
 		return
 	}
 	// Everything the sandbox can influence has been validated. Admit: live pair
@@ -367,12 +370,14 @@ func sqlState(body []byte) string {
 // refusalFrame is a relay-authored FATAL error. Broker message text is never
 // forwarded; only a capacity refusal keeps its code and a fixed explanation.
 func refusalFrame(code string) []byte {
-	message := "Gatehouse: the broker refused this connection"
 	if code == "53300" {
-		message = "Gatehouse: too many concurrent database sessions for this worker; close one and retry"
-	} else {
-		code = "08004"
+		return errorFrame(code, "Gatehouse: too many concurrent database sessions for this worker; close one and retry")
 	}
+	return errorFrame("08004", "Gatehouse: the broker refused this connection")
+}
+
+// errorFrame builds a FATAL ErrorResponse with relay-authored text only.
+func errorFrame(code, message string) []byte {
 	var body []byte
 	for _, f := range []struct {
 		t byte

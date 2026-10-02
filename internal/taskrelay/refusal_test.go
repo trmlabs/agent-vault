@@ -2,8 +2,23 @@ package taskrelay
 
 import (
 	"bytes"
+	"net"
 	"testing"
 )
+
+// refusedWithError reports whether the relay refused: it either closed at once
+// or sent one ErrorResponse and then closed. Nothing else may follow.
+func refusedWithError(c net.Conn) bool {
+	typ, _, e := readPGFrame(c, 4096)
+	if e != nil {
+		return true
+	}
+	if typ != 'E' {
+		return false
+	}
+	_, e = c.Read(make([]byte, 1))
+	return e != nil
+}
 
 func errorBody(code, message string) []byte {
 	var b []byte
@@ -27,5 +42,12 @@ func TestOtherBrokerErrorsBecomeOneGenericRefusal(t *testing.T) {
 	}
 	if sqlState([]byte{'C'}) != "" {
 		t.Fatal("malformed body parsed")
+	}
+}
+
+func TestErrorFrameCarriesCodeAndMessage(t *testing.T) {
+	frame := errorFrame("28P01", "Gatehouse: wrong placeholder password for this binding")
+	if sqlState(frame[5:]) != "28P01" || !bytes.Contains(frame, []byte("wrong placeholder")) {
+		t.Fatalf("frame %q", frame)
 	}
 }
