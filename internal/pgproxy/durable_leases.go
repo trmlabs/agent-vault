@@ -300,6 +300,11 @@ func (m *DurableLeaseMinter) run() {
 					defer m.mu.Unlock()
 					ctx, cancel := context.WithTimeout(m.ctx, leaseRevokeTimeout)
 					defer cancel()
+					// Claim on every pass, not only on heartbeats, so a dead
+					// replica's records move within a second of its expiry.
+					if m.untilFence(time.Now()) > 0 {
+						_, _ = m.journal.ClaimOrphanedDatabaseCleanup(ctx, m.owner)
+					}
 					_ = m.reconcile(ctx, "")
 				}()
 			default:
