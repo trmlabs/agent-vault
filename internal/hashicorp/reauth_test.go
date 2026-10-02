@@ -24,17 +24,18 @@ const testJWT = "header.payload.signature"
 // parent logins with a fixed maximum, child sessions that die with their
 // parent, and an outage switch that fails every request.
 type fakeVault struct {
-	t        *testing.T
-	mu       sync.Mutex
-	down     bool
-	maxTTL   int
-	logins   int
-	children int
-	alive    map[string]bool
-	parentOf map[string]string // child accessor -> parent token
-	revoked  []string          // parent tokens revoked by the broker
-	creates  int
-	lastJWT  string
+	t           *testing.T
+	mu          sync.Mutex
+	down        bool
+	maxTTL      int
+	logins      int
+	children    int
+	alive       map[string]bool
+	parentOf    map[string]string // child accessor -> parent token
+	revoked     []string          // parent tokens revoked by the broker
+	failRevokes int               // revoke-self calls to fail before succeeding
+	creates     int
+	lastJWT     string
 }
 
 func newFakeVault(t *testing.T, maxTTL int) (*fakeVault, *httptest.Server) {
@@ -76,6 +77,11 @@ func (f *fakeVault) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, map[string]any{"auth": map[string]any{"client_token": token, "lease_duration": 600, "renewable": true}})
 	case "/v1/auth/token/revoke-self":
+		if f.failRevokes > 0 {
+			f.failRevokes--
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 		f.alive[token] = false
 		f.revoked = append(f.revoked, token)
 		for child, parent := range f.parentOf {
@@ -240,6 +246,37 @@ func TestJWTOlderLoginWithNoSessionIsRevokedAtNextTick(t *testing.T) {
 	h.advance(time.Minute)
 	if _, _, revoked := h.vault.snapshot(); len(revoked) != 1 || revoked[0] != "parent-1" {
 		t.Fatalf("revoked=%v", revoked)
+	}
+}
+
+func TestJWTOlderLoginRevokeIsRetried(t *testing.T) {
+	h := newJWTHarness(t, 3600, defaultReauthOptions())
+	h.vault.mu.Lock()
+	h.vault.failRevokes = 1
+	h.vault.mu.Unlock()
+	h.advance(21 * time.Minute) // refresh, then the older login's revoke fails
+	if _, _, revoked := h.vault.snapshot(); len(revoked) != 0 {
+		t.Fatalf("revoked=%v", revoked)
+	}
+	h.advance(time.Minute)
+	if _, _, revoked := h.vault.snapshot(); len(revoked) != 1 || revoked[0] != "parent-1" {
+		t.Fatalf("revoked=%v; a failed revoke must be retried", revoked)
+	}
+}
+
+func TestJWTCloseRevokesLoginsWithoutSessions(t *testing.T) {
+	h := newJWTHarness(t, 4*3600, defaultReauthOptions())
+	held := h.mustSession()
+	h.advance(20 * time.Minute) // parent-1 keeps its session; parent-2 is current
+	h.c.Close()
+	if _, _, revoked := h.vault.snapshot(); len(revoked) != 1 || revoked[0] != "parent-2" {
+		t.Fatalf("revoked=%v; want the idle current login only", revoked)
+	}
+	if h.vault.parent(held.Accessor) != "parent-1" {
+		t.Fatal("close ended a live session")
+	}
+	if h.c.Ready() {
+		t.Fatal("ready after close")
 	}
 }
 

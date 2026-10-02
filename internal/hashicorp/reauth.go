@@ -137,6 +137,36 @@ func (s *loginSet) idle(now time.Time) []*heldLogin {
 	return revoke
 }
 
+// requeue returns a login whose revoke failed, so the next tick tries again.
+func (s *loginSet) requeue(l *heldLogin) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.retired = append(s.retired, l)
+}
+
+// drain removes and returns every login that needs no further custody, the
+// current one included, for revocation at Close. A login with a live session
+// stays: revoking it would end the session.
+func (s *loginSet) drain() []*heldLogin {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []*heldLogin
+	kept := s.retired[:0]
+	for _, l := range s.retired {
+		if len(l.children) == 0 && l.pending == 0 {
+			out = append(out, l)
+		} else {
+			kept = append(kept, l)
+		}
+	}
+	s.retired = kept
+	if l := s.current; l != nil && len(l.children) == 0 && l.pending == 0 {
+		out = append(out, l)
+		s.current = nil
+	}
+	return out
+}
+
 func (s *loginSet) rotationDue(now time.Time) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -368,31 +398,44 @@ func (c *Client) renewLogin(ctx context.Context, l *heldLogin, now time.Time) {
 }
 
 // revokeIdle revokes each older login as soon as its last session has ended.
+// A failed revoke is retried at the next tick until the login's maximum
+// lifetime, when Vault ends it anyway.
 func (c *Client) revokeIdle(ctx context.Context) {
 	for _, l := range c.logins.idle(c.clock()) {
-		api, err := tokenAPI(c.api, l.token)
-		if err != nil {
-			continue
-		}
-		callCtx, cancel := context.WithTimeout(ctx, reauthCallTimeout)
-		err = api.Auth().Token().RevokeSelfWithContext(callCtx, "")
-		cancel()
-		if err != nil {
-			// Vault still ends it at its fixed maximum lifetime.
-			c.logger.Warn("vault older login revoke failed")
+		if !c.revokeLogin(ctx, l) {
+			c.logins.requeue(l)
+			c.logger.Warn("vault older login revoke failed; retrying")
 			continue
 		}
 		c.logger.Info("vault older login revoked")
 	}
 }
 
-// Close stops login refresh. Held logins end at their Vault maximum lifetime.
+func (c *Client) revokeLogin(ctx context.Context, l *heldLogin) bool {
+	api, err := tokenAPI(c.api, l.token)
+	if err != nil {
+		return false
+	}
+	callCtx, cancel := context.WithTimeout(ctx, reauthCallTimeout)
+	defer cancel()
+	return api.Auth().Token().RevokeSelfWithContext(callCtx, "") == nil
+}
+
+// Close stops login refresh and revokes every held login with no live
+// session, the current one included; the client mints nothing afterwards. A
+// login still holding a session, or whose revoke fails, ends at its Vault
+// maximum lifetime.
 func (c *Client) Close() {
 	if c == nil || c.stopReauth == nil {
 		return
 	}
 	c.stopReauth()
 	<-c.reauthDone
+	for _, l := range c.logins.drain() {
+		if !c.revokeLogin(context.Background(), l) {
+			c.logger.Warn("vault login revoke at close failed")
+		}
+	}
 }
 
 func (c *Client) clock() time.Time {
