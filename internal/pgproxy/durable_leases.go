@@ -78,7 +78,6 @@ type DurableLeaseMinter struct {
 	renewMu   sync.Mutex
 	lastRenew time.Time // send time of the last successful renewal
 	fenced    atomic.Bool
-	ready     atomic.Bool
 	live      atomic.Int64
 	kick      chan struct{}
 }
@@ -144,10 +143,12 @@ func (m *DurableLeaseMinter) Owner() string { return m.owner }
 // Fenced reports that this replica lost or could not renew its owner row.
 func (m *DurableLeaseMinter) Fenced() bool { return m.fenced.Load() }
 
-// Ready reports one renewal after start and no fence. Waiting one heartbeat
-// lets the other replicas count this one and shrink their budgets first.
+// Ready reports a fresh owner row: claimed at start or renewed within half the
+// fence deadline. A restarted process is ready only once it holds its own new
+// row, and a replica whose renewals are failing stops taking new sessions
+// before it fences.
 func (m *DurableLeaseMinter) Ready() bool {
-	return m.ready.Load() && m.ctx.Err() == nil && m.untilFence(time.Now()) > 0
+	return !m.fenced.Load() && m.ctx.Err() == nil && m.untilFence(time.Now()) > m.opts.FenceAfter/2
 }
 
 // LiveReplicas is the number of live owner rows at the last heartbeat,
@@ -191,7 +192,6 @@ func (m *DurableLeaseMinter) heartbeat() bool {
 	m.renewMu.Lock()
 	m.lastRenew = sent
 	m.renewMu.Unlock()
-	m.ready.Store(true)
 	if n, err := m.journal.LiveDatabaseCleanupOwners(ctx); err == nil && n > 0 {
 		m.live.Store(int64(n))
 	}

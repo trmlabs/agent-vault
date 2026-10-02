@@ -23,6 +23,34 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]string{"status": "ok"})
 }
 
+// handleReady is the readiness gate. Unlike handleHealth it also requires a
+// listening database broker that holds a fresh cleanup owner row, so a
+// restarted broker takes no traffic until it has registered as a new owner.
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	unready := func(reason string) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "unready", "error": reason})
+	}
+	if s.store.DialectName() == "postgres" {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := s.store.Ping(ctx); err != nil {
+			unready("database unreachable")
+			return
+		}
+	}
+	if s.pgBroker != nil && !s.pgBroker.IsListening() {
+		unready("database broker not listening")
+		return
+	}
+	if cleanup, ok := s.pgLeaseCloser.(interface{ Ready() bool }); ok && !cleanup.Ready() {
+		unready("database cleanup ownership not fresh")
+		return
+	}
+	jsonOK(w, map[string]string{"status": "ready"})
+}
+
 // handleStatus returns the instance initialization status (public, no auth).
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]interface{}{

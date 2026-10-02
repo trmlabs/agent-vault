@@ -421,6 +421,12 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		refuse("audit_unavailable", "08004", "Agent Vault: audit unavailable")
 		return
 	}
+	// A replica without a fresh owner row takes no new sessions: it is
+	// starting, or its renewals are failing on the way to a fence.
+	if ready, ok := b.opts.Leases.(interface{ Ready() bool }); ok && !ready.Ready() {
+		refuse("not_ready", "57P03", "Agent Vault: broker not ready; retry")
+		return
+	}
 
 	// Authenticated: a longer budget for the mint + upstream-connect phase, which
 	// can be slow when role DDL serializes at scale.

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -128,7 +129,6 @@ func TestDurableLeaseFencesBeforeTakeoverWhenPartitioned(t *testing.T) {
 	}
 	defer session.Close()
 	waitWithin(t, 2*time.Second, "session registered", func() bool { b.mu.Lock(); defer b.mu.Unlock(); return len(b.conns) == 1 })
-	waitWithin(t, 2*time.Second, "first heartbeat", a.Ready)
 
 	cut.cut.Store(true)
 	select {
@@ -176,7 +176,6 @@ func TestDurableLeaseSurvivesBriefStoreOutage(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer a.Close(context.Background())
-	waitWithin(t, 2*time.Second, "first heartbeat", a.Ready)
 	cut.cut.Store(true)
 	time.Sleep(time.Second)
 	cut.cut.Store(false)
@@ -253,4 +252,55 @@ func TestDurableLeaseRestartRecoversCrashedPredecessor(t *testing.T) {
 	if _, err := restarted.Mint(context.Background(), "vault", fleetService); err != nil {
 		t.Fatal(err)
 	}
+}
+
+type readinessMinter struct {
+	*fakeMinter
+	ready atomic.Bool
+}
+
+func (m *readinessMinter) Ready() bool { return m.ready.Load() }
+
+// A broker without a fresh owner row refuses new sessions before minting.
+func TestBrokerRefusesSessionsUntilReady(t *testing.T) {
+	lease := newLease()
+	upstream := startFakeUpstream(t, authTrust, lease.Password)
+	minter := &readinessMinter{fakeMinter: &fakeMinter{lease: lease}}
+	_, addr := startBroker(t, Options{
+		Auth:      &fakeAuth{scope: &AgentScope{VaultID: "vault-1", ActorID: "agent-uuid-1"}},
+		Databases: &fakeResolver{svc: &DatabaseService{Name: "analytics", Addr: upstream.addr(), Mount: "database", Role: "readonly", SSLMode: "disable"}},
+		Leases:    minter,
+	})
+	if _, err := runAgentQuery(t, addr, "agent-vault-token", "appdb", "SELECT 1"); err == nil || !strings.Contains(err.Error(), "57P03") {
+		t.Fatalf("session admitted before ready: %v", err)
+	}
+	if minter.mintCallCount() != 0 {
+		t.Fatal("minted before ready")
+	}
+	minter.ready.Store(true)
+	if _, err := runAgentQuery(t, addr, "agent-vault-token", "appdb", "SELECT 1"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Readiness follows renewal: a fresh minter is ready at once, a stalled one
+// stops taking sessions before it fences, and recovery restores it.
+func TestDurableLeaseReadinessFollowsRenewal(t *testing.T) {
+	client, st, _ := durableFixture(t)
+	cut := &partitionJournal{CleanupJournal: st}
+	a, err := NewDurableLeaseMinter(context.Background(), client, cut, DurableLeaseOptions{OwnerTTL: 3 * time.Second, RetryInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close(context.Background())
+	if !a.Ready() {
+		t.Fatal("fresh owner row not ready")
+	}
+	cut.cut.Store(true)
+	waitWithin(t, 2*time.Second, "unready while renewals fail", func() bool { return !a.Ready() })
+	if a.Fenced() {
+		t.Fatal("fenced before going unready")
+	}
+	cut.cut.Store(false)
+	waitWithin(t, 2*time.Second, "ready after recovery", a.Ready)
 }

@@ -35,6 +35,12 @@ Evidence:
 
 ## Moving a live SQLite broker to PostgreSQL
 
+> **Warning.** Move a store only with a binary that includes the `migrate-db`
+> fix for broker tables (`fix(store): migrate-db carries the broker's tables`).
+> Older binaries copy no pending cleanup records, so every credential still
+> waiting for revocation would be forgotten and its database login left
+> behind. The live staging store needs this fix before any move.
+
 1. Create an empty PostgreSQL database for the store. Put its URL in a Secret; it holds a password, so never pass it on a command line you log.
 2. Stop the broker: `kubectl scale statefulset <broker> --replicas=0`. Wait until its Pod is gone. Records left by a crash are safe: they move with the data.
 3. Back up the SQLite volume.
@@ -51,6 +57,8 @@ consulted. A StatefulSet rolling update with one replica already guarantees this
 
 ## Operating the fleet
 
-- **Readiness.** A replica is ready after its first heartbeat (`DurableLeaseMinter.Ready`), so the others have counted it before it opens connections.
+- **Restart after a fence.** A replica that loses its owner row exits; Kubernetes restarts it as a new owner. It takes no traffic until it holds a fresh owner row of its own: the process registers the row before the broker listens, `GET /ready` returns 503 without a fresh row, and the broker refuses new sessions with SQLSTATE 57P03. Point the readiness probe at `GET /ready` on the API port and keep `GET /health` for liveness.
+- **Readiness.** A row is fresh when it was claimed at start or renewed within the last 10 seconds. A replica whose renewals are failing goes unready and refuses new sessions about 10 seconds before it fences, so the Service stops routing to it first.
+- **Joining.** A joining replica counts itself at once. The others shrink their pool budgets at their next heartbeat, so the fleet can exceed a database budget by one replica's share for up to 5 seconds.
 - **Disruption.** Allow one replica down at a time. A graceful stop releases the owner row at once, so its leftover records move within a second.
 - **Partition.** A replica that cannot reach the store exits within about 20 seconds. Its credentials are revoked by a survivor about 10 seconds later.

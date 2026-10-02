@@ -840,6 +840,7 @@ func New(addr string, store Store, encKey []byte, notifier *notify.Notifier, ini
 	// /health, /v1/status, and other public static routes rely on the
 	// server-wide TierGlobal backstop; no per-route limit is useful.
 	mux.HandleFunc("GET /health", s.handleHealth)
+	mux.HandleFunc("GET /ready", s.handleReady)
 	mux.HandleFunc("GET /v1/status", s.handleStatus)
 	mux.HandleFunc("POST /v1/auth/register", ipAuth(limitBody(s.handleRegister)))
 	mux.HandleFunc("POST /v1/auth/verify", ipAuth(limitBody(s.handleVerify)))
