@@ -103,6 +103,7 @@ type Chain struct {
 	key            Key
 	lastCheckpoint time.Time
 	failed         bool
+	done           chan struct{} // closed when the chain fails
 }
 
 // New fetches the current key and writes the chain_start row. Without a key
@@ -125,7 +126,7 @@ func New(ctx context.Context, opts Options) (*Chain, error) {
 	if err != nil {
 		return nil, fmt.Errorf("audit boot unavailable: %w", err)
 	}
-	c := &Chain{opts: opts, boot: boot, key: key, lastCheckpoint: opts.Now()}
+	c := &Chain{opts: opts, boot: boot, key: key, lastCheckpoint: opts.Now(), done: make(chan struct{})}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	start := Row{Event: EventChainStart, PrevBoot: previous.Boot, PrevCheckpointSeq: previous.CheckpointSeq, PrevCheckpointMAC: previous.CheckpointMAC}
@@ -271,18 +272,30 @@ func (c *Chain) appendLocked(r Row) (Row, error) {
 	r.MAC = r.computeMAC(c.key.secret)
 	line, err := json.Marshal(r)
 	if err != nil {
-		c.failed = true
+		c.failLocked()
 		return Row{}, ErrAuditFailed
 	}
 	if _, err := c.opts.Out.Write(append(line, '\n')); err != nil {
 		// A partial line may exist. Stop the chain rather than continue past
 		// a row whose presence is unknown.
-		c.failed = true
+		c.failLocked()
 		return Row{}, ErrAuditFailed
 	}
 	c.seq++
 	c.prev = r.MAC
 	return r, nil
+}
+
+// Failed is closed when the chain stops for good. Admit then refuses new
+// sessions; sessions already open must end too, since nothing they do can be
+// recorded any more.
+func (c *Chain) Failed() <-chan struct{} { return c.done }
+
+func (c *Chain) failLocked() {
+	if !c.failed {
+		c.failed = true
+		close(c.done)
+	}
 }
 
 // identifier admits bounded printable ASCII without spaces or quotes, which

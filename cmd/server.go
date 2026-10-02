@@ -451,7 +451,7 @@ func attachPostgresBrokerIfEnabled(srv *server.Server, host string, postgresPort
 		}
 		opts.Databases = server.NewCatalogDatabaseResolver(catalog, authz.verifier(), authz.entitlements, sessionBinder(srv.CleanupStore()))
 	}
-	if chain, err := sharedAuditChain(context.Background(), client, srv.CleanupStore(), os.Getenv); err != nil {
+	if chain, err := sharedAuditChain(context.Background(), client, srv.CleanupStore(), os.Getenv, logger); err != nil {
 		return fmt.Errorf("postgres broker audit: %w", err)
 	} else if chain != nil {
 		opts.Audit = chain
