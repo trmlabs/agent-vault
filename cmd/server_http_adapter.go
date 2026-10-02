@@ -42,11 +42,7 @@ func brokerCatalog(ctx context.Context, client *hashicorp.Client, getenv func(st
 	if err := catalogEnvironment(getenv); err != nil {
 		return nil, err
 	}
-	// Test harnesses whose fixture database serves no TLS only.
-	if v := getenv("AGENT_VAULT_CATALOG_PLAINTEXT_DATABASES"); v == "1" || v == "true" {
-		httpcatalog.PlaintextDatabases.Store(true)
-		logger.Warn("broker catalog: plaintext database entries allowed (AGENT_VAULT_CATALOG_PLAINTEXT_DATABASES); never set this outside a test harness")
-	}
+	testPlaintextDatabases(getenv, logger)
 	var source *httpcatalog.Source
 	if location := getenv("AGENT_VAULT_CATALOG_VAULT_PATH"); location != "" {
 		mount, path, ok := strings.Cut(location, "/")

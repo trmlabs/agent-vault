@@ -18,6 +18,8 @@ const databaseCatalog = `{"pools":[{"name":"cursor","namespace":"agents","servic
   "postgres":{"database":"auditlog","mount":"database","role":"staging.us.crunchy.auditlog-readonly","sslmode":"verify-full","maxConns":5}}]}`
 
 func TestCatalogDatabaseResolverFollowsTheLiveCatalog(t *testing.T) {
+	httpcatalog.Environment.Store("staging")
+	t.Cleanup(func() { httpcatalog.Environment.Store("") })
 	first, err := httpcatalog.Parse([]byte(databaseCatalog))
 	if err != nil {
 		t.Fatal(err)

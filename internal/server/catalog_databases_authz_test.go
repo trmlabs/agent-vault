@@ -46,13 +46,15 @@ func (d directory) Lookup(_ context.Context, subject string, groups []string) (e
 }
 
 func TestCatalogDatabaseResolverAppliesTheAuthorizationModel(t *testing.T) {
+	httpcatalog.Environment.Store("staging")
+	t.Cleanup(func() { httpcatalog.Environment.Store("") })
 	catalog, err := httpcatalog.Parse([]byte(`{"pools":[
 	  {"name":"cursor","namespace":"n","serviceAccount":"cursor"},
 	  {"name":"claude","namespace":"n","serviceAccount":"claude","identity":"claude-session","ccpoolID":"ccpool_abc","ceiling":"T2"}],
 	 "entries":[
-	  {"name":"open","kind":"postgres","host":"db.example","pools":["cursor","claude"],"postgres":{"database":"open","mount":"database","role":"open-ro"}},
-	  {"name":"t1db","kind":"postgres","host":"db.example","pools":["claude"],"tier":"T1","requires":["` + t1Group + `"],"postgres":{"database":"t1db","mount":"database","role":"t1-ro"}},
-	  {"name":"t2db","kind":"postgres","host":"db.example","pools":["claude"],"tier":"T2","requires":["` + t2Group + `"],"postgres":{"database":"t2db","mount":"database","role":"t2-ro"}}]}`))
+	  {"name":"open","kind":"postgres","host":"db.example","pools":["cursor","claude"],"postgres":{"database":"open","mount":"database","role":"staging.us.crunchy.open-readonly"}},
+	  {"name":"t1db","kind":"postgres","host":"db.example","pools":["claude"],"tier":"T1","requires":["` + t1Group + `"],"postgres":{"database":"t1db","mount":"database","role":"staging.us.crunchy.t1-readonly"}},
+	  {"name":"t2db","kind":"postgres","host":"db.example","pools":["claude"],"tier":"T2","requires":["` + t2Group + `"],"postgres":{"database":"t2db","mount":"database","role":"staging.us.crunchy.t2-readonly"}}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
