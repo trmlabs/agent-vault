@@ -220,9 +220,14 @@ func TestDurableLeaseTwoSurvivorsTakeOverOnce(t *testing.T) {
 		records, err := st.ListDatabaseCleanup(context.Background())
 		return err == nil && len(records) == 0 && vault.liveSessions() == 0
 	})
+	// Each survivor's count refreshes on its own heartbeat after the dead
+	// owner row expires.
+	waitWithin(t, 3*time.Second, "survivors count two live replicas", func() bool {
+		return survivors[0].LiveReplicas() == 2 && survivors[1].LiveReplicas() == 2
+	})
 	for _, s := range survivors {
-		if s.LiveReplicas() != 2 || s.Fenced() {
-			t.Fatalf("survivor sees %d live replicas, fenced %v", s.LiveReplicas(), s.Fenced())
+		if s.Fenced() {
+			t.Fatal("a survivor fenced itself")
 		}
 	}
 }
