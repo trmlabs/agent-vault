@@ -424,15 +424,24 @@ func (c *Client) revokeLogin(ctx context.Context, l *heldLogin) bool {
 // Close stops login refresh and revokes every held login with no live
 // session, the current one included; the client mints nothing afterwards. A
 // login still holding a session, or whose revoke fails, ends at its Vault
-// maximum lifetime.
-func (c *Client) Close() {
+// maximum lifetime. Token and AppRole logins are the operator's and are
+// never revoked.
+func (c *Client) Close() { c.CloseContext(context.Background()) }
+
+// CloseContext is Close within ctx, for a shutdown that must end in time.
+func (c *Client) CloseContext(ctx context.Context) {
 	if c == nil || c.stopReauth == nil {
 		return
 	}
 	c.stopReauth()
-	<-c.reauthDone
+	select {
+	case <-c.reauthDone:
+	case <-ctx.Done():
+		c.logger.Warn("vault login refresh did not stop before shutdown; logins end at their maximum lifetime")
+		return
+	}
 	for _, l := range c.logins.drain() {
-		if !c.revokeLogin(context.Background(), l) {
+		if !c.revokeLogin(ctx, l) {
 			c.logger.Warn("vault login revoke at close failed")
 		}
 	}
