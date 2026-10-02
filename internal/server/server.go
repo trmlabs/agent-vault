@@ -65,7 +65,7 @@ type Server struct {
 	store         Store
 	encKey        []byte // 32-byte encryption key, held in memory while running
 	notifier      *notify.Notifier
-	initialized   bool                // true when at least one owner account exists
+	initialized   atomic.Bool         // true when at least one owner account exists; replicas share registration
 	lastInitCheck atomic.Int64        // unix-millis of last DB check for initialization (throttle)
 	baseURL       string              // externally-reachable base URL (e.g. "https://sb.example.com")
 	skillCLI      []byte              // embedded CLI skill content (served at GET /v1/skills/cli)
@@ -822,7 +822,6 @@ func New(addr string, store Store, encKey []byte, notifier *notify.Notifier, ini
 		store:          store,
 		encKey:         encKey,
 		notifier:       notifier,
-		initialized:    initialized,
 		baseURL:        strings.TrimRight(baseURL, "/"),
 		logger:         logger,
 		rateLimit:      rl,
@@ -1001,6 +1000,7 @@ func New(addr string, store Store, encKey []byte, notifier *notify.Notifier, ini
 	mux.HandleFunc("GET /account/{path...}", s.handleSPA)
 	mux.HandleFunc("GET /{$}", s.handleSPA)
 
+	s.initialized.Store(initialized)
 	return s
 }
 
@@ -1010,7 +1010,7 @@ func New(addr string, store Store, encKey []byte, notifier *notify.Notifier, ini
 // false, throttled to once every 2 seconds to avoid per-request queries.
 func (s *Server) requireInitialized(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !s.initialized {
+		if !s.initialized.Load() {
 			now := time.Now().UnixMilli()
 			if now-s.lastInitCheck.Load() < 2000 {
 				jsonStatus(w, http.StatusServiceUnavailable, map[string]string{
@@ -1021,7 +1021,7 @@ func (s *Server) requireInitialized(next http.HandlerFunc) http.HandlerFunc {
 			}
 			s.lastInitCheck.Store(now)
 			if count, err := s.store.CountUsers(r.Context()); err == nil && count > 0 {
-				s.initialized = true
+				s.initialized.Store(true)
 			} else {
 				jsonStatus(w, http.StatusServiceUnavailable, map[string]string{
 					"error":   "not_initialized",
@@ -1063,7 +1063,7 @@ func (s *Server) Start() error {
 		defer func() { _ = strictMITMLn.Close() }()
 	}
 	// Non-fatal: registry already holds env-based config from New().
-	if s.initialized {
+	if s.initialized.Load() {
 		if _, err := s.applyRateLimitSettingToRegistry(context.Background()); err != nil {
 			s.logger.Warn("ratelimit setting load failed", "err", err.Error())
 		}
@@ -1152,7 +1152,7 @@ func (s *Server) Start() error {
 	}
 	go func() {
 		fmt.Printf("Agent Vault server listening on %s\n", s.baseURL)
-		if !s.initialized {
+		if !s.initialized.Load() {
 			fmt.Printf("Run `agent-vault auth register` or visit %s to create the owner account\n", s.baseURL)
 		}
 		if err := s.httpServer.Serve(httpLn); err != nil && err != http.ErrServerClosed {

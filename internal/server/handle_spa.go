@@ -26,8 +26,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // handleStatus returns the instance initialization status (public, no auth).
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]interface{}{
-		"initialized":      s.initialized,
-		"needs_first_user": !s.initialized,
+		"initialized":      s.initialized.Load(),
+		"needs_first_user": !s.initialized.Load(),
 	}
 
 	// Expose base_url only when the operator has explicitly set

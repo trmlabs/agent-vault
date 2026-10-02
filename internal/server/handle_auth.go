@@ -150,7 +150,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	user, err := s.store.RegisterFirstUser(ctx, req.Email, hash, salt, defaultVaultID, kdfParams.Time, kdfParams.Memory, kdfParams.Threads)
 	if err == nil {
 		// First user: owner created successfully.
-		s.initialized = true
+		s.initialized.Store(true)
 
 		// Auto-login: token + expires_at are returned alongside the
 		// cookie so non-cookie clients (the CLI) can persist the
