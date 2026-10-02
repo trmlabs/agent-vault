@@ -12,8 +12,8 @@ Not all of this is live yet:
 
 | Part | Status |
 |---|---|
-| Gatehouse support for all six destination kinds | Built on agent-vault branches; not merged to main or in a release yet |
-| Adding an entry with one trm-infra pull request | The module is written and in review; it is not merged or connected to Vault yet |
+| Gatehouse support for all six destination kinds | Built on the agent-vault `noah/gatehouse-integration` branch; not merged to main or in a release yet |
+| Adding an entry with one trm-infra pull request | The module is written on the trm-infra `noah/gatehouse-catalog` branch; it has no pull request yet and is not merged or connected to Vault |
 | Entries limited to named people (tiers T1 and T2) | Refused today. The live Entra group lookup stays off until Security approves its app registration. |
 | Database entries above T0 | The database path carries the person's session, so T1 and T2 databases work once the Entra lookup is on, as for HTTP |
 | Repository and pull request entries | Wait for the GitHub App, which is not created yet |
@@ -25,8 +25,8 @@ read by `vault/terraform/modules/gatehouse-catalog` in trm-infra. You add one
 entry and open one pull request; Atlantis, the Terraform pull request bot,
 creates the Vault access the entry needs, and Gatehouse picks up the change
 within 30 seconds with no restart. Check an entry locally first, with an
-`agent-vault` binary built from the Gatehouse branch (the command is not in a
-release yet):
+`agent-vault` binary built from the `noah/gatehouse-integration` branch (the
+command is not in a release yet):
 
 ```sh
 agent-vault broker-catalog validate --require-pools gatehouse-catalog.yaml
@@ -142,9 +142,9 @@ exact audit row. Database refusals reach the client from the sidecar with the
 fixed text below, at connect time and inside a session; Gatehouse's own text
 never reaches the worker. Refusing one query inside a session leaves the
 session open, unless earlier messages of the same batch had already reached
-the database; then the session ends. Errors from PostgreSQL itself, such as a syntax error or a
-PostgreSQL permission error, pass through unchanged. For anything unclear,
-give Security the pool and the time to find the audit row.
+the database; then the session ends. Errors from PostgreSQL itself, such as
+a syntax error or a PostgreSQL permission error, pass through unchanged. For
+anything unclear, give Security the pool and the time to find the audit row.
 
 | You see | Usually means | Fix |
 |---|---|---|
