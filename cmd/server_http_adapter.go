@@ -44,7 +44,8 @@ func brokerCatalog(ctx context.Context, client *hashicorp.Client, getenv func(st
 		if source, err = httpcatalog.Open(ctx, load); err != nil {
 			return nil, fmt.Errorf("broker catalog: %w", err)
 		}
-		go source.Watch(context.Background(), 30*time.Second, load, func(version int, err error) {
+		// ctx is the server's lifetime context, so the watch runs until exit.
+		go source.Watch(ctx, 30*time.Second, load, func(version int, err error) {
 			logger.Error("broker catalog version rejected; keeping the last good catalog",
 				slog.Int("version", version), slog.Int("in_force", source.Version()), slog.String("error", err.Error()))
 		})
