@@ -43,7 +43,7 @@ func TestRealVault_ChainRotatesAndVerifies(t *testing.T) {
 	keys := KVKeys{Vault: client.Logical(), Mount: "secret", Path: path, Field: "key"}
 	signer := TransitSigner{Vault: client.Logical(), Mount: "transit", Key: path}
 	var out bytes.Buffer
-	chain, err := New(ctx, Options{Out: &out, Replica: "broker-0", Keys: keys, Signer: signer})
+	chain, err := New(ctx, Options{Out: &out, Replica: "broker-0", Keys: keys, Signer: signer, Boots: newMemBoots()})
 	if err != nil {
 		t.Fatal(err)
 	}

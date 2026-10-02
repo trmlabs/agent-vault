@@ -32,6 +32,7 @@ key material, and exits 1 if the trail cannot be trusted as complete.`,
 		input, _ := flags.GetString("input")
 		maxUnsigned, _ := flags.GetDuration("max-unsigned")
 		sortBySeq, _ := flags.GetBool("sort-by-seq")
+		partial, _ := flags.GetBool("partial-history")
 		keys := auditchain.KVKeys{Mount: stringFlag(cmd, "hmac-mount"), Path: stringFlag(cmd, "hmac-path"), Field: stringFlag(cmd, "hmac-field")}
 		signer := auditchain.TransitSigner{Mount: stringFlag(cmd, "transit-mount"), Key: stringFlag(cmd, "transit-key")}
 		ctx, cancel := context.WithTimeout(cmd.Context(), 5*time.Minute)
@@ -54,7 +55,7 @@ key material, and exits 1 if the trail cannot be trusted as complete.`,
 			defer func() { _ = f.Close() }()
 			r = f
 		}
-		verifier := auditchain.Verifier{HMACKey: func(version int) ([]byte, error) { return keys.Version(ctx, version) }, PublicKeys: public, MaxUnsigned: maxUnsigned, SortBySeq: sortBySeq}
+		verifier := auditchain.Verifier{HMACKey: func(version int) ([]byte, error) { return keys.Version(ctx, version) }, PublicKeys: public, MaxUnsigned: maxUnsigned, SortBySeq: sortBySeq, PartialHistory: partial}
 		return runAuditVerify(r, cmd.OutOrStdout(), verifier)
 	},
 }
@@ -82,13 +83,14 @@ func runAuditVerify(r io.Reader, w io.Writer, verifier auditchain.Verifier) erro
 func init() {
 	f := auditVerifyCmd.Flags()
 	f.String("input", "-", "file of exported rows, or - for stdin")
-	f.String("hmac-mount", "secret", "KV version 2 mount holding the HMAC key")
+	f.String("hmac-mount", "gatehouse", "KV version 2 mount holding the HMAC key")
 	f.String("hmac-path", "", "KV path of the HMAC key")
 	f.String("hmac-field", "key", "field holding the base64 HMAC key")
 	f.String("transit-mount", "transit", "Transit mount of the checkpoint key")
 	f.String("transit-key", "", "Transit ed25519 checkpoint key name")
 	f.Duration("max-unsigned", 5*time.Minute, "longest allowed run of rows after the last checkpoint; 0 disables")
 	f.Bool("sort-by-seq", false, "check rows in sequence order, for exports that do not preserve order")
+	f.Bool("partial-history", false, "accept that each replica's earliest exported boot links to a boot outside the export")
 	_ = auditVerifyCmd.MarkFlagRequired("hmac-path")
 	_ = auditVerifyCmd.MarkFlagRequired("transit-key")
 	auditCmd.AddCommand(auditVerifyCmd)

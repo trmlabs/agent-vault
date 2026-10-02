@@ -27,17 +27,20 @@ const (
 	FindingKeyUnavailable = "key_unavailable" // no HMAC key for the row's version
 	FindingKeyChange      = "key_change"      // key version changed without a key_rotated row
 	FindingMalformed      = "malformed"       // an audit row that cannot be parsed
+	FindingMissingBoot    = "missing_boot"    // a boot the next boot links to is absent
+	FindingTruncatedTail  = "truncated_tail"  // a boot ends before the checkpoint its successor links to
+	FindingBootLink       = "boot_link"       // a boot's link to its predecessor does not match
 )
 
 type Finding struct {
 	Kind    string
 	Replica string
-	Boot    string
+	Boot    uint64
 	Seq     uint64
 }
 
 func (f Finding) String() string {
-	return fmt.Sprintf("%s replica=%s boot=%s seq=%d", f.Kind, f.Replica, f.Boot, f.Seq)
+	return fmt.Sprintf("%s replica=%s boot=%d seq=%d", f.Kind, f.Replica, f.Boot, f.Seq)
 }
 
 type Report struct {
@@ -59,9 +62,22 @@ type Verifier struct {
 	// impossible, but a moved row still cannot hide an edit: sequence numbers
 	// and links are inside the MAC.
 	SortBySeq bool
+	// PartialHistory accepts that each replica's earliest exported boot links
+	// to a boot outside the export. Without it, every link must resolve.
+	PartialHistory bool
 }
 
-type chainKey struct{ replica, boot string }
+type chainKey struct {
+	replica string
+	boot    uint64
+}
+
+// chainState is what boot linking needs from a verified chain.
+type chainState struct {
+	start  *Row
+	rows   map[uint64]Row
+	maxSeq uint64
+}
 
 // Verify reads newline-delimited rows, either bare or wrapped as Cloud
 // Logging entries ({"jsonPayload": row}). Other lines are ignored. Rows are
@@ -99,15 +115,65 @@ func (v Verifier) Verify(r io.Reader) (Report, error) {
 		return order[i].replica < order[j].replica || order[i].replica == order[j].replica && order[i].boot < order[j].boot
 	})
 	keys := map[int][]byte{}
+	states := map[chainKey]chainState{}
 	for _, k := range order {
 		report.Chains++
 		if v.SortBySeq {
 			rows := chains[k]
 			sort.SliceStable(rows, func(i, j int) bool { return rows[i].Seq < rows[j].Seq })
 		}
-		report.Findings = append(report.Findings, v.verifyChain(k, chains[k], keys)...)
+		findings, state := v.verifyChain(k, chains[k], keys)
+		report.Findings = append(report.Findings, findings...)
+		states[k] = state
+	}
+	earliest := map[string]uint64{}
+	for _, k := range order {
+		if b, ok := earliest[k.replica]; !ok || k.boot < b {
+			earliest[k.replica] = k.boot
+		}
+	}
+	for _, k := range order {
+		report.Findings = append(report.Findings, v.verifyBootLink(k, states, earliest[k.replica] == k.boot)...)
 	}
 	return report, nil
+}
+
+// verifyBootLink checks that boot N's first row names boot N-1 and that boot
+// N-1 is present and reaches the checkpoint row boot N recorded for it.
+func (v Verifier) verifyBootLink(k chainKey, states map[chainKey]chainState, earliest bool) []Finding {
+	start := states[k].start
+	if start == nil {
+		return nil // already reported as no_chain_start
+	}
+	finding := func(kind string, boot, seq uint64) []Finding {
+		return []Finding{{Kind: kind, Replica: k.replica, Boot: boot, Seq: seq}}
+	}
+	if k.boot == 0 || start.PrevBoot != k.boot-1 || (start.PrevBoot == 0 && (start.PrevCheckpointSeq != 0 || start.PrevCheckpointMAC != "")) {
+		return finding(FindingBootLink, k.boot, 0)
+	}
+	if start.PrevBoot == 0 {
+		return nil
+	}
+	previous, ok := states[chainKey{k.replica, start.PrevBoot}]
+	if !ok {
+		if earliest && v.PartialHistory {
+			return nil
+		}
+		return finding(FindingMissingBoot, start.PrevBoot, 0)
+	}
+	if start.PrevCheckpointMAC == "" {
+		return nil // the previous boot never persisted a checkpoint
+	}
+	linked, ok := previous.rows[start.PrevCheckpointSeq]
+	switch {
+	case !ok && start.PrevCheckpointSeq > previous.maxSeq:
+		return finding(FindingTruncatedTail, start.PrevBoot, previous.maxSeq+1)
+	case !ok:
+		return nil // the missing row is already reported as a gap
+	case linked.Event != EventCheckpoint || !hmac.Equal([]byte(linked.MAC), []byte(start.PrevCheckpointMAC)):
+		return finding(FindingBootLink, k.boot, 0)
+	}
+	return nil
 }
 
 func parseLine(line []byte) (Row, bool, error) {
@@ -140,8 +206,9 @@ func parseLine(line []byte) (Row, bool, error) {
 	return row, true, nil
 }
 
-func (v Verifier) verifyChain(k chainKey, rows []Row, keys map[int][]byte) []Finding {
+func (v Verifier) verifyChain(k chainKey, rows []Row, keys map[int][]byte) ([]Finding, chainState) {
 	var findings []Finding
+	state := chainState{rows: map[uint64]Row{}}
 	add := func(kind string, seq uint64) {
 		findings = append(findings, Finding{Kind: kind, Replica: k.replica, Boot: k.boot, Seq: seq})
 	}
@@ -196,6 +263,13 @@ func (v Verifier) verifyChain(k chainKey, rows []Row, keys map[int][]byte) []Fin
 		}
 		if _, dup := macs[row.Seq]; !dup {
 			macs[row.Seq] = row.MAC
+			state.rows[row.Seq] = row
+		}
+		if row.Seq == 0 && row.Event == EventChainStart && state.start == nil {
+			state.start = &rows[i]
+		}
+		if row.Seq > state.maxSeq {
+			state.maxSeq = row.Seq
 		}
 		if prev == nil || row.Seq > prev.Seq {
 			prev = &rows[i]
@@ -210,7 +284,7 @@ func (v Verifier) verifyChain(k chainKey, rows []Row, keys map[int][]byte) []Fin
 			add(FindingUnsigned, prev.Seq)
 		}
 	}
-	return findings
+	return findings, state
 }
 
 func (v Verifier) checkpointValid(row Row, macs map[uint64]string) bool {

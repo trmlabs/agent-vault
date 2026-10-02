@@ -2,14 +2,14 @@ package auditchain
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"sync"
 	"time"
+
+	"github.com/Infisical/agent-vault/internal/store"
 )
 
 // Key is one version of the chain's HMAC key. Its bytes never leave this
@@ -41,6 +41,13 @@ type Signer interface {
 	Sign(context.Context, []byte) (string, error)
 }
 
+// BootStore persists each replica's boot counter and newest checkpoint row.
+// *store.SQLStore implements it.
+type BootStore interface {
+	BeginAuditBoot(ctx context.Context, replica string) (uint64, store.AuditBoot, error)
+	RecordAuditCheckpoint(ctx context.Context, replica string, boot, seq uint64, mac string) error
+}
+
 // Event is what a caller records; the chain fills in everything else.
 type Event struct {
 	Event     string
@@ -63,6 +70,7 @@ type Options struct {
 	Replica string    // stable replica name, such as the Pod name
 	Keys    KeySource
 	Signer  Signer
+	Boots   BootStore
 	// Grace is how long the chain may go without a signed checkpoint before
 	// Admit refuses new sessions. Default 5 minutes.
 	Grace time.Duration
@@ -73,7 +81,7 @@ type Options struct {
 // concurrent use; rows are written whole and in sequence order.
 type Chain struct {
 	opts Options
-	boot string
+	boot uint64
 
 	mu             sync.Mutex
 	seq            uint64
@@ -86,8 +94,8 @@ type Chain struct {
 // New fetches the current key and writes the chain_start row. Without a key
 // or a writable output there is no chain, and the caller must not serve.
 func New(ctx context.Context, opts Options) (*Chain, error) {
-	if opts.Out == nil || opts.Keys == nil || opts.Signer == nil || !identifier(opts.Replica, false) {
-		return nil, errors.New("audit chain requires output, replica name, key source and signer")
+	if opts.Out == nil || opts.Keys == nil || opts.Signer == nil || opts.Boots == nil || !identifier(opts.Replica, false) {
+		return nil, errors.New("audit chain requires output, replica name, key source, signer and boot store")
 	}
 	if opts.Grace <= 0 {
 		opts.Grace = 5 * time.Minute
@@ -99,14 +107,15 @@ func New(ctx context.Context, opts Options) (*Chain, error) {
 	if err != nil {
 		return nil, fmt.Errorf("audit HMAC key unavailable: %w", err)
 	}
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return nil, err
+	boot, previous, err := opts.Boots.BeginAuditBoot(ctx, opts.Replica)
+	if err != nil {
+		return nil, fmt.Errorf("audit boot unavailable: %w", err)
 	}
-	c := &Chain{opts: opts, boot: hex.EncodeToString(b[:]), key: key, lastCheckpoint: opts.Now()}
+	c := &Chain{opts: opts, boot: boot, key: key, lastCheckpoint: opts.Now()}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, err := c.appendLocked(Row{Event: EventChainStart}); err != nil {
+	start := Row{Event: EventChainStart, PrevBoot: previous.Boot, PrevCheckpointSeq: previous.CheckpointSeq, PrevCheckpointMAC: previous.CheckpointMAC}
+	if _, err := c.appendLocked(start); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -145,8 +154,10 @@ func (c *Chain) Record(e Event) error {
 	return err
 }
 
-// Checkpoint signs the current head outside the lock, then appends the
-// signature as a row. A signing failure is itself recorded in the chain.
+// Checkpoint signs the current head outside the lock, appends the signature
+// as a row and persists that row as the boot's newest checkpoint. A signing
+// or persistence failure is itself recorded in the chain, and the grace
+// period keeps running until both succeed.
 func (c *Chain) Checkpoint(ctx context.Context) error {
 	c.mu.Lock()
 	if c.failed {
@@ -164,8 +175,19 @@ func (c *Chain) Checkpoint(ctx context.Context) error {
 		}
 		return fmt.Errorf("audit checkpoint not signed: %w", ErrCheckpointOverdue)
 	}
-	if _, err := c.appendLocked(Row{Event: EventCheckpoint, SignedSeq: seq, SignedMAC: mac, Signature: signature}); err != nil {
+	row, err := c.appendLocked(Row{Event: EventCheckpoint, SignedSeq: seq, SignedMAC: mac, Signature: signature})
+	if err != nil {
 		return err
+	}
+	// Persist outside the lock so a slow store never stalls session rows.
+	c.mu.Unlock()
+	err = c.opts.Boots.RecordAuditCheckpoint(ctx, c.opts.Replica, c.boot, row.Seq, row.MAC)
+	c.mu.Lock()
+	if err != nil {
+		if _, appendErr := c.appendLocked(Row{Event: EventCheckpointFailed, Outcome: "store_unavailable"}); appendErr != nil {
+			return appendErr
+		}
+		return fmt.Errorf("audit checkpoint not persisted: %w", ErrCheckpointOverdue)
 	}
 	c.lastCheckpoint = c.opts.Now()
 	return nil

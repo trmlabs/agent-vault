@@ -6,10 +6,12 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/Infisical/agent-vault/internal/auditchain"
+	"github.com/Infisical/agent-vault/internal/store"
 )
 
 type cmdTestKeys struct{ secret []byte }
@@ -31,7 +33,12 @@ func TestAuditVerifyExitStatus(t *testing.T) {
 	}
 	secret := bytes.Repeat([]byte{0x5a}, 32) // synthetic
 	var trail bytes.Buffer
-	chain, err := auditchain.New(context.Background(), auditchain.Options{Out: &trail, Replica: "broker-0", Keys: cmdTestKeys{secret}, Signer: cmdTestSigner{private}})
+	db, err := store.Open(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	chain, err := auditchain.New(context.Background(), auditchain.Options{Out: &trail, Replica: "broker-0", Keys: cmdTestKeys{secret}, Signer: cmdTestSigner{private}, Boots: db})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +70,7 @@ func TestAuditVerifyExitStatus(t *testing.T) {
 
 func TestBrokerAuditChainSettings(t *testing.T) {
 	t.Setenv("AGENT_VAULT_AUDIT_CHAIN", "")
-	if chain, err := brokerAuditChain(context.Background(), nil, func(string) string { return "" }); chain != nil || err != nil {
+	if chain, err := brokerAuditChain(context.Background(), nil, nil, func(string) string { return "" }); chain != nil || err != nil {
 		t.Fatalf("disabled chain started: %v", err)
 	}
 	t.Setenv("AGENT_VAULT_AUDIT_CHAIN", "1")
@@ -73,7 +80,7 @@ func TestBrokerAuditChainSettings(t *testing.T) {
 		{"AGENT_VAULT_AUDIT_TRANSIT_KEY": "gatehouse-audit"},
 		{"AGENT_VAULT_AUDIT_HMAC_PATH": "gatehouse/audit-hmac", "AGENT_VAULT_AUDIT_TRANSIT_KEY": "gatehouse-audit"}, // no Vault client
 	} {
-		if _, err := brokerAuditChain(context.Background(), nil, func(k string) string { return env[k] }); err == nil {
+		if _, err := brokerAuditChain(context.Background(), nil, nil, func(k string) string { return env[k] }); err == nil {
 			t.Fatalf("incomplete audit settings accepted: %v", env)
 		}
 	}

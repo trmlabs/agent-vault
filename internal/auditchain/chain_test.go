@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Infisical/agent-vault/internal/store"
 )
 
 // Synthetic test keys, generated per run; never real credentials.
@@ -86,6 +88,36 @@ func (s *testSigner) Sign(_ context.Context, input []byte) (string, error) {
 
 func (s *testSigner) setDown(down bool) { s.mu.Lock(); s.down = down; s.mu.Unlock() }
 
+// memBoots mirrors the store's boot table for one process.
+type memBoots struct {
+	mu        sync.Mutex
+	replicas  map[string]store.AuditBoot
+	recordErr error
+}
+
+func newMemBoots() *memBoots { return &memBoots{replicas: map[string]store.AuditBoot{}} }
+
+func (m *memBoots) BeginAuditBoot(_ context.Context, replica string) (uint64, store.AuditBoot, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	previous := m.replicas[replica]
+	m.replicas[replica] = store.AuditBoot{Boot: previous.Boot + 1}
+	return previous.Boot + 1, previous, nil
+}
+
+func (m *memBoots) RecordAuditCheckpoint(_ context.Context, replica string, boot, seq uint64, mac string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.recordErr != nil {
+		return m.recordErr
+	}
+	if m.replicas[replica].Boot != boot {
+		return errors.New("boot no longer current")
+	}
+	m.replicas[replica] = store.AuditBoot{Boot: boot, CheckpointSeq: seq, CheckpointMAC: mac}
+	return nil
+}
+
 type clock struct {
 	mu  sync.Mutex
 	now time.Time
@@ -98,19 +130,26 @@ type fixture struct {
 	out    *bytes.Buffer
 	keys   *testKeys
 	signer *testSigner
+	boots  *memBoots
 	clock  *clock
 	chain  *Chain
 }
 
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
-	f := &fixture{out: &bytes.Buffer{}, keys: newTestKeys(t), signer: newTestSigner(t), clock: &clock{now: time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)}}
-	chain, err := New(context.Background(), Options{Out: f.out, Replica: "broker-0", Keys: f.keys, Signer: f.signer, Now: f.clock.Now})
+	f := &fixture{out: &bytes.Buffer{}, keys: newTestKeys(t), signer: newTestSigner(t), boots: newMemBoots(), clock: &clock{now: time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)}}
+	f.restart(t)
+	return f
+}
+
+// restart begins the replica's next boot, appending to the same output.
+func (f *fixture) restart(t *testing.T) {
+	t.Helper()
+	chain, err := New(context.Background(), Options{Out: f.out, Replica: "broker-0", Keys: f.keys, Signer: f.signer, Boots: f.boots, Now: f.clock.Now})
 	if err != nil {
 		t.Fatal(err)
 	}
 	f.chain = chain
-	return f
 }
 
 func (f *fixture) verifier() Verifier {
@@ -363,10 +402,10 @@ func (w *failingWriter) Write(p []byte) (int, error) {
 
 func TestOutputFailureFailsClosed(t *testing.T) {
 	keys, signer := newTestKeys(t), newTestSigner(t)
-	if _, err := New(context.Background(), Options{Out: &failingWriter{}, Replica: "broker-0", Keys: keys, Signer: signer}); err == nil {
+	if _, err := New(context.Background(), Options{Out: &failingWriter{}, Replica: "broker-0", Keys: keys, Signer: signer, Boots: newMemBoots()}); err == nil {
 		t.Fatal("chain started without a writable output")
 	}
-	c, err := New(context.Background(), Options{Out: &failingWriter{after: 1}, Replica: "broker-0", Keys: keys, Signer: signer})
+	c, err := New(context.Background(), Options{Out: &failingWriter{after: 1}, Replica: "broker-0", Keys: keys, Signer: signer, Boots: newMemBoots()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -381,8 +420,11 @@ func TestOutputFailureFailsClosed(t *testing.T) {
 func TestChainRequiresKeyAndRejectsFreeText(t *testing.T) {
 	keys := newTestKeys(t)
 	keys.err = errors.New("vault sealed")
-	if _, err := New(context.Background(), Options{Out: &bytes.Buffer{}, Replica: "broker-0", Keys: keys, Signer: newTestSigner(t)}); err == nil {
+	if _, err := New(context.Background(), Options{Out: &bytes.Buffer{}, Replica: "broker-0", Keys: keys, Signer: newTestSigner(t), Boots: newMemBoots()}); err == nil {
 		t.Fatal("chain started without a key")
+	}
+	if _, err := New(context.Background(), Options{Out: &bytes.Buffer{}, Replica: "broker-0", Keys: newTestKeys(t), Signer: newTestSigner(t)}); err == nil {
+		t.Fatal("chain started without a boot store")
 	}
 	f := newFixture(t)
 	for _, e := range []Event{
@@ -445,5 +487,120 @@ func TestSortBySeqAcceptsShuffledExportButNotEdits(t *testing.T) {
 	}
 	if got := kinds(verify(t, v, strings.Replace(shuffled, `"outcome":"closed"`, `"outcome":"admitted"`, 1))); strings.Join(got, " ") != FindingEdit {
 		t.Fatalf("edit hidden by sorting: %v", got)
+	}
+}
+
+// threeBoots writes boots 1 to 3 of one replica, each with a session and a
+// checkpoint, and returns each boot's lines.
+func threeBoots(t *testing.T) (*fixture, [][]string) {
+	t.Helper()
+	f := newFixture(t)
+	var boots [][]string
+	written := 0
+	for boot := 1; boot <= 3; boot++ {
+		if boot > 1 {
+			f.restart(t)
+		}
+		f.session(t, boot)
+		f.checkpoint(t)
+		lines := strings.Split(strings.TrimSpace(f.out.String()), "\n")
+		boots = append(boots, lines[written:])
+		written = len(lines)
+	}
+	return f, boots
+}
+
+func joinBoots(boots ...[]string) string {
+	var all []string
+	for _, b := range boots {
+		all = append(all, b...)
+	}
+	return strings.Join(all, "\n") + "\n"
+}
+
+func TestBootsLinkToTheirPredecessor(t *testing.T) {
+	f, boots := threeBoots(t)
+	if report := verify(t, f.verifier(), f.out.String()); len(report.Findings) != 0 || report.Chains != 3 {
+		t.Fatalf("linked boots rejected: %d %v", report.Chains, kinds(report))
+	}
+	first := rows(t, boots[0][0])[0]
+	second := rows(t, boots[1][0])[0]
+	lastOfFirst := rows(t, boots[0][len(boots[0])-1])[0]
+	if first.Boot != 1 || first.PrevBoot != 0 || second.Boot != 2 || second.PrevBoot != 1 ||
+		second.PrevCheckpointSeq != lastOfFirst.Seq || second.PrevCheckpointMAC != lastOfFirst.MAC || lastOfFirst.Event != EventCheckpoint {
+		t.Fatalf("boot link: first=%+v second=%+v", first, second)
+	}
+}
+
+// Deleting a whole boot is detected, unless it predates the export window and
+// the verifier is told the history is partial.
+func TestVerifierDetectsMissingBoot(t *testing.T) {
+	f, boots := threeBoots(t)
+	report := verify(t, f.verifier(), joinBoots(boots[0], boots[2]))
+	if len(report.Findings) != 1 || report.Findings[0].Kind != FindingMissingBoot || report.Findings[0].Boot != 2 {
+		t.Fatalf("deleted boot not reported: %v", report.Findings)
+	}
+	if got := kinds(verify(t, f.verifier(), joinBoots(boots[1], boots[2]))); strings.Join(got, " ") != FindingMissingBoot {
+		t.Fatalf("missing first boot not reported: %v", got)
+	}
+	partial := f.verifier()
+	partial.PartialHistory = true
+	if got := kinds(verify(t, partial, joinBoots(boots[1], boots[2]))); len(got) != 0 {
+		t.Fatalf("partial history rejected: %v", got)
+	}
+	if got := kinds(verify(t, partial, joinBoots(boots[0], boots[2]))); strings.Join(got, " ") != FindingMissingBoot {
+		t.Fatalf("partial history hid an interior boot: %v", got)
+	}
+}
+
+// Cutting a boot's tail back past the checkpoint its successor recorded is
+// detected even though the remaining rows chain correctly.
+func TestVerifierDetectsTruncatedTailAcrossBoots(t *testing.T) {
+	f, boots := threeBoots(t)
+	truncated := boots[0][:len(boots[0])-1] // drop boot 1's final checkpoint
+	report := verify(t, f.verifier(), joinBoots(truncated, boots[1], boots[2]))
+	if len(report.Findings) != 1 || report.Findings[0].Kind != FindingTruncatedTail || report.Findings[0].Boot != 1 {
+		t.Fatalf("truncated tail not reported: %v", report.Findings)
+	}
+}
+
+// A broker holding the HMAC key cannot re-point a boot at a different
+// predecessor checkpoint.
+func TestVerifierDetectsForgedBootLink(t *testing.T) {
+	f, boots := threeBoots(t)
+	start := rows(t, boots[1][0])[0]
+	start.PrevCheckpointSeq = 0
+	start.PrevCheckpointMAC = rows(t, boots[0][0])[0].MAC // points at chain_start, not a checkpoint
+	key, _ := f.keys.lookup(start.KeyVersion)
+	start.MAC = start.computeMAC(key)
+	line, _ := json.Marshal(start)
+	forged := append([]string{string(line)}, boots[1][1:]...)
+	got := kinds(verify(t, f.verifier(), joinBoots(boots[0], forged, boots[2])))
+	found := false
+	for _, k := range got {
+		found = found || k == FindingBootLink
+	}
+	if !found {
+		t.Fatalf("forged boot link accepted: %v", got)
+	}
+}
+
+// A checkpoint that cannot be persisted does not count: it is recorded, and
+// admission closes once the grace period passes.
+func TestCheckpointPersistenceFailureCountsAsMissed(t *testing.T) {
+	f := newFixture(t)
+	f.boots.mu.Lock()
+	f.boots.recordErr = errors.New("store unavailable")
+	f.boots.mu.Unlock()
+	f.clock.advance(6 * time.Minute)
+	if err := f.chain.Checkpoint(context.Background()); !errors.Is(err, ErrCheckpointOverdue) {
+		t.Fatalf("checkpoint error = %v", err)
+	}
+	if err := f.chain.Admit(); !errors.Is(err, ErrCheckpointOverdue) {
+		t.Fatalf("admitted with an unpersisted checkpoint: %v", err)
+	}
+	got := rows(t, f.out.String())
+	if last := got[len(got)-1]; last.Event != EventCheckpointFailed || last.Outcome != "store_unavailable" {
+		t.Fatalf("failure not recorded: %+v", last)
 	}
 }

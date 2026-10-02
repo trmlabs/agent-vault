@@ -18,7 +18,7 @@ const (
 // brokerAuditChain starts the signed audit trail when AGENT_VAULT_AUDIT_CHAIN
 // is set. Enabled with incomplete settings, an unreadable key or an unwritable
 // stdout, it fails startup rather than serve unaudited.
-func brokerAuditChain(ctx context.Context, client *hashicorp.Client, getenv func(string) string) (*auditchain.Chain, error) {
+func brokerAuditChain(ctx context.Context, client *hashicorp.Client, db any, getenv func(string) string) (*auditchain.Chain, error) {
 	if !boolEnvValue("AGENT_VAULT_AUDIT_CHAIN") {
 		return nil, nil
 	}
@@ -32,13 +32,14 @@ func brokerAuditChain(ctx context.Context, client *hashicorp.Client, getenv func
 	if replica == "" {
 		replica, _ = os.Hostname()
 	}
-	keys := auditchain.KVKeys{Mount: setting("AGENT_VAULT_AUDIT_HMAC_MOUNT", "secret"), Path: getenv("AGENT_VAULT_AUDIT_HMAC_PATH"), Field: setting("AGENT_VAULT_AUDIT_HMAC_FIELD", "key")}
+	keys := auditchain.KVKeys{Mount: setting("AGENT_VAULT_AUDIT_HMAC_MOUNT", "gatehouse"), Path: getenv("AGENT_VAULT_AUDIT_HMAC_PATH"), Field: setting("AGENT_VAULT_AUDIT_HMAC_FIELD", "key")}
 	signer := auditchain.TransitSigner{Mount: setting("AGENT_VAULT_AUDIT_TRANSIT_MOUNT", "transit"), Key: getenv("AGENT_VAULT_AUDIT_TRANSIT_KEY")}
-	if client == nil || keys.Path == "" || signer.Key == "" {
-		return nil, fmt.Errorf("audit chain requires a Vault client, AGENT_VAULT_AUDIT_HMAC_PATH and AGENT_VAULT_AUDIT_TRANSIT_KEY")
+	boots, ok := db.(auditchain.BootStore)
+	if client == nil || !ok || keys.Path == "" || signer.Key == "" {
+		return nil, fmt.Errorf("audit chain requires a Vault client, the SQL store, AGENT_VAULT_AUDIT_HMAC_PATH and AGENT_VAULT_AUDIT_TRANSIT_KEY")
 	}
 	keys.Vault, signer.Vault = client.Logical(), client.Logical()
-	chain, err := auditchain.New(ctx, auditchain.Options{Out: os.Stdout, Replica: replica, Keys: keys, Signer: signer})
+	chain, err := auditchain.New(ctx, auditchain.Options{Out: os.Stdout, Replica: replica, Keys: keys, Signer: signer, Boots: boots})
 	if err != nil {
 		return nil, err
 	}

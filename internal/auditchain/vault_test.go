@@ -80,7 +80,7 @@ func TestVaultBackedChainVerifies(t *testing.T) {
 		t.Fatalf("current key: %v %v", key, err)
 	}
 	var out bytes.Buffer
-	chain, err := New(context.Background(), Options{Out: &out, Replica: "broker-0", Keys: keys, Signer: signer})
+	chain, err := New(context.Background(), Options{Out: &out, Replica: "broker-0", Keys: keys, Signer: signer, Boots: newMemBoots()})
 	if err != nil {
 		t.Fatal(err)
 	}

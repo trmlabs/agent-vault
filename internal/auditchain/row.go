@@ -31,7 +31,7 @@ const (
 type Row struct {
 	Type       string `json:"type"`
 	Replica    string `json:"replica"`
-	Boot       string `json:"boot"`
+	Boot       uint64 `json:"boot"` // per-replica counter persisted in the store
 	Seq        uint64 `json:"seq"`
 	Time       string `json:"ts"`
 	Event      string `json:"event"`
@@ -45,6 +45,11 @@ type Row struct {
 	SignedMAC  string `json:"signedMAC,omitempty"`
 	Signature  string `json:"signature,omitempty"` // checkpoint: Transit "vault:vN:..." signature
 	PrevKey    int    `json:"prevKeyVersion,omitempty"`
+	// chain_start: the previous boot and its last persisted checkpoint row,
+	// so a deleted boot or a truncated tail is detectable.
+	PrevBoot          uint64 `json:"prevBoot,omitempty"`
+	PrevCheckpointSeq uint64 `json:"prevCheckpointSeq,omitempty"`
+	PrevCheckpointMAC string `json:"prevCheckpointMAC,omitempty"`
 	KeyVersion int    `json:"keyVersion"`
 	Prev       string `json:"prev"`
 	MAC        string `json:"mac"`
@@ -54,10 +59,11 @@ type Row struct {
 // distinct rows share an input regardless of field contents.
 func (r Row) macInput() []byte {
 	fields := []string{
-		r.Type, r.Replica, r.Boot, strconv.FormatUint(r.Seq, 10), r.Time, r.Event,
+		r.Type, r.Replica, strconv.FormatUint(r.Boot, 10), strconv.FormatUint(r.Seq, 10), r.Time, r.Event,
 		r.Pool, r.PodUID, r.Binding, r.Session, r.Outcome, r.Requester,
 		strconv.FormatUint(r.SignedSeq, 10), r.SignedMAC, r.Signature,
-		strconv.Itoa(r.PrevKey), strconv.Itoa(r.KeyVersion), r.Prev,
+		strconv.Itoa(r.PrevKey), strconv.FormatUint(r.PrevBoot, 10), strconv.FormatUint(r.PrevCheckpointSeq, 10), r.PrevCheckpointMAC,
+		strconv.Itoa(r.KeyVersion), r.Prev,
 	}
 	return lengthPrefixed("gatehouse-audit-v1", fields...)
 }
@@ -69,8 +75,8 @@ func (r Row) computeMAC(key []byte) string {
 }
 
 // checkpointInput is what Transit signs: the chain identity and its head.
-func checkpointInput(replica, boot string, seq uint64, mac string) []byte {
-	return lengthPrefixed("gatehouse-checkpoint-v1", replica, boot, strconv.FormatUint(seq, 10), mac)
+func checkpointInput(replica string, boot, seq uint64, mac string) []byte {
+	return lengthPrefixed("gatehouse-checkpoint-v1", replica, strconv.FormatUint(boot, 10), strconv.FormatUint(seq, 10), mac)
 }
 
 func lengthPrefixed(domain string, fields ...string) []byte {
