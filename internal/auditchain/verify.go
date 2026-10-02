@@ -30,6 +30,9 @@ const (
 	FindingMissingBoot    = "missing_boot"    // a boot the next boot links to is absent
 	FindingTruncatedTail  = "truncated_tail"  // a boot ends before the checkpoint its successor links to
 	FindingBootLink       = "boot_link"       // a boot's link to its predecessor does not match
+	FindingMissingHead    = "missing_head"    // the export does not reach the head the store holds for a replica
+	FindingUnknownBoot    = "unknown_boot"    // a boot or replica the store never issued
+	FindingKeyDowngrade   = "key_downgrade"   // a boot starts under an older key than its predecessor ended on
 )
 
 type Finding struct {
@@ -65,6 +68,21 @@ type Verifier struct {
 	// PartialHistory accepts that each replica's earliest exported boot links
 	// to a boot outside the export. Without it, every link must resolve.
 	PartialHistory bool
+	// Heads, when set, is the store's head for every replica (agent-vault
+	// audit heads). Each replica's newest boot must be present and reach its
+	// head's checkpoint, so deleting a whole boot or cutting a tail back to an
+	// earlier checkpoint is a finding even for a boot with no successor. Rows
+	// after the newest persisted checkpoint (at most one checkpoint interval)
+	// are bounded only by MaxUnsigned.
+	Heads []Head
+}
+
+// Head is one replica's current boot and newest persisted checkpoint row.
+type Head struct {
+	Replica       string `json:"replica"`
+	Boot          uint64 `json:"boot"`
+	CheckpointSeq uint64 `json:"checkpointSeq"`
+	CheckpointMAC string `json:"checkpointMac"`
 }
 
 type chainKey struct {
@@ -74,9 +92,10 @@ type chainKey struct {
 
 // chainState is what boot linking needs from a verified chain.
 type chainState struct {
-	start  *Row
-	rows   map[uint64]Row
-	maxSeq uint64
+	start   *Row
+	rows    map[uint64]Row
+	maxSeq  uint64
+	lastKey int // key version of the highest-sequence row
 }
 
 // Verify reads newline-delimited rows, either bare or wrapped as Cloud
@@ -135,7 +154,39 @@ func (v Verifier) Verify(r io.Reader) (Report, error) {
 	for _, k := range order {
 		report.Findings = append(report.Findings, v.verifyBootLink(k, states, earliest[k.replica] == k.boot)...)
 	}
+	if v.Heads != nil {
+		report.Findings = append(report.Findings, v.verifyHeads(order, states)...)
+	}
 	return report, nil
+}
+
+// verifyHeads checks the export against the store: every replica's newest
+// boot is present and reaches its persisted checkpoint, and no exported boot
+// is newer than the store's (or belongs to a replica the store never saw).
+func (v Verifier) verifyHeads(order []chainKey, states map[chainKey]chainState) []Finding {
+	var findings []Finding
+	heads := map[string]Head{}
+	for _, head := range v.Heads {
+		heads[head.Replica] = head
+		state, ok := states[chainKey{head.Replica, head.Boot}]
+		if !ok {
+			findings = append(findings, Finding{Kind: FindingMissingHead, Replica: head.Replica, Boot: head.Boot})
+			continue
+		}
+		if head.CheckpointMAC == "" {
+			continue // the boot has not persisted a checkpoint yet
+		}
+		row, ok := state.rows[head.CheckpointSeq]
+		if !ok || row.Event != EventCheckpoint || !hmac.Equal([]byte(row.MAC), []byte(head.CheckpointMAC)) {
+			findings = append(findings, Finding{Kind: FindingMissingHead, Replica: head.Replica, Boot: head.Boot, Seq: head.CheckpointSeq})
+		}
+	}
+	for _, k := range order {
+		if head, ok := heads[k.replica]; !ok || k.boot > head.Boot {
+			findings = append(findings, Finding{Kind: FindingUnknownBoot, Replica: k.replica, Boot: k.boot})
+		}
+	}
+	return findings
 }
 
 // verifyBootLink checks that boot N's first row names boot N-1 and that boot
@@ -160,6 +211,11 @@ func (v Verifier) verifyBootLink(k chainKey, states map[chainKey]chainState, ear
 			return nil
 		}
 		return finding(FindingMissingBoot, start.PrevBoot, 0)
+	}
+	// A boot never starts under an older key than its predecessor ended on, so
+	// a retired key cannot fabricate a later boot.
+	if start.KeyVersion < previous.lastKey {
+		return finding(FindingKeyDowngrade, k.boot, 0)
 	}
 	if start.PrevCheckpointMAC == "" {
 		return nil // the previous boot never persisted a checkpoint
@@ -277,19 +333,22 @@ func (v Verifier) verifyChain(k chainKey, rows []Row, keys map[int][]byte) ([]Fi
 		if row.Seq == 0 && row.Event == EventChainStart && state.start == nil {
 			state.start = &rows[i]
 		}
-		if row.Seq > state.maxSeq {
-			state.maxSeq = row.Seq
+		if row.Seq >= state.maxSeq {
+			state.maxSeq, state.lastKey = row.Seq, row.KeyVersion
 		}
 		if prev == nil || row.Seq > prev.Seq {
 			prev = &rows[i]
 		}
 	}
-	if v.MaxUnsigned > 0 && prev != nil {
-		if !signedAny {
-			lastSigned, _ = time.Parse(time.RFC3339Nano, rows[0].Time)
-		}
+	// A boot signs a checkpoint as it starts, so one with none at all is
+	// unsigned however short: anyone holding a key could have written it.
+	switch {
+	case prev == nil:
+	case !signedAny:
+		add(FindingUnsigned, prev.Seq)
+	case v.MaxUnsigned > 0:
 		last, err := time.Parse(time.RFC3339Nano, prev.Time)
-		if err != nil || lastSigned.IsZero() || last.Sub(lastSigned) > v.MaxUnsigned {
+		if err != nil || last.Sub(lastSigned) > v.MaxUnsigned {
 			add(FindingUnsigned, prev.Seq)
 		}
 	}
