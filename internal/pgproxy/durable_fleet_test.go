@@ -5,6 +5,9 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -303,4 +306,104 @@ func TestDurableLeaseReadinessFollowsRenewal(t *testing.T) {
 	}
 	cut.cut.Store(false)
 	waitWithin(t, 2*time.Second, "ready after recovery", a.Ready)
+}
+
+// Two broker processes configured with the same replica name: the second
+// refuses to start while the first keeps renewing, and the first is unharmed.
+func TestSecondBrokerWithTheSameReplicaNameRefusesToStart(t *testing.T) {
+	client, st, _ := durableFixture(t)
+	opts := DurableLeaseOptions{OwnerTTL: 3 * time.Second, RetryInterval: time.Hour, Replica: "gatehouse-0"}
+	first, err := NewDurableLeaseMinter(context.Background(), client, st, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close(context.Background())
+	start := time.Now()
+	second, err := NewDurableLeaseMinter(context.Background(), client, st, opts)
+	if err == nil {
+		second.Close(context.Background())
+		t.Fatal("a second process started under a live replica name")
+	}
+	if !errors.Is(err, store.ErrReplicaNameInUse) {
+		t.Fatalf("refusal = %v, want ErrReplicaNameInUse", err)
+	}
+	// It waited long enough to tell a live holder from a crashed one.
+	if waited := time.Since(start); waited < opts.OwnerTTL {
+		t.Fatalf("refused after %s, before a crashed holder's row could expire", waited)
+	}
+	if first.Fenced() || !first.Ready() {
+		t.Fatal("the refused start harmed the live broker")
+	}
+}
+
+// A restart under the same name after a crash waits for the crashed row to
+// expire, then starts: only a holder that is still renewing blocks the name.
+func TestRestartUnderTheSameNameWaitsOutTheCrashedRow(t *testing.T) {
+	client, st, _ := durableFixture(t)
+	opts := DurableLeaseOptions{OwnerTTL: 3 * time.Second, RetryInterval: time.Hour, Replica: "gatehouse-0"}
+	old, err := NewDurableLeaseMinter(context.Background(), client, st, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old.cancel() // crash: no release
+	<-old.done
+	start := time.Now()
+	restarted, err := NewDurableLeaseMinter(context.Background(), client, st, opts)
+	if err != nil {
+		t.Fatal("restart after a crash refused:", err)
+	}
+	defer restarted.Close(context.Background())
+	if waited := time.Since(start); waited < time.Second {
+		t.Fatalf("started after %s, while the crashed row was still live", waited)
+	}
+}
+
+// The same guard across real processes sharing one store file: the child
+// broker process, configured with the parent's replica name, exits refusing.
+func TestSecondBrokerProcessWithTheSameNameRefuses(t *testing.T) {
+	if os.Getenv("GH_REPLICA_GUARD_DB") != "" {
+		t.Skip("helper process")
+	}
+	path := filepath.Join(t.TempDir(), "journal.db")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	client, _, _ := durableFixtureOn(t, st)
+	first, err := NewDurableLeaseMinter(context.Background(), client, st, DurableLeaseOptions{OwnerTTL: 3 * time.Second, RetryInterval: time.Hour, Replica: "gatehouse-0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close(context.Background())
+	cmd := exec.Command(os.Args[0], "-test.run=^TestReplicaGuardHelperProcess$", "-test.count=1")
+	cmd.Env = append(os.Environ(), "GH_REPLICA_GUARD_DB="+path)
+	out, err := cmd.CombinedOutput()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 3 {
+		t.Fatalf("second process did not refuse (err %v):\n%s", err, out)
+	}
+	if first.Fenced() {
+		t.Fatal("the refused process fenced the live broker")
+	}
+}
+
+func TestReplicaGuardHelperProcess(t *testing.T) {
+	path := os.Getenv("GH_REPLICA_GUARD_DB")
+	if path == "" {
+		t.Skip("run by TestSecondBrokerProcessWithTheSameNameRefuses")
+	}
+	st, err := store.Open(path)
+	if err != nil {
+		os.Exit(2)
+	}
+	client, _, _ := durableFixtureOn(t, st)
+	m, err := NewDurableLeaseMinter(context.Background(), client, st, DurableLeaseOptions{OwnerTTL: 3 * time.Second, RetryInterval: time.Hour, Replica: "gatehouse-0"})
+	if errors.Is(err, store.ErrReplicaNameInUse) {
+		os.Exit(3)
+	}
+	if err == nil {
+		m.Close(context.Background())
+	}
+	os.Exit(4)
 }
