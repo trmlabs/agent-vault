@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/Infisical/agent-vault/internal/hashicorp"
 	"github.com/Infisical/agent-vault/internal/httpcatalog"
 	"github.com/Infisical/agent-vault/internal/mitm"
+	"github.com/Infisical/agent-vault/internal/netguard"
 	"github.com/Infisical/agent-vault/internal/server"
 )
 
@@ -91,7 +93,12 @@ func httpHeaderAdapter(ctx context.Context, srv *server.Server, getenv func(stri
 	if chain == nil {
 		return nil, fmt.Errorf("requires AGENT_VAULT_AUDIT_CHAIN")
 	}
-	adapter := &mitm.HeaderAdapter{Catalog: source, Keys: &httpcatalog.Keys{Vault: client.Logical()}, Audit: chain}
+	keys := &httpcatalog.Keys{Vault: client.Logical()}
+	adapter := &mitm.HeaderAdapter{Catalog: source, Keys: keys, Audit: chain}
+	// Browser-session test users log in through Auth0 from the broker, over
+	// the same guarded dialer as every other upstream.
+	adapter.BrowserTokens = &httpcatalog.Auth0Tokens{Keys: keys, Client: &http.Client{Timeout: 10 * time.Second,
+		Transport: &http.Transport{DialContext: netguard.SafeDialContext(netguard.AllowPrivateFromEnv()), TLSHandshakeTimeout: 5 * time.Second}}}
 	githubEntries := false
 	for _, e := range source.Current().Entries() {
 		githubEntries = githubEntries || e.Kind == "git" || e.Kind == "github-api"
