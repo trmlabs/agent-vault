@@ -225,14 +225,6 @@ func sslMode(mode string) string {
 	}
 }
 
-// negotiateUpstreamTLS performs the PostgreSQL SSL negotiation according to the
-// service's sslmode and returns the connection to use (raw or TLS-wrapped) and
-// whether the channel is encrypted:
-//   - disable: no negotiation; plaintext.
-//   - prefer (default): request TLS, use it if offered, else plaintext.
-//   - require: request TLS, fail if the server declines; encrypt without
-//     verifying the certificate (matching libpq).
-//   - verify-full: as require, but verify the certificate chain and hostname.
 // privatePeer reports whether the connection's remote end is a loopback or
 // private (RFC 1918, IPv6 unique local) address, or not an IP address at all
 // (a local socket). Plaintext never goes to a public address, whatever the
@@ -250,6 +242,14 @@ func privatePeer(conn net.Conn) bool {
 	return addr.IsLoopback() || addr.IsPrivate()
 }
 
+// negotiateUpstreamTLS performs the PostgreSQL SSL negotiation according to the
+// service's sslmode and returns the connection to use (raw or TLS-wrapped) and
+// whether the channel is encrypted:
+//   - disable: no negotiation; plaintext.
+//   - prefer (default): request TLS, use it if offered, else plaintext.
+//   - require: request TLS, fail if the server declines; encrypt without
+//     verifying the certificate (matching libpq).
+//   - verify-full: as require, but verify the certificate chain and hostname.
 func negotiateUpstreamTLS(ctx context.Context, conn net.Conn, svc *DatabaseService) (net.Conn, bool, error) {
 	switch svc.SSLMode {
 	case "", "disable", "prefer", "require", "verify-full":
