@@ -235,7 +235,7 @@ var masterPasswordRemoveCmd = &cobra.Command{
 // ensureServerStopped checks that no server process is running.
 // Master password operations require exclusive access to the database.
 func ensureServerStopped(force bool) error {
-	if os.Getenv("DATABASE_URL") != "" {
+	if sharedStoreConfigured() {
 		if !force {
 			fmt.Fprintln(os.Stderr,
 				"DATABASE_URL is set, which means multiple instances may share this database.",
@@ -261,7 +261,10 @@ func ensureServerStopped(force bool) error {
 // openDB opens the store, using DATABASE_URL when set or the default
 // SQLite path otherwise.
 func openDB() (store.Store, func(), error) {
-	dbURL := os.Getenv("DATABASE_URL")
+	dbURL, err := databaseURL()
+	if err != nil {
+		return nil, nil, err
+	}
 	if dbURL != "" {
 		db, err := store.OpenStore(store.StoreConfig{DatabaseURL: dbURL})
 		if err != nil {
