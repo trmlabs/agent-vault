@@ -158,3 +158,35 @@ func TestKillDetachesAndClosesTheServerConnection(t *testing.T) {
 		t.Fatal("cancel key still bound after kill")
 	}
 }
+
+// A client that stops reading is cut off once a write has waited
+// clientWriteTimeout, so it cannot hold the server connection behind it.
+func TestPooledSessionEndsWhenTheClientStopsReading(t *testing.T) {
+	saved := clientWriteTimeout
+	clientWriteTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { clientWriteTimeout = saved })
+	brokerSide, client := net.Pipe() // unbuffered: a write waits for a read that never comes
+	defer func() { _ = client.Close() }()
+	s := &pooledSession{client: brokerSide, backend: pgproto3.NewBackend(brokerSide, brokerSide)}
+	started := time.Now()
+	s.writeClientMessage(&pgproto3.DataRow{Values: [][]byte{[]byte(strings.Repeat("x", 1<<16))}}, true)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		s.mu.Lock()
+		killed := s.killed
+		s.mu.Unlock()
+		if killed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("session survived a client that never reads")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if elapsed := time.Since(started); elapsed < clientWriteTimeout {
+		t.Fatalf("session ended after %v, before the write timeout", elapsed)
+	}
+	if _, err := brokerSide.Write([]byte{0}); err == nil {
+		t.Fatal("client connection still open")
+	}
+}
