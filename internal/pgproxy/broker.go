@@ -446,7 +446,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		}
 		b.logger.Warn("pgproxy: agent authentication failed", slog.String("error", err.Error()))
 		b.auditDenied(auditchain.Event{}, "authentication")
-		writeClientError(backend, "28000", "Agent Vault: authentication failed")
+		writeClientError(backend, "28000", "authentication", "Agent Vault: authentication failed")
 		return
 	}
 	// Audit identity comes only from the verified scope. The binding is added
@@ -455,7 +455,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	connCtx := WithSession(b.ctx, session)
 	refuse := func(outcome, code, message string) {
 		b.auditDenied(event, outcome)
-		writeClientError(backend, code, message)
+		writeClientError(backend, code, outcome, message)
 	}
 	if err := b.auditAdmit(); err != nil {
 		b.logger.Error("pgproxy: audit trail unavailable; refusing session", slog.String("error", err.Error()))
@@ -655,7 +655,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	opened.Event, opened.Outcome = auditchain.EventSessionOpen, "admitted"
 	if err := b.auditRecord(opened); err != nil {
 		b.logger.Error("pgproxy: audit trail unavailable; refusing session", slog.String("error", err.Error()))
-		writeClientError(backend, "08004", "Agent Vault: audit unavailable")
+		writeClientError(backend, "08004", "audit_unavailable", "Agent Vault: audit unavailable")
 		return
 	}
 	defer func() {
