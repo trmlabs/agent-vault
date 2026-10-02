@@ -41,8 +41,10 @@ type Options struct {
 	// TrustProxyHeader reads a PROXY v1 header from the in-Pod loopback TLS
 	// terminator on every connection and uses its source as the peer address.
 	TrustProxyHeader bool
-	Pool             *PoolOptions // transaction-mode multiplexing; nil keeps one upstream connection per session
-	Audit            AuditTrail   // signed audit trail; nil disables it
+	// Sessions, when set, caps live sessions per Pod across every broker replica.
+	Sessions SessionLedger
+	Pool     *PoolOptions // transaction-mode multiplexing; nil keeps one upstream connection per session
+	Audit    AuditTrail   // signed audit trail; nil disables it
 }
 
 // Broker is the PostgreSQL credential-brokering TCP listener. It mirrors the
@@ -472,6 +474,36 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		return
 	}
 	defer b.releaseLeaseSlot(capKey)
+	// Across the fleet, the store holds the authoritative per-Pod count; the
+	// in-memory slot above only spares the store a call this replica can refuse.
+	if b.opts.Sessions != nil && scope.WorkloadID != "" {
+		id := newSessionID()
+		sessionID := "ledger-" + id
+		err := errors.New("session ID unavailable")
+		if id != "" {
+			err = b.opts.Sessions.Add(admissionCtx, sessionID, scope.WorkloadID, b.opts.MaxLeasesPerActor)
+		}
+		if errors.Is(err, ErrSessionLimit) {
+			b.logger.Warn("pgproxy: per-workload live-credential limit reached across the fleet",
+				slog.String("vault", scope.VaultID), slog.String("actor", scope.ActorID),
+				slog.String("workload", scope.WorkloadID), slog.Int("limit", b.opts.MaxLeasesPerActor))
+			refuse("actor_limit", "53300", "Agent Vault: too many concurrent database sessions")
+			return
+		}
+		if err != nil {
+			b.logger.Error("pgproxy: session ledger unavailable; refusing session", slog.String("error", err.Error()))
+			refuse("ledger_unavailable", "08004", "Agent Vault: session accounting unavailable")
+			return
+		}
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
+			defer cancel()
+			if err := b.opts.Sessions.Remove(ctx, sessionID); err != nil {
+				// The row stops counting when this replica's owner row expires.
+				b.logger.Warn("pgproxy: session ledger removal failed", slog.String("error", err.Error()))
+			}
+		}()
+	}
 
 	// Global backstop: bound the total upstream connections across all databases,
 	// applied only after auth so unauthenticated handshakes cannot consume it.

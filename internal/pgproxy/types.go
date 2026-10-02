@@ -10,6 +10,7 @@ package pgproxy
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
 	"time"
@@ -132,3 +133,14 @@ const (
 	// agent from monopolizing the serving cap and starving other agents.
 	defaultMaxLeasesPerActor = 16
 )
+
+// ErrSessionLimit is returned by a SessionLedger when a Pod is at its cap.
+var ErrSessionLimit = errors.New("workload session limit reached")
+
+// SessionLedger records live sessions in shared storage so a Pod's cap holds
+// across broker replicas. Add must be atomic per Pod and return
+// ErrSessionLimit at the cap; any other error refuses the session.
+type SessionLedger interface {
+	Add(ctx context.Context, sessionID, workload string, limit int) error
+	Remove(ctx context.Context, sessionID string) error
+}

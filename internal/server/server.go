@@ -101,6 +101,7 @@ type Server struct {
 	// --postgres-port is 0 or no database services are configured.
 	cleanupObserverServer *http.Server
 	pgBroker              *pgproxy.Broker
+	readiness             []readinessCheck
 	pgLeaseCloser         interface{ Close(context.Context) error }
 }
 
@@ -140,6 +141,17 @@ func (s *Server) HashicorpClient() *hashicorp.Client { return s.hashicorpClient 
 // SIGINT/SIGTERM/Shutdown stops it alongside the HTTP server. Must be called
 // before Start.
 func (s *Server) AttachPostgresBroker(b *pgproxy.Broker) { s.pgBroker = b }
+
+// AttachReadiness adds a named check to GET /readyz. Every check must pass for
+// the replica to receive traffic; names, never values, appear in the response.
+func (s *Server) AttachReadiness(name string, check func() bool) {
+	s.readiness = append(s.readiness, readinessCheck{name: name, check: check})
+}
+
+type readinessCheck struct {
+	name  string
+	check func() bool
+}
 
 // AttachHashicorpSyncer pre-wires a syncer instead of letting Start build one
 // from the attached client. Used by tests to inject a fake fetcher; in prod
@@ -840,6 +852,7 @@ func New(addr string, store Store, encKey []byte, notifier *notify.Notifier, ini
 	// /health, /v1/status, and other public static routes rely on the
 	// server-wide TierGlobal backstop; no per-route limit is useful.
 	mux.HandleFunc("GET /health", s.handleHealth)
+	mux.HandleFunc("GET /readyz", s.handleReady)
 	mux.HandleFunc("GET /ready", s.handleReady)
 	mux.HandleFunc("GET /v1/status", s.handleStatus)
 	mux.HandleFunc("POST /v1/auth/register", ipAuth(limitBody(s.handleRegister)))

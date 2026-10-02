@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Infisical/agent-vault/internal/auditchain"
+	"github.com/Infisical/agent-vault/internal/brokercore"
 	"github.com/Infisical/agent-vault/internal/hashicorp"
 )
 
@@ -51,10 +52,7 @@ func brokerAuditChain(ctx context.Context, client *hashicorp.Client, db any, get
 		}
 		return fallback
 	}
-	replica := getenv("AGENT_VAULT_AUDIT_REPLICA")
-	if replica == "" {
-		replica, _ = os.Hostname()
-	}
+	replica := brokercore.ReplicaName(getenv)
 	keys := auditchain.KVKeys{Mount: setting("AGENT_VAULT_AUDIT_HMAC_MOUNT", "gatehouse"), Path: getenv("AGENT_VAULT_AUDIT_HMAC_PATH"), Field: setting("AGENT_VAULT_AUDIT_HMAC_FIELD", "key")}
 	signer := auditchain.TransitSigner{Mount: setting("AGENT_VAULT_AUDIT_TRANSIT_MOUNT", "transit"), Key: getenv("AGENT_VAULT_AUDIT_TRANSIT_KEY")}
 	boots, ok := db.(auditchain.BootStore)
