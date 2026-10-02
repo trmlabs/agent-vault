@@ -46,7 +46,11 @@ func (r catalogDatabaseResolver) ResolveDatabase(ctx context.Context, scope pgpr
 	who, refusal := authorize.Resolve(ctx, pool, pgproxy.Session(ctx), r.runner)
 	record := pgproxy.Requester{Kind: who.Kind, Subject: who.Subject, TokenSHA256: who.TokenSHA256}
 	if refusal == "" {
-		d := authorize.Decide(ctx, r.entitlements, pool, *entry, who)
+		decideCtx := ctx
+		if pgproxy.IsRecheck(ctx) {
+			decideCtx = entitlement.WithRecheck(ctx)
+		}
+		d := authorize.Decide(decideCtx, r.entitlements, pool, *entry, who)
 		record.Tier, record.Decision, record.ObjectID = d.Tier, d.Outcome, d.ObjectID
 		record.Groups, record.CacheAgeSec = strings.Join(d.Groups, ","), int64(d.CacheAge.Seconds())
 		if !d.Allowed {

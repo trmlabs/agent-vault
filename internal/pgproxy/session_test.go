@@ -210,3 +210,36 @@ func TestSessionTokenNeverReachesLogsErrorsOrAudit(t *testing.T) {
 type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+// recheckResolver records, per call, whether it was an admission or a recheck.
+type recheckResolver struct {
+	svc  *DatabaseService
+	mu   sync.Mutex
+	seen []bool
+}
+
+func (r *recheckResolver) ResolveDatabase(ctx context.Context, _ AgentScope, _ string) (*DatabaseService, error) {
+	r.mu.Lock()
+	r.seen = append(r.seen, IsRecheck(ctx))
+	r.mu.Unlock()
+	return r.svc, nil
+}
+
+func TestResolverKnowsAdmissionFromRecheck(t *testing.T) {
+	lease := newLease()
+	upstream := startFakeUpstream(t, authTrust, lease.Password)
+	r := &recheckResolver{svc: &DatabaseService{Name: "analytics", Addr: upstream.addr()}}
+	_, addr := startBroker(t, Options{Auth: &fakePeerAuth{}, Databases: r, Leases: &fakeMinter{lease: lease},
+		TrustProxyHeader: true, AuthorizationInterval: 50 * time.Millisecond})
+	conn, err := openSession(t, addr, header("10.244.0.9"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	waitFor(t, 2*time.Second, func() bool { r.mu.Lock(); defer r.mu.Unlock(); return len(r.seen) >= 3 }, "no rechecks")
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.seen[0] || !r.seen[1] || !r.seen[2] {
+		t.Fatalf("admission/recheck marks %v, want [false true true ...]", r.seen)
+	}
+}

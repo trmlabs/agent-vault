@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/Infisical/agent-vault/internal/entitlement"
 	"github.com/Infisical/agent-vault/internal/httpcatalog"
@@ -94,5 +95,56 @@ func TestCatalogDatabaseResolverAppliesTheAuthorizationModel(t *testing.T) {
 	// The catalog itself never grants a T1 database to the Cursor pool.
 	if _, err := r.ResolveDatabase(pgproxy.WithSession(context.Background(), "alice"), pgproxy.AgentScope{ActorID: "a", Pool: "cursor"}, "t1db"); err == nil {
 		t.Fatal("Cursor pool resolved a T1 database")
+	}
+}
+
+type countingDirectory struct {
+	directory
+	asks int
+}
+
+func (c *countingDirectory) Lookup(ctx context.Context, subject string, groups []string) (entitlement.Person, error) {
+	c.asks++
+	return c.directory.Lookup(ctx, subject, groups)
+}
+
+// The broker's recheck mark reaches the decision: a T2 admission asks the
+// directory every time, a T2 recheck may use the cache, and a refused recheck
+// purges the person.
+func TestCatalogDatabaseResolverFreshT2AdmissionsAndPurge(t *testing.T) {
+	catalog, err := httpcatalog.Parse([]byte(`{"pools":[
+	  {"name":"claude","namespace":"n","serviceAccount":"claude","identity":"claude-session","ccpoolID":"ccpool_abc","ceiling":"T2"}],
+	 "entries":[
+	  {"name":"t1db","kind":"postgres","host":"db.example","pools":["claude"],"tier":"T1","requires":["` + t1Group + `"],"postgres":{"database":"t1db","mount":"database","role":"t1-ro"}},
+	  {"name":"t2db","kind":"postgres","host":"db.example","pools":["claude"],"tier":"T2","requires":["` + t2Group + `"],"postgres":{"database":"t2db","mount":"database","role":"t2-ro"}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := &countingDirectory{directory: directory{"sso|carol": {t1Group, t2Group}}}
+	r := NewCatalogDatabaseResolver(httpcatalog.NewSource(catalog, 1),
+		fakeRunner{"carol": {Kind: runnerid.KindPerson, Subject: "sso|carol", Pools: []string{"ccpool_abc"}}},
+		&entitlement.Cache{Source: dir, TTL: time.Minute})
+	scope := pgproxy.AgentScope{ActorID: "a", Pool: "claude"}
+	admit := pgproxy.WithSession(context.Background(), "carol")
+	recheck := pgproxy.WithRecheck(admit)
+	resolve := func(ctx context.Context, db string) error { _, err := r.ResolveDatabase(ctx, scope, db); return err }
+	if resolve(admit, "t1db") != nil || resolve(admit, "t2db") != nil || resolve(admit, "t2db") != nil {
+		t.Fatal("carol refused")
+	}
+	if dir.asks != 3 {
+		t.Fatalf("asks %d, want 3 (one T1, two fresh T2)", dir.asks)
+	}
+	if resolve(recheck, "t2db") != nil || dir.asks != 3 {
+		t.Fatalf("T2 recheck did not use the cache (asks %d)", dir.asks)
+	}
+	dir.directory["sso|carol"] = nil
+	if resolve(admit, "t2db") == nil {
+		t.Fatal("T2 admission after removal rode the cache")
+	}
+	if resolve(recheck, "t2db") == nil {
+		t.Fatal("recheck allowed a removed person")
+	}
+	if resolve(admit, "t1db") == nil {
+		t.Fatal("T1 after a refused recheck rode the cache")
 	}
 }
