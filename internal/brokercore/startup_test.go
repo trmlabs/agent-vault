@@ -47,12 +47,28 @@ func TestStartupValue(t *testing.T) {
 		{"options", "-c statement_timeout=0", "", false},
 		{"replication", "database", "", false},
 		{"role", "admin", "", false},
-		{"datestyle", "ISO", "", false}, // keys are exact, as PostgreSQL reports them
 	}
 	for _, c := range cases {
 		got, ok := StartupValue(c.key, c.value)
 		if ok != c.ok || got != c.want {
 			t.Errorf("StartupValue(%q, %q) = %q, %v; want %q, %v", c.key, c.value, got, ok, c.want, c.ok)
+		}
+	}
+}
+
+// Keys match case-insensitively and come back canonical: libpq sends PGTZ
+// and PGDATESTYLE as lowercase "timezone" and "datestyle".
+func TestStartupParameterKeys(t *testing.T) {
+	for key, want := range map[string]string{"timezone": "TimeZone", "datestyle": "DateStyle", "TimeZone": "TimeZone",
+		"CLIENT_ENCODING": "client_encoding", "Application_Name": "application_name"} {
+		name, _, ok := StartupParameter(key, "UTF8")
+		if !ok || name != want {
+			t.Errorf("StartupParameter(%q) = %q, %v; want %q", key, name, ok, want)
+		}
+	}
+	for _, key := range []string{"options", "OPTIONS", "replication", "role", "session_authorization"} {
+		if _, _, ok := StartupParameter(key, "x"); ok {
+			t.Errorf("%s accepted", key)
 		}
 	}
 }

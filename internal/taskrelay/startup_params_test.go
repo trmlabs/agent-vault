@@ -45,7 +45,8 @@ func TestPostgresPassesDriverStartupParameters(t *testing.T) {
 	drivers := map[string]map[string]string{
 		"jdbc": {"client_encoding": "UTF8", "DateStyle": "ISO", "TimeZone": "America/Denver", "extra_float_digits": "2",
 			"application_name": "PostgreSQL JDBC Driver"},
-		"psql with PGTZ and PGDATESTYLE": {"TimeZone": "Asia/Tokyo", "DateStyle": "ISO, DMY", "client_encoding": "SQL_ASCII",
+		// libpq sends PGTZ and PGDATESTYLE under lowercase keys.
+		"psql with PGTZ and PGDATESTYLE": {"timezone": "Asia/Tokyo", "datestyle": "ISO, DMY", "client_encoding": "SQL_ASCII",
 			"application_name": "psql"},
 		"search_path and conforming strings": {"search_path": "public, analytics", "standard_conforming_strings": "on",
 			"statement_timeout": "30000"},
@@ -66,8 +67,12 @@ func TestPostgresPassesDriverStartupParameters(t *testing.T) {
 		select {
 		case got := <-startups:
 			for k, v := range extra {
-				if got[k] != v {
-					t.Errorf("%s: %s reached the broker as %q, want %q", name, k, got[k], v)
+				canonical := map[string]string{"timezone": "TimeZone", "datestyle": "DateStyle"}[k]
+				if canonical == "" {
+					canonical = k
+				}
+				if got[canonical] != v {
+					t.Errorf("%s: %s reached the broker as %q, want %q", name, canonical, got[canonical], v)
 				}
 			}
 		case <-time.After(5 * time.Second):

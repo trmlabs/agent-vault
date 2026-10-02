@@ -97,11 +97,13 @@ func (b *Broker) servePooled(ctx context.Context, conn net.Conn, backend *pgprot
 	}
 	s := &pooledSession{b: b, key: key, vaultID: scope.VaultID, svc: *svc, client: conn, backend: backend, event: event,
 		params: map[string]string{}, txStatus: 'I', statements: map[string]clientStatement{}}
+	wanted := map[string]bool{}
 	for _, name := range sessionParams {
-		if value, ok := startupParams[name]; ok {
-			if v, valid := brokercore.StartupValue(name, value); valid {
-				s.params[name] = v
-			}
+		wanted[name] = true
+	}
+	for key, value := range startupParams {
+		if name, v, valid := brokercore.StartupParameter(key, value); valid && wanted[name] {
+			s.params[name] = v
 		}
 	}
 	unregister, clientKey, err := b.registerPooledCancel(s)

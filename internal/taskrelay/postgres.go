@@ -74,11 +74,9 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig) {
 	// Preserve validated client behavior while fixing connection authority to the
 	// operator's database/user. Never forward arbitrary backend options.
 	parameters := map[string]string{"user": c.User, "database": c.Database}
-	for _, key := range brokercore.StartupParameters {
-		if value, ok := startup.Parameters[key]; ok {
-			if v, valid := brokercore.StartupValue(key, value); valid {
-				parameters[key] = v
-			}
+	for key, value := range startup.Parameters {
+		if name, v, valid := brokercore.StartupParameter(key, value); valid {
+			parameters[name] = v
 		}
 	}
 	packet, e = (&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber, Parameters: parameters}).Encode(nil)
@@ -214,7 +212,7 @@ func validStartup(parameters map[string]string, c *PostgresConfig) bool {
 		if key == "database" || key == "user" {
 			continue
 		}
-		if _, ok := brokercore.StartupValue(key, value); !ok {
+		if _, _, ok := brokercore.StartupParameter(key, value); !ok {
 			return false
 		}
 	}

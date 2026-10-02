@@ -15,9 +15,33 @@ import (
 var StartupParameters = []string{"application_name", "client_encoding", "DateStyle", "extra_float_digits",
 	"search_path", "standard_conforming_strings", "statement_timeout", "TimeZone"}
 
-// StartupValue reports whether a client may send key with value at startup,
-// and returns the value to forward. The relay and the broker share it, so the
-// two can never disagree.
+// StartupParameter reports whether a client may send key with value at
+// startup, and returns the canonical key and value to forward. Keys match
+// case-insensitively, as PostgreSQL's settings do: libpq sends PGTZ and
+// PGDATESTYLE as "timezone" and "datestyle", JDBC as "TimeZone" and
+// "DateStyle". The relay and the broker share it, so the two can never
+// disagree.
+func StartupParameter(key, value string) (string, string, bool) {
+	name, ok := canonicalKeys[strings.ToLower(key)]
+	if !ok {
+		return "", "", false
+	}
+	v, ok := StartupValue(name, value)
+	if !ok {
+		return "", "", false
+	}
+	return name, v, true
+}
+
+var canonicalKeys = func() map[string]string {
+	m := make(map[string]string, len(StartupParameters))
+	for _, name := range StartupParameters {
+		m[strings.ToLower(name)] = name
+	}
+	return m
+}()
+
+// StartupValue checks one value for a canonical key; see StartupParameter.
 //
 // A startup parameter overrides a role-level ALTER ROLE ... SET, so values
 // are bounded, not only keys:

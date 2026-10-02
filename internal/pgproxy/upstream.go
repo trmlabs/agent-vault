@@ -70,8 +70,8 @@ func connectUpstream(ctx context.Context, dial DialFunc, svc *DatabaseService, l
 	// relay's rule too: a startup parameter overrides ALTER ROLE ... SET, so
 	// values are bounded as well as keys. Anything else is dropped.
 	for key, value := range clientParams {
-		if v, ok := brokercore.StartupValue(key, value); ok {
-			params[key] = v
+		if name, v, ok := brokercore.StartupParameter(key, value); ok {
+			params[name] = v
 		}
 	}
 
