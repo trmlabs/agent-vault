@@ -293,12 +293,13 @@ func (b *Broker) Shutdown(ctx context.Context) error {
 			_ = conn.Close()
 		}
 		if drain {
-			force, cancel := ctx, context.CancelFunc(func() {})
-			if deadline, ok := ctx.Deadline(); ok {
-				force, cancel = context.WithDeadline(ctx, deadline.Add(-drainReserve))
-			}
 			go func() {
-				defer cancel()
+				force := ctx
+				if deadline, ok := ctx.Deadline(); ok {
+					var cancel context.CancelFunc
+					force, cancel = context.WithDeadline(ctx, deadline.Add(-drainReserve))
+					defer cancel()
+				}
 				select {
 				case <-force.Done():
 					b.logger.Warn("pgproxy: drain deadline reached; closing busy sessions")
