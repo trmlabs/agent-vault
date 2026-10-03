@@ -320,7 +320,7 @@ func TestVerifierRejectsOldKeyAfterRotation(t *testing.T) {
 	parsed := rows(t, f.out.String())
 	last := parsed[len(parsed)-1]
 	key1, _ := f.keys.lookup(1)
-	forged := Row{Type: RowType, Replica: last.Replica, Boot: last.Boot, Seq: last.Seq + 1, Time: last.Time, Event: EventSessionOpen, Pool: "p", KeyVersion: 1, Prev: last.MAC}
+	forged := Row{Type: RowType, Replica: last.Replica, Boot: last.Boot, Seq: last.Seq + 1, Time: last.Time, Event: EventSessionOpen, Pool: "p", KeyVersion: 1, Prev: last.MAC, MACVersion: MACVersionCurrent}
 	forged.MAC = forged.computeMAC(key1)
 	line, _ := json.Marshal(forged)
 	report := verify(t, f.verifier(), f.out.String()+string(line)+"\n")

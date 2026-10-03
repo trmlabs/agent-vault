@@ -99,6 +99,9 @@ var serverCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+		if err := checkShutdownSeconds(os.Getenv); err != nil {
+			return err
+		}
 		logger := buildLogger(logLevel)
 
 		// --- Detached child path: read master key + initialized flag from stdin pipe ---
@@ -252,6 +255,12 @@ func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKe
 		fmt.Fprintf(os.Stderr, "warning: transparent proxy disabled (CA init failed: %v); pass --mitm-port 0 to suppress\n", err)
 		return nil
 	}
+	// A fleet replica drains its tunnels on SIGTERM; unset keeps the 5s stop
+	// and leaves open tunnels to end with the process.
+	drainSeconds := min(intEnvValue("AGENT_VAULT_SHUTDOWN_SECONDS"), maxShutdownSeconds)
+	if drainSeconds > 0 {
+		srv.SetShutdownTimeout(time.Duration(drainSeconds) * time.Second)
+	}
 	srv.AttachMITM(mitm.New(
 		net.JoinHostPort(host, strconv.Itoa(mitmPort)),
 		mitm.Options{
@@ -269,6 +278,7 @@ func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKe
 			LogSink:               srv.LogSink(),
 			MaxResponseBytes:      maxRespBytes,
 			MaxRequestBytes:       maxReqBytes,
+			DrainTunnels:          drainSeconds > 0,
 		},
 	))
 	return nil
@@ -441,7 +451,11 @@ func attachPostgresBrokerIfEnabled(srv *server.Server, host string, postgresPort
 	if catalog, err := brokerCatalog(context.Background(), client, os.Getenv, logger); err != nil {
 		return fmt.Errorf("postgres broker catalog: %w", err)
 	} else if catalog != nil {
-		opts.Databases = server.NewCatalogDatabaseResolver(catalog)
+		authz, err := loadAuthorization(os.Getenv)
+		if err != nil {
+			return fmt.Errorf("postgres broker authorization: %w", err)
+		}
+		opts.Databases = server.NewCatalogDatabaseResolver(catalog, authz.verifier(), authz.entitlements, sessionBinder(srv.CleanupStore()))
 	}
 	if chain, err := sharedAuditChain(context.Background(), client, srv.CleanupStore(), os.Getenv, logger); err != nil {
 		return fmt.Errorf("postgres broker audit: %w", err)
@@ -491,7 +505,9 @@ func attachPostgresBrokerIfEnabled(srv *server.Server, host string, postgresPort
 	// client sessions; each database's server budget comes from the catalog.
 	if boolEnvValue("AGENT_VAULT_DB_POOLING") {
 		opts.Pool = &pgproxy.PoolOptions{Replicas: intEnvValue("AGENT_VAULT_DB_POOL_REPLICAS"), DefaultBudget: intEnvValue("AGENT_VAULT_DB_POOL_BUDGET"),
-			QueueFactor: intEnvValue("AGENT_VAULT_DB_POOL_QUEUE_FACTOR"), QueueWait: time.Duration(intEnvValue("AGENT_VAULT_DB_POOL_QUEUE_WAIT_MS")) * time.Millisecond}
+			QueueFactor: intEnvValue("AGENT_VAULT_DB_POOL_QUEUE_FACTOR"), QueueWait: time.Duration(intEnvValue("AGENT_VAULT_DB_POOL_QUEUE_WAIT_MS")) * time.Millisecond,
+			// A graceful stop ends each session between transactions.
+			DrainSessions: intEnvValue("AGENT_VAULT_SHUTDOWN_SECONDS") > 0}
 	}
 	srv.AttachPostgresBroker(pgproxy.New(net.JoinHostPort(host, strconv.Itoa(postgresPort)), opts))
 	return nil
@@ -513,6 +529,25 @@ func boolEnvValue(key string) bool {
 
 // intEnvValue reads a positive integer from the named environment variable,
 // returning 0 when unset or invalid.
+// maxShutdownSeconds keeps a drain, the 5 s database cleanup and the 5 s
+// Vault login revoke inside a 75 s termination grace. It is a ceiling only: a
+// preStop pause spends the same grace before SIGTERM, so a render with one
+// must set a shorter drain.
+const maxShutdownSeconds = 65
+
+// checkShutdownSeconds refuses a drain the Pod's grace cannot hold: past it,
+// the kubelet kills the broker before the Vault logins are revoked.
+func checkShutdownSeconds(getenv func(string) string) error {
+	raw := getenv("AGENT_VAULT_SHUTDOWN_SECONDS")
+	if raw == "" {
+		return nil
+	}
+	if n, err := strconv.Atoi(raw); err != nil || n < 0 || n > maxShutdownSeconds {
+		return fmt.Errorf("AGENT_VAULT_SHUTDOWN_SECONDS must be 0 to %d", maxShutdownSeconds)
+	}
+	return nil
+}
+
 func intEnvValue(key string) int {
 	if raw := os.Getenv(key); raw != "" {
 		if n, err := strconv.Atoi(raw); err == nil && n > 0 {

@@ -39,20 +39,28 @@ type Row struct {
 	Seq       uint64 `json:"seq"`
 	Time      string `json:"ts"`
 	Event     string `json:"event"`
-	Pool      string `json:"pool,omitempty"`       // catalog pool name of the worker
-	Agent     string `json:"agent,omitempty"`      // broker agent ID (store UUID)
-	PodUID    string `json:"podUID,omitempty"`     // verified runtime instance
-	Binding   string `json:"binding,omitempty"`    // vault/service
-	Session   string `json:"session,omitempty"`    // broker-generated session ID
-	Outcome   string `json:"outcome,omitempty"`    // fixed code
-	Requester string `json:"requester,omitempty"`  // developer identity, only from a verified source
-	Method    string `json:"method,omitempty"`     // HTTP rows only
-	Status    int    `json:"status,omitempty"`     // HTTP response rows: upstream or broker status
-	Duration  int64  `json:"durationMs,omitempty"` // transaction rows: milliseconds from first message to completion
-	SignedSeq uint64 `json:"signedSeq,omitempty"`  // checkpoint: the chain head it signs
-	SignedMAC string `json:"signedMAC,omitempty"`
-	Signature string `json:"signature,omitempty"` // checkpoint: Transit "vault:vN:..." signature
-	PrevKey   int    `json:"prevKeyVersion,omitempty"`
+	Pool      string `json:"pool,omitempty"`      // catalog pool name of the worker
+	Agent     string `json:"agent,omitempty"`     // broker agent ID (store UUID)
+	PodUID    string `json:"podUID,omitempty"`    // verified runtime instance
+	Binding   string `json:"binding,omitempty"`   // vault/service
+	Session   string `json:"session,omitempty"`   // broker-generated session ID
+	Outcome   string `json:"outcome,omitempty"`   // fixed code
+	Requester string `json:"requester,omitempty"` // developer identity, only from a verified source
+	// Authorization decision fields (see mitm authorize).
+	RequesterKind string `json:"requesterKind,omitempty"` // person, agent, workload or none
+	RequesterOID  string `json:"requesterOID,omitempty"`  // Entra object ID of a person
+	TokenSHA256   string `json:"tokenSHA256,omitempty"`   // runner session token hash; never the token
+	Tier          string `json:"tier,omitempty"`
+	Decision      string `json:"decision,omitempty"`
+	Groups        string `json:"groups,omitempty"` // required groups checked
+	CacheAgeSec   int64  `json:"cacheAgeSec,omitempty"`
+	Method        string `json:"method,omitempty"`     // HTTP rows only
+	Status        int    `json:"status,omitempty"`     // HTTP response rows: upstream or broker status
+	Duration      int64  `json:"durationMs,omitempty"` // transaction rows: milliseconds from first message to completion
+	SignedSeq     uint64 `json:"signedSeq,omitempty"`  // checkpoint: the chain head it signs
+	SignedMAC     string `json:"signedMAC,omitempty"`
+	Signature     string `json:"signature,omitempty"` // checkpoint: Transit "vault:vN:..." signature
+	PrevKey       int    `json:"prevKeyVersion,omitempty"`
 	// chain_start: the previous boot and its last persisted checkpoint row,
 	// so a deleted boot or a truncated tail is detectable.
 	PrevBoot          uint64 `json:"prevBoot,omitempty"`
@@ -60,11 +68,20 @@ type Row struct {
 	PrevCheckpointMAC string `json:"prevCheckpointMAC,omitempty"`
 	KeyVersion        int    `json:"keyVersion"`
 	Prev              string `json:"prev"`
-	MAC               string `json:"mac"`
+	// MACVersion selects the MAC input: absent (0) is v1, written before the
+	// authorization fields existed; MACVersionCurrent covers every field.
+	MACVersion int    `json:"macVersion,omitempty"`
+	MAC        string `json:"mac"`
 }
 
+// MACVersionCurrent is the MAC input every new row uses.
+const MACVersionCurrent = 2
+
 // macInput encodes every field except MAC with explicit lengths, so no two
-// distinct rows share an input regardless of field contents.
+// distinct rows share an input regardless of field contents. Version 2 adds
+// the authorization fields and the version itself; version 1 is kept only to
+// verify rows written before it, and a v1 row that carries any v2-only field
+// fails verification (see v2Only).
 func (r Row) macInput() []byte {
 	fields := []string{
 		r.Type, r.Replica, strconv.FormatUint(r.Boot, 10), strconv.FormatUint(r.Seq, 10), r.Time, r.Event,
@@ -73,7 +90,18 @@ func (r Row) macInput() []byte {
 		strconv.Itoa(r.PrevKey), strconv.FormatUint(r.PrevBoot, 10), strconv.FormatUint(r.PrevCheckpointSeq, 10), r.PrevCheckpointMAC,
 		strconv.Itoa(r.KeyVersion), r.Prev,
 	}
-	return lengthPrefixed("gatehouse-audit-v1", fields...)
+	if r.MACVersion < 2 {
+		return lengthPrefixed("gatehouse-audit-v1", fields...)
+	}
+	fields = append(fields, strconv.Itoa(r.MACVersion),
+		r.RequesterKind, r.RequesterOID, r.TokenSHA256, r.Tier, r.Decision, r.Groups, strconv.FormatInt(r.CacheAgeSec, 10))
+	return lengthPrefixed("gatehouse-audit-v2", fields...)
+}
+
+// v2Only reports whether a row sets a field that only the v2 MAC covers.
+func (r Row) v2Only() bool {
+	return r.RequesterKind != "" || r.RequesterOID != "" || r.TokenSHA256 != "" || r.Tier != "" ||
+		r.Decision != "" || r.Groups != "" || r.CacheAgeSec != 0
 }
 
 func (r Row) computeMAC(key []byte) string {

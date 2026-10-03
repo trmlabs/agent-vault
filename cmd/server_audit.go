@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"github.com/Infisical/agent-vault/internal/brokercore"
 	"log/slog"
 	"os"
 	"sync"
@@ -55,13 +56,13 @@ func brokerAuditChain(ctx context.Context, client *hashicorp.Client, db any, get
 	}
 	// A stable name, such as a StatefulSet Pod name, lets each boot link to
 	// the last and the store's head name the chain an export must reach.
-	// AGENT_VAULT_REPLICA (the fleet's Pod name) comes first; there is no
-	// hostname fallback.
-	replica := getenv("AGENT_VAULT_REPLICA")
-	if replica == "" {
-		replica = getenv("AGENT_VAULT_AUDIT_REPLICA")
+	// Brokers sharing a store must set AGENT_VAULT_REPLICA; a single broker
+	// may use AGENT_VAULT_AUDIT_REPLICA. There is no hostname fallback.
+	replica, err := brokercore.FleetReplicaName(getenv)
+	if err != nil {
+		return nil, err
 	}
-	if replica == "" {
+	if getenv("AGENT_VAULT_REPLICA") == "" && getenv("AGENT_VAULT_AUDIT_REPLICA") == "" {
 		return nil, fmt.Errorf("audit chain requires AGENT_VAULT_REPLICA or AGENT_VAULT_AUDIT_REPLICA, a stable replica name such as the Pod name")
 	}
 	keys := auditchain.KVKeys{Mount: setting("AGENT_VAULT_AUDIT_HMAC_MOUNT", "gatehouse"), Path: getenv("AGENT_VAULT_AUDIT_HMAC_PATH"), Field: setting("AGENT_VAULT_AUDIT_HMAC_FIELD", "key")}

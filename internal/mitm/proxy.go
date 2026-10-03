@@ -33,6 +33,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -64,6 +65,14 @@ type Proxy struct {
 	adapter               *HeaderAdapter
 	attestor              brokercore.Attestor
 	peerReader            PeerReader
+
+	// Tunnel drain (opt-in): Shutdown lets each tunnel finish its current
+	// request instead of leaving tunnels to die with the process.
+	drainTunnels bool
+	tunnelsMu    sync.Mutex
+	tunnels      map[*http.Server]struct{}
+	tunnelWG     sync.WaitGroup
+	draining     bool
 }
 
 // Options carries the dependencies a Proxy needs. BaseURL is the
@@ -79,8 +88,12 @@ type Options struct {
 	HeaderAdapter             *HeaderAdapter     // strict mode only: catalog destinations with signed audit
 	// Attestor, when set, admits workers by projected token and real peer
 	// address instead of Sessions; Sessions remains the token-review fallback.
-	Attestor         brokercore.Attestor
-	PeerReader       PeerReader // nil: the TCP remote address
+	Attestor   brokercore.Attestor
+	PeerReader PeerReader // nil: the TCP remote address
+	// DrainTunnels makes Shutdown stop taking tunnels and wait, within its
+	// context, for each open tunnel's current request to finish. Off, open
+	// tunnels are left to end with the process.
+	DrainTunnels     bool
 	CA               ca.Provider
 	Sessions         brokercore.SessionResolver
 	Credentials      brokercore.CredentialProvider
@@ -128,6 +141,8 @@ func New(addr string, opts Options) *Proxy {
 		adapter:               opts.HeaderAdapter,
 		attestor:              opts.Attestor,
 		peerReader:            opts.PeerReader,
+		drainTunnels:          opts.DrainTunnels,
+		tunnels:               make(map[*http.Server]struct{}),
 		strictTunnels:         make(chan struct{}, tunnelLimit),
 		sessions:              opts.Sessions,
 		creds:                 opts.Credentials,
@@ -197,15 +212,74 @@ func (p *Proxy) Serve(l net.Listener) error {
 	return p.httpServer.Serve(peerListener{Listener: l, reader: p.peerReader})
 }
 
-// Shutdown gracefully stops the listener. In-flight CONNECT tunnels are
-// not tracked by http.Server's shutdown machinery (they detach from the
-// handler on Hijack), so callers should allow the process to exit after
-// Shutdown returns; the tunnels will die with it.
+// Shutdown gracefully stops the listener. Without DrainTunnels, in-flight
+// CONNECT tunnels are not tracked by http.Server's shutdown machinery (they
+// detach from the handler on Hijack), so callers should allow the process to
+// exit after Shutdown returns; the tunnels will die with it. With
+// DrainTunnels, Shutdown refuses new tunnels, closes idle ones, lets each
+// active request finish with Connection: close, and force-closes whatever
+// remains when ctx ends.
 func (p *Proxy) Shutdown(ctx context.Context) error {
 	p.upstream.CloseIdleConnections()
-	err := p.httpServer.Shutdown(ctx)
-	p.revokeGitTokens()
-	return err
+	// Cached GitHub installation tokens are revoked however the stop goes.
+	defer p.revokeGitTokens()
+	if !p.drainTunnels {
+		return p.httpServer.Shutdown(ctx)
+	}
+	p.tunnelsMu.Lock()
+	p.draining = true
+	for srv := range p.tunnels {
+		srv.SetKeepAlivesEnabled(false)
+	}
+	p.tunnelsMu.Unlock()
+	outer := make(chan error, 1)
+	go func() { outer <- p.httpServer.Shutdown(ctx) }()
+	done := make(chan struct{})
+	go func() { p.tunnelWG.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		p.tunnelsMu.Lock()
+		for srv := range p.tunnels {
+			_ = srv.Close()
+		}
+		p.tunnelsMu.Unlock()
+	}
+	return <-outer
+}
+
+// reserveTunnel counts a tunnel before its CONNECT is answered, so Shutdown
+// waits for it; false once draining, when the CONNECT must be refused.
+func (p *Proxy) reserveTunnel() (release func(), ok bool) {
+	if !p.drainTunnels {
+		return func() {}, true
+	}
+	p.tunnelsMu.Lock()
+	defer p.tunnelsMu.Unlock()
+	if p.draining {
+		return nil, false
+	}
+	p.tunnelWG.Add(1)
+	return p.tunnelWG.Done, true
+}
+
+// trackTunnel registers a tunnel's request server. One registered after
+// Shutdown began serves its current request and then closes.
+func (p *Proxy) trackTunnel(srv *http.Server) (untrack func()) {
+	if !p.drainTunnels {
+		return func() {}
+	}
+	p.tunnelsMu.Lock()
+	defer p.tunnelsMu.Unlock()
+	p.tunnels[srv] = struct{}{}
+	if p.draining {
+		srv.SetKeepAlivesEnabled(false)
+	}
+	return func() {
+		p.tunnelsMu.Lock()
+		delete(p.tunnels, srv)
+		p.tunnelsMu.Unlock()
+	}
 }
 
 // revokeGitTokens revokes every cached GitHub installation token, which GitHub

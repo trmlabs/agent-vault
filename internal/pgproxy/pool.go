@@ -30,6 +30,11 @@ type PoolOptions struct {
 	// SessionShare caps, per pool key, the connections pinned to one client
 	// for session state, as a fraction of the budget. Default 0.1, minimum 1.
 	SessionShare float64
+	// DrainSessions makes Shutdown close each client session at its next idle
+	// point (no open transaction, nothing unanswered) with 57P01, and cut only
+	// sessions still busy at the deadline. Off, Shutdown closes every session
+	// at once.
+	DrainSessions bool
 	// QueueFactor bounds waiting checkouts at this multiple of the budget;
 	// QueueWait bounds how long one waits. Defaults 20 and 5 seconds, so 50
 	// clients on a 5-connection budget queue rather than fail. Overflow

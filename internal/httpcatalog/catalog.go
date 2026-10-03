@@ -49,6 +49,14 @@ type Entry struct {
 	Git            *GitBinding            `json:"git,omitempty"`
 	Postgres       *PostgresBinding       `json:"postgres,omitempty"`
 	BrowserSession *BrowserSessionBinding `json:"browserSession,omitempty"`
+	// Kind "gcp" mints a short-lived Google token per entry; see GCPBinding.
+	GCP *GCPBinding `json:"gcp,omitempty"`
+	// Tier is T0 (data every worker allowed on the pool may read; the default),
+	// T1 (a verified person in every Requires group) or T2 (T1 with
+	// time-boxed groups granted through Lumos). Requires lists Entra group
+	// object IDs and is mandatory for T1 and T2.
+	Tier     string   `json:"tier,omitempty"`
+	Requires []string `json:"requires,omitempty"`
 }
 
 // GitBinding names the GitHub App installation that mints tokens and the
@@ -85,6 +93,28 @@ type Pool struct {
 	Name           string `json:"name"`
 	Namespace      string `json:"namespace"`
 	ServiceAccount string `json:"serviceAccount"`
+	// Identity says who can stand behind a request: "none" (Cursor; the
+	// default), "claude-session" (a runner session token naming the person)
+	// or "workload" (CI and automation: Entitlements, never a person).
+	Identity string `json:"identity,omitempty"`
+	// Ceiling is the highest tier the pool may reach (default T0).
+	Ceiling string `json:"ceiling,omitempty"`
+	// CCPoolID is the runner pool a claude-session token must be issued for.
+	CCPoolID string `json:"ccpoolID,omitempty"`
+	// BaseGroup gates session start in the runner's spawn hook.
+	BaseGroup string `json:"baseGroup,omitempty"`
+	// Entitlements are a workload pool's fixed groups.
+	Entitlements []string `json:"entitlements,omitempty"`
+}
+
+// Pool returns the defined pool with this name.
+func (c Catalog) Pool(name string) (Pool, bool) {
+	for _, p := range c.pools {
+		if p.Name == name {
+			return p, true
+		}
+	}
+	return Pool{}, false
 }
 
 // PostgresBinding is a database the broker reaches with a Vault dynamic role.
@@ -199,11 +229,16 @@ func Parse(data []byte) (Catalog, error) {
 		return Catalog{}, errors.New("HTTP catalog has no entries")
 	}
 	poolNames := map[string]bool{}
+	pools := map[string]Pool{}
 	for _, pool := range file.Pools {
 		if !idPattern.MatchString(pool.Name) || poolNames[pool.Name] || !dnsLabel.MatchString(pool.Namespace) || !dnsLabel.MatchString(pool.ServiceAccount) {
 			return Catalog{}, fmt.Errorf("invalid or duplicate pool %q", pool.Name)
 		}
+		if err := pool.validate(); err != nil {
+			return Catalog{}, fmt.Errorf("pool %q: %w", pool.Name, err)
+		}
 		poolNames[pool.Name] = true
+		pools[pool.Name] = pool
 	}
 	names := map[string]bool{}
 	routes := map[string]string{}
@@ -217,9 +252,15 @@ func Parse(data []byte) (Catalog, error) {
 			return Catalog{}, fmt.Errorf("duplicate HTTP catalog entry %q", e.Name)
 		}
 		names[e.Name] = true
+		if err := e.validateTier(); err != nil {
+			return Catalog{}, fmt.Errorf("HTTP catalog entry %q: %w", e.Name, err)
+		}
 		for _, pool := range e.Pools {
 			if len(poolNames) > 0 && !poolNames[pool] {
 				return Catalog{}, fmt.Errorf("HTTP catalog entry %q grants undefined pool %q", e.Name, pool)
+			}
+			if err := grantable(*e, pools[pool], len(poolNames) > 0); err != nil {
+				return Catalog{}, fmt.Errorf("HTTP catalog entry %q to pool %q: %w", e.Name, pool, err)
 			}
 		}
 		hostKey := fmt.Sprintf("%s:%d", e.Host, e.Port)
@@ -299,9 +340,11 @@ func (e *Entry) normalize() error {
 		return nil
 	case "browser-session":
 		return e.normalizeBrowser()
+	case "gcp":
+		return e.normalizeGCP()
 	case "":
-		if e.Git != nil || e.Postgres != nil || e.BrowserSession != nil {
-			return errors.New("git, postgres or browserSession settings require their kind")
+		if e.Git != nil || e.Postgres != nil || e.BrowserSession != nil || e.GCP != nil {
+			return errors.New("git, postgres, browserSession or gcp settings require their kind")
 		}
 	default:
 		return fmt.Errorf("unknown kind %q", e.Kind)
@@ -365,7 +408,7 @@ func (e *Entry) normalize() error {
 
 func (e *Entry) normalizePostgres() error {
 	if len(e.PathPrefixes) > 0 || len(e.Methods) > 0 || e.Header != "" || e.Scheme != "" || e.Placeholder != "" || e.Key != (KeyRef{}) ||
-		len(e.ForwardHeaders) > 0 || e.Git != nil || e.BrowserSession != nil || e.MaxRequestBytes != 0 || e.MaxResponseBytes != 0 {
+		len(e.ForwardHeaders) > 0 || e.Git != nil || e.BrowserSession != nil || e.GCP != nil || e.MaxRequestBytes != 0 || e.MaxResponseBytes != 0 {
 		return errors.New("postgres entries take only host, port, pools and postgres settings")
 	}
 	p := e.Postgres
@@ -448,7 +491,7 @@ func (c Catalog) CheckHosts(suffixes []string) error {
 }
 
 func (e *Entry) normalizeGit() error {
-	if e.Postgres != nil || e.BrowserSession != nil {
+	if e.Postgres != nil || e.BrowserSession != nil || e.GCP != nil {
 		return errors.New("postgres settings require kind postgres")
 	}
 	if len(e.PathPrefixes) > 0 || len(e.Methods) > 0 || e.Header != "" || e.Scheme != "" || e.Placeholder != "" || e.Key != (KeyRef{}) || len(e.ForwardHeaders) > 0 {
@@ -741,4 +784,98 @@ func (e *Entry) ForwardsHeader(name string) bool {
 		return true
 	}
 	return contains(e.ForwardHeaders, name)
+}
+
+var (
+	groupID  = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+	ccpoolID = regexp.MustCompile(`^ccpool_[A-Za-z0-9]{1,120}$`)
+	tierRank = map[string]int{"": 0, "T0": 0, "T1": 1, "T2": 2}
+)
+
+func (p Pool) validate() error {
+	if _, ok := tierRank[p.Ceiling]; !ok {
+		return fmt.Errorf("unknown ceiling %q", p.Ceiling)
+	}
+	for _, g := range append(append([]string(nil), p.Entitlements...), p.BaseGroup) {
+		if g != "" && !groupID.MatchString(g) {
+			return fmt.Errorf("groups must be Entra object IDs")
+		}
+	}
+	switch p.Identity {
+	case "", "none":
+		if p.CCPoolID != "" || len(p.Entitlements) != 0 || p.BaseGroup != "" || tierRank[p.Ceiling] > 0 {
+			return fmt.Errorf("a pool with no verified identity reaches T0 only and takes no runner or workload settings")
+		}
+	case "claude-session":
+		if !ccpoolID.MatchString(p.CCPoolID) || len(p.Entitlements) != 0 {
+			return fmt.Errorf("a claude-session pool needs its ccpool_ ID and takes no fixed entitlements")
+		}
+	case "workload":
+		if p.CCPoolID != "" || p.BaseGroup != "" || tierRank[p.Ceiling] > 1 {
+			return fmt.Errorf("a workload pool takes fixed entitlements only and never reaches T2")
+		}
+	default:
+		return fmt.Errorf("unknown identity %q", p.Identity)
+	}
+	return nil
+}
+
+func (e *Entry) validateTier() error {
+	rank, ok := tierRank[e.Tier]
+	if !ok {
+		return fmt.Errorf("unknown tier %q", e.Tier)
+	}
+	if rank == 0 && len(e.Requires) != 0 {
+		return fmt.Errorf("a T0 entry requires no groups")
+	}
+	if rank > 0 && len(e.Requires) == 0 {
+		return fmt.Errorf("a %s entry must name its required groups", e.Tier)
+	}
+	// The audit row records the groups checked within its 512-byte identifier
+	// limit; more groups would make every request on the entry fail closed.
+	if len(e.Requires) > maxRequiredGroups {
+		return fmt.Errorf("an entry requires at most %d groups", maxRequiredGroups)
+	}
+	for _, g := range e.Requires {
+		if !groupID.MatchString(g) {
+			return fmt.Errorf("required groups must be Entra object IDs")
+		}
+	}
+	return nil
+}
+
+const maxRequiredGroups = 8
+
+// grantable is the CI rule: an entry above T0 is never granted to a pool that
+// cannot carry it. Without defined pools only T0 entries may be granted.
+func grantable(e Entry, p Pool, defined bool) error {
+	rank := tierRank[e.Tier]
+	if rank == 0 {
+		return nil
+	}
+	if !defined {
+		return fmt.Errorf("%s entries need defined pools", e.Tier)
+	}
+	if rank > tierRank[p.Ceiling] {
+		return fmt.Errorf("%s exceeds the pool's ceiling", e.Tier)
+	}
+	switch p.Identity {
+	case "claude-session":
+		return nil
+	case "workload":
+		if rank >= 2 {
+			return fmt.Errorf("T2 is never granted to a workload pool")
+		}
+		have := map[string]bool{}
+		for _, g := range p.Entitlements {
+			have[g] = true
+		}
+		for _, g := range e.Requires {
+			if !have[g] {
+				return fmt.Errorf("the workload pool lacks a required group")
+			}
+		}
+		return nil
+	}
+	return fmt.Errorf("%s entries are never granted to a pool with no verified identity", e.Tier)
 }

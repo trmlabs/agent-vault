@@ -81,3 +81,18 @@ func TestAuth0ClientDialsOnlyCatalogDomains(t *testing.T) {
 		t.Fatal("redirects followed")
 	}
 }
+
+// A drain longer than 65 s would outlast the Pod's 75 s grace with the
+// database cleanup and the Vault revoke, so the server refuses to start.
+func TestShutdownSecondsMustFitTheGrace(t *testing.T) {
+	for raw, ok := range map[string]bool{"": true, "0": true, "60": true, "65": true, "66": false, "300": false, "-1": false, "1m": false} {
+		err := checkShutdownSeconds(func(string) string { return raw })
+		if (err == nil) != ok {
+			t.Errorf("AGENT_VAULT_SHUTDOWN_SECONDS=%q: %v", raw, err)
+		}
+	}
+	t.Setenv("AGENT_VAULT_SHUTDOWN_SECONDS", "75")
+	if err := serverCmd.RunE(serverCmd, nil); err == nil || !strings.Contains(err.Error(), "AGENT_VAULT_SHUTDOWN_SECONDS") {
+		t.Fatalf("server started with a 75 s drain: %v", err)
+	}
+}

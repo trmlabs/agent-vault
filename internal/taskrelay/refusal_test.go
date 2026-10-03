@@ -28,17 +28,66 @@ func errorBody(code, message string) []byte {
 	return append(b, 0)
 }
 
-func TestCapacityRefusalKeepsItsCode(t *testing.T) {
-	frame := refusalFrame(sqlState(errorBody("53300", "Agent Vault: too many concurrent database sessions")))
-	if frame[0] != 'E' || sqlState(frame[5:]) != "53300" || !bytes.Contains(frame, []byte("too many concurrent database sessions for this worker")) {
-		t.Fatalf("frame %q", frame)
+// reasonBody is an ErrorResponse body as the broker authors it: with its
+// reason code and its own text, which must never reach the worker.
+func reasonBody(severity, code, reason string) []byte {
+	var b []byte
+	for _, f := range [][2]string{{"S", severity}, {"C", code}, {"M", "Agent Vault: broker detail that must not leak"}, {"G", reason}} {
+		b = append(append(append(b, f[0][0]), f[1]...), 0)
+	}
+	return append(b, 0)
+}
+
+// Each broker reason reaches the worker as its code and fixed words.
+func TestBrokerReasonsBecomeFixedWords(t *testing.T) {
+	for reason, want := range map[string][2]string{
+		"actor_limit":     {"53300", "this worker reached its session cap"},
+		"database_limit":  {"53300", "the database's Gatehouse connection budget is full; retry shortly"},
+		"pool_budget":     {"53300", "the database's Gatehouse connection budget is full; retry shortly"},
+		"capacity":        {"53300", "Gatehouse is at capacity; retry shortly"},
+		"pinned_share":    {"53300", "no session-mode database connection is free"},
+		"not_ready":       {"57P03", "Gatehouse is starting; retry in a few seconds"},
+		"no_database":     {"3D000", "this database isn't in the Gatehouse catalog for your pool"},
+		"authentication":  {"28000", "Gatehouse could not verify this worker"},
+		"upstream":        {"08006", "Gatehouse could not reach the database; retry"},
+		"credential":      {"08006", "Gatehouse could not get a database credential; retry shortly"},
+		"restarting":      {"57P01", "Gatehouse is restarting; reconnect"},
+		"role_change":     {"42501", "Gatehouse refuses ALTER ROLE, ALTER USER and ALTER DATABASE"},
+		"statement_limit": {"54000", "too many prepared statements"},
+		"not_entitled":    {"42501", "not authorized for this database"},
+		"no_person":       {"42501", "not authorized for this database"},
+	} {
+		// Authorization decisions have many reasons and one code, 42501.
+		frame := refusalFrame(reasonBody("FATAL", want[0], reason))
+		if frame[0] != 'E' || sqlState(frame[5:]) != want[0] || !bytes.Contains(frame, []byte(want[1])) || bytes.Contains(frame, []byte("must not leak")) {
+			t.Errorf("%s: frame %q", reason, frame)
+		}
+	}
+}
+
+// Without a reason (an older broker), the known codes still keep fixed words.
+func TestKnownBrokerRefusalsKeepTheirCodeWithFixedText(t *testing.T) {
+	for code, want := range map[string]string{
+		"57P03": "Gatehouse is starting; retry in a few seconds",
+		"3D000": "this database isn't in the Gatehouse catalog for your pool",
+		"28000": "Gatehouse could not verify this worker",
+		"53300": "this worker reached its session cap",
+		"42501": "not authorized for this database",
+	} {
+		frame := refusalFrame(errorBody(code, "detail the broker must not leak"))
+		if frame[0] != 'E' || sqlState(frame[5:]) != code || !bytes.Contains(frame, []byte(want)) || bytes.Contains(frame, []byte("must not leak")) {
+			t.Errorf("%s: frame %q", code, frame)
+		}
 	}
 }
 
 func TestOtherBrokerErrorsBecomeOneGenericRefusal(t *testing.T) {
-	frame := refusalFrame(sqlState(errorBody("28000", "detail the broker must not leak")))
-	if sqlState(frame[5:]) != "08004" || bytes.Contains(frame, []byte("must not leak")) {
-		t.Fatalf("frame %q", frame)
+	for _, body := range [][]byte{errorBody("XX000", "detail the broker must not leak"), errorBody("08006", "detail the broker must not leak"),
+		reasonBody("FATAL", "08004", "audit_unavailable"), reasonBody("FATAL", "08004", "ledger_unavailable")} {
+		frame := refusalFrame(body)
+		if sqlState(frame[5:]) != "08004" || bytes.Contains(frame, []byte("must not leak")) {
+			t.Fatalf("frame %q", frame)
+		}
 	}
 	if sqlState([]byte{'C'}) != "" {
 		t.Fatal("malformed body parsed")

@@ -114,6 +114,9 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	peer, peerErr := peerFromContext(r.Context())
+	// The runner session token, set by the sidecar on CONNECT only; requests
+	// inside the tunnel cannot supply or replace it.
+	session := r.Header.Get(SessionHeader)
 	connectScope, err := p.resolveScope(r.Context(), token, hint, peer, peerErr, false)
 	if err != nil {
 		p.recordAuthFailure(r)
@@ -130,6 +133,20 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		p.adapterDeny(w, auditchain.Event{Pool: connectScope.Pool, Agent: connectScope.AgentID, PodUID: connectScope.WorkloadID}, http.StatusForbidden, "unlisted")
 		return
 	}
+
+	// A replica shutting down takes no new tunnels; the client retries on
+	// another one.
+	release, ok := p.reserveTunnel()
+	if !ok {
+		w.Header().Set("Connection", "close")
+		if p.strictCredentialProxy {
+			p.strictUnauthenticatedDeny(w, r, http.StatusServiceUnavailable)
+			return
+		}
+		http.Error(w, "proxy shutting down", http.StatusServiceUnavailable)
+		return
+	}
+	defer release()
 
 	hj, ok := w.(http.Hijacker)
 	if !ok {
@@ -192,7 +209,8 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 				writeAuthError(w, err)
 				return
 			}
-			p.forwardHandler(target, host, port, scope).ServeHTTP(w, r)
+			r.Header.Del(SessionHeader)
+			p.forwardHandler(target, host, port, scope).ServeHTTP(w, r.WithContext(withSessionToken(r.Context(), session)))
 		}),
 		// ReadHeaderTimeout and ReadTimeout bound the request side
 		// (slow-loris defense). IdleTimeout caps keep-alives between
@@ -218,7 +236,15 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		deadline := time.AfterFunc(time.Until(connectScope.NotAfter), func() { _ = tlsConn.Close() })
 		defer deadline.Stop()
 	}
+	defer p.trackTunnel(srv)()
 	_ = srv.Serve(listener)
+	// Serve can stop before taking the connection (a forced close during
+	// shutdown); nothing else owns it then.
+	select {
+	case c := <-listener.yield:
+		_ = c.Close()
+	default:
+	}
 }
 
 // recordAuthFailure records one auth-failure event against the per-IP

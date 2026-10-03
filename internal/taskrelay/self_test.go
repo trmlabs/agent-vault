@@ -25,6 +25,7 @@ func TestSelfModeAcceptsLoopbackOnly(t *testing.T) {
 		"over 8 hours":          func(c *FixedConfig) { c.Deadline = time.Now().Add(9 * time.Hour) },
 		"no audit":              func(c *FixedConfig) { c.AuditFile = "" },
 		"no listener":           func(c *FixedConfig) { c.PostgresBindings = nil },
+		"relative session file": func(c *FixedConfig) { c.PostgresBindings[0].Upstream.SessionFile = "token" },
 	} {
 		c := selfConfig()
 		c.PostgresBindings = append([]PostgresConfig(nil), c.PostgresBindings...)

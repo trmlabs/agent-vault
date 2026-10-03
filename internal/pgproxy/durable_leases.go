@@ -5,6 +5,8 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,6 +50,8 @@ type DurableLeaseOptions struct {
 	// Replica names the broker in owner IDs, for operators. Each process adds a
 	// random suffix, so a restarted Pod never inherits its predecessor's records.
 	Replica string
+	// Logger names a refused start or a duplicate-name fence. Default discard.
+	Logger *slog.Logger
 }
 
 type durableLease struct {
@@ -74,6 +78,9 @@ type DurableLeaseMinter struct {
 	active   map[string]durableLease
 	closed   bool
 	closeErr error
+
+	releaseOnce sync.Once
+	releaseErr  error
 
 	renewMu   sync.Mutex
 	lastRenew time.Time // send time of the last successful renewal
@@ -115,8 +122,12 @@ func NewDurableLeaseMinter(ctx context.Context, client *hashicorp.Client, journa
 	}
 	m := &DurableLeaseMinter{client: client, journal: journal, opts: opts, owner: owner, done: make(chan struct{}), active: make(map[string]durableLease), kick: make(chan struct{}, 1)}
 	m.ctx, m.cancel = context.WithCancel(ctx)
-	sent := time.Now()
-	if err := journal.ClaimDatabaseCleanupOwner(ctx, m.owner, opts.OwnerTTL); err != nil {
+	if opts.Logger == nil {
+		opts.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+		m.opts.Logger = opts.Logger
+	}
+	sent, err := claimOwner(ctx, journal, m.owner, opts)
+	if err != nil {
 		m.cancel()
 		return nil, err
 	}
@@ -131,6 +142,31 @@ func NewDurableLeaseMinter(ctx context.Context, client *hashicorp.Client, journa
 	}
 	go m.run()
 	return m, nil
+}
+
+// claimOwner registers this process. Another process under the same replica
+// name may be a crashed predecessor whose row has not expired yet, so the
+// claim is retried until a row that stopped renewing would have expired; a
+// name still held after that belongs to a live process, and this one refuses
+// to start.
+func claimOwner(ctx context.Context, journal CleanupJournal, owner string, opts DurableLeaseOptions) (time.Time, error) {
+	deadline := time.Now().Add(opts.OwnerTTL + opts.Heartbeat)
+	for {
+		sent := time.Now()
+		err := journal.ClaimDatabaseCleanupOwner(ctx, owner, opts.OwnerTTL)
+		if !errors.Is(err, store.ErrReplicaNameInUse) {
+			return sent, err
+		}
+		if time.Now().After(deadline) {
+			opts.Logger.Error("pgproxy: replica name held by another live broker; refusing to start", slog.String("replica", opts.Replica))
+			return time.Time{}, fmt.Errorf("%w: replica %q (each broker needs its own AGENT_VAULT_REPLICA)", store.ErrReplicaNameInUse, opts.Replica)
+		}
+		select {
+		case <-ctx.Done():
+			return time.Time{}, ctx.Err()
+		case <-time.After(opts.Heartbeat):
+		}
+	}
 }
 
 // AuthorityDone closes when this replica fences itself or closes. The broker
@@ -183,6 +219,10 @@ func (m *DurableLeaseMinter) heartbeat() bool {
 	ctx, cancel := context.WithTimeout(m.ctx, min(m.opts.Heartbeat, remaining))
 	defer cancel()
 	err := m.journal.RenewDatabaseCleanupOwner(ctx, m.owner, m.opts.OwnerTTL)
+	if errors.Is(err, store.ErrReplicaNameInUse) {
+		m.opts.Logger.Error("pgproxy: replica name held by another live broker; fencing", slog.String("replica", m.opts.Replica))
+		return false
+	}
 	if errors.Is(err, store.ErrDatabaseCleanupOwnershipLost) {
 		return false
 	}
@@ -480,7 +520,11 @@ func (m *DurableLeaseMinter) Revoke(ctx context.Context, id string) error {
 
 // Close runs after the broker stops sessions. Failed records remain durable for
 // the next owner. Caller context bounds waiting and all shutdown cleanup.
+// However that goes, the owner row is released last, on its own short
+// deadline, so a planned restart under the same replica name registers at
+// once instead of waiting out the row; records still held become claimable.
 func (m *DurableLeaseMinter) Close(ctx context.Context) error {
+	defer func() { _ = m.release() }()
 	m.cancel()
 	select {
 	case <-m.done:
@@ -499,9 +543,19 @@ func (m *DurableLeaseMinter) Close(ctx context.Context) error {
 	m.active = make(map[string]durableLease)
 	m.activeMu.Unlock()
 	err := m.reconcile(ctx, "")
-	if releaseErr := m.journal.ReleaseDatabaseCleanupOwner(ctx, m.owner); err == nil {
+	if releaseErr := m.release(); err == nil {
 		err = releaseErr
 	}
 	m.closeErr = err
 	return err
+}
+
+// release gives up the owner row once, even after the caller's deadline.
+func (m *DurableLeaseMinter) release() error {
+	m.releaseOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
+		defer cancel()
+		m.releaseErr = m.journal.ReleaseDatabaseCleanupOwner(ctx, m.owner)
+	})
+	return m.releaseErr
 }

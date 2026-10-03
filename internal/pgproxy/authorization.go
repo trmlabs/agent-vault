@@ -23,7 +23,7 @@ func (b *Broker) authorizationLoop(ctx context.Context, token, hint, requested s
 			return
 		case <-ticker.C:
 		}
-		checkCtx, cancel := context.WithTimeout(ctx, b.opts.AuthorizationTimeout)
+		checkCtx, cancel := context.WithTimeout(WithRecheck(ctx), b.opts.AuthorizationTimeout)
 		// A dependency must honor context, but cannot postpone terminating access
 		// simply by returning late. A fired watchdog cannot revive the session.
 		watchdog := time.AfterFunc(b.opts.AuthorizationTimeout, terminate)
@@ -77,3 +77,14 @@ func (b *Broker) renewalAuthenticator(peer netip.Addr) AgentAuthenticator {
 	}
 	return b.opts.Auth
 }
+
+type recheckKey struct{}
+
+// WithRecheck marks a context as the periodic recheck of an open session.
+func WithRecheck(ctx context.Context) context.Context {
+	return context.WithValue(ctx, recheckKey{}, true)
+}
+
+// IsRecheck reports whether a DatabaseResolver call is the periodic recheck of
+// an open session rather than an admission.
+func IsRecheck(ctx context.Context) bool { v, _ := ctx.Value(recheckKey{}).(bool); return v }

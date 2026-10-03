@@ -58,9 +58,19 @@ type Event struct {
 	Session   string
 	Outcome   string
 	Requester string
-	Method    string
-	Status    int
-	Duration  int64 // milliseconds
+	// Authorization decision: who stood behind the request and why it was
+	// allowed or refused. TokenSHA256 identifies a runner session token
+	// without storing it.
+	RequesterKind string
+	RequesterOID  string
+	TokenSHA256   string
+	Tier          string
+	Decision      string
+	Groups        string
+	CacheAgeSec   int64
+	Method        string
+	Status        int
+	Duration      int64 // milliseconds
 }
 
 var (
@@ -156,14 +166,19 @@ func (c *Chain) Record(e Event) error {
 	if e.Status != 0 && (e.Status < 100 || e.Status > 599) || e.Duration < 0 {
 		return ErrInvalidEvent
 	}
-	for _, v := range []string{e.Pool, e.Agent, e.PodUID, e.Binding, e.Session, e.Outcome, e.Requester} {
+	if e.CacheAgeSec < 0 {
+		return ErrInvalidEvent
+	}
+	for _, v := range []string{e.Pool, e.Agent, e.PodUID, e.Binding, e.Session, e.Outcome, e.Requester, e.RequesterKind, e.RequesterOID, e.TokenSHA256, e.Tier, e.Decision, e.Groups} {
 		if !identifier(v, true) {
 			return ErrInvalidEvent
 		}
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	_, err := c.appendLocked(Row{Event: e.Event, Pool: e.Pool, Agent: e.Agent, PodUID: e.PodUID, Binding: e.Binding, Session: e.Session, Outcome: e.Outcome, Requester: e.Requester, Method: e.Method, Status: e.Status, Duration: e.Duration})
+	_, err := c.appendLocked(Row{Event: e.Event, Pool: e.Pool, Agent: e.Agent, PodUID: e.PodUID, Binding: e.Binding, Session: e.Session, Outcome: e.Outcome, Requester: e.Requester,
+		RequesterKind: e.RequesterKind, RequesterOID: e.RequesterOID, TokenSHA256: e.TokenSHA256, Tier: e.Tier, Decision: e.Decision, Groups: e.Groups, CacheAgeSec: e.CacheAgeSec,
+		Method: e.Method, Status: e.Status, Duration: e.Duration})
 	return err
 }
 
@@ -253,7 +268,7 @@ func (c *Chain) appendLocked(r Row) (Row, error) {
 	}
 	r.Type, r.Replica, r.Boot, r.Seq = RowType, c.opts.Replica, c.boot, c.seq
 	r.Time = c.opts.Now().UTC().Format(time.RFC3339Nano)
-	r.KeyVersion, r.Prev = c.key.Version, c.prev
+	r.KeyVersion, r.Prev, r.MACVersion = c.key.Version, c.prev, MACVersionCurrent
 	r.MAC = r.computeMAC(c.key.secret)
 	line, err := json.Marshal(r)
 	if err != nil {

@@ -103,7 +103,8 @@ type Server struct {
 	pgBroker              *pgproxy.Broker
 	readiness             []readinessCheck
 	pgLeaseCloser         interface{ Close(context.Context) error }
-	storeOK               atomic.Int64 // Unix ms of the last good store ping; 0 before the first
+	shutdownTimeout       time.Duration // 0: the default 5s
+	storeOK               atomic.Int64  // Unix ms of the last good store ping; 0 before the first
 }
 
 // lockVaultServices acquires the per-vault mutation lock via the store's
@@ -142,6 +143,17 @@ func (s *Server) HashicorpClient() *hashicorp.Client { return s.hashicorpClient 
 // SIGINT/SIGTERM/Shutdown stops it alongside the HTTP server. Must be called
 // before Start.
 func (s *Server) AttachPostgresBroker(b *pgproxy.Broker) { s.pgBroker = b }
+
+// SetShutdownTimeout sets how long a graceful stop waits for in-flight work,
+// such as tunnel requests the proxy drains. Zero keeps the default 5s.
+func (s *Server) SetShutdownTimeout(d time.Duration) { s.shutdownTimeout = d }
+
+func (s *Server) shutdownBudget() time.Duration {
+	if s.shutdownTimeout > 0 {
+		return s.shutdownTimeout
+	}
+	return 5 * time.Second
+}
 
 // AttachReadiness adds a named check to GET /readyz. Every check must pass for
 // the replica to receive traffic; names, never values, appear in the response.
@@ -1052,6 +1064,16 @@ func (s *Server) requireInitialized(next http.HandlerFunc) http.HandlerFunc {
 // Start starts the server and blocks until shutdown.
 // It listens for SIGINT/SIGTERM to shut down gracefully.
 func (s *Server) Start() error {
+	// Vault logins are revoked last, after the database cleanup below has
+	// revoked its sessions with them, on a short budget inside the Pod's
+	// termination grace.
+	if s.hashicorpClient != nil {
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), vaultCloseTimeout)
+			defer cancel()
+			s.hashicorpClient.CloseContext(ctx)
+		}()
+	}
 	// Release journal ownership on every exit, including startup failures.
 	if s.pgLeaseCloser != nil {
 		defer func() {
@@ -1233,7 +1255,7 @@ func (s *Server) Start() error {
 	case <-stop:
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), s.shutdownBudget())
 	defer cancel()
 
 	fmt.Println("shutting down server...")
@@ -1290,6 +1312,11 @@ func (s *Server) Start() error {
 }
 
 var errTooManyPendingCodes = errors.New("too many pending verification codes")
+
+// vaultCloseTimeout bounds revoking the Vault logins at shutdown. A drain of
+// AGENT_VAULT_SHUTDOWN_SECONDS, the 5 s database cleanup and this must fit in
+// the Pod's termination grace.
+const vaultCloseTimeout = 5 * time.Second
 
 const passwordResetTTL = 15 * time.Minute
 

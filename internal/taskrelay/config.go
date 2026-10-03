@@ -54,6 +54,12 @@ type UpstreamConfig struct {
 	CAFile     string `json:"caFile"`
 	ProofFile  string `json:"proofFile"`
 	Audience   string `json:"audience"`
+	// SessionFile, in self mode, holds the Claude runner's session token. The
+	// relay sends it to the broker on each CONNECT, and on each PostgreSQL
+	// connection as a preamble line ahead of the startup it authors, so the
+	// broker can verify the person behind the session. A missing or empty
+	// file sends nothing.
+	SessionFile string `json:"sessionFile,omitempty"`
 }
 type ConnectConfig struct {
 	Listen         string         `json:"listen"`
@@ -99,6 +105,14 @@ func LoadConfig(path string) (FixedConfig, error) {
 func (c FixedConfig) Validate(now time.Time) error {
 	if c.Self {
 		return c.validateSelf(now)
+	}
+	if (c.Connect != nil && c.Connect.Upstream.SessionFile != "") || c.Browser != nil && c.Browser.Upstream.SessionFile != "" {
+		return errConfig // only a sidecar in the session's own Pod forwards its token
+	}
+	for _, p := range c.postgresBindings() {
+		if p.Upstream.SessionFile != "" {
+			return errConfig
+		}
 	}
 	if !containerName.MatchString(c.Sandbox.ContainerName) {
 		return errConfig
@@ -155,6 +169,14 @@ func (c FixedConfig) Validate(now time.Time) error {
 
 // validateSelf allows only loopback listeners, no browser and no pairing input.
 func (c FixedConfig) validateSelf(now time.Time) error {
+	if c.Connect != nil && c.Connect.Upstream.SessionFile != "" && !strings.HasPrefix(c.Connect.Upstream.SessionFile, "/") {
+		return errConfig
+	}
+	for _, p := range c.postgresBindings() {
+		if p.Upstream.SessionFile != "" && !strings.HasPrefix(p.Upstream.SessionFile, "/") {
+			return errConfig
+		}
+	}
 	if !safeName.MatchString(c.TaskID) || !c.Deadline.After(now) || c.Deadline.After(now.Add(8*time.Hour)) || c.AuditFile == "" || c.Browser != nil ||
 		c.Sandbox != (SandboxConfig{}) || c.Kubernetes != (KubernetesConfig{}) || c.TLSCertFile != "" || c.TLSKeyFile != "" {
 		return errConfig

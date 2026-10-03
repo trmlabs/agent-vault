@@ -85,6 +85,7 @@ type Broker struct {
 	shutdownDone         chan struct{}
 	wg                   sync.WaitGroup
 	pools                *serverPools // nil unless Options.Pool is set
+	pooled               map[net.Conn]*pooledSession
 	denied               deniedLimiter
 }
 
@@ -150,6 +151,7 @@ func New(addr string, opts Options) *Broker {
 		connActors:     make(map[net.Conn]runtimestatus.Attribution),
 		leaseCounts:    make(map[string]int),
 		leaseChanged:   make(chan struct{}),
+		pooled:         make(map[net.Conn]*pooledSession),
 	}
 	if opts.Pool != nil {
 		pool := *opts.Pool
@@ -206,6 +208,9 @@ func (b *Broker) Serve(l net.Listener) error {
 				b.authorityLost.Store(true)
 				ctx, cancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
 				defer cancel()
+				// A drain already under way would keep serving on credentials
+				// other replicas may have claimed and revoked: end it now.
+				b.forceClose()
 				_ = b.Shutdown(ctx)
 			case <-b.ctx.Done():
 			}
@@ -260,22 +265,58 @@ func (b *Broker) Serve(l net.Listener) error {
 	}
 }
 
+// drainReserve is the part of Shutdown's budget kept for revoking pooled
+// credentials after draining sessions.
+const drainReserve = leaseRevokeTimeout
+
 // Shutdown stops accepting, closes all live connections (which unblocks their
 // relays and triggers per-connection lease revocation), and waits for handlers
-// to finish or ctx to expire.
+// to finish or ctx to expire. With PoolOptions.DrainSessions, pooled sessions
+// instead end at their next idle point, and only those still busy when ctx is
+// within drainReserve of its deadline are closed. A stop forced by lost
+// cleanup authority never drains.
 func (b *Broker) Shutdown(ctx context.Context) error {
+	var draining []*pooledSession
 	b.mu.Lock()
 	if !b.closed {
 		b.closed = true
-		b.cancel()
+		drain := b.opts.Pool != nil && b.opts.Pool.DrainSessions && !b.authorityLost.Load()
+		if !drain {
+			b.cancel()
+		}
 		if b.listener != nil {
 			_ = b.listener.Close()
 		}
 		for conn := range b.conns {
+			if s := b.pooled[conn]; drain && s != nil {
+				draining = append(draining, s)
+				continue
+			}
 			_ = conn.Close()
+		}
+		if drain {
+			go func() {
+				force := ctx
+				if deadline, ok := ctx.Deadline(); ok {
+					var cancel context.CancelFunc
+					force, cancel = context.WithDeadline(ctx, deadline.Add(-drainReserve))
+					defer cancel()
+				}
+				select {
+				case <-force.Done():
+					b.logger.Warn("pgproxy: drain deadline reached; closing busy sessions")
+					b.mu.Lock()
+					for conn := range b.conns {
+						_ = conn.Close()
+					}
+					b.mu.Unlock()
+				case <-b.shutdownDone:
+				}
+			}()
 		}
 		go func() {
 			b.wg.Wait()
+			b.cancel()
 			// Sessions are gone: close idle server connections and revoke
 			// pooled credentials.
 			if b.pools != nil {
@@ -285,12 +326,44 @@ func (b *Broker) Shutdown(ctx context.Context) error {
 		}()
 	}
 	b.mu.Unlock()
+	for _, s := range draining {
+		s.beginDrain()
+	}
 	select {
 	case <-b.shutdownDone:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// forceClose ends every connection now, for a stop that must not drain, such
+// as lost cleanup authority while a graceful drain is running. Shutdown, if
+// not yet called, then finds nothing left to drain.
+func (b *Broker) forceClose() {
+	b.mu.Lock()
+	for conn := range b.conns {
+		_ = conn.Close()
+	}
+	b.mu.Unlock()
+}
+
+// trackPooled lists a pooled session for draining; false once Shutdown has
+// begun, when the session must not start.
+func (b *Broker) trackPooled(conn net.Conn, s *pooledSession) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return false
+	}
+	b.pooled[conn] = s
+	return true
+}
+
+func (b *Broker) untrackPooled(conn net.Conn) {
+	b.mu.Lock()
+	delete(b.pooled, conn)
+	b.mu.Unlock()
 }
 
 func (b *Broker) unregister(conn net.Conn) {
@@ -416,7 +489,14 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		peer = remote.Addr().Unmap()
 	}
 
-	clientReader := &messageReader{reader: conn, startup: true}
+	// The sidecar's session line, if any, precedes the startup packet.
+	_ = conn.SetDeadline(time.Now().Add(b.opts.StartupTimeout))
+	session, stream, err := readSessionPreamble(conn)
+	if err != nil {
+		b.logger.Debug("pgproxy: session preamble refused")
+		return
+	}
+	clientReader := &messageReader{reader: stream, startup: true}
 	backend := pgproto3.NewBackend(clientReader, conn)
 	backend.SetMaxBodyLen(maxAuthMessageBytes)
 
@@ -454,15 +534,16 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		if b.denied.allow(time.Now(), b.logger) {
 			b.auditDenied(auditchain.Event{}, "authentication")
 		}
-		writeClientError(backend, "28000", "Agent Vault: authentication failed")
+		writeClientError(backend, "28000", "authentication", "Agent Vault: authentication failed")
 		return
 	}
 	// Audit identity comes only from the verified scope. The binding is added
 	// once the database resolves.
 	event := auditchain.Event{Pool: scope.Pool, Agent: scope.ActorID, PodUID: scope.WorkloadID, Session: newSessionID()}
+	connCtx := WithSession(b.ctx, session)
 	refuse := func(outcome, code, message string) {
 		b.auditDenied(event, outcome)
-		writeClientError(backend, code, message)
+		writeClientError(backend, code, outcome, message)
 	}
 	if err := b.auditAdmit(); err != nil {
 		b.logger.Error("pgproxy: audit trail unavailable; refusing session", slog.String("error", err.Error()))
@@ -480,7 +561,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 
 	// Authenticated: a longer budget for the mint + upstream-connect phase, which
 	// can be slow when role DDL serializes at scale.
-	hsCtx, cancel := context.WithTimeout(b.ctx, b.opts.HandshakeTimeout)
+	hsCtx, cancel := context.WithTimeout(connCtx, b.opts.HandshakeTimeout)
 	defer cancel()
 	_ = conn.SetDeadline(time.Now().Add(b.opts.HandshakeTimeout))
 
@@ -574,7 +655,22 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		return
 	}
 
-	svc, err := b.opts.Databases.ResolveDatabase(hsCtx, *scope, requestedDB)
+	var who Requester
+	svc, err := b.opts.Databases.ResolveDatabase(withRequesterRecord(hsCtx, &who), *scope, requestedDB)
+	event.RequesterKind, event.TokenSHA256, event.RequesterOID = who.Kind, who.TokenSHA256, who.ObjectID
+	event.Tier, event.Decision, event.Groups, event.CacheAgeSec = who.Tier, who.Decision, who.Groups, who.CacheAgeSec
+	if who.Kind == "person" || who.Kind == "agent" {
+		event.Requester = who.Subject
+	}
+	var refused *RefusedError
+	if errors.As(err, &refused) {
+		// A refusal names an entry that exists and is granted to the pool.
+		event.Binding = databaseBinding(scope.VaultID, &DatabaseService{Name: requestedDB})
+		b.logger.Warn("pgproxy: database refused by the authorization model",
+			slog.String("vault", scope.VaultID), slog.String("database", requestedDB), slog.String("decision", refused.Outcome))
+		refuse(refused.Outcome, "42501", fmt.Sprintf("Agent Vault: not authorized for database %q (%s)", requestedDB, refused.Outcome))
+		return
+	}
 	if err != nil {
 		b.logger.Warn("pgproxy: database service resolution failed",
 			slog.String("vault", scope.VaultID),
@@ -661,7 +757,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	opened.Event, opened.Outcome = auditchain.EventSessionOpen, "admitted"
 	if err := b.auditRecord(opened); err != nil {
 		b.logger.Error("pgproxy: audit trail unavailable; refusing session", slog.String("error", err.Error()))
-		writeClientError(backend, "08004", "Agent Vault: audit unavailable")
+		writeClientError(backend, "08004", "audit_unavailable", "Agent Vault: audit unavailable")
 		return
 	}
 	defer func() {
@@ -688,7 +784,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		slog.String("upstream", svc.Addr),
 		slog.String("lease", lease.ID))
 
-	relayCtx, relayCancel := context.WithCancel(b.ctx)
+	relayCtx, relayCancel := context.WithCancel(connCtx)
 	defer relayCancel()
 	terminate := sync.OnceFunc(func() {
 		_ = conn.Close()

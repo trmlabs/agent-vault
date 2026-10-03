@@ -67,7 +67,7 @@ var BrowserForwardHeaders = []string{"Accept", "Accept-Language", "Access-Contro
 	"Cache-Control", "Content-Type", "If-Modified-Since", "If-None-Match", "Origin", "Pragma", "Referer", "User-Agent"}
 
 func (e *Entry) normalizeBrowser() error {
-	if e.Git != nil || e.Postgres != nil || e.Key != (KeyRef{}) || e.Header != "" || e.Scheme != "" || len(e.Methods) > 0 {
+	if e.Git != nil || e.Postgres != nil || e.GCP != nil || e.Key != (KeyRef{}) || e.Header != "" || e.Scheme != "" || len(e.Methods) > 0 {
 		return errors.New("browser-session entries take host, pools, placeholder, browserSession and optional path prefixes and forward headers")
 	}
 	b := e.BrowserSession
