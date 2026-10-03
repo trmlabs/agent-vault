@@ -134,7 +134,7 @@ func TestRealVault_BrokerParentExpiry(t *testing.T) {
 		_ = m.Close(c)
 	}()
 	svc := &pgproxy.DatabaseService{Name: "read", Addr: os.Getenv("AV_TEST_PG_UPSTREAM"), Database: "appdb", Mount: "database", Role: "readonly", SSLMode: "disable"}
-	lease, err := m.Mint(ctx, v.ID, svc)
+	lease, err := m.Mint(ctx, pgproxy.AgentScope{VaultID: v.ID}, svc)
 	check(err, "positive PG issuance")
 	cfg, err := pgx.ParseConfig("postgres://" + svc.Addr + "/appdb?sslmode=disable")
 	check(err, "PG config")
@@ -173,7 +173,7 @@ func TestRealVault_BrokerParentExpiry(t *testing.T) {
 	if calls.Load() != before {
 		t.Fatal("expired parent forwarded HTTP")
 	}
-	if _, e := m.Mint(ctx, v.ID, svc); e == nil {
+	if _, e := m.Mint(ctx, pgproxy.AgentScope{VaultID: v.ID}, svc); e == nil {
 		t.Fatal("expired parent minted credentials")
 	}
 	wait("parent expiry did not remove exact role and sessions", func() bool {
@@ -199,7 +199,7 @@ func TestRealVault_BrokerParentExpiry(t *testing.T) {
 	m, err = pgproxy.NewDurableLeaseMinter(ctx, hc, st, pgproxy.DurableLeaseOptions{})
 	check(err, "fresh-parent recovery")
 	request(http.StatusOK)
-	recovered, err := m.Mint(ctx, v.ID, svc)
+	recovered, err := m.Mint(ctx, pgproxy.AgentScope{VaultID: v.ID}, svc)
 	check(err, "recovered PG issuance")
 	cfg.User = recovered.Username
 	cfg.Password = recovered.Password

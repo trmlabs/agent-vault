@@ -30,7 +30,7 @@ func TestObserverHasNoProxyGrant(t *testing.T) {
 	}
 	observer := observerFor(t, f)
 	f.s.role = "proxy"
-	if err := observer.Authorize(context.Background(), token(f.c)); err != nil {
+	if _, err := observer.Authorize(context.Background(), token(f.c)); err != nil {
 		t.Fatal(err)
 	}
 	if observer.resolver.store != nil {
@@ -57,11 +57,11 @@ func TestObserverLiveIdentityDenials(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			f := setup(t)
 			o := observerFor(t, f)
-			if err := o.Authorize(context.Background(), token(f.c)); err != nil {
+			if _, err := o.Authorize(context.Background(), token(f.c)); err != nil {
 				t.Fatal(err)
 			}
 			change(f)
-			if err := o.Authorize(context.Background(), token(f.c)); err == nil {
+			if _, err := o.Authorize(context.Background(), token(f.c)); err == nil {
 				t.Fatal("invalid observer admitted")
 			}
 		})
@@ -82,5 +82,33 @@ func TestObserverConfigurationSeparation(t *testing.T) {
 	observer.Bindings[0].ServiceAccount = "relay"
 	if err := ValidateObserverSeparation(observer, proxy); err == nil {
 		t.Fatal("shared account accepted")
+	}
+}
+
+func TestObserverListAgentsIsPerBindingAndObserverOnly(t *testing.T) {
+	f := setup(t)
+	plain := observerFor(t, f)
+	if access, err := plain.Authorize(context.Background(), token(f.c)); err != nil || access.ListAgents {
+		t.Fatalf("list access without capability: %+v %v", access, err)
+	}
+	config := plain.resolver.config
+	config.Bindings = append([]Binding(nil), config.Bindings...)
+	config.Bindings[0].ListAgents = true
+	controller, err := NewObserver(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if access, err := controller.Authorize(context.Background(), token(f.c)); err != nil || !access.ListAgents {
+		t.Fatalf("controller capability lost: %+v %v", access, err)
+	}
+	f.podStatus = 404
+	if access, err := controller.Authorize(context.Background(), token(f.c)); err == nil || access.ListAgents {
+		t.Fatal("capability returned for a denied proof")
+	}
+	proxy := f.r.config
+	proxy.Bindings = append([]Binding(nil), proxy.Bindings...)
+	proxy.Bindings[0].ListAgents = true
+	if _, err := New(proxy, f.s); err == nil {
+		t.Fatal("observer access accepted in proxy policy")
 	}
 }

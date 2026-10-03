@@ -2,8 +2,11 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"regexp"
 	"strings"
 	"sync"
@@ -13,6 +16,7 @@ import (
 	"github.com/Infisical/agent-vault/internal/hashicorp"
 	"github.com/Infisical/agent-vault/internal/httpcatalog"
 	"github.com/Infisical/agent-vault/internal/mitm"
+	"github.com/Infisical/agent-vault/internal/netguard"
 	"github.com/Infisical/agent-vault/internal/server"
 )
 
@@ -49,8 +53,8 @@ func brokerCatalog(ctx context.Context, client *hashicorp.Client, getenv func(st
 		if source, err = httpcatalog.Open(ctx, load); err != nil {
 			return nil, fmt.Errorf("broker catalog: %w", err)
 		}
-		// The watch outlives the startup context; it runs for the process.
-		go source.Watch(context.WithoutCancel(ctx), 30*time.Second, load, func(version int, err error) {
+		// ctx is the server's lifetime context, so the watch runs until exit.
+		go source.Watch(ctx, 30*time.Second, load, func(version int, err error) {
 			logger.Error("broker catalog version rejected; keeping the last good catalog",
 				slog.Int("version", version), slog.Int("in_force", source.Version()), slog.String("error", err.Error()))
 		})
@@ -96,7 +100,9 @@ func httpHeaderAdapter(ctx context.Context, srv *server.Server, getenv func(stri
 	if chain == nil {
 		return nil, fmt.Errorf("requires AGENT_VAULT_AUDIT_CHAIN")
 	}
-	adapter := &mitm.HeaderAdapter{Catalog: source, Keys: &httpcatalog.Keys{Vault: client.Logical()}, Audit: chain}
+	keys := &httpcatalog.Keys{Vault: client.Logical()}
+	adapter := &mitm.HeaderAdapter{Catalog: source, Keys: keys, Audit: chain}
+	adapter.BrowserTokens = &httpcatalog.Auth0Tokens{Keys: keys, Client: auth0Client(source, netguard.SafeDialContext(netguard.AllowPrivateFromEnv()))}
 	githubEntries := false
 	for _, e := range source.Current().Entries() {
 		githubEntries = githubEntries || e.Kind == "git" || e.Kind == "github-api"
@@ -121,6 +127,24 @@ func httpHeaderAdapter(ctx context.Context, srv *server.Server, getenv func(stri
 		return nil, err
 	}
 	return adapter, nil
+}
+
+// auth0Client is how browser-session test users log in from the broker: over
+// the same guarded dialer as every other upstream, to an Auth0 domain the
+// current catalog names on port 443 and nowhere else, never following a
+// redirect, since the login body holds the user's password and the client
+// secret.
+func auth0Client(catalog interface{ Current() httpcatalog.Catalog }, dial func(context.Context, string, string) (net.Conn, error)) *http.Client {
+	pinned := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil || port != "443" || !catalog.Current().HasAuth0Domain(host) {
+			return nil, errors.New("auth0 login: host not in the catalog")
+		}
+		return dial(ctx, network, addr)
+	}
+	return &http.Client{Timeout: 10 * time.Second,
+		Transport:     &http.Transport{DialContext: pinned, TLSHandshakeTimeout: 5 * time.Second},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 }
 
 // gitScope names a token's permissions as the catalog grants them.

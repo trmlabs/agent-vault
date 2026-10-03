@@ -42,7 +42,9 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 	if e != nil {
 		return e
 	}
-	defer pair.client.CloseIdleConnections()
+	if pair.client != nil {
+		defer pair.client.CloseIdleConnections()
+	}
 	if e = pair.check(parent, ""); e != nil {
 		return e
 	}
@@ -54,11 +56,14 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 	ctx, cancel := context.WithDeadline(parent, c.Deadline)
 	defer cancel()
 	r := &relay{config: c, pair: pair, audit: audit, ctx: ctx, cancel: cancel, slots: make(chan struct{}, maxConnections)}
-	cert, e := tls.LoadX509KeyPair(c.TLSCertFile, c.TLSKeyFile)
-	if e != nil {
-		return errConfig
+	var tlsConfig *tls.Config
+	if !c.Self {
+		cert, e := tls.LoadX509KeyPair(c.TLSCertFile, c.TLSKeyFile)
+		if e != nil {
+			return errConfig
+		}
+		tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}}
 	}
-	tlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}}
 	var listeners []net.Listener
 	defer func() {
 		r.workMu.Lock()
@@ -79,7 +84,10 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 		if e != nil {
 			return nil, e
 		}
-		l := tls.NewListener(&boundedListener{Listener: plain, slots: listenerSlots}, tlsConfig)
+		var l net.Listener = &boundedListener{Listener: plain, slots: listenerSlots}
+		if tlsConfig != nil {
+			l = tls.NewListener(l, tlsConfig)
+		}
 		if e == nil {
 			listeners = append(listeners, l)
 		}

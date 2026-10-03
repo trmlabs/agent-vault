@@ -1,9 +1,12 @@
 package pgproxy
 
 import (
+	"net/netip"
+
 	"context"
 	"errors"
 	"fmt"
+	"github.com/Infisical/agent-vault/internal/brokercore"
 	"io"
 	"log/slog"
 	"net"
@@ -14,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgproto3"
 
 	"github.com/Infisical/agent-vault/internal/auditchain"
+	"github.com/Infisical/agent-vault/internal/runtimestatus"
 )
 
 // Options configures a Broker. Auth, Databases, and Leases are required; the
@@ -34,8 +38,19 @@ type Options struct {
 	MinRenewInterval      time.Duration // floor on the renew cadence (default 5s)
 	MaxConns              int           // cap on concurrent SERVING connections = upstream DB connections (default 50)
 	MaxPendingConns       int           // cap on accepted-but-not-yet-serving connections (default 512)
-	MaxLeasesPerActor     int           // cap on live credentials/connections per agent identity (default 16; clamped to <= MaxConns)
-	Audit                 AuditTrail    // signed audit trail; nil disables it
+	MaxLeasesPerActor     int           // cap on live credentials/connections per workload (Pod), or per agent when no workload is known (default 16; clamped to <= MaxConns)
+	// MaxLeasesPerAgent caps one agent's sessions across all its workloads on
+	// this replica, so a pool agent with many Pods cannot take the whole
+	// serving cap (default MaxConns minus MaxLeasesPerActor, at least
+	// MaxLeasesPerActor; clamped to <= MaxConns).
+	MaxLeasesPerAgent int
+	// TrustProxyHeader reads a PROXY v1 header from the in-Pod loopback TLS
+	// terminator on every connection and uses its source as the peer address.
+	TrustProxyHeader bool
+	// Sessions, when set, caps live sessions per Pod across every broker replica.
+	Sessions SessionLedger
+	Pool     *PoolOptions // transaction-mode multiplexing; nil keeps one upstream connection per session
+	Audit    AuditTrail   // signed audit trail; nil disables it
 }
 
 // Broker is the PostgreSQL credential-brokering TCP listener. It mirrors the
@@ -47,8 +62,11 @@ type Broker struct {
 	logger *slog.Logger
 
 	isListening atomic.Bool
-	acceptSem   chan struct{} // bounds accepted (handshaking) connections
-	serveSem    chan struct{} // bounds TOTAL serving connections across all databases
+	// authorityLost records a stop forced by the cleanup journal, so Serve
+	// reports it and the process restarts as a new owner.
+	authorityLost atomic.Bool
+	acceptSem     chan struct{} // bounds accepted (handshaking) connections
+	serveSem      chan struct{} // bounds TOTAL serving connections across all databases
 
 	cancellations  map[string]*cancelTarget
 	serveMu        sync.Mutex
@@ -57,6 +75,7 @@ type Broker struct {
 	mu                   sync.Mutex
 	listener             net.Listener
 	conns                map[net.Conn]struct{}
+	connActors           map[net.Conn]runtimestatus.Attribution // authenticated actor and instance; absent means unattributed
 	connectionGeneration uint64
 	leaseCounts          map[string]int // live leases per actor id
 	leaseChanged         chan struct{}  // wakes bounded admissions after cleanup
@@ -65,6 +84,7 @@ type Broker struct {
 	cancel               context.CancelFunc
 	shutdownDone         chan struct{}
 	wg                   sync.WaitGroup
+	pools                *serverPools // nil unless Options.Pool is set
 	denied               deniedLimiter
 }
 
@@ -109,8 +129,13 @@ func New(addr string, opts Options) *Broker {
 		// A per-actor limit above the global ceiling has no effect.
 		opts.MaxLeasesPerActor = opts.MaxConns
 	}
+	if opts.MaxLeasesPerAgent <= 0 {
+		// Leave another agent at least one workload's worth of the cap.
+		opts.MaxLeasesPerAgent = max(opts.MaxConns-opts.MaxLeasesPerActor, opts.MaxLeasesPerActor)
+	}
+	opts.MaxLeasesPerAgent = min(opts.MaxLeasesPerAgent, opts.MaxConns)
 	ctx, cancel := context.WithCancel(context.Background()) // #nosec G118 -- Broker.Shutdown owns cancellation.
-	return &Broker{
+	b := &Broker{
 		addr:           addr,
 		cancellations:  make(map[string]*cancelTarget),
 		opts:           opts,
@@ -122,10 +147,23 @@ func New(addr string, opts Options) *Broker {
 		cancel:         cancel,
 		shutdownDone:   make(chan struct{}),
 		conns:          make(map[net.Conn]struct{}),
+		connActors:     make(map[net.Conn]runtimestatus.Attribution),
 		leaseCounts:    make(map[string]int),
 		leaseChanged:   make(chan struct{}),
 	}
+	if opts.Pool != nil {
+		pool := *opts.Pool
+		if live, ok := opts.Leases.(interface{ LiveReplicas() int }); ok && pool.LiveReplicas == nil {
+			pool.LiveReplicas = live.LiveReplicas
+		}
+		b.pools = newServerPools(b, pool)
+	}
+	return b
 }
+
+// ErrAuthorityLost reports that the broker stopped because its cleanup
+// authority ended: this replica fenced itself or lost its owner row.
+var ErrAuthorityLost = errors.New("postgres broker stopped: database cleanup authority lost")
 
 // Addr returns the configured listen address.
 func (b *Broker) Addr() string { return b.addr }
@@ -165,6 +203,7 @@ func (b *Broker) Serve(l net.Listener) error {
 					return
 				}
 				b.logger.Error("pgproxy: durable cleanup authority unavailable; stopping broker")
+				b.authorityLost.Store(true)
 				ctx, cancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
 				defer cancel()
 				_ = b.Shutdown(ctx)
@@ -180,6 +219,9 @@ func (b *Broker) Serve(l net.Listener) error {
 			closed := b.closed
 			b.mu.Unlock()
 			if closed {
+				if b.authorityLost.Load() {
+					return ErrAuthorityLost
+				}
 				return nil
 			}
 			return err
@@ -199,6 +241,9 @@ func (b *Broker) Serve(l net.Listener) error {
 			b.mu.Unlock()
 			<-b.acceptSem
 			_ = conn.Close()
+			if b.authorityLost.Load() {
+				return ErrAuthorityLost
+			}
 			return nil
 		}
 		b.conns[conn] = struct{}{}
@@ -229,7 +274,15 @@ func (b *Broker) Shutdown(ctx context.Context) error {
 		for conn := range b.conns {
 			_ = conn.Close()
 		}
-		go func() { b.wg.Wait(); close(b.shutdownDone) }()
+		go func() {
+			b.wg.Wait()
+			// Sessions are gone: close idle server connections and revoke
+			// pooled credentials.
+			if b.pools != nil {
+				b.pools.close()
+			}
+			close(b.shutdownDone)
+		}()
 	}
 	b.mu.Unlock()
 	select {
@@ -243,20 +296,29 @@ func (b *Broker) Shutdown(ctx context.Context) error {
 func (b *Broker) unregister(conn net.Conn) {
 	b.mu.Lock()
 	delete(b.conns, conn)
+	delete(b.connActors, conn)
 	b.connectionGeneration++
 	b.mu.Unlock()
 }
 
+func (b *Broker) attribute(conn net.Conn, owner runtimestatus.Attribution) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if _, ok := b.conns[conn]; ok {
+		b.connActors[conn] = owner
+	}
+}
+
 // acquireLeaseSlot preserves the actor credential cap while waiting for cleanup.
 // The caller retains its pending slot and shares a bounded admission deadline.
-func (b *Broker) acquireLeaseSlot(ctx context.Context, actorID string) bool {
+func (b *Broker) acquireLeaseSlot(ctx context.Context, actorID string, limit int) bool {
 	for {
 		b.mu.Lock()
 		if ctx.Err() != nil {
 			b.mu.Unlock()
 			return false
 		}
-		if b.leaseCounts[actorID] < b.opts.MaxLeasesPerActor {
+		if b.leaseCounts[actorID] < limit {
 			b.leaseCounts[actorID]++
 			b.mu.Unlock()
 			return true
@@ -341,6 +403,19 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	}()
 	defer func() { _ = conn.Close() }()
 
+	peer := netip.Addr{}
+	if b.opts.TrustProxyHeader {
+		_ = conn.SetDeadline(time.Now().Add(b.opts.StartupTimeout))
+		source, err := brokercore.ReadProxyV1(conn, conn.RemoteAddr())
+		if err != nil {
+			b.logger.Debug("pgproxy: PROXY header refused")
+			return
+		}
+		peer = source
+	} else if remote, err := netip.ParseAddrPort(conn.RemoteAddr().String()); err == nil {
+		peer = remote.Addr().Unmap()
+	}
+
 	clientReader := &messageReader{reader: conn, startup: true}
 	backend := pgproto3.NewBackend(clientReader, conn)
 	backend.SetMaxBodyLen(maxAuthMessageBytes)
@@ -368,7 +443,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		requestedDB = startup.Parameters["user"]
 	}
 
-	scope, token, err := authenticateAgent(startupCtx, backend, b.opts.Auth, startup)
+	scope, token, err := authenticateAgent(startupCtx, backend, b.authenticator(peer), startup)
 	startupCancel()
 	if err != nil || scope == nil || scope.VaultID == "" || scope.ActorID == "" {
 		if err == nil {
@@ -394,6 +469,14 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		refuse("audit_unavailable", "08004", "Agent Vault: audit unavailable")
 		return
 	}
+	// A replica without a fresh owner row takes no new sessions: it is
+	// starting, or its renewals are failing on the way to a fence.
+	if ready, ok := b.opts.Leases.(interface{ Ready() bool }); ok && !ready.Ready() {
+		refuse("not_ready", "57P03", "Agent Vault: broker not ready; retry")
+		return
+	}
+	// Until now this connection counted against every actor's cleanup status.
+	b.attribute(conn, runtimestatus.Attribution{ActorID: scope.ActorID, WorkloadID: scope.WorkloadID})
 
 	// Authenticated: a longer budget for the mint + upstream-connect phase, which
 	// can be slow when role DDL serializes at scale.
@@ -405,15 +488,65 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	admissionCtx, admissionCancel := context.WithTimeout(hsCtx, b.opts.AdmissionTimeout)
 	defer admissionCancel()
 	// Cap live credentials per agent identity before minting (fail closed).
-	if !b.acquireLeaseSlot(admissionCtx, scope.ActorID) {
-		b.logger.Warn("pgproxy: per-actor live-credential limit reached",
+	// One pool agent serves many workers, so the cap applies per workload (Pod).
+	capKey := scope.ActorID
+	if scope.WorkloadID != "" {
+		capKey = "workload:" + scope.WorkloadID
+	}
+	if !b.acquireLeaseSlot(admissionCtx, capKey, b.opts.MaxLeasesPerActor) {
+		b.logger.Warn("pgproxy: per-workload live-credential limit reached",
 			slog.String("vault", scope.VaultID),
 			slog.String("actor", scope.ActorID),
+			slog.String("workload", scope.WorkloadID),
 			slog.Int("limit", b.opts.MaxLeasesPerActor))
 		refuse("actor_limit", "53300", "Agent Vault: too many concurrent database sessions")
 		return
 	}
-	defer b.releaseLeaseSlot(scope.ActorID)
+	defer b.releaseLeaseSlot(capKey)
+	// A pool agent's workloads together stay under the per-agent cap, taken
+	// after the workload's own so a Pod waiting at its cap holds none of it.
+	if scope.WorkloadID != "" {
+		agentKey := "agent:" + scope.ActorID
+		if !b.acquireLeaseSlot(admissionCtx, agentKey, b.opts.MaxLeasesPerAgent) {
+			b.logger.Warn("pgproxy: per-agent live-credential limit reached",
+				slog.String("vault", scope.VaultID),
+				slog.String("actor", scope.ActorID),
+				slog.Int("limit", b.opts.MaxLeasesPerAgent))
+			refuse("actor_limit", "53300", "Agent Vault: too many concurrent database sessions")
+			return
+		}
+		defer b.releaseLeaseSlot(agentKey)
+	}
+	// Across the fleet, the store holds the authoritative per-Pod count; the
+	// in-memory slot above only spares the store a call this replica can refuse.
+	if b.opts.Sessions != nil && scope.WorkloadID != "" {
+		id := newSessionID()
+		sessionID := "ledger-" + id
+		err := errors.New("session ID unavailable")
+		if id != "" {
+			err = b.opts.Sessions.Add(admissionCtx, sessionID, scope.WorkloadID, b.opts.MaxLeasesPerActor)
+		}
+		if errors.Is(err, ErrSessionLimit) {
+			b.logger.Warn("pgproxy: per-workload live-credential limit reached across the fleet",
+				slog.String("vault", scope.VaultID), slog.String("actor", scope.ActorID),
+				slog.String("workload", scope.WorkloadID), slog.Int("limit", b.opts.MaxLeasesPerActor))
+			refuse("actor_limit", "53300", "Agent Vault: too many concurrent database sessions")
+			return
+		}
+		if err != nil {
+			b.logger.Error("pgproxy: session ledger unavailable; refusing session", slog.String("error", err.Error()))
+			refuse("ledger_unavailable", "08004", "Agent Vault: session accounting unavailable")
+			return
+		}
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
+			defer cancel()
+			if err := b.opts.Sessions.Remove(ctx, sessionID); err != nil {
+				// The row stops counting when this replica's owner row expires.
+				b.logger.Warn("pgproxy: session ledger removal failed", slog.String("error", err.Error()))
+			}
+		}()
+	}
 
 	// Global backstop: bound the total upstream connections across all databases,
 	// applied only after auth so unauthenticated handshakes cannot consume it.
@@ -432,7 +565,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	// Admission can wait for cleanup. Recheck the original proof before using
 	// its scope to resolve a destination or issue another credential.
 	checkCtx, checkCancel := context.WithTimeout(hsCtx, b.opts.AuthorizationTimeout)
-	current, checkErr := b.opts.Auth.Authenticate(checkCtx, token, startup.Parameters["agent_vault_vault"])
+	current, checkErr := b.authenticator(peer).Authenticate(checkCtx, token, startup.Parameters["agent_vault_vault"])
 	valid := checkErr == nil && checkCtx.Err() == nil && current != nil &&
 		current.ActorID == scope.ActorID && current.VaultID == scope.VaultID && current.WorkloadID == scope.WorkloadID
 	checkCancel()
@@ -451,6 +584,12 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		return
 	}
 	event.Binding = databaseBinding(scope.VaultID, svc)
+	if b.pools != nil {
+		// Multiplexed: the pool owns the database budget, credentials and
+		// server connections, so this session takes none of its own.
+		b.servePooled(hsCtx, conn, backend, *scope, svc, token, startup.Parameters["agent_vault_vault"], requestedDB, peer, startup.Parameters, event)
+		return
+	}
 
 	// Per-database budget: bound the connections to THIS upstream so a burst to
 	// one database cannot starve the others behind the same broker. Applied
@@ -465,7 +604,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	}
 	defer b.releaseUpstreamSlot(svc)
 
-	lease, err := b.opts.Leases.Mint(hsCtx, scope.VaultID, svc)
+	lease, err := b.opts.Leases.Mint(hsCtx, *scope, svc)
 	if err != nil {
 		b.logger.Error("pgproxy: credential minting failed",
 			slog.String("vault", scope.VaultID),
@@ -565,9 +704,14 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	authorizationDone := make(chan struct{})
 	go func() {
 		defer close(authorizationDone)
-		b.authorizationLoop(relayCtx, token, startup.Parameters["agent_vault_vault"], requestedDB, *scope, *svc, terminate)
+		b.authorizationLoop(relayCtx, token, startup.Parameters["agent_vault_vault"], requestedDB, *scope, *svc, terminate, peer)
 	}()
 	defer func() { relayCancel(); <-authorizationDone }()
+	if !scope.NotAfter.IsZero() {
+		// A pool Pod's session ends at its deadline, independent of any recheck.
+		deadline := time.AfterFunc(time.Until(scope.NotAfter), terminate)
+		defer deadline.Stop()
+	}
 	renewDone := make(chan struct{})
 	go func() { defer close(renewDone); b.renewLoop(relayCtx, lease, svc, terminate) }()
 	defer func() { relayCancel(); <-renewDone }()

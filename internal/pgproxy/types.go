@@ -10,7 +10,9 @@ package pgproxy
 
 import (
 	"context"
+	"errors"
 	"net"
+	"net/netip"
 	"time"
 )
 
@@ -21,7 +23,8 @@ type AgentScope struct {
 	VaultName  string
 	ActorID    string
 	WorkloadID string
-	Pool       string // catalog pool name; empty matches no catalog grant
+	Pool       string    // catalog pool name; empty matches no catalog grant
+	NotAfter   time.Time // zero, or when the session must end (a pool Pod's deadline)
 }
 
 // AgentAuthenticator validates the agent's Agent Vault token (presented in the
@@ -30,6 +33,13 @@ type AgentScope struct {
 // SessionResolver to this interface. It must fail closed.
 type AgentAuthenticator interface {
 	Authenticate(ctx context.Context, token, vaultHint string) (*AgentScope, error)
+}
+
+// PeerAuthenticator also binds admission to the connection's peer address, as
+// pool workers require. renewal is true for the periodic recheck of an open
+// session: the token may have expired, but its Pod must still qualify.
+type PeerAuthenticator interface {
+	AuthenticatePeer(ctx context.Context, token, vaultHint string, peer netip.Addr, renewal bool) (*AgentScope, error)
 }
 
 // DatabaseService is a resolved upstream database the agent may reach: a
@@ -70,8 +80,10 @@ type Lease struct {
 // must honor context cancellation. Production uses DurableLeaseMinter to retain
 // revocation accessors across restarts; passwords remain memory-only.
 type LeaseMinter interface {
-	// Mint issues a fresh credential for svc within vaultID.
-	Mint(ctx context.Context, vaultID string, svc *DatabaseService) (*Lease, error)
+	// Mint issues a fresh credential for svc within scope.VaultID. Durable
+	// cleanup records scope.ActorID and scope.WorkloadID for per-actor and
+	// per-instance accounting.
+	Mint(ctx context.Context, scope AgentScope, svc *DatabaseService) (*Lease, error)
 	// Renew extends a lease and returns its new expiry. minRemaining is a hint
 	// for how much additional lifetime the caller wants.
 	Renew(ctx context.Context, leaseID string, minRemaining time.Duration) (time.Time, error)
@@ -123,3 +135,14 @@ const (
 	// agent from monopolizing the serving cap and starving other agents.
 	defaultMaxLeasesPerActor = 16
 )
+
+// ErrSessionLimit is returned by a SessionLedger when a Pod is at its cap.
+var ErrSessionLimit = errors.New("workload session limit reached")
+
+// SessionLedger records live sessions in shared storage so a Pod's cap holds
+// across broker replicas. Add must be atomic per Pod and return
+// ErrSessionLimit at the cap; any other error refuses the session.
+type SessionLedger interface {
+	Add(ctx context.Context, sessionID, workload string, limit int) error
+	Remove(ctx context.Context, sessionID string) error
+}

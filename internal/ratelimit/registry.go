@@ -266,4 +266,3 @@ func (r *Registry) FailureReset(tier Tier, key string) {
 		fc.reset(key)
 	}
 }
-

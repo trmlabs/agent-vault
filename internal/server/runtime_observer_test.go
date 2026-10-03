@@ -29,7 +29,9 @@ func TestRuntimeObserverDisabledByDefault(t *testing.T) {
 func TestRuntimeObserverDoesNotAcceptOwnerSession(t *testing.T) {
 	s, _, owner, _ := setupDatabaseAPITest(t)
 	called := false
-	h, err := runtimestatus.New(func(context.Context, string) error { return errors.New("not observer workload") }, func(context.Context) (runtimestatus.Observation, error) {
+	h, err := runtimestatus.New(func(context.Context, string) (runtimestatus.Access, error) {
+		return runtimestatus.Access{}, errors.New("not observer workload")
+	}, func(context.Context) (runtimestatus.Observation, error) {
 		called = true
 		return runtimestatus.Observation{}, nil
 	})
@@ -57,11 +59,11 @@ func TestRuntimeObserverDoesNotAcceptOwnerSession(t *testing.T) {
 
 func TestCleanupListenerExcludesManagementOnColdStore(t *testing.T) {
 	// No owner or store is needed: this listener has only the observer handler.
-	h, err := runtimestatus.New(func(_ context.Context, proof string) error {
+	h, err := runtimestatus.New(func(_ context.Context, proof string) (runtimestatus.Access, error) {
 		if proof != "observer-proof" {
-			return errors.New("denied")
+			return runtimestatus.Access{}, errors.New("denied")
 		}
-		return nil
+		return runtimestatus.Access{}, nil
 	}, func(context.Context) (runtimestatus.Observation, error) {
 		return runtimestatus.Observation{Initialized: true, Healthy: true, Consistent: true}, nil
 	})

@@ -66,7 +66,7 @@ type fakeMinter struct {
 	revoked    []string
 }
 
-func (f *fakeMinter) Mint(_ context.Context, _ string, _ *DatabaseService) (*Lease, error) {
+func (f *fakeMinter) Mint(_ context.Context, _ AgentScope, _ *DatabaseService) (*Lease, error) {
 	f.mu.Lock()
 	f.mintCalls++
 	f.mu.Unlock()
@@ -123,8 +123,10 @@ type fakeUpstream struct {
 	lastDB      string
 	lastAppNm   string
 	lastTimeout string
+	lastIdleTxn string
 	forbidParam string // a param key that must never be forwarded upstream
 	forbidSeen  bool
+	accepted    int // upstream connections accepted
 }
 
 func startFakeUpstream(t *testing.T, mode upstreamAuthMode, password string) *fakeUpstream {
@@ -179,6 +181,9 @@ func (fu *fakeUpstream) acceptLoop() {
 		if err != nil {
 			return
 		}
+		fu.mu.Lock()
+		fu.accepted++
+		fu.mu.Unlock()
 		go fu.handle(conn)
 	}
 }
@@ -218,6 +223,7 @@ func (fu *fakeUpstream) handle(conn net.Conn) {
 	fu.lastDB = startup.Parameters["database"]
 	fu.lastAppNm = startup.Parameters["application_name"]
 	fu.lastTimeout = startup.Parameters["statement_timeout"]
+	fu.lastIdleTxn = startup.Parameters["idle_in_transaction_session_timeout"]
 	if fu.forbidParam != "" {
 		if _, seen := startup.Parameters[fu.forbidParam]; seen {
 			fu.forbidSeen = true
@@ -264,12 +270,16 @@ func (fu *fakeUpstream) handle(conn net.Conn) {
 		if err != nil {
 			return
 		}
-		switch m.(type) {
+		switch q := m.(type) {
 		case *pgproto3.Query:
 			// Answer any query with a single row echoing the authenticated user,
 			// so the test can prove the upstream saw the Vault username.
 			be.Send(&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{{Name: []byte("current_user"), DataTypeOID: 25, Format: 0}}})
-			be.Send(&pgproto3.DataRow{Values: [][]byte{[]byte(fu.seenUser())}})
+			value := fu.seenUser()
+			if strings.HasPrefix(q.String, "DISCARD SEQUENCES;") {
+				value = "clean" // the pool's check-in query: nothing left behind
+			}
+			be.Send(&pgproto3.DataRow{Values: [][]byte{[]byte(value)}})
 			be.Send(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")})
 			be.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 			if err := be.Flush(); err != nil {

@@ -16,6 +16,21 @@ func TestRealPostgres_DatabaseCleanupJournal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	t.Cleanup(func() { _ = s.Close() }) // after the journal's own cleanup
 	checkDatabaseCleanupJournal(t, s)
+}
+
+func TestRealPostgres_DatabaseCleanupActor(t *testing.T) {
+	dsn := os.Getenv("AV_TEST_STORE_PG_URL")
+	if dsn == "" {
+		t.Skip("set AV_TEST_STORE_PG_URL")
+	}
+	checkDatabaseCleanupActorMigration(t, func() (*SQLStore, error) { return openPostgres(dsn) })
+	s, err := openPostgres(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Close after the checks' own cleanups release their owner claims.
+	t.Cleanup(func() { _ = s.Close() })
+	checkDatabaseCleanupRecordsActor(t, s)
 }

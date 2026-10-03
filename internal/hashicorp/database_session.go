@@ -39,10 +39,19 @@ func (c *Client) NewDatabaseSession(ctx context.Context, mount, role string, ttl
 	if err != nil {
 		return nil, fmt.Errorf("prepare database session failed")
 	}
-	api.SetToken(c.api.Token())
+	parent, ceiling, done := c.api.Token(), time.Time{}, func(string, time.Time) {}
+	if c.logins != nil {
+		// Only a young login may parent a new session; see reauth.go.
+		if parent, ceiling, done, err = c.logins.acquire(c.clock()); err != nil {
+			return nil, err
+		}
+	}
+	accessor, expiry := "", time.Time{}
+	defer func() { done(accessor, expiry) }()
+	api.SetToken(parent)
 	api.SetMaxRetries(0)
 	renewable := false
-	started := time.Now()
+	started := c.clock()
 	secret, err := api.Auth().Token().CreateWithContext(ctx, &vaultapi.TokenCreateRequest{
 		Policies:        []string{DatabaseCredentialPolicyName(mount, role)},
 		NoDefaultPolicy: true, Renewable: &renewable, Type: "service",
@@ -65,12 +74,16 @@ func (c *Client) NewDatabaseSession(ctx context.Context, mount, role string, ttl
 	if int64(secret.Auth.LeaseDuration) < int64(ttl/time.Second) {
 		granted = time.Duration(secret.Auth.LeaseDuration) * time.Second
 	}
-	return &DatabaseSession{Accessor: secret.Auth.Accessor, ExpiresAt: started.Add(granted),
-		client: &Client{api: api, method: c.method, logger: c.logger}, mount: mount, role: role}, nil
+	accessor, expiry = secret.Auth.Accessor, started.Add(granted)
+	if !ceiling.IsZero() && ceiling.Before(expiry) {
+		expiry = ceiling
+	}
+	return &DatabaseSession{Accessor: accessor, ExpiresAt: expiry,
+		client: &Client{api: api, method: c.method, logger: c.logger, now: c.now}, mount: mount, role: role}, nil
 }
 
 func (s *DatabaseSession) ReadCredential(ctx context.Context) (*DatabaseCredential, error) {
-	if !time.Now().Before(s.ExpiresAt) {
+	if !s.client.clock().Before(s.ExpiresAt) {
 		return nil, fmt.Errorf("database session expired")
 	}
 	credential, err := s.client.ReadDatabaseCredential(ctx, s.mount, s.role)
@@ -88,10 +101,14 @@ func (c *Client) RevokeDatabaseSession(ctx context.Context, accessor string) err
 	// Retrying after a successful revoke and failed journal deletion is safe.
 	var response *vaultapi.ResponseError
 	if errors.As(err, &response) && response.StatusCode == 400 && len(response.Errors) == 1 && response.Errors[0] == "invalid accessor" {
-		return nil
+		err = nil
 	}
 	if err != nil {
 		return fmt.Errorf("revoke database session failed")
+	}
+	if c.logins != nil {
+		c.logins.forget(accessor)
+		c.revokeIdle(ctx)
 	}
 	return nil
 }

@@ -2,50 +2,80 @@ package store
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
 
+// resetFleetTables empties the fleet tables, so a reused PostgreSQL test
+// database starts clean.
+func resetFleetTables(t *testing.T, s *SQLStore) {
+	t.Helper()
+	for _, table := range []string{"database_cleanup", "database_cleanup_replica", "broker_sessions"} {
+		if _, err := s.db.Exec("DELETE FROM " + table); err != nil { // #nosec G202 -- fixed table names
+			t.Fatal(err)
+		}
+	}
+}
+
 func checkDatabaseCleanupJournal(t *testing.T, s *SQLStore) {
 	t.Helper()
+	resetFleetTables(t, s)
+	t.Cleanup(func() { resetFleetTables(t, s) })
 	ctx := context.Background()
-	now := time.Now()
-	if err := s.ClaimDatabaseCleanupOwner(ctx, "owner-a", now, now.Add(time.Minute)); err != nil {
+	if err := s.ClaimDatabaseCleanupOwner(ctx, "owner-a", time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		_ = s.ReleaseDatabaseCleanupOwner(ctx, "owner-a")
-		_ = s.ReleaseDatabaseCleanupOwner(ctx, "owner-b")
-	})
-	if err := s.ClaimDatabaseCleanupOwner(ctx, "owner-b", now, now.Add(time.Minute)); err == nil {
-		t.Fatal("second broker acquired live owner")
+	// Replicas coexist; each owns only what it wrote.
+	if err := s.ClaimDatabaseCleanupOwner(ctx, "owner-b", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimDatabaseCleanupOwner(ctx, "owner-a", time.Minute); err == nil {
+		t.Fatal("owner registered twice")
 	}
 	record := DatabaseCleanup{Accessor: "test-accessor", Binding: "test-binding"}
-	if err := s.AddDatabaseCleanup(ctx, "owner-b", record); err == nil {
-		t.Fatal("non-owner journal write accepted")
+	if err := s.AddDatabaseCleanup(ctx, "owner-unregistered", record); err == nil {
+		t.Fatal("unregistered owner journal write accepted")
 	}
 	if err := s.AddDatabaseCleanup(ctx, "owner-a", record); err != nil {
 		t.Fatal(err)
+	}
+	if err := s.SetDatabaseCleanupLease(ctx, "owner-b", record.Accessor, "database/creds/r/x"); err == nil {
+		t.Fatal("another replica set this replica's lease")
 	}
 	rows, err := s.ListDatabaseCleanup(ctx)
 	if err != nil || len(rows) != 1 || rows[0] != record {
 		t.Fatalf("journal roundtrip: rows=%d err=%v", len(rows), err)
 	}
+	if owned, err := s.ListOwnedDatabaseCleanup(ctx, "owner-b"); err != nil || len(owned) != 0 {
+		t.Fatalf("live replica's record listed for another: %d %v", len(owned), err)
+	}
+	if n, err := s.ClaimOrphanedDatabaseCleanup(ctx, "owner-b"); err != nil || n != 0 {
+		t.Fatalf("live replica's record claimed: %d %v", n, err)
+	}
+	if live, err := s.LiveDatabaseCleanupOwners(ctx); err != nil || live != 2 {
+		t.Fatalf("live owners = %d, %v", live, err)
+	}
 	if err := s.ReleaseDatabaseCleanupOwner(ctx, "owner-a"); err != nil {
 		t.Fatal(err)
 	}
-	// A released owner cannot renew itself into authority or erase its successor.
-	if err := s.ClaimDatabaseCleanupOwner(ctx, "owner-b", now, now.Add(time.Minute)); err != nil {
-		t.Fatal(err)
+	// A released owner cannot renew itself into authority; its records move.
+	if err := s.RenewDatabaseCleanupOwner(ctx, "owner-a", time.Minute); !errors.Is(err, ErrDatabaseCleanupOwnershipLost) {
+		t.Fatalf("released owner renewed: %v", err)
 	}
-	if err := s.RenewDatabaseCleanupOwner(ctx, "owner-a", now, now.Add(time.Minute)); err == nil {
-		t.Fatal("stale owner renewed")
+	if n, err := s.ClaimOrphanedDatabaseCleanup(ctx, "owner-b"); err != nil || n != 1 {
+		t.Fatalf("orphan not claimed: %d %v", n, err)
 	}
-	if err := s.ReleaseDatabaseCleanupOwner(ctx, "owner-a"); err != nil {
-		t.Fatal(err)
+	if owned, err := s.ListOwnedDatabaseCleanup(ctx, "owner-b"); err != nil || len(owned) != 1 {
+		t.Fatalf("claimed record not owned: %d %v", len(owned), err)
 	}
-	if err := s.RenewDatabaseCleanupOwner(ctx, "owner-b", now, now.Add(time.Minute)); err != nil {
+	if n, err := s.ClaimOrphanedDatabaseCleanup(ctx, "owner-b"); err != nil || n != 0 {
+		t.Fatalf("claim not idempotent: %d %v", n, err)
+	}
+	if err := s.RenewDatabaseCleanupOwner(ctx, "owner-b", time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.DeleteDatabaseCleanup(ctx, record.Accessor); err != nil {
@@ -54,6 +84,157 @@ func checkDatabaseCleanupJournal(t *testing.T, s *SQLStore) {
 	if err := s.DeleteDatabaseCleanup(ctx, record.Accessor); err != nil {
 		t.Fatal("delete not idempotent", err)
 	}
+	checkOwnerExpiresByDatabaseClock(t, s)
+	checkSurvivorsRaceToClaim(t, s)
+	checkPodSessionCap(t, s)
+}
+
+// Expiry is decided by the database clock. The API takes no replica time, and
+// an expired owner never comes back.
+func checkOwnerExpiresByDatabaseClock(t *testing.T, s *SQLStore) {
+	t.Helper()
+	ctx := context.Background()
+	if err := s.ClaimDatabaseCleanupOwner(ctx, "short", 300*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddDatabaseCleanup(ctx, "short", DatabaseCleanup{Accessor: "short-accessor", Binding: "b"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CheckDatabaseCleanupOwner(ctx, "short"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(600 * time.Millisecond)
+	if err := s.CheckDatabaseCleanupOwner(ctx, "short"); !errors.Is(err, ErrDatabaseCleanupOwnershipLost) {
+		t.Fatalf("expired owner still live: %v", err)
+	}
+	if err := s.RenewDatabaseCleanupOwner(ctx, "short", time.Minute); !errors.Is(err, ErrDatabaseCleanupOwnershipLost) {
+		t.Fatalf("expired owner revived: %v", err)
+	}
+	if err := s.AddDatabaseCleanup(ctx, "short", DatabaseCleanup{Accessor: "late", Binding: "b"}); err == nil {
+		t.Fatal("expired owner wrote a record")
+	}
+	if n, err := s.ClaimOrphanedDatabaseCleanup(ctx, "owner-b"); err != nil || n != 1 {
+		t.Fatalf("expired owner's record not claimed: %d %v", n, err)
+	}
+	if err := s.DeleteDatabaseCleanup(ctx, "short-accessor"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Two survivors claim a dead replica's records at the same moment. Each record
+// moves exactly once: the claimed counts add up to the record count.
+func checkSurvivorsRaceToClaim(t *testing.T, s *SQLStore) {
+	t.Helper()
+	ctx := context.Background()
+	const records = 200
+	if err := s.ClaimDatabaseCleanupOwner(ctx, "dead", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	for i := range records {
+		if err := s.AddDatabaseCleanup(ctx, "dead", DatabaseCleanup{Accessor: fmt.Sprintf("race-%03d", i), Binding: "b"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, owner := range []string{"survivor-1", "survivor-2"} {
+		if err := s.ClaimDatabaseCleanupOwner(ctx, owner, time.Minute); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.ReleaseDatabaseCleanupOwner(ctx, "dead"); err != nil {
+		t.Fatal(err)
+	}
+	for round := range 20 {
+		var wg sync.WaitGroup
+		claimed := make([]int, 2)
+		start := make(chan struct{})
+		for i, owner := range []string{"survivor-1", "survivor-2"} {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				for {
+					n, err := s.ClaimOrphanedDatabaseCleanup(ctx, owner)
+					if err == nil {
+						claimed[i] = n
+						return
+					}
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+		one, _ := s.ListOwnedDatabaseCleanup(ctx, "survivor-1")
+		two, _ := s.ListOwnedDatabaseCleanup(ctx, "survivor-2")
+		if claimed[0]+claimed[1] != records || len(one)+len(two) != records || len(one) != claimed[0] {
+			t.Fatalf("round %d: claimed %v, owned %d+%d of %d", round, claimed, len(one), len(two), records)
+		}
+		// Hand everything back to a dead owner for the next round.
+		if _, err := s.db.Exec("UPDATE database_cleanup SET owner = 'dead' WHERE accessor LIKE 'race-%'"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.db.Exec("DELETE FROM database_cleanup WHERE accessor LIKE 'race-%'"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func checkPodSessionCap(t *testing.T, s *SQLStore) {
+	t.Helper()
+	ctx := context.Background()
+	const limit, attempts = 5, 20
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	admitted, refused := 0, 0
+	for i := range attempts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			owner := []string{"survivor-1", "survivor-2"}[i%2]
+			for {
+				err := s.AddBrokerSession(ctx, owner, fmt.Sprintf("session-%d", i), "pod-uid-1", limit)
+				mu.Lock()
+				switch {
+				case err == nil:
+					admitted++
+				case errors.Is(err, ErrPodSessionLimit):
+					refused++
+				default:
+					mu.Unlock()
+					continue // SQLite busy; retry
+				}
+				mu.Unlock()
+				return
+			}
+		}()
+	}
+	wg.Wait()
+	if admitted != limit || refused != attempts-limit {
+		t.Fatalf("admitted %d refused %d, want %d and %d", admitted, refused, limit, attempts-limit)
+	}
+	if n, err := s.CountPodSessions(ctx, "pod-uid-1"); err != nil || n != limit {
+		t.Fatalf("count = %d, %v", n, err)
+	}
+	// A dead replica's sessions stop counting at once and are swept later.
+	if err := s.ReleaseDatabaseCleanupOwner(ctx, "survivor-2"); err != nil {
+		t.Fatal(err)
+	}
+	n, err := s.CountPodSessions(ctx, "pod-uid-1")
+	if err != nil || n >= limit {
+		t.Fatalf("dead replica's sessions still count: %d, %v", n, err)
+	}
+	if _, err := s.ClaimOrphanedDatabaseCleanup(ctx, "survivor-1"); err != nil {
+		t.Fatal(err)
+	}
+	var rows int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM broker_sessions").Scan(&rows); err != nil || rows != n {
+		t.Fatalf("dead replica's session rows not swept: %d of %d, %v", rows, n, err)
+	}
+	if err := s.AddBrokerSession(ctx, "survivor-2", "session-dead", "pod-uid-1", 0); err == nil {
+		t.Fatal("dead replica recorded a session")
+	}
+	if err := s.RemoveBrokerSession(ctx, "session-0"); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestDatabaseCleanupJournalOwnership(t *testing.T) { checkDatabaseCleanupJournal(t, openTestDB(t)) }
@@ -61,8 +242,7 @@ func TestDatabaseCleanupJournalOwnership(t *testing.T) { checkDatabaseCleanupJou
 func TestDatabaseCleanupOperatorConfirmationIsExactAndRetained(t *testing.T) {
 	s := openTestDB(t)
 	ctx := context.Background()
-	now := time.Now()
-	if err := s.ClaimDatabaseCleanupOwner(ctx, "owner", now, now.Add(time.Minute)); err != nil {
+	if err := s.ClaimDatabaseCleanupOwner(ctx, "owner", time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	for _, id := range []string{"unknown-one", "unknown-two", "known"} {
@@ -97,6 +277,43 @@ func TestDatabaseCleanupOperatorConfirmationIsExactAndRetained(t *testing.T) {
 	}
 }
 
+// An unknown issuance quarantines its binding for every replica, not only for
+// the owner that found it.
+func TestDatabaseCleanupQuarantineIsFleetWide(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+	for _, owner := range []string{"owner", "other"} {
+		if err := s.ClaimDatabaseCleanupOwner(ctx, owner, time.Minute); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.AddDatabaseCleanup(ctx, "owner", DatabaseCleanup{Accessor: "unknown", Binding: "vault/db"}); err != nil {
+		t.Fatal(err)
+	}
+	// In flight: not yet quarantined, so other replicas keep minting.
+	if q, err := s.DatabaseBindingQuarantined(ctx, "vault/db"); err != nil || q {
+		t.Fatalf("in-flight issuance quarantined: %v %v", q, err)
+	}
+	if err := s.QuarantineDatabaseCleanup(ctx, "other", "unknown"); err != nil {
+		t.Fatal(err)
+	}
+	if q, _ := s.DatabaseBindingQuarantined(ctx, "vault/db"); q {
+		t.Fatal("non-owner quarantined a record")
+	}
+	if err := s.QuarantineDatabaseCleanup(ctx, "owner", "unknown"); err != nil {
+		t.Fatal(err)
+	}
+	if q, err := s.DatabaseBindingQuarantined(ctx, "vault/db"); err != nil || !q {
+		t.Fatalf("quarantine not visible fleet-wide: %v %v", q, err)
+	}
+	if err := s.ConfirmDatabaseCleanup(ctx, "other", "unknown", "operator verified no role remains"); err != nil {
+		t.Fatal(err)
+	}
+	if q, _ := s.DatabaseBindingQuarantined(ctx, "vault/db"); q {
+		t.Fatal("confirmation did not lift quarantine")
+	}
+}
+
 func TestDatabaseCleanupJournalSurvivesReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "journal.db")
 	s, err := Open(path)
@@ -104,8 +321,7 @@ func TestDatabaseCleanupJournalSurvivesReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	now := time.Now()
-	if err = s.ClaimDatabaseCleanupOwner(ctx, "old", now, now.Add(time.Minute)); err != nil {
+	if err = s.ClaimDatabaseCleanupOwner(ctx, "old", time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	if err = s.AddDatabaseCleanup(ctx, "old", DatabaseCleanup{Accessor: "accessor", Binding: "binding"}); err != nil {
@@ -123,11 +339,55 @@ func TestDatabaseCleanupJournalSurvivesReopen(t *testing.T) {
 	if err != nil || len(records) != 1 {
 		t.Fatalf("lost durable record: %v", err)
 	}
-	if err = s.ClaimDatabaseCleanupOwner(ctx, "new", now.Add(2*time.Minute), now.Add(3*time.Minute)); err != nil {
+	// A restarted process is a new owner. It waits for the old row to expire.
+	if err = s.ClaimDatabaseCleanupOwner(ctx, "new", time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if err = s.RenewDatabaseCleanupOwner(ctx, "old", now.Add(2*time.Minute), now.Add(3*time.Minute)); err == nil {
-		t.Fatal("expired owner renewed")
+	if n, err := s.ClaimOrphanedDatabaseCleanup(ctx, "new"); err != nil || n != 0 {
+		t.Fatalf("live owner's record taken early: %d %v", n, err)
+	}
+}
+
+// The fleet migration runs on an existing SQLite store with live records from
+// the single-owner schema. Records survive, have no owner, and the first live
+// broker claims them.
+func TestDatabaseCleanupFleetMigrationKeepsLiveRecords(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "upgrade.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		"DROP TABLE database_cleanup_replica",
+		"DROP TABLE broker_sessions",
+		"DROP TABLE database_cleanup",
+		`CREATE TABLE database_cleanup (accessor TEXT PRIMARY KEY, binding TEXT NOT NULL,
+			lease_id TEXT NOT NULL DEFAULT '', reconciliation_evidence TEXT NOT NULL DEFAULT '')`,
+		"INSERT INTO database_cleanup (accessor, binding, lease_id) VALUES ('legacy-known', 'vault/db', 'database/creds/r/1'), ('legacy-unknown', 'vault/db', '')",
+		"INSERT INTO database_cleanup_owner (id, owner, expires_ns) VALUES (1, 'old-binary', 0)",
+		"DELETE FROM schema_migrations WHERE name IN ('20261001120000_database_cleanup_actor', '20261001130000_database_cleanup_workload', '20261003120000_database_cleanup_fleet')",
+	} {
+		if _, err := s.db.Exec(statement); err != nil {
+			t.Fatalf("%s: %v", statement, err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if s, err = Open(path); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	records, err := s.ListDatabaseCleanup(ctx)
+	if err != nil || len(records) != 2 {
+		t.Fatalf("migration lost records: %d %v", len(records), err)
+	}
+	if err := s.ClaimDatabaseCleanupOwner(ctx, "first", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.ClaimOrphanedDatabaseCleanup(ctx, "first"); err != nil || n != 2 {
+		t.Fatalf("legacy records not claimed: %d %v", n, err)
 	}
 }
 
@@ -137,8 +397,7 @@ func TestDatabaseCleanupJournalSurvivesReopen(t *testing.T) {
 func TestDatabaseCleanupRejectsLeaseAfterOperatorConfirmation(t *testing.T) {
 	s := openTestDB(t)
 	ctx := context.Background()
-	now := time.Now()
-	if err := s.ClaimDatabaseCleanupOwner(ctx, "owner", now, now.Add(time.Minute)); err != nil {
+	if err := s.ClaimDatabaseCleanupOwner(ctx, "owner", time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.AddDatabaseCleanup(ctx, "owner", DatabaseCleanup{Accessor: "pending", Binding: "vault/db"}); err != nil {
@@ -153,23 +412,106 @@ func TestDatabaseCleanupRejectsLeaseAfterOperatorConfirmation(t *testing.T) {
 }
 
 func TestCheckDatabaseCleanupOwnerDoesNotExtendClaim(t *testing.T) {
-	s, err := Open(filepath.Join(t.TempDir(), "observe.db"))
+	s := openTestDB(t)
+	ctx := context.Background()
+	if err := s.ClaimDatabaseCleanupOwner(ctx, "observer-test", 400*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CheckDatabaseCleanupOwner(ctx, "other"); err == nil {
+		t.Fatal("wrong owner accepted")
+	}
+	for range 3 {
+		if err := s.CheckDatabaseCleanupOwner(ctx, "observer-test"); err != nil {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if err := s.CheckDatabaseCleanupOwner(ctx, "observer-test"); err == nil {
+		t.Fatal("observation extended ownership")
+	}
+}
+
+func TestDatabaseCleanupRecordsActor(t *testing.T) {
+	checkDatabaseCleanupRecordsActor(t, openTestDB(t))
+}
+
+func checkDatabaseCleanupRecordsActor(t *testing.T, s *SQLStore) {
+	t.Helper()
+	ctx := context.Background()
+	if err := s.ClaimDatabaseCleanupOwner(ctx, "owner", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = s.DeleteDatabaseCleanup(ctx, "actor-a")
+		_ = s.DeleteDatabaseCleanup(ctx, "actor-b")
+		_ = s.ReleaseDatabaseCleanupOwner(ctx, "owner")
+	})
+	for _, record := range []DatabaseCleanup{{Accessor: "actor-a", Binding: "vault/db", ActorID: "agent-one", WorkloadID: "pod-uid-one"}, {Accessor: "actor-b", Binding: "vault/db"}} {
+		if err := s.AddDatabaseCleanup(ctx, "owner", record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, err := s.ListDatabaseCleanup(ctx)
+	if err != nil || len(rows) != 2 || rows[0].ActorID != "agent-one" || rows[0].WorkloadID != "pod-uid-one" || rows[1].ActorID != "" || rows[1].WorkloadID != "" {
+		t.Fatalf("actor attribution not retained: %+v %v", rows, err)
+	}
+}
+
+// The live SQLite store predates actor attribution. Its pending records must
+// survive the upgrade unchanged and read back as unattributed.
+func TestDatabaseCleanupActorMigrationKeepsLegacyRecordsUnattributed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	checkDatabaseCleanupActorMigration(t, func() (*SQLStore, error) { return Open(path) })
+}
+
+// checkDatabaseCleanupActorMigration rewinds the journal to its pre-attribution
+// shape with pending records, then proves reopening upgrades it exactly once.
+func checkDatabaseCleanupActorMigration(t *testing.T, open func() (*SQLStore, error)) {
+	t.Helper()
+	s, err := open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`DROP TABLE database_cleanup`,
+		`CREATE TABLE database_cleanup (accessor TEXT PRIMARY KEY, binding TEXT NOT NULL,
+			lease_id TEXT NOT NULL DEFAULT '', reconciliation_evidence TEXT NOT NULL DEFAULT '')`,
+		`INSERT INTO database_cleanup (accessor, binding, lease_id) VALUES ('legacy-known', 'vault/db', 'database/creds/reader/one'), ('legacy-unknown', 'vault/db', '')`,
+		`DELETE FROM schema_migrations WHERE name IN ('20261001120000_database_cleanup_actor', '20261001130000_database_cleanup_workload',
+			'20261003120000_database_cleanup_fleet')`,
+	} {
+		if _, err := s.db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 { // The second open proves the migration is recorded once.
+		s, err = open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows, err := s.ListDatabaseCleanup(context.Background())
+		if err != nil || len(rows) != 2 {
+			t.Fatalf("legacy records lost: %d %v", len(rows), err)
+		}
+		if rows[0] != (DatabaseCleanup{Accessor: "legacy-known", Binding: "vault/db", LeaseID: "database/creds/reader/one"}) ||
+			rows[1] != (DatabaseCleanup{Accessor: "legacy-unknown", Binding: "vault/db"}) {
+			t.Fatalf("legacy records changed: %+v", rows)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s, err = open()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	ctx := context.Background()
-	now := time.Now()
-	if err := s.ClaimDatabaseCleanupOwner(ctx, "observer-test", now, now.Add(time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.CheckDatabaseCleanupOwner(ctx, "observer-test", now); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.CheckDatabaseCleanupOwner(ctx, "other", now); err == nil {
-		t.Fatal("wrong owner accepted")
-	}
-	if err := s.CheckDatabaseCleanupOwner(ctx, "observer-test", now.Add(2*time.Second)); err == nil {
-		t.Fatal("observation extended ownership")
+	for _, accessor := range []string{"legacy-known", "legacy-unknown"} {
+		if err := s.DeleteDatabaseCleanup(context.Background(), accessor); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

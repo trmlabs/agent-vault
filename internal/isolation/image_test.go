@@ -49,9 +49,9 @@ func TestUnpackAssets_WritesFilesWithModes(t *testing.T) {
 	}
 
 	expect := map[string]os.FileMode{
-		"Dockerfile":        0o644,
-		"entrypoint.sh":     0o755,
-		"init-firewall.sh":  0o755,
+		"Dockerfile":       0o644,
+		"entrypoint.sh":    0o755,
+		"init-firewall.sh": 0o755,
 	}
 	for name, wantMode := range expect {
 		p := filepath.Join(dir, name)

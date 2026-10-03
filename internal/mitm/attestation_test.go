@@ -239,7 +239,7 @@ func TestForgedProxyHeaderFromNonLoopbackPeerIsRefused(t *testing.T) {
 // loopback, so the header can only ever come from inside the Pod.
 func TestProxyHeaderRequiresLoopbackListener(t *testing.T) {
 	p := New("0.0.0.0:0", Options{Attestor: &fakeAttestor{}, PeerReader: readTestProxyV1})
-	l, err := net.Listen("tcp", "0.0.0.0:0") //nolint:gosec // G102: the test needs a non-loopback listener to prove it is refused
+	l, err := net.Listen("tcp", "0.0.0.0:0") // #nosec G102 -- the test needs a listener that is not loopback
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1327,6 +1327,33 @@ func TestHealthEndpoint(t *testing.T) {
 	}
 }
 
+type readiness struct{ ready bool }
+
+func (r *readiness) Ready() bool                 { return r.ready }
+func (r *readiness) Close(context.Context) error { return nil }
+
+// The readiness gate follows the cleanup owner row; liveness does not.
+func TestReadyEndpointFollowsCleanupOwnership(t *testing.T) {
+	cleanup := &readiness{}
+	srv := newTestServer()
+	srv.AttachDatabaseCleanup(cleanup)
+	get := func(path string) int {
+		rec := httptest.NewRecorder()
+		srv.httpServer.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		return rec.Code
+	}
+	if code := get("/ready"); code != http.StatusServiceUnavailable {
+		t.Fatalf("ready without a fresh owner row: %d", code)
+	}
+	if code := get("/health"); code != http.StatusOK {
+		t.Fatalf("liveness followed readiness: %d", code)
+	}
+	cleanup.ready = true
+	if code := get("/ready"); code != http.StatusOK {
+		t.Fatalf("not ready with a fresh owner row: %d", code)
+	}
+}
+
 func TestHealthEndpointRejectsPost(t *testing.T) {
 	srv := newTestServer()
 

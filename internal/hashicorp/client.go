@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	vaultapi "github.com/hashicorp/vault/api"
 )
@@ -25,6 +26,13 @@ type Client struct {
 	api    *vaultapi.Client
 	method AuthMethod
 	logger *slog.Logger
+	now    func() time.Time
+
+	// JWT mode only: held logins and their refresh loop.
+	jwt        jwtConfig
+	logins     *loginSet
+	stopReauth context.CancelFunc
+	reauthDone chan struct{}
 }
 
 // NewClient returns ErrNotConfigured when VAULT_ADDR is unset (callers keep
@@ -64,6 +72,14 @@ func NewClient(ctx context.Context, logger *slog.Logger) (*Client, error) {
 		logger.Warn("hashicorp vault TLS verification disabled (VAULT_SKIP_VERIFY=true); the broker↔Vault channel is unauthenticated")
 	}
 
+	if method == AuthJWT {
+		c, err := newJWTClient(ctx, api, logger, os.Getenv, defaultReauthOptions(), time.Now)
+		if err != nil {
+			return nil, fmt.Errorf("hashicorp login (%s): %w", method, err)
+		}
+		logger.Info("hashicorp vault client ready", slog.String("addr", addr), slog.String("auth_method", string(method)))
+		return c, nil
+	}
 	if err := login(ctx, api, method); err != nil {
 		return nil, fmt.Errorf("hashicorp login (%s): %w", method, err)
 	}
@@ -73,6 +89,30 @@ func NewClient(ctx context.Context, logger *slog.Logger) (*Client, error) {
 		slog.String("auth_method", string(method)))
 
 	return &Client{api: api, method: method, logger: logger}, nil
+}
+
+// newJWTClient performs the first login and starts the refresh loop, which
+// outlives ctx and stops on Close.
+func newJWTClient(ctx context.Context, api *vaultapi.Client, logger *slog.Logger, getenv func(string) string, opts reauthOptions, now func() time.Time) (*Client, error) {
+	cfg, err := jwtConfigFromEnv(getenv)
+	if err != nil {
+		return nil, err
+	}
+	first, err := jwtLogin(ctx, api, cfg, now)
+	if err != nil {
+		return nil, err
+	}
+	if !first.issued.Before(first.mintUntil(opts)) {
+		revokeToken(api, first.token)
+		return nil, fmt.Errorf("vault login lifetime is shorter than the minimum database session lifetime")
+	}
+	api.SetToken(first.token)
+	logins := &loginSet{opts: opts}
+	_ = logins.rotate(first)
+	loopCtx, cancel := context.WithCancel(context.Background()) // #nosec G118 -- Close owns cancellation.
+	c := &Client{api: api, method: AuthJWT, logger: logger, now: now, jwt: cfg, logins: logins, stopReauth: cancel, reauthDone: make(chan struct{})}
+	go c.reauthLoop(loopCtx)
+	return c, nil
 }
 
 // AuthMethod returns the auth flow this client used.

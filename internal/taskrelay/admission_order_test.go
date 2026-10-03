@@ -87,7 +87,7 @@ func TestBareConnectPerformsNoAdmission(t *testing.T) {
 		t.Fatal("valid startup was not offered authentication")
 	}
 	c.Write(encodePGFrame('p', []byte("attacker-proof\x00")))
-	if _, e = c.Read(make([]byte, 1)); e == nil {
+	if !refusedWithError(c) {
 		t.Fatal("accepted nonplaceholder")
 	}
 	c.Close()
@@ -106,7 +106,7 @@ func TestBareConnectPerformsNoAdmission(t *testing.T) {
 	c = f.dial(t, f.c.Postgres.Listen)
 	b, _ = (&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber, Parameters: map[string]string{"user": "workload", "database": "other"}}).Encode(nil)
 	c.Write(b)
-	if _, e = c.Read(make([]byte, 1)); e == nil {
+	if !refusedWithError(c) {
 		t.Fatal("accepted wrong database")
 	}
 	c.Close()

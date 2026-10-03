@@ -3,22 +3,31 @@ package pgproxy
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Infisical/agent-vault/internal/hashicorp"
 	"github.com/Infisical/agent-vault/internal/store"
 )
 
+// CleanupJournal is the store's per-replica cleanup journal. Owner expiry is
+// written and compared by the database clock inside these methods.
 type CleanupJournal interface {
-	CheckDatabaseCleanupOwner(context.Context, string, time.Time) error
-	ClaimDatabaseCleanupOwner(context.Context, string, time.Time, time.Time) error
-	RenewDatabaseCleanupOwner(context.Context, string, time.Time, time.Time) error
+	CheckDatabaseCleanupOwner(context.Context, string) error
+	ClaimDatabaseCleanupOwner(context.Context, string, time.Duration) error
+	RenewDatabaseCleanupOwner(context.Context, string, time.Duration) error
 	ReleaseDatabaseCleanupOwner(context.Context, string) error
+	ClaimOrphanedDatabaseCleanup(context.Context, string) (int, error)
+	LiveDatabaseCleanupOwners(context.Context) (int, error)
 	AddDatabaseCleanup(context.Context, string, store.DatabaseCleanup) error
 	SetDatabaseCleanupLease(context.Context, string, string, string) error
+	QuarantineDatabaseCleanup(context.Context, string, string) error
+	DatabaseBindingQuarantined(context.Context, string) (bool, error)
 	ListDatabaseCleanup(context.Context) ([]store.DatabaseCleanup, error)
+	ListOwnedDatabaseCleanup(context.Context, string) ([]store.DatabaseCleanup, error)
 	DeleteDatabaseCleanup(context.Context, string) error
 	ConfirmDatabaseCleanup(context.Context, string, string, string) error
 }
@@ -26,7 +35,19 @@ type CleanupJournal interface {
 type DurableLeaseOptions struct {
 	TokenTTL      time.Duration
 	RetryInterval time.Duration
-	OwnerTTL      time.Duration
+	// OwnerTTL is the takeover delay: survivors may claim this replica's
+	// records once this long has passed, by the database clock, since its last
+	// renewal. Default 30s.
+	OwnerTTL time.Duration
+	// FenceAfter stops this replica when no renewal has succeeded for this long
+	// since the renewal was sent. It is shorter than OwnerTTL, so sessions are
+	// closed before any survivor can claim. Default two thirds of OwnerTTL.
+	FenceAfter time.Duration
+	// Heartbeat is the renewal interval. Default one sixth of OwnerTTL.
+	Heartbeat time.Duration
+	// Replica names the broker in owner IDs, for operators. Each process adds a
+	// random suffix, so a restarted Pod never inherits its predecessor's records.
+	Replica string
 }
 
 type durableLease struct {
@@ -36,8 +57,10 @@ type durableLease struct {
 
 // DurableLeaseMinter journals a child-token accessor before credential issuance.
 // Known leases are reconciled automatically. An interrupted response without a
-// lease ID keeps its binding quarantined for explicit operator reconciliation.
-// Only one broker may own the journal; this is not a multi-replica lease manager.
+// lease ID quarantines its binding fleet-wide for explicit operator
+// reconciliation. Each replica owns the records it wrote; a survivor claims a
+// dead replica's records and revokes them. A replica that cannot renew fences
+// itself before its records become claimable.
 type DurableLeaseMinter struct {
 	client   *hashicorp.Client
 	journal  CleanupJournal
@@ -51,6 +74,12 @@ type DurableLeaseMinter struct {
 	active   map[string]durableLease
 	closed   bool
 	closeErr error
+
+	renewMu   sync.Mutex
+	lastRenew time.Time // send time of the last successful renewal
+	fenced    atomic.Bool
+	live      atomic.Int64
+	kick      chan struct{}
 }
 
 func NewDurableLeaseMinter(ctx context.Context, client *hashicorp.Client, journal CleanupJournal, opts DurableLeaseOptions) (*DurableLeaseMinter, error) {
@@ -66,25 +95,114 @@ func NewDurableLeaseMinter(ctx context.Context, client *hashicorp.Client, journa
 	if opts.OwnerTTL <= 0 {
 		opts.OwnerTTL = 30 * time.Second
 	}
-	if opts.OwnerTTL < 3*time.Second || opts.TokenTTL < time.Second || opts.TokenTTL > 24*time.Hour {
+	if opts.FenceAfter <= 0 {
+		opts.FenceAfter = opts.OwnerTTL * 2 / 3
+	}
+	if opts.Heartbeat <= 0 {
+		opts.Heartbeat = opts.OwnerTTL / 6
+	}
+	if opts.OwnerTTL < 3*time.Second || opts.TokenTTL < time.Second || opts.TokenTTL > 24*time.Hour ||
+		opts.Heartbeat >= opts.FenceAfter || opts.FenceAfter >= opts.OwnerTTL {
 		return nil, fmt.Errorf("invalid database lifecycle timing")
 	}
 	var random [16]byte
 	if _, err := rand.Read(random[:]); err != nil {
 		return nil, err
 	}
-	m := &DurableLeaseMinter{client: client, journal: journal, opts: opts, owner: fmt.Sprintf("%x", random), done: make(chan struct{}), active: make(map[string]durableLease)}
+	owner := fmt.Sprintf("%x", random)
+	if opts.Replica != "" {
+		owner = opts.Replica + "/" + owner
+	}
+	m := &DurableLeaseMinter{client: client, journal: journal, opts: opts, owner: owner, done: make(chan struct{}), active: make(map[string]durableLease), kick: make(chan struct{}, 1)}
 	m.ctx, m.cancel = context.WithCancel(ctx)
-	now := time.Now()
-	if err := journal.ClaimDatabaseCleanupOwner(ctx, m.owner, now, now.Add(opts.OwnerTTL)); err != nil {
+	sent := time.Now()
+	if err := journal.ClaimDatabaseCleanupOwner(ctx, m.owner, opts.OwnerTTL); err != nil {
 		m.cancel()
 		return nil, err
+	}
+	m.lastRenew = sent
+	m.live.Store(1)
+	if n, err := journal.LiveDatabaseCleanupOwners(ctx); err == nil && n > 0 {
+		m.live.Store(int64(n))
+	}
+	// A restart takes over expired predecessors at once rather than a heartbeat later.
+	if claimed, err := journal.ClaimOrphanedDatabaseCleanup(ctx, m.owner); err == nil && claimed > 0 {
+		m.kick <- struct{}{}
 	}
 	go m.run()
 	return m, nil
 }
 
+// AuthorityDone closes when this replica fences itself or closes. The broker
+// then stops accepting and closes every session.
 func (m *DurableLeaseMinter) AuthorityDone() <-chan struct{} { return m.ctx.Done() }
+
+// Owner is this process's owner ID in the journal, for session rows.
+func (m *DurableLeaseMinter) Owner() string { return m.owner }
+
+// Fenced reports that this replica lost or could not renew its owner row.
+func (m *DurableLeaseMinter) Fenced() bool { return m.fenced.Load() }
+
+// Ready reports a fresh owner row: claimed at start or renewed within half the
+// fence deadline. A restarted process is ready only once it holds its own new
+// row, and a replica whose renewals are failing stops taking new sessions
+// before it fences.
+func (m *DurableLeaseMinter) Ready() bool {
+	return !m.fenced.Load() && m.ctx.Err() == nil && m.untilFence(time.Now()) > m.opts.FenceAfter/2
+}
+
+// LiveReplicas is the number of live owner rows at the last heartbeat,
+// including this replica.
+func (m *DurableLeaseMinter) LiveReplicas() int { return int(max(1, m.live.Load())) }
+
+// untilFence is the time left before this replica must stop. It counts both
+// monotonic and wall time since the last renewal was sent: the monotonic clock
+// can stop while a host is suspended, and the larger reading wins.
+func (m *DurableLeaseMinter) untilFence(now time.Time) time.Duration {
+	m.renewMu.Lock()
+	last := m.lastRenew
+	m.renewMu.Unlock()
+	elapsed := max(now.Sub(last), now.Round(0).Sub(last.Round(0)))
+	return m.opts.FenceAfter - elapsed
+}
+
+func (m *DurableLeaseMinter) fence() {
+	m.fenced.Store(true)
+	m.cancel()
+}
+
+// heartbeat renews the owner row, then claims orphaned records. It returns
+// false when this replica must fence: ownership is lost, or the fence deadline
+// passed. A failed renewal is retried on the next tick until the deadline.
+func (m *DurableLeaseMinter) heartbeat() bool {
+	sent := time.Now()
+	remaining := m.untilFence(sent)
+	if remaining <= 0 {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(m.ctx, min(m.opts.Heartbeat, remaining))
+	defer cancel()
+	err := m.journal.RenewDatabaseCleanupOwner(ctx, m.owner, m.opts.OwnerTTL)
+	if errors.Is(err, store.ErrDatabaseCleanupOwnershipLost) {
+		return false
+	}
+	if err != nil {
+		return m.untilFence(time.Now()) > 0
+	}
+	m.renewMu.Lock()
+	m.lastRenew = sent
+	m.renewMu.Unlock()
+	if n, err := m.journal.LiveDatabaseCleanupOwners(ctx); err == nil && n > 0 {
+		m.live.Store(int64(n))
+	}
+	if claimed, err := m.journal.ClaimOrphanedDatabaseCleanup(ctx, m.owner); err == nil && claimed > 0 {
+		select {
+		case m.kick <- struct{}{}:
+		default:
+		}
+	}
+	return true
+}
 
 func (m *DurableLeaseMinter) lock(ctx context.Context) error {
 	ticker := time.NewTicker(5 * time.Millisecond)
@@ -112,11 +230,10 @@ func (m *DurableLeaseMinter) ConfirmDatabaseCleanup(ctx context.Context, accesso
 		return err
 	}
 	defer m.mu.Unlock()
-	if m.ctx.Err() != nil || m.closed {
+	if m.ctx.Err() != nil || m.closed || m.untilFence(time.Now()) <= 0 {
 		return fmt.Errorf("database cleanup authority unavailable")
 	}
-	now := time.Now()
-	if err := m.journal.RenewDatabaseCleanupOwner(ctx, m.owner, now, now.Add(m.opts.OwnerTTL)); err != nil {
+	if err := m.journal.CheckDatabaseCleanupOwner(ctx, m.owner); err != nil {
 		return fmt.Errorf("database cleanup authority unavailable")
 	}
 	records, err := m.journal.ListDatabaseCleanup(ctx)
@@ -141,28 +258,36 @@ func (m *DurableLeaseMinter) ConfirmDatabaseCleanup(ctx context.Context, accesso
 
 func (m *DurableLeaseMinter) run() {
 	defer close(m.done)
-	heartbeat := time.NewTicker(m.opts.OwnerTTL / 3)
+	heartbeat := time.NewTicker(m.opts.Heartbeat)
 	defer heartbeat.Stop()
 	retry := time.NewTicker(m.opts.RetryInterval)
 	defer retry.Stop()
+	fence := time.NewTimer(m.untilFence(time.Now()))
+	defer fence.Stop()
 	// Heartbeats must continue while a failed external cleanup is timing out.
 	var cleanup sync.WaitGroup
 	defer cleanup.Wait()
 	busy := make(chan struct{}, 1)
 	for {
+		reconcile := false
 		select {
 		case <-m.ctx.Done():
 			return
+		case <-fence.C:
+			m.fence()
+			return
 		case <-heartbeat.C:
-			ctx, cancel := context.WithTimeout(m.ctx, m.opts.OwnerTTL/3)
-			now := time.Now()
-			err := m.journal.RenewDatabaseCleanupOwner(ctx, m.owner, now, now.Add(m.opts.OwnerTTL))
-			cancel()
-			if err != nil {
-				m.cancel()
+			if !m.heartbeat() {
+				m.fence()
 				return
 			}
+			fence.Reset(m.untilFence(time.Now()))
 		case <-retry.C:
+			reconcile = true
+		case <-m.kick:
+			reconcile = true
+		}
+		if reconcile {
 			select {
 			case busy <- struct{}{}:
 				cleanup.Add(1)
@@ -175,6 +300,11 @@ func (m *DurableLeaseMinter) run() {
 					defer m.mu.Unlock()
 					ctx, cancel := context.WithTimeout(m.ctx, leaseRevokeTimeout)
 					defer cancel()
+					// Claim on every pass, not only on heartbeats, so a dead
+					// replica's records move within a second of its expiry.
+					if m.untilFence(time.Now()) > 0 {
+						_, _ = m.journal.ClaimOrphanedDatabaseCleanup(ctx, m.owner)
+					}
 					_ = m.reconcile(ctx, "")
 				}()
 			default:
@@ -189,12 +319,14 @@ func databaseBinding(vaultID string, svc *DatabaseService) string {
 	return vaultID + "/" + svc.Name
 }
 
+// reconcile revokes this replica's records that no live session holds,
+// including records claimed from dead replicas. Revocation is idempotent, so a
+// record revoked twice after a contested takeover is harmless.
 func (m *DurableLeaseMinter) reconcile(ctx context.Context, binding string) error {
-	now := time.Now()
-	if err := m.journal.RenewDatabaseCleanupOwner(ctx, m.owner, now, now.Add(m.opts.OwnerTTL)); err != nil {
+	if err := m.journal.CheckDatabaseCleanupOwner(ctx, m.owner); err != nil {
 		return err
 	}
-	records, err := m.journal.ListDatabaseCleanup(ctx)
+	records, err := m.journal.ListOwnedDatabaseCleanup(ctx, m.owner)
 	if err != nil {
 		return err
 	}
@@ -209,14 +341,14 @@ func (m *DurableLeaseMinter) reconcile(ctx context.Context, binding string) erro
 		if active[record.Accessor] || (binding != "" && binding != record.Binding) {
 			continue
 		}
-		now := time.Now()
-		if err := m.journal.RenewDatabaseCleanupOwner(ctx, m.owner, now, now.Add(m.opts.OwnerTTL)); err != nil {
+		if err := m.journal.CheckDatabaseCleanupOwner(ctx, m.owner); err != nil {
 			return err
 		}
 		cleanupCtx, cancel := context.WithTimeout(ctx, leaseRevokeTimeout)
 		var err error
 		if record.LeaseID == "" {
 			_ = m.client.RevokeDatabaseSession(cleanupCtx, record.Accessor)
+			_ = m.journal.QuarantineDatabaseCleanup(cleanupCtx, m.owner, record.Accessor)
 			err = fmt.Errorf("unknown database issuance requires operator reconciliation")
 		} else {
 			err = m.client.RevokeDatabaseLeaseConfirmed(cleanupCtx, record.LeaseID)
@@ -232,11 +364,17 @@ func (m *DurableLeaseMinter) reconcile(ctx context.Context, binding string) erro
 			failure = fmt.Errorf("database binding cleanup incomplete: %w", err)
 		}
 	}
+	if failure == nil && binding != "" {
+		// Another replica's unresolved issuance holds the binding too.
+		if quarantined, err := m.journal.DatabaseBindingQuarantined(ctx, binding); err != nil || quarantined {
+			failure = fmt.Errorf("database binding cleanup incomplete: unknown issuance requires operator reconciliation")
+		}
+	}
 	return failure
 }
 
-func (m *DurableLeaseMinter) Mint(ctx context.Context, vaultID string, svc *DatabaseService) (*Lease, error) {
-	if svc == nil || vaultID == "" || svc.Name == "" {
+func (m *DurableLeaseMinter) Mint(ctx context.Context, scope AgentScope, svc *DatabaseService) (*Lease, error) {
+	if svc == nil || scope.VaultID == "" || svc.Name == "" {
 		return nil, fmt.Errorf("database binding is required")
 	}
 	ctx, cancel := context.WithCancel(ctx)
@@ -247,10 +385,10 @@ func (m *DurableLeaseMinter) Mint(ctx context.Context, vaultID string, svc *Data
 		return nil, err
 	}
 	defer m.mu.Unlock()
-	if m.ctx.Err() != nil {
+	if m.ctx.Err() != nil || m.untilFence(time.Now()) <= 0 {
 		return nil, fmt.Errorf("database cleanup authority unavailable")
 	}
-	binding := databaseBinding(vaultID, svc)
+	binding := databaseBinding(scope.VaultID, svc)
 	if err := m.reconcile(ctx, binding); err != nil {
 		return nil, err
 	}
@@ -258,7 +396,7 @@ func (m *DurableLeaseMinter) Mint(ctx context.Context, vaultID string, svc *Data
 	if err != nil {
 		return nil, err
 	}
-	record := store.DatabaseCleanup{Accessor: session.Accessor, Binding: binding}
+	record := store.DatabaseCleanup{Accessor: session.Accessor, Binding: binding, ActorID: scope.ActorID, WorkloadID: scope.WorkloadID}
 	if err := m.journal.AddDatabaseCleanup(ctx, m.owner, record); err != nil {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
 		defer cleanupCancel()
@@ -297,7 +435,7 @@ func (m *DurableLeaseMinter) Renew(ctx context.Context, id string, increment tim
 	m.activeMu.Lock()
 	lease, ok := m.active[id]
 	m.activeMu.Unlock()
-	if !ok || m.ctx.Err() != nil || !time.Now().Before(lease.expires) {
+	if !ok || m.ctx.Err() != nil || m.untilFence(time.Now()) <= 0 || !time.Now().Before(lease.expires) {
 		return time.Time{}, fmt.Errorf("database session unavailable")
 	}
 	started := time.Now()

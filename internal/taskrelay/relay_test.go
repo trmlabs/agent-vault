@@ -454,6 +454,9 @@ func TestPostgresDeniesAuthorityAndMalformedFramesBeforeUpstream(t *testing.T) {
 	for key, values := range map[string][]string{
 		"application_name":  {strings.Repeat("a", 64), "injected\nlog", "client\x01", "客户端"},
 		"statement_timeout": {"", "0", "-1", "+1", "30s", " 30000", "2147483648", "99999999999", "30000 -c role=admin"},
+		"client_encoding":   {"SJIS", "GBK", "nonsense", "UTF8'; SET role admin"},
+		"TimeZone":          {"UTC\r\nrole=admin"},
+		"search_path":       {"public\x00; drop table t"},
 	} {
 		for _, value := range values {
 			invalid = append(invalid, map[string]string{"user": "workload", "database": "canary", key: value})
@@ -463,7 +466,7 @@ func TestPostgresDeniesAuthorityAndMalformedFramesBeforeUpstream(t *testing.T) {
 		c := f.dial(t, f.c.Postgres.Listen)
 		b, _ := (&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber, Parameters: parameters}).Encode(nil)
 		c.Write(b)
-		if _, e := c.Read(make([]byte, 1)); e == nil {
+		if !refusedWithError(c) {
 			t.Fatal("accepted invalid startup")
 		}
 		c.Close()
@@ -481,7 +484,7 @@ func TestPostgresDeniesAuthorityAndMalformedFramesBeforeUpstream(t *testing.T) {
 		t.Fatal("compatible startup not accepted")
 	}
 	c.Write(encodePGFrame('p', []byte("attacker-proof\x00")))
-	if _, e = c.Read(make([]byte, 1)); e == nil {
+	if !refusedWithError(c) {
 		t.Fatal("accepted nonplaceholder")
 	}
 	c.Close()

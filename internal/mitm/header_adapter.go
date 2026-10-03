@@ -40,6 +40,12 @@ type HeaderAdapter struct {
 		Token(ctx context.Context, app githubapp.App, repo string, permissions githubapp.Permissions) (githubapp.Token, error)
 		Invalidate(app githubapp.App, repo string, permissions githubapp.Permissions)
 	}
+	// BrowserTokens logs browser-session test users in. Without it, those
+	// requests are refused.
+	BrowserTokens interface {
+		Token(context.Context, *httpcatalog.Entry) (httpcatalog.BrowserToken, error)
+		Invalidate(*httpcatalog.Entry)
+	}
 }
 
 func (a *HeaderAdapter) valid() bool {
@@ -105,6 +111,10 @@ func (p *Proxy) forwardCatalog(w http.ResponseWriter, r *http.Request, target, h
 	}
 	if api, ok, err := catalog.GitHubAPIMatch(host, port, r.Method, r.URL.Path, r.URL.RawQuery, scope.Pool); ok {
 		p.forwardGitHubAPI(w, r, target, scope, event, api, err)
+		return
+	}
+	if browser, ok, err := catalog.BrowserMatch(host, port, r.Method, r.URL.Path, scope.Pool); ok {
+		p.forwardBrowser(w, r, target, scope, event, browser, err)
 		return
 	}
 	entry, err := catalog.Match(host, port, r.Method, r.URL.Path, scope.Pool)
@@ -209,7 +219,7 @@ func (p *Proxy) forwardCatalog(w http.ResponseWriter, r *http.Request, target, h
 		_ = a.Audit.Record(done)
 	}
 	needles := secretRepresentations(map[string]string{"key": secret.Value(), "credential": credential})
-	p.relayScreened(w, out, needles, entry.MaxResponseBytes, finish, func() {
+	p.relayScreened(w, out, needles, entry.MaxResponseBytes, finish, func(*http.Response) {
 		// The vendor may have rotated or revoked the key; read the newest next.
 		a.Keys.Invalidate(entry.Key)
 	}, nil)
@@ -217,9 +227,9 @@ func (p *Proxy) forwardCatalog(w http.ResponseWriter, r *http.Request, target, h
 
 // relayScreened sends out upstream and streams the response back, refusing
 // compressed or upgraded responses and any that carry a needle. rejected runs
-// on a 401 or 403. tooLarge, when set, reports that the request body was cut
+// on a 401 or 403 and may look at the response to decide what it means. tooLarge, when set, reports that the request body was cut
 // off at its limit.
-func (p *Proxy) relayScreened(w http.ResponseWriter, out *http.Request, needles [][]byte, limit int64, finish func(int, string), rejected func(), tooLarge func() bool) {
+func (p *Proxy) relayScreened(w http.ResponseWriter, out *http.Request, needles [][]byte, limit int64, finish func(int, string), rejected func(*http.Response), tooLarge func() bool) {
 	resp, err := p.upstream.RoundTrip(out)
 	if err != nil {
 		if tooLarge != nil && tooLarge() {
@@ -233,7 +243,7 @@ func (p *Proxy) relayScreened(w http.ResponseWriter, out *http.Request, needles 
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		rejected()
+		rejected(resp)
 	}
 	encoding := resp.Header.Get("Content-Encoding")
 	if resp.Header.Get("Upgrade") != "" || (encoding != "" && encoding != "identity") || headersContain(resp.Header, needles) {

@@ -132,8 +132,8 @@ var userInviteCmd = &cobra.Command{
 		}
 
 		var resp struct {
-			Email     string `json:"email"`
-			EmailSent bool   `json:"email_sent"`
+			Email      string `json:"email"`
+			EmailSent  bool   `json:"email_sent"`
 			InviteLink string `json:"invite_link"`
 		}
 		_ = json.Unmarshal(respBody, &resp)

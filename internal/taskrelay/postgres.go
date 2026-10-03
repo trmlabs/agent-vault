@@ -1,17 +1,20 @@
 package taskrelay
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"io"
 	"net"
-	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
+
+	"github.com/Infisical/agent-vault/internal/brokercore"
 )
 
 const cancelCode = 80877102
@@ -64,14 +67,16 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig) {
 	c := &binding
 	if startup.Decode(packet[4:]) != nil || startup.ProtocolVersion != pgproto3.ProtocolVersionNumber || !validStartup(startup.Parameters, c) {
 		_ = r.record("postgres", "denied:bad-startup")
+		_, _ = conn.Write(errorFrame("08004", "Gatehouse: connection refused: use this binding's database and user, and only the "+
+			startupParameterList+" startup parameters, with bounded values (set others with SET after connecting)"))
 		return
 	}
 	// Preserve validated client behavior while fixing connection authority to the
 	// operator's database/user. Never forward arbitrary backend options.
 	parameters := map[string]string{"user": c.User, "database": c.Database}
-	for _, key := range []string{"application_name", "statement_timeout", "client_encoding"} {
-		if value, ok := startup.Parameters[key]; ok {
-			parameters[key] = value
+	for key, value := range startup.Parameters {
+		if name, v, valid := brokercore.StartupParameter(key, value); valid {
+			parameters[name] = v
 		}
 	}
 	packet, e = (&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber, Parameters: parameters}).Encode(nil)
@@ -92,6 +97,7 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig) {
 	}
 	if typ != 'p' || string(password) != c.Placeholder+"\x00" {
 		_ = r.record("postgres", "denied:placeholder")
+		_, _ = conn.Write(errorFrame("28P01", "Gatehouse: wrong placeholder password for this binding"))
 		return
 	}
 	// Everything the sandbox can influence has been validated. Admit: live pair
@@ -171,6 +177,11 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig) {
 			if !authenticated || len(body) != 1 {
 				return
 			}
+		case 'E':
+			// Tell the client why, in the relay's own words: a known capacity
+			// refusal by code, anything else as one generic refusal.
+			_, _ = conn.Write(refusalFrame(sqlState(body)))
+			return
 		default:
 			return
 		}
@@ -190,50 +201,27 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig) {
 	copyTunnel(r.ctx, conn, conn, up, up, expiry)
 }
 
-// validStartup is the relay's stricter allowlist. internal/pgproxy/upstream.go
-// (validStartupValue) applies the same per-key bounds at the broker; keep both
-// in step when changing either.
+// validStartup fixes database and user to the binding and allows only the
+// startup parameters brokercore.StartupValue accepts, the same rule the broker
+// applies, so a client that passes here is never refused there.
 func validStartup(parameters map[string]string, c *PostgresConfig) bool {
 	if parameters["database"] != c.Database || parameters["user"] != c.User {
 		return false
 	}
 	for key, value := range parameters {
-		switch key {
-		case "database", "user":
-		case "application_name":
-			if len(value) > 63 {
-				return false
-			}
-			for _, char := range value {
-				if char < 32 || char > 126 {
-					return false
-				}
-			}
-		case "statement_timeout":
-			// Accept a positive millisecond value, not units, options or a request
-			// to disable the timeout. SQL permissions remain the access boundary.
-			if value == "" || len(value) > 10 {
-				return false
-			}
-			for _, char := range value {
-				if char < '0' || char > '9' {
-					return false
-				}
-			}
-			n, err := strconv.ParseUint(value, 10, 31)
-			if err != nil || n == 0 {
-				return false
-			}
-		case "client_encoding":
-			if value != "UTF8" {
-				return false
-			}
-		default:
+		if key == "database" || key == "user" {
+			continue
+		}
+		if _, _, ok := brokercore.StartupParameter(key, value); !ok {
 			return false
 		}
 	}
 	return true
 }
+
+// startupParameterList names the accepted parameters for the refusal message.
+var startupParameterList = strings.Join(brokercore.StartupParameters[:len(brokercore.StartupParameters)-1], ", ") +
+	" and " + brokercore.StartupParameters[len(brokercore.StartupParameters)-1]
 
 func readStartupPacket(reader io.Reader) ([]byte, error) {
 	var length [4]byte
@@ -340,4 +328,41 @@ func (r *relay) cancelPostgres(peer string, packet []byte, binding PostgresConfi
 	if _, e = up.Write(target.packet); e == nil {
 		_, _ = io.Copy(io.Discard, up)
 	}
+}
+
+// sqlState returns the SQLSTATE field of a PostgreSQL ErrorResponse body.
+func sqlState(body []byte) string {
+	for len(body) > 0 && body[0] != 0 {
+		field := body[0]
+		end := bytes.IndexByte(body[1:], 0)
+		if end < 0 {
+			return ""
+		}
+		if field == 'C' {
+			return string(body[1 : 1+end])
+		}
+		body = body[2+end:]
+	}
+	return ""
+}
+
+// refusalFrame is a relay-authored FATAL error. Broker message text is never
+// forwarded; only a capacity refusal keeps its code and a fixed explanation.
+func refusalFrame(code string) []byte {
+	if code == "53300" {
+		return errorFrame(code, "Gatehouse: too many concurrent database sessions for this worker; close one and retry")
+	}
+	return errorFrame("08004", "Gatehouse: the broker refused this connection")
+}
+
+// errorFrame builds a FATAL ErrorResponse with relay-authored text only.
+func errorFrame(code, message string) []byte {
+	var body []byte
+	for _, f := range []struct {
+		t byte
+		v string
+	}{{'S', "FATAL"}, {'V', "FATAL"}, {'C', code}, {'M', message}} {
+		body = append(append(append(body, f.t), f.v...), 0)
+	}
+	return encodePGFrame('E', append(body, 0))
 }

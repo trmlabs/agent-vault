@@ -131,7 +131,7 @@ func (p *Proxy) forwardGit(w http.ResponseWriter, r *http.Request, target string
 		_ = a.Audit.Record(done)
 	}
 	needles := secretRepresentations(map[string]string{"token": token.Value(), "basic": payload, "credential": credential})
-	p.relayScreened(w, out, needles, entry.MaxResponseBytes, finish, func() {
+	p.relayScreened(w, out, needles, entry.MaxResponseBytes, finish, func(*http.Response) {
 		a.GitTokens.Invalidate(app, git.Repo.Repo, permissions)
 	}, body.exceeded.Load)
 }
@@ -213,7 +213,7 @@ func objectID(s string) bool {
 		return false
 	}
 	for i := 0; i < len(s); i++ {
-		if (s[i] < '0' || s[i] > '9') && (s[i] < 'a' || s[i] > 'f') {
+		if c := s[i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return false
 		}
 	}

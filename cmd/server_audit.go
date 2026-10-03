@@ -55,9 +55,14 @@ func brokerAuditChain(ctx context.Context, client *hashicorp.Client, db any, get
 	}
 	// A stable name, such as a StatefulSet Pod name, lets each boot link to
 	// the last and the store's head name the chain an export must reach.
-	replica := getenv("AGENT_VAULT_AUDIT_REPLICA")
+	// AGENT_VAULT_REPLICA (the fleet's Pod name) comes first; there is no
+	// hostname fallback.
+	replica := getenv("AGENT_VAULT_REPLICA")
 	if replica == "" {
-		return nil, fmt.Errorf("audit chain requires AGENT_VAULT_AUDIT_REPLICA, a stable replica name such as the Pod name")
+		replica = getenv("AGENT_VAULT_AUDIT_REPLICA")
+	}
+	if replica == "" {
+		return nil, fmt.Errorf("audit chain requires AGENT_VAULT_REPLICA or AGENT_VAULT_AUDIT_REPLICA, a stable replica name such as the Pod name")
 	}
 	keys := auditchain.KVKeys{Mount: setting("AGENT_VAULT_AUDIT_HMAC_MOUNT", "gatehouse"), Path: getenv("AGENT_VAULT_AUDIT_HMAC_PATH"), Field: setting("AGENT_VAULT_AUDIT_HMAC_FIELD", "key")}
 	signer := auditchain.TransitSigner{Mount: setting("AGENT_VAULT_AUDIT_TRANSIT_MOUNT", "transit"), Key: getenv("AGENT_VAULT_AUDIT_TRANSIT_KEY")}
@@ -75,7 +80,6 @@ func brokerAuditChain(ctx context.Context, client *hashicorp.Client, db any, get
 	signCtx, cancel := context.WithTimeout(ctx, auditCheckpointInterval/2)
 	_ = chain.Checkpoint(signCtx)
 	cancel()
-	// The chain outlives the startup context; it runs for the process.
-	go chain.Run(context.WithoutCancel(ctx), auditCheckpointInterval, auditKeyRefresh)
+	go chain.Run(ctx, auditCheckpointInterval, auditKeyRefresh) // ctx is the server's lifetime context
 	return chain, nil
 }

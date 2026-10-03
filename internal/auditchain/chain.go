@@ -60,6 +60,7 @@ type Event struct {
 	Requester string
 	Method    string
 	Status    int
+	Duration  int64 // milliseconds
 }
 
 var (
@@ -143,7 +144,7 @@ func (c *Chain) Admit() error {
 // caller must not start or continue the action it describes.
 func (c *Chain) Record(e Event) error {
 	switch e.Event {
-	case EventSessionOpen, EventSessionClose, EventDenied, EventHTTPRequest, EventHTTPResponse:
+	case EventSessionOpen, EventSessionClose, EventDenied, EventHTTPRequest, EventHTTPResponse, EventTransaction, EventStateLeak:
 	default:
 		return ErrInvalidEvent
 	}
@@ -152,7 +153,7 @@ func (c *Chain) Record(e Event) error {
 	default:
 		return ErrInvalidEvent
 	}
-	if e.Status != 0 && (e.Status < 100 || e.Status > 599) {
+	if e.Status != 0 && (e.Status < 100 || e.Status > 599) || e.Duration < 0 {
 		return ErrInvalidEvent
 	}
 	for _, v := range []string{e.Pool, e.Agent, e.PodUID, e.Binding, e.Session, e.Outcome, e.Requester} {
@@ -162,7 +163,7 @@ func (c *Chain) Record(e Event) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	_, err := c.appendLocked(Row{Event: e.Event, Pool: e.Pool, Agent: e.Agent, PodUID: e.PodUID, Binding: e.Binding, Session: e.Session, Outcome: e.Outcome, Requester: e.Requester, Method: e.Method, Status: e.Status})
+	_, err := c.appendLocked(Row{Event: e.Event, Pool: e.Pool, Agent: e.Agent, PodUID: e.PodUID, Binding: e.Binding, Session: e.Session, Outcome: e.Outcome, Requester: e.Requester, Method: e.Method, Status: e.Status, Duration: e.Duration})
 	return err
 }
 

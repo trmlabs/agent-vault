@@ -3,7 +3,6 @@ package pgproxy
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/Infisical/agent-vault/internal/runtimestatus"
 )
@@ -27,9 +26,25 @@ func CleanupSnapshot(b *Broker, m *DurableLeaseMinter) runtimestatus.Snapshot {
 		if m.closed || m.ctx.Err() != nil {
 			return result, fmt.Errorf("cleanup authority unavailable")
 		}
+		// An empty actor (unauthenticated connection, legacy record) is
+		// unattributed and counts against every actor.
+		attributed := make(map[runtimestatus.Attribution]runtimestatus.Counts)
+		var unattributed runtimestatus.Counts
+		tally := func(owner runtimestatus.Attribution, change func(*runtimestatus.Counts)) {
+			if owner.ActorID == "" {
+				change(&unattributed)
+				return
+			}
+			counts := attributed[owner]
+			change(&counts)
+			attributed[owner] = counts
+		}
 		b.mu.Lock()
 		before := b.connectionGeneration
 		active := len(b.conns)
+		for conn := range b.conns {
+			tally(b.connActors[conn], func(c *runtimestatus.Counts) { c.ActiveConnections++ })
+		}
 		closed := b.closed
 		b.mu.Unlock()
 		if closed || !b.IsListening() {
@@ -38,7 +53,7 @@ func CleanupSnapshot(b *Broker, m *DurableLeaseMinter) runtimestatus.Snapshot {
 		if err := m.client.CheckAuthorization(ctx); err != nil {
 			return result, err
 		}
-		records, err := m.journal.ListDatabaseCleanup(ctx)
+		records, err := m.journal.ListOwnedDatabaseCleanup(ctx, m.owner)
 		if err != nil {
 			return result, err
 		}
@@ -50,11 +65,18 @@ func CleanupSnapshot(b *Broker, m *DurableLeaseMinter) runtimestatus.Snapshot {
 		}
 		unknown := 0
 		for _, record := range records {
-			if record.LeaseID == "" {
+			known := record.LeaseID != ""
+			if !known {
 				unknown++
 			}
+			tally(runtimestatus.Attribution{ActorID: record.ActorID, WorkloadID: record.WorkloadID}, func(c *runtimestatus.Counts) {
+				c.UnfinishedCleanup++
+				if !known {
+					c.UnknownCleanup++
+				}
+			})
 		}
-		if err := m.journal.CheckDatabaseCleanupOwner(ctx, m.owner, time.Now()); err != nil {
+		if err := m.journal.CheckDatabaseCleanupOwner(ctx, m.owner); err != nil {
 			return result, err
 		}
 		b.mu.Lock()
@@ -63,6 +85,7 @@ func CleanupSnapshot(b *Broker, m *DurableLeaseMinter) runtimestatus.Snapshot {
 		if ctx.Err() != nil || m.ctx.Err() != nil {
 			return result, fmt.Errorf("cleanup authority unavailable")
 		}
-		return runtimestatus.Observation{Initialized: true, Healthy: true, Consistent: consistent, ActiveConnections: active, UnfinishedCleanup: len(records), UnknownCleanup: unknown}, nil
+		return runtimestatus.Observation{Initialized: true, Healthy: true, Consistent: consistent, ActiveConnections: active, UnfinishedCleanup: len(records), UnknownCleanup: unknown,
+			Attributed: attributed, Unattributed: unattributed}, nil
 	}
 }
