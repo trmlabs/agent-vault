@@ -104,6 +104,7 @@ type Server struct {
 	readiness             []readinessCheck
 	pgLeaseCloser         interface{ Close(context.Context) error }
 	shutdownTimeout       time.Duration // 0: the default 5s
+	storeOK               atomic.Int64  // Unix ms of the last good store ping; 0 before the first
 }
 
 // lockVaultServices acquires the per-vault mutation lock via the store's
@@ -1141,6 +1142,9 @@ func (s *Server) Start() error {
 	pruneCtx, stopWorkers := context.WithCancel(context.Background())
 	defer stopWorkers()
 	go s.runTouchCachePruner(pruneCtx)
+	if s.store.DialectName() == "postgres" {
+		go s.watchStore(pruneCtx)
+	}
 
 	// Each external-store syncer's done channel closes once its Run has
 	// returned AND drained its in-flight refresh goroutines. We block on all
