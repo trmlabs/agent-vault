@@ -349,6 +349,7 @@ func attachServerExtensions(srv *server.Server, host string, mitmPort, postgresP
 		if err != nil {
 			return err
 		}
+		resolver.SetLogger(logger)
 		sessions = resolver
 		proxyIdentity = config
 		proxyResolver = resolver

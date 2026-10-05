@@ -176,9 +176,11 @@ type livePod struct {
 		} `json:"ownerReferences"`
 	} `json:"metadata"`
 	Spec struct {
-		ServiceAccountName    string     `json:"serviceAccountName"`
-		ActiveDeadlineSeconds *int64     `json:"activeDeadlineSeconds"`
-		EphemeralContainers   []struct{} `json:"ephemeralContainers"`
+		ServiceAccountName    string `json:"serviceAccountName"`
+		ActiveDeadlineSeconds *int64 `json:"activeDeadlineSeconds"`
+		EphemeralContainers   []struct {
+			Name string `json:"name"`
+		} `json:"ephemeralContainers"`
 	} `json:"spec"`
 	Status struct {
 		Phase                 string                `json:"phase"`
@@ -199,22 +201,25 @@ type containerStatus struct {
 	} `json:"state"`
 }
 
-// imagesAllowed reports whether every container and init container (a native
-// sidecar is one) runs an image whose digest the binding lists, and no
-// ephemeral container was added. A container not yet started has no imageID
-// and fails.
-func (p *livePod) imagesAllowed(digests []string) bool {
-	if len(p.Spec.EphemeralContainers) != 0 || len(p.Status.ContainerStatuses) == 0 {
-		return false
+// refusedImage names the container that keeps the Pod out, or "" when every
+// container and init container (a native sidecar is one) runs an image whose
+// digest the binding lists and no ephemeral container was added. A container
+// not yet started has no imageID and is refused.
+func (p *livePod) refusedImage(digests []string) string {
+	if len(p.Spec.EphemeralContainers) != 0 {
+		return "ephemeral:" + p.Spec.EphemeralContainers[0].Name
+	}
+	if len(p.Status.ContainerStatuses) == 0 {
+		return "(no container status)"
 	}
 	for _, s := range append(append([]containerStatus(nil), p.Status.ContainerStatuses...), p.Status.InitContainerStatuses...) {
 		// repo@sha256:..., or a bare sha256:... for a locally loaded image.
 		digest := s.ImageID[strings.LastIndexByte(s.ImageID, '@')+1:]
 		if digest == "" || !slices.Contains(digests, digest) {
-			return false
+			return s.Name
 		}
 	}
-	return true
+	return ""
 }
 
 // controllerKind is the kind of the Pod's controller owner, or "".
@@ -237,13 +242,14 @@ func (p *livePod) images() []string {
 }
 
 // deadline returns when the Pod's admission ends, or the zero time if it is
-// not an admissible pool Pod right now.
-func (p *livePod) deadline(b *Binding, c claims, peer netip.Addr, now time.Time) time.Time {
+// not an admissible pool Pod right now. refusedContainer names the container
+// when an unlisted image is the reason, for the operational log.
+func (p *livePod) deadline(b *Binding, c claims, peer netip.Addr, now time.Time) (end time.Time, refusedContainer string) {
 	k := c.Kubernetes
 	m := p.Metadata
 	if m.UID != k.Pod.UID || m.Name != k.Pod.Name || m.Namespace != k.Namespace || m.DeletionTimestamp != nil ||
 		p.Spec.ServiceAccountName != k.ServiceAccount.Name || p.Status.Phase != "Running" || p.Status.StartTime == nil {
-		return time.Time{}
+		return time.Time{}, ""
 	}
 	// Second check: the connection came from this Pod's own address.
 	addresses := []string{p.Status.PodIP}
@@ -257,7 +263,7 @@ func (p *livePod) deadline(b *Binding, c claims, peer netip.Addr, now time.Time)
 		}
 	}
 	if !matched {
-		return time.Time{}
+		return time.Time{}, ""
 	}
 	// ownerReferences are written by whoever creates the Pod, so this is not
 	// proof the controller made it: anyone who may create Pods under this
@@ -277,35 +283,35 @@ func (p *livePod) deadline(b *Binding, c claims, peer netip.Addr, now time.Time)
 		}
 	}
 	if !owned {
-		return time.Time{}
+		return time.Time{}, ""
 	}
-	if !p.imagesAllowed(b.ImageDigests) {
-		return time.Time{}
+	if container := p.refusedImage(b.ImageDigests); container != "" {
+		return time.Time{}, container
 	}
 	if b.ContainerName != "" {
 		running := 0
 		for _, s := range p.Status.ContainerStatuses {
 			if s.Name == b.ContainerName {
 				if s.State.Running == nil || s.RestartCount != 0 {
-					return time.Time{}
+					return time.Time{}, ""
 				}
 				running++
 			}
 		}
 		if running != 1 {
-			return time.Time{}
+			return time.Time{}, ""
 		}
 	}
-	end := p.Status.StartTime.Add(time.Duration(b.MaxPodSeconds) * time.Second)
+	end = p.Status.StartTime.Add(time.Duration(b.MaxPodSeconds) * time.Second)
 	if d := p.Spec.ActiveDeadlineSeconds; d != nil {
 		if active := p.Status.StartTime.Add(time.Duration(*d) * time.Second); active.Before(end) {
 			end = active
 		}
 	}
 	if !now.Before(end) {
-		return time.Time{}
+		return time.Time{}, ""
 	}
-	return end
+	return end, ""
 }
 
 // Attest admits a pool worker: local token verification first, then the live
@@ -361,8 +367,12 @@ func (r *Resolver) attest(ctx context.Context, token string, peer netip.Addr, re
 	if r.api(ctx, http.MethodGet, "/api/v1/namespaces/"+url.PathEscape(k.Namespace)+"/pods/"+url.PathEscape(k.Pod.Name), nil, &pod) != nil {
 		return nil, deny
 	}
-	notAfter := pod.deadline(binding, c, peer, r.now())
+	notAfter, refusedContainer := pod.deadline(binding, c, peer, r.now())
 	if notAfter.IsZero() || !r.profileAdmits(binding.Pool, d, IdentityPodToken, k.Namespace, pod.controllerKind(), pod.images()) {
+		if refusedContainer != "" {
+			r.logger.Warn("workloadidentity: pool Pod refused", "reason", "image_not_allowed", "container", refusedContainer,
+				"namespace", k.Namespace, "pod", k.Pod.Name)
+		}
 		return nil, deny
 	}
 	scope, err := r.grant(ctx, binding, "")

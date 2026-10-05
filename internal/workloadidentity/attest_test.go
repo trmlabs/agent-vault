@@ -1,6 +1,7 @@
 package workloadidentity
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/rand"
@@ -9,6 +10,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
+	"log/slog"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -16,10 +19,13 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Infisical/agent-vault/internal/brokercore"
 )
 
 // poolFixture serves the cluster's signing keys and one live Pod. Tokens are
@@ -367,5 +373,49 @@ func TestSigningKeyFetchIsSingleFlightOutsideTheLock(t *testing.T) {
 	}
 	if n := f.jwksCalls.Load(); n != 2 {
 		t.Fatalf("key fetches %d, want 2", n)
+	}
+}
+
+// A Pod refused for an unlisted image is logged with the reason and the
+// container, so operators see why; the worker still sees a generic refusal.
+func TestAttestLogsTheRefusedImage(t *testing.T) {
+	for name, tc := range map[string]struct {
+		mutate    func(f *poolFixture)
+		container string
+	}{
+		"swapped worker image": {func(f *poolFixture) {
+			f.pod["status"].(map[string]any)["containerStatuses"].([]any)[0].(map[string]any)["imageID"] = "registry.example/worker@" + otherDigest
+		}, "container=agent"},
+		"unlisted sidecar image": {func(f *poolFixture) {
+			f.pod["status"].(map[string]any)["initContainerStatuses"].([]any)[0].(map[string]any)["imageID"] = "registry.example/broker@" + otherDigest
+		}, "container=gatehouse-sidecar"},
+		"ephemeral container": {func(f *poolFixture) {
+			f.pod["spec"].(map[string]any)["ephemeralContainers"] = []any{map[string]any{"name": "debugger", "image": "busybox"}}
+		}, "container=ephemeral:debugger"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := setupPool(t)
+			var logs bytes.Buffer
+			f.r.SetLogger(slog.New(slog.NewTextHandler(&logs, nil)))
+			tc.mutate(f)
+			if scope, err := f.r.Attest(context.Background(), f.token(f.c), workerIP); err == nil || scope != nil {
+				t.Fatalf("admitted: %+v", scope)
+			} else if !errors.Is(err, brokercore.ErrInvalidSession) {
+				t.Fatalf("worker saw %v, want the generic refusal", err)
+			}
+			if !strings.Contains(logs.String(), "reason=image_not_allowed") || !strings.Contains(logs.String(), tc.container) {
+				t.Fatalf("log %q lacks the reason or %s", logs.String(), tc.container)
+			}
+		})
+	}
+	// Other refusals do not claim an image reason.
+	f := setupPool(t)
+	var logs bytes.Buffer
+	f.r.SetLogger(slog.New(slog.NewTextHandler(&logs, nil)))
+	if _, err := f.r.Attest(context.Background(), f.token(f.c), netip.MustParseAddr("10.244.0.77")); err == nil {
+		t.Fatal("stolen token admitted")
+	}
+	if strings.Contains(logs.String(), "image_not_allowed") {
+		t.Fatalf("address refusal logged as an image refusal: %q", logs.String())
 	}
 }
