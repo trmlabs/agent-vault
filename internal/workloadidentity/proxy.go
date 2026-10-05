@@ -192,28 +192,33 @@ func (p *ProxyBinding) fromSource(peer netip.Addr) bool {
 // verified by attest; here the connection's source, the attestation and the
 // profile are checked, and the scope is the attested Pod's.
 func (r *Resolver) attestProxied(ctx context.Context, binding *Binding, c claims, d *domain, peer netip.Addr, encoded string, renewal bool) (*brokercore.ProxyScope, error) {
-	deny := brokercore.ErrInvalidSession
 	p := binding.Proxy
 	if !p.fromSource(peer) {
-		return nil, deny
+		return nil, brokercore.Denied("proxy_source")
 	}
 	// A recheck may outlive the proxy token, but only by one token lifetime.
 	if renewal && r.now().Unix() > c.Expires+d.maxLifetime {
-		return nil, deny
+		return nil, brokercore.Denied("proxy_token_expired")
 	}
 	a, err := decodeAttestation(encoded)
-	if err != nil || a.OwnerKind != p.OwnerKind {
-		return nil, deny
+	if err != nil {
+		return nil, brokercore.Denied("attestation_invalid")
+	}
+	if a.OwnerKind != p.OwnerKind {
+		return nil, brokercore.Denied("attestation_owner_kind")
 	}
 	// The namespace picks the profile and pool; the proxy must name the same
 	// profile, and an unlisted namespace is refused.
 	profile, ok := p.profileFor(a.Namespace)
-	if !ok || a.Profile != profile.Profile {
-		return nil, deny
+	if !ok {
+		return nil, brokercore.Denied("attestation_namespace")
+	}
+	if a.Profile != profile.Profile {
+		return nil, brokercore.Denied("attestation_profile")
 	}
 	for _, image := range a.Images {
 		if !imagerule.Allowed(image, profile.ImagePrefix, p.ImageDigests) {
-			return nil, deny
+			return nil, brokercore.Denied("attestation_image")
 		}
 	}
 	notAfter := time.Unix(a.NotAfter, 0)
@@ -221,17 +226,17 @@ func (r *Resolver) attestProxied(ctx context.Context, binding *Binding, c claims
 		notAfter = limit
 	}
 	if !r.now().Before(notAfter) {
-		return nil, deny
+		return nil, brokercore.Denied("deadline")
 	}
 	if !r.proxyProfileAdmits(profile, d, a) {
-		return nil, deny
+		return nil, brokercore.Denied("catalog_profile")
 	}
 	scope, err := r.grant(ctx, binding, "")
 	if err != nil {
 		return nil, err
 	}
 	if ctx.Err() != nil || (c.Expires <= r.now().Unix() && !renewal) || !r.now().Before(notAfter) {
-		return nil, deny
+		return nil, brokercore.Denied("deadline")
 	}
 	scope.WorkloadID, scope.NotAfter, scope.Pool, scope.IdentityKind = a.PodUID, notAfter, profile.Pool, brokercore.KindProxyAttested
 	return scope, nil

@@ -1,6 +1,7 @@
 package brokercore
 
 import (
+	"errors"
 	"io"
 	"net"
 	"slices"
@@ -54,3 +55,23 @@ func ConnKinds(c net.Conn) []string {
 
 // KindAdmitted reports whether a scope of this kind may use the listener.
 func KindAdmitted(kinds []string, kind string) bool { return slices.Contains(kinds, kind) }
+
+// deniedError is an identity refusal with a fixed reason code. It is
+// ErrInvalidSession to every caller; the reason only reaches the broker's own
+// log, so an operator can tell which check refused a workload.
+type deniedError struct{ reason string }
+
+func (e deniedError) Error() string        { return "workload not admitted: " + e.reason }
+func (e deniedError) Is(target error) bool { return target == ErrInvalidSession }
+
+// Denied returns ErrInvalidSession carrying a fixed reason code.
+func Denied(reason string) error { return deniedError{reason: reason} }
+
+// DenialReason returns the reason code of a refusal, or "".
+func DenialReason(err error) string {
+	var d deniedError
+	if errors.As(err, &d) {
+		return d.reason
+	}
+	return ""
+}

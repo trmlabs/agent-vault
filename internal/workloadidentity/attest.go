@@ -117,19 +117,18 @@ func (r *Resolver) fetchSigningKeys(ctx context.Context, d *domain, flight chan 
 // domain that issued it, and its claims against that domain's policy. It is
 // authentication, not a pre-filter.
 func (r *Resolver) verifyLocally(ctx context.Context, token string, renewal bool) (claims, *domain, error) {
-	deny := brokercore.ErrInvalidSession
 	if len(token) == 0 || len(token) > 32768 {
-		return claims{}, nil, deny
+		return claims{}, nil, brokercore.Denied("token_format")
 	}
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
-		return claims{}, nil, deny
+		return claims{}, nil, brokercore.Denied("token_format")
 	}
 	headerBytes, err1 := base64.RawURLEncoding.DecodeString(parts[0])
 	payload, err2 := base64.RawURLEncoding.DecodeString(parts[1])
 	signature, err3 := base64.RawURLEncoding.DecodeString(parts[2])
 	if err1 != nil || err2 != nil || err3 != nil {
-		return claims{}, nil, deny
+		return claims{}, nil, brokercore.Denied("token_format")
 	}
 	var header struct {
 		Alg, Kid, Typ string
@@ -137,27 +136,30 @@ func (r *Resolver) verifyLocally(ctx context.Context, token string, renewal bool
 	}
 	var c claims
 	if json.Unmarshal(headerBytes, &header) != nil || header.Alg != "RS256" || header.Kid == "" || len(header.Crit) != 0 || json.Unmarshal(payload, &c) != nil {
-		return claims{}, nil, deny
+		return claims{}, nil, brokercore.Denied("token_format")
 	}
 	// The issuer picks the domain; its keys alone can then verify the token.
 	d := r.domainFor(c.Issuer)
 	if d == nil {
-		return claims{}, nil, deny
+		return claims{}, nil, brokercore.Denied("token_issuer")
 	}
 	now := r.now().Unix()
 	// A renewal recheck of an open session accepts an expired token; its Pod
 	// must still qualify below. A new connection needs an unexpired token.
 	if !exactly(c.Audience, d.audience) || (c.Expires <= now && !renewal) || c.Issued <= 0 || c.Issued > now+60 || c.NotBefore > now+60 || c.Expires <= c.Issued || c.Expires-c.Issued > d.maxLifetime {
-		return claims{}, nil, deny
+		return claims{}, nil, brokercore.Denied("token_claims")
 	}
 	k := c.Kubernetes
 	if k.Pod.UID == "" || !pathSegment(k.Pod.Name) || !pathSegment(k.Namespace) || k.ServiceAccount.UID == "" || c.Subject != "system:serviceaccount:"+k.Namespace+":"+k.ServiceAccount.Name {
-		return claims{}, nil, deny
+		return claims{}, nil, brokercore.Denied("token_pod_claims")
 	}
 	key := r.signingKey(ctx, d, header.Kid)
 	digest := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
-	if key == nil || rsa.VerifyPKCS1v15(key, crypto.SHA256, digest[:], signature) != nil {
-		return claims{}, nil, deny
+	if key == nil {
+		return claims{}, nil, brokercore.Denied("token_keys_unavailable")
+	}
+	if rsa.VerifyPKCS1v15(key, crypto.SHA256, digest[:], signature) != nil {
+		return claims{}, nil, brokercore.Denied("token_signature")
 	}
 	return c, d, nil
 }
@@ -323,9 +325,8 @@ func (r *Resolver) Reattest(ctx context.Context, token string, peer netip.Addr) 
 }
 
 func (r *Resolver) attest(ctx context.Context, token string, peer netip.Addr, renewal bool) (*brokercore.ProxyScope, error) {
-	deny := brokercore.ErrInvalidSession
 	if !peer.IsValid() || peer.IsLoopback() || peer.IsUnspecified() {
-		return nil, deny
+		return nil, brokercore.Denied("peer")
 	}
 	peer = peer.Unmap()
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(r.config.TimeoutSeconds)*time.Second)
@@ -344,7 +345,7 @@ func (r *Resolver) attest(ctx context.Context, token string, peer netip.Addr, re
 		}
 	}
 	if binding == nil {
-		return nil, deny
+		return nil, brokercore.Denied("no_binding")
 	}
 	attestation := brokercore.AttestationFrom(ctx)
 	if binding.Proxy != nil {
@@ -352,25 +353,28 @@ func (r *Resolver) attest(ctx context.Context, token string, peer netip.Addr, re
 	}
 	// Only a proxy binding may vouch for another Pod.
 	if attestation != "" || d.remote {
-		return nil, deny
+		return nil, brokercore.Denied("attestation_not_proxy")
 	}
 	if len(binding.OwnerUIDs) == 0 {
 		return r.ResolveForProxy(ctx, token, "")
 	}
 	var pod livePod
 	if r.api(ctx, http.MethodGet, "/api/v1/namespaces/"+url.PathEscape(k.Namespace)+"/pods/"+url.PathEscape(k.Pod.Name), nil, &pod) != nil {
-		return nil, deny
+		return nil, brokercore.Denied("pod_unreadable")
 	}
 	notAfter := pod.deadline(binding, c, peer, r.now())
-	if notAfter.IsZero() || !r.profileAdmits(binding.Pool, d, IdentityPodToken, k.Namespace, pod.controllerKind(), pod.images()) {
-		return nil, deny
+	if notAfter.IsZero() {
+		return nil, brokercore.Denied("pod_not_admissible")
+	}
+	if !r.profileAdmits(binding.Pool, d, IdentityPodToken, k.Namespace, pod.controllerKind(), pod.images()) {
+		return nil, brokercore.Denied("catalog_profile")
 	}
 	scope, err := r.grant(ctx, binding, "")
 	if err != nil {
 		return nil, err
 	}
 	if ctx.Err() != nil || (c.Expires <= r.now().Unix() && !renewal) || !r.now().Before(notAfter) {
-		return nil, deny
+		return nil, brokercore.Denied("deadline")
 	}
 	scope.WorkloadID, scope.NotAfter, scope.Pool, scope.IdentityKind = k.Pod.UID, notAfter, binding.Pool, brokercore.KindPodToken
 	return scope, nil

@@ -1,10 +1,14 @@
 package mitm
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"net"
 	"net/netip"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/Infisical/agent-vault/internal/brokercore"
 )
@@ -91,4 +95,24 @@ type kindAttestorScope struct{ scope *brokercore.ProxyScope }
 func (a kindAttestorScope) Attest(context.Context, string, netip.Addr) (*brokercore.ProxyScope, error) {
 	s := *a.scope
 	return &s, nil
+}
+
+// Refusals are logged by reason code, at most once per reason per interval,
+// with the count of those folded in.
+func TestRefusalLogIsRateLimitedByReason(t *testing.T) {
+	var buf bytes.Buffer
+	p := &Proxy{logger: slog.New(slog.NewTextHandler(&buf, nil))}
+	for i := 0; i < 5; i++ {
+		p.logRefusal("proxy_source")
+	}
+	p.logRefusal("catalog_profile")
+	out := buf.String()
+	if strings.Count(out, "reason=proxy_source") != 1 || strings.Count(out, "reason=catalog_profile") != 1 {
+		t.Fatalf("log: %s", out)
+	}
+	p.refusals.last["proxy_source"] = time.Now().Add(-refusalLogEvery)
+	p.logRefusal("proxy_source")
+	if !strings.Contains(buf.String(), "reason=proxy_source count=5") {
+		t.Fatalf("folded count missing: %s", buf.String())
+	}
 }

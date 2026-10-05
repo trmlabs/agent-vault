@@ -179,10 +179,47 @@ func (p *Proxy) resolveAnyScope(ctx context.Context, token, hint string, peer ne
 		scope, err = p.attestor.Attest(ctx, token, peer)
 	}
 	if err != nil || scope == nil {
+		p.logRefusal(brokercore.DenialReason(err))
 		return nil, brokercore.ErrInvalidSession
 	}
 	if !scope.NotAfter.IsZero() && !time.Now().Before(scope.NotAfter) {
+		p.logRefusal("deadline")
 		return nil, brokercore.ErrInvalidSession
 	}
 	return scope, nil
+}
+
+// refusalLogEvery bounds the refusal log: one line per reason per interval,
+// with the count since the last, so a flood of bad callers stays one line.
+const refusalLogEvery = 10 * time.Second
+
+type refusalLog struct {
+	mu     sync.Mutex
+	last   map[string]time.Time
+	counts map[string]int
+}
+
+// logRefusal records why an identity was refused: a fixed code, never a
+// token, name or address.
+func (p *Proxy) logRefusal(reason string) {
+	if reason == "" {
+		reason = "unspecified"
+	}
+	l := &p.refusals
+	l.mu.Lock()
+	if l.last == nil {
+		l.last, l.counts = map[string]time.Time{}, map[string]int{}
+	}
+	l.counts[reason]++
+	now := time.Now()
+	if now.Sub(l.last[reason]) < refusalLogEvery {
+		l.mu.Unlock()
+		return
+	}
+	count := l.counts[reason]
+	l.last[reason], l.counts[reason] = now, 0
+	l.mu.Unlock()
+	if p.logger != nil {
+		p.logger.Warn("workload identity refused", "reason", reason, "count", count)
+	}
 }

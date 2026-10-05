@@ -2,6 +2,7 @@ package workloadidentity
 
 import (
 	"context"
+	"errors"
 	"net/netip"
 	"testing"
 	"time"
@@ -466,4 +467,61 @@ func TestProxyImagePrefixes(t *testing.T) {
 			t.Errorf("%s: accepted", name)
 		}
 	}
+}
+
+// Each refusal names the check that refused it, as a fixed code, and is
+// still ErrInvalidSession to every caller.
+func TestRefusalsNameTheirCheck(t *testing.T) {
+	p := setupProxy(t)
+	token := p.rc.token(p.rc.claims())
+	unknown := p.a
+	unknown.Namespace = "other-sandboxes"
+	wrongProfile := p.a
+	wrongProfile.Profile = "agent-sandbox-orion"
+	for want, call := range map[string]func() error{
+		"proxy_source": func() error {
+			_, err := p.r.Attest(p.ctx(t, p.a), token, netip.MustParseAddr("10.201.0.7"))
+			return err
+		},
+		"attestation_namespace": func() error { _, err := p.r.Attest(p.ctx(t, unknown), token, linkIP); return err },
+		"attestation_profile":   func() error { _, err := p.r.Attest(p.ctx(t, wrongProfile), token, linkIP); return err },
+		"catalog_profile": func() error {
+			p.r.SetProfiles(func(string) (Profile, bool) { return Profile{}, false })
+			defer setupProfiles(p)
+			_, err := p.r.Attest(p.ctx(t, p.a), token, linkIP)
+			return err
+		},
+		"token_issuer": func() error {
+			c := p.rc.claims()
+			c.Issuer = "https://unknown.example"
+			_, err := p.r.Attest(p.ctx(t, p.a), p.rc.token(c), linkIP)
+			return err
+		},
+		"attestation_not_proxy": func() error {
+			_, err := p.r.Attest(p.ctx(t, p.a), p.pool.token(p.pool.c), workerIP)
+			return err
+		},
+	} {
+		err := call()
+		if brokercore.DenialReason(err) != want || !errors.Is(err, brokercore.ErrInvalidSession) {
+			t.Errorf("%s: got %v", want, err)
+		}
+	}
+}
+
+// setupProfiles restores the fixture's catalog profiles.
+func setupProfiles(p *proxyFixture) {
+	p.r.SetProfiles(func(pool string) (Profile, bool) {
+		profile := Profile{Issuer: remoteIssuer, Audience: "gatehouse-edge", Remote: true, Kind: IdentityProxyAttested, OwnerKind: "Sandbox",
+			ImageDigests: []string{workerDigest}}
+		switch pool {
+		case "sandboxes":
+			profile.Name, profile.Namespaces = "agent-sandbox-developers", []string{"agent-sandboxes"}
+		case "orion":
+			profile.Name, profile.Namespaces = "agent-sandbox-orion", []string{"orion-sandboxes"}
+		default:
+			return Profile{}, false
+		}
+		return profile, true
+	})
 }

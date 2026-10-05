@@ -55,6 +55,7 @@ type Proxy struct {
 	isListening           atomic.Bool
 	baseURL               string // externally-reachable control-plane URL for help links
 	logger                *slog.Logger
+	refusals              refusalLog
 	rateLimit             *ratelimit.Registry // shared with the HTTP server; nil = no-op
 	logSink               requestlog.Sink     // never nil (Nop default); shared with the HTTP server
 	maxResponseBytes      int64               // 0 = unlimited
