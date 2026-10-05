@@ -22,7 +22,10 @@ import (
 var _ brokercore.Attestor = (*Resolver)(nil)
 
 const (
-	jwksMaxAge         = time.Hour
+	jwksMaxAge = time.Hour
+	// jwksMaxStale bounds how long the last good keys stand while refetches
+	// fail: a key the cluster rotated out stops verifying within a day.
+	jwksMaxStale       = 24 * time.Hour
 	jwksRefetchBackoff = 30 * time.Second
 	jwksFetchTimeout   = 10 * time.Second
 )
@@ -49,7 +52,11 @@ func (r *Resolver) signingKey(ctx context.Context, d *domain, kid string) *rsa.P
 		// An unknown kid or an old set triggers a refetch for key rotation, at
 		// most every 30 s; meanwhile the last good keys stand.
 		if (key != nil && now.Sub(j.fetched) < jwksMaxAge) || waited || (!j.attempted.IsZero() && now.Sub(j.attempted) < jwksRefetchBackoff) {
+			stale := now.Sub(j.fetched) > jwksMaxStale
 			j.mu.Unlock()
+			if stale {
+				return nil
+			}
 			return key
 		}
 		flight := j.flight
