@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -38,6 +39,10 @@ type Binding struct {
 	ContainerName string   `json:"containerName,omitempty"`
 	MaxPodSeconds int64    `json:"maxPodSeconds,omitempty"`
 	Pool          string   `json:"pool,omitempty"` // catalog pool name reported as ProxyScope.Pool
+	// ImageDigests lists the image digests (sha256:<64 hex>) every container of
+	// a pool Pod must run, so a Pod whose image is swapped keeps its UID, owner
+	// and token but is no longer admitted.
+	ImageDigests []string `json:"imageDigests,omitempty"`
 	// ListAgents is valid only in observer policy. It lets the admission
 	// controller read every agent's outstanding cleanup by agent and Pod UID.
 	ListAgents bool `json:"listAgents,omitempty"`
@@ -73,6 +78,8 @@ type Resolver struct {
 }
 
 var _ brokercore.SessionResolver = (*Resolver)(nil)
+
+var imageDigest = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
 // LoadConfig reads a bounded JSON policy and rejects unknown fields.
 func LoadConfig(path string) (Config, error) {
@@ -140,7 +147,7 @@ func newResolver(c Config, s Store, observer bool) (*Resolver, error) {
 		if observer && (b.AgentID != "" || b.VaultID != "") {
 			return nil, errors.New("observer policy must not contain proxy grants")
 		}
-		if len(b.OwnerUIDs) != 0 || b.ContainerName != "" || b.MaxPodSeconds != 0 || b.Pool != "" {
+		if len(b.OwnerUIDs) != 0 || b.ContainerName != "" || b.MaxPodSeconds != 0 || b.Pool != "" || len(b.ImageDigests) != 0 {
 			if b.Pool != "" && !pathSegment(b.Pool) {
 				return nil, errors.New("pool binding name must be a lowercase DNS-style name")
 			}
@@ -150,6 +157,14 @@ func newResolver(c Config, s Store, observer bool) (*Resolver, error) {
 			for _, owner := range b.OwnerUIDs {
 				if owner == "" {
 					return nil, errors.New("pool binding owner UID must be non-empty")
+				}
+			}
+			if len(b.ImageDigests) == 0 || len(b.ImageDigests) > 16 {
+				return nil, errors.New("pool binding requires 1 to 16 image digests")
+			}
+			for _, digest := range b.ImageDigests {
+				if !imageDigest.MatchString(digest) {
+					return nil, errors.New("pool binding image digest must be sha256: and 64 lowercase hex characters")
 				}
 			}
 		}

@@ -59,7 +59,8 @@ func setupPool(t *testing.T) *poolFixture {
 			"ownerReferences": []any{map[string]any{"uid": "pool-controller-uid", "controller": controller, "blockOwnerDeletion": true}}},
 		"spec": map[string]any{"serviceAccountName": "worker", "activeDeadlineSeconds": 1800},
 		"status": map[string]any{"phase": "Running", "podIP": workerIP.String(), "startTime": f.start.UTC().Format(time.RFC3339),
-			"containerStatuses": []any{map[string]any{"name": "agent", "restartCount": 0, "state": map[string]any{"running": map[string]any{}}}}},
+			"containerStatuses":     []any{map[string]any{"name": "agent", "imageID": "registry.example/worker@" + workerDigest, "restartCount": 0, "state": map[string]any{"running": map[string]any{}}}},
+			"initContainerStatuses": []any{map[string]any{"name": "gatehouse-sidecar", "imageID": "registry.example/broker@" + sidecarDigest, "restartCount": 0, "state": map[string]any{"running": map[string]any{}}}}},
 	}
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer reviewer" {
@@ -97,7 +98,8 @@ func setupPool(t *testing.T) *poolFixture {
 	os.WriteFile(tokenFile, []byte("reviewer"), 0600)
 	c := Config{APIServer: srv.URL, CAFile: caFile, ReviewerTokenFile: tokenFile, Issuer: f.c.Issuer, Audience: "gatehouse",
 		Bindings: []Binding{{Namespace: "pool", ServiceAccount: "worker", ServiceAccountUID: "account-uid", AgentID: "agent", VaultID: "vault",
-			OwnerUIDs: []string{"pool-controller-uid"}, ContainerName: "agent", MaxPodSeconds: 3600, Pool: "database-developers"}}}
+			OwnerUIDs: []string{"pool-controller-uid"}, ContainerName: "agent", MaxPodSeconds: 3600, Pool: "database-developers",
+			ImageDigests: []string{workerDigest, sidecarDigest}}}}
 	r, err := New(c, &fakeStore{status: "active", role: "proxy"})
 	if err != nil {
 		t.Fatal(err)
@@ -116,6 +118,13 @@ func (f *poolFixture) tokenWithKid(c claims, kid string) string {
 	sig, _ := rsa.SignPKCS1v15(rand.Reader, f.key, crypto.SHA256, digest[:])
 	return input + "." + base64.RawURLEncoding.EncodeToString(sig)
 }
+
+// The worker and its native sidecar run approved images.
+const (
+	workerDigest  = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+	sidecarDigest = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+	otherDigest   = "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+)
 
 func TestAttestAdmitsPoolPodWithItsDeadline(t *testing.T) {
 	f := setupPool(t)
@@ -178,6 +187,24 @@ func TestAttestRefusals(t *testing.T) {
 			f.pod["status"].(map[string]any)["containerStatuses"] = []any{map[string]any{"name": "agent", "restartCount": 1, "state": map[string]any{"running": map[string]any{}}}}
 			return f.token(f.c), workerIP
 		},
+		"swapped worker image": func(f *poolFixture) (string, netip.Addr) {
+			f.pod["status"].(map[string]any)["containerStatuses"].([]any)[0].(map[string]any)["imageID"] = "registry.example/worker@" + otherDigest
+			return f.token(f.c), workerIP
+		},
+		"unlisted init container image": func(f *poolFixture) (string, netip.Addr) {
+			status := f.pod["status"].(map[string]any)
+			status["initContainerStatuses"] = append(status["initContainerStatuses"].([]any),
+				map[string]any{"name": "setup", "imageID": "registry.example/setup@" + otherDigest, "state": map[string]any{}})
+			return f.token(f.c), workerIP
+		},
+		"ephemeral container": func(f *poolFixture) (string, netip.Addr) {
+			f.pod["spec"].(map[string]any)["ephemeralContainers"] = []any{map[string]any{"name": "debugger", "image": "busybox"}}
+			return f.token(f.c), workerIP
+		},
+		"image not yet resolved": func(f *poolFixture) (string, netip.Addr) {
+			f.pod["status"].(map[string]any)["initContainerStatuses"].([]any)[0].(map[string]any)["imageID"] = ""
+			return f.token(f.c), workerIP
+		},
 		"not running": func(f *poolFixture) (string, netip.Addr) {
 			f.pod["status"].(map[string]any)["phase"] = "Pending"
 			return f.token(f.c), workerIP
@@ -232,14 +259,31 @@ func TestPoolBindingNeverAdmittedWithoutPeer(t *testing.T) {
 }
 
 func TestPoolBindingValidation(t *testing.T) {
-	base := Binding{Namespace: "pool", ServiceAccount: "worker", ServiceAccountUID: "u", AgentID: "a", VaultID: "v", OwnerUIDs: []string{"o"}, MaxPodSeconds: 1800}
+	base := Binding{Namespace: "pool", ServiceAccount: "worker", ServiceAccountUID: "u", AgentID: "a", VaultID: "v", OwnerUIDs: []string{"o"}, MaxPodSeconds: 1800,
+		ImageDigests: []string{workerDigest}}
+	f := setupPool(t)
+	c := f.r.config
+	c.Bindings = []Binding{base}
+	if _, err := New(c, &fakeStore{status: "active", role: "proxy"}); err != nil {
+		t.Fatalf("valid pool binding refused: %v", err)
+	}
 	for name, mutate := range map[string]func(*Binding){
-		"Pod UID pinned":    func(b *Binding) { b.PodUID = "p" },
-		"lifetime too long": func(b *Binding) { b.MaxPodSeconds = 9 * 3600 },
-		"lifetime missing":  func(b *Binding) { b.MaxPodSeconds = 0 },
-		"empty owner":       func(b *Binding) { b.OwnerUIDs = []string{""} },
-		"bad container":     func(b *Binding) { b.ContainerName = "Bad Name" },
-		"bad pool name":     func(b *Binding) { b.Pool = "Pool A" },
+		"no image digests":        func(b *Binding) { b.ImageDigests = nil },
+		"malformed image digest":  func(b *Binding) { b.ImageDigests = []string{"sha256:ABC"} },
+		"tag instead of a digest": func(b *Binding) { b.ImageDigests = []string{"worker:latest"} },
+		"too many image digests": func(b *Binding) {
+			b.ImageDigests = nil
+			for range 17 {
+				b.ImageDigests = append(b.ImageDigests, workerDigest)
+			}
+		},
+		"digests on a non-pool binding": func(b *Binding) { b.OwnerUIDs, b.MaxPodSeconds = nil, 0 },
+		"Pod UID pinned":                func(b *Binding) { b.PodUID = "p" },
+		"lifetime too long":             func(b *Binding) { b.MaxPodSeconds = 9 * 3600 },
+		"lifetime missing":              func(b *Binding) { b.MaxPodSeconds = 0 },
+		"empty owner":                   func(b *Binding) { b.OwnerUIDs = []string{""} },
+		"bad container":                 func(b *Binding) { b.ContainerName = "Bad Name" },
+		"bad pool name":                 func(b *Binding) { b.Pool = "Pool A" },
 	} {
 		b := base
 		mutate(&b)

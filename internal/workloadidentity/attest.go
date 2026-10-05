@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -161,22 +162,45 @@ type livePod struct {
 		} `json:"ownerReferences"`
 	} `json:"metadata"`
 	Spec struct {
-		ServiceAccountName    string `json:"serviceAccountName"`
-		ActiveDeadlineSeconds *int64 `json:"activeDeadlineSeconds"`
+		ServiceAccountName    string     `json:"serviceAccountName"`
+		ActiveDeadlineSeconds *int64     `json:"activeDeadlineSeconds"`
+		EphemeralContainers   []struct{} `json:"ephemeralContainers"`
 	} `json:"spec"`
 	Status struct {
-		Phase             string                `json:"phase"`
-		PodIP             string                `json:"podIP"`
-		PodIPs            []struct{ IP string } `json:"podIPs"`
-		StartTime         *time.Time            `json:"startTime"`
-		ContainerStatuses []struct {
-			Name         string `json:"name"`
-			RestartCount int    `json:"restartCount"`
-			State        struct {
-				Running *struct{} `json:"running"`
-			} `json:"state"`
-		} `json:"containerStatuses"`
+		Phase                 string                `json:"phase"`
+		PodIP                 string                `json:"podIP"`
+		PodIPs                []struct{ IP string } `json:"podIPs"`
+		StartTime             *time.Time            `json:"startTime"`
+		ContainerStatuses     []containerStatus     `json:"containerStatuses"`
+		InitContainerStatuses []containerStatus     `json:"initContainerStatuses"`
 	} `json:"status"`
+}
+
+type containerStatus struct {
+	Name         string `json:"name"`
+	ImageID      string `json:"imageID"`
+	RestartCount int    `json:"restartCount"`
+	State        struct {
+		Running *struct{} `json:"running"`
+	} `json:"state"`
+}
+
+// imagesAllowed reports whether every container and init container (a native
+// sidecar is one) runs an image whose digest the binding lists, and no
+// ephemeral container was added. A container not yet started has no imageID
+// and fails.
+func (p *livePod) imagesAllowed(digests []string) bool {
+	if len(p.Spec.EphemeralContainers) != 0 || len(p.Status.ContainerStatuses) == 0 {
+		return false
+	}
+	for _, s := range append(append([]containerStatus(nil), p.Status.ContainerStatuses...), p.Status.InitContainerStatuses...) {
+		// repo@sha256:..., or a bare sha256:... for a locally loaded image.
+		digest := s.ImageID[strings.LastIndexByte(s.ImageID, '@')+1:]
+		if digest == "" || !slices.Contains(digests, digest) {
+			return false
+		}
+	}
+	return true
 }
 
 // deadline returns when the Pod's admission ends, or the zero time if it is
@@ -220,6 +244,9 @@ func (p *livePod) deadline(b *Binding, c claims, peer netip.Addr, now time.Time)
 		}
 	}
 	if !owned {
+		return time.Time{}
+	}
+	if !p.imagesAllowed(b.ImageDigests) {
 		return time.Time{}
 	}
 	if b.ContainerName != "" {
