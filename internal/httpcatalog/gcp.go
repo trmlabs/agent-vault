@@ -53,7 +53,7 @@ var gcpForwardHeaders = []string{"Accept", "Content-Type", "User-Agent", "X-Goog
 	"X-Upload-Content-Type", "X-Upload-Content-Length", "Content-Range", "Range", "If-Match", "If-None-Match"}
 
 func (e *Entry) normalizeGCP() error {
-	if e.Git != nil || e.Postgres != nil || e.BrowserSession != nil || e.Key != (KeyRef{}) || e.Header != "" || e.Scheme != "" {
+	if e.Git != nil || e.Postgres != nil || e.BrowserSession != nil || e.Key != (KeyRef{}) || e.Header != "" || e.Scheme != "" || e.BasicUser {
 		return errors.New("gcp entries take host, pools, placeholder, tier, gcp and optional paths, methods and forward headers")
 	}
 	g := e.GCP

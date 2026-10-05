@@ -241,3 +241,19 @@ func TestTTLIsCappedAtOneMinute(t *testing.T) {
 		t.Fatal("a TTL above one minute was honored")
 	}
 }
+
+// basicUser applies only to HTTP header entries; a browser or Google entry
+// that sets it is refused at load instead of silently ignoring it.
+func TestBasicUserRefusedOnBrowserAndGoogleEntries(t *testing.T) {
+	browser := `{"entries":[` + browserEntryJSON(`,"basicUser":true`) + `]}`
+	if _, err := Parse([]byte(browser)); err == nil {
+		t.Fatal("basicUser on a browser-session entry was accepted")
+	}
+	gcp := `{` + gcpPools + `,"entries":[` + strings.Replace(gcsEntry, `"kind":"gcp",`, `"kind":"gcp","basicUser":true,`, 1) + `]}`
+	if _, err := Parse([]byte(gcp)); err == nil {
+		t.Fatal("basicUser on a gcp entry was accepted")
+	}
+	if _, err := Parse([]byte(`{` + gcpPools + `,"entries":[` + gcsEntry + `]}`)); err != nil {
+		t.Fatalf("control gcp entry: %v", err)
+	}
+}
