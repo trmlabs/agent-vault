@@ -12,21 +12,21 @@ Not all of this is live yet:
 
 | Part | Status |
 |---|---|
-| Gatehouse support for all six destination kinds | Built on the agent-vault `noah/gatehouse-integration` branch; not merged to main or in a release yet |
-| Adding an entry with one trm-infra pull request | The module is written on the trm-infra `noah/gatehouse-catalog` branch; it has no pull request yet and is not merged or connected to Vault |
-| Entries limited to named people (tiers T1 and T2) | Refused today. The live Entra group lookup stays off until Security approves its app registration. |
+| Gatehouse support for all six destination kinds | Added by agent-vault #22 to #24; not in a release yet |
+| Adding an entry with one trm-infra pull request | The module is trm-infra #1041. Nothing calls it yet; a follow-up pull request adds the catalog file and connects it to Vault |
+| Entries limited to named people (tiers T1 and T2) | Refused today. The live Entra group lookup stays off until its app registration exists. |
 | Database entries above T0 | The database path carries the person's session, so T1 and T2 databases work once the Entra lookup is on, as for HTTP |
 | Repository and pull request entries | Wait for the GitHub App, which is not created yet |
 
 ## Add a destination with one catalog entry
 
-Once the trm-infra module is merged, the catalog is `gatehouse-catalog.yaml`,
+Once the trm-infra module is wired in, the catalog is `gatehouse-catalog.yaml`,
 read by `vault/terraform/modules/gatehouse-catalog` in trm-infra. You add one
 entry and open one pull request; Atlantis, the Terraform pull request bot,
 creates the Vault access the entry needs, and Gatehouse picks up the change
 within 30 seconds with no restart. Check an entry locally first, with an
-`agent-vault` binary built from the `noah/gatehouse-integration` branch (the
-command is not in a release yet):
+`agent-vault` binary built from this repository (the command is not in a
+release yet):
 
 ```sh
 agent-vault broker-catalog validate --require-pools gatehouse-catalog.yaml
@@ -134,6 +134,22 @@ end-to-end test harness's.
 
 - **Trust:** the worker must trust Gatehouse's interception certificate authority, at `/public/mitm-ca.crt` in the harness. Point `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE` or `REQUESTS_CA_BUNDLE` at it.
 - **Database startup settings:** `application_name`, `client_encoding`, `DateStyle`, `extra_float_digits`, `search_path`, `standard_conforming_strings`, `statement_timeout` and `TimeZone` (so `PGTZ` works) are accepted. Anything else, including `options`, is refused; use `SET` after connecting.
+
+## From a Cursor self-hosted worker
+
+Pick the Gatehouse pool in Cursor's environment picker and use the standard
+connection strings and environment variables the pool's worker template sets;
+there is no SDK. The staging pool, its variables and its limits are in
+trm-internal-apps, `apps/gatehouse/runbooks/cursor-developer.md`.
+
+- **Tier T0 only:** Cursor does not tell Gatehouse who started a task, so a
+  Cursor pool has no person behind it and a ceiling of T0. A catalog that
+  grants a Cursor pool an entry above T0 is refused when Gatehouse loads it.
+- **No group control on the pool:** anyone in the Cursor team who can use
+  self-hosted machines can pick any team pool. Grant a Cursor pool only data
+  every such person may read.
+- **Group-limited entries:** use a Claude pool, where Gatehouse verifies the
+  person and checks their groups on each request.
 
 ## Every refusal names its cause
 
