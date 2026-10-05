@@ -278,3 +278,16 @@ func TestHarnessImagePrefixes(t *testing.T) {
 		}
 	}
 }
+
+// Pinned keys are another cluster's keys, as remote ones are.
+func TestHarnessPinnedKeys(t *testing.T) {
+	c := harnessCatalog()
+	harnessAt(c, 2)["trustDomain"].(map[string]any)["keys"] = "pinned"
+	if _, err := parseCatalog(t, c); err != nil {
+		t.Fatalf("pinned cross-cluster harness refused: %v", err)
+	}
+	harnessAt(c, 2)["path"].(map[string]any)["crossCluster"] = false
+	if _, err := parseCatalog(t, c); err == nil {
+		t.Fatal("pinned keys on a same-cluster path accepted")
+	}
+}

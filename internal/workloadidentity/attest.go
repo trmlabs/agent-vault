@@ -3,6 +3,7 @@ package workloadidentity
 import (
 	"context"
 	"crypto"
+	"crypto/ecdsa"
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
@@ -37,13 +38,13 @@ const (
 // fails the admissions the cached keys can still verify.
 type signingKeys struct {
 	mu        sync.Mutex
-	keys      map[string]*rsa.PublicKey
+	keys      map[string]crypto.PublicKey
 	fetched   time.Time     // last successful fetch
 	attempted time.Time     // last fetch started
 	flight    chan struct{} // closed when the running fetch ends
 }
 
-func (r *Resolver) signingKey(ctx context.Context, d *domain, kid string) *rsa.PublicKey {
+func (r *Resolver) signingKey(ctx context.Context, d *domain, kid string) crypto.PublicKey {
 	j := d.keys
 	for waited := false; ; waited = true {
 		j.mu.Lock()
@@ -82,26 +83,15 @@ func (r *Resolver) fetchSigningKeys(ctx context.Context, d *domain, flight chan 
 	ctx, cancel := context.WithTimeout(ctx, jwksFetchTimeout)
 	defer cancel()
 	var set struct {
-		Keys []struct {
-			Kty, Kid, Alg, Use, N, E string
-		} `json:"keys"`
+		Keys []map[string]any `json:"keys"`
 	}
 	err := d.fetch(ctx, &set)
-	keys := map[string]*rsa.PublicKey{}
-	for _, k := range set.Keys {
-		if k.Kty != "RSA" || k.Kid == "" || (k.Alg != "" && k.Alg != "RS256") || (k.Use != "" && k.Use != "sig") {
-			continue
+	keys := map[string]crypto.PublicKey{}
+	for _, m := range set.Keys {
+		// A published set may hold keys this broker cannot use; skip them.
+		if kid, key, ok := parseJWK(m); ok {
+			keys[kid] = key
 		}
-		n, errN := base64.RawURLEncoding.DecodeString(k.N)
-		e, errE := base64.RawURLEncoding.DecodeString(k.E)
-		if errN != nil || errE != nil || len(n) < 256 || len(e) == 0 || len(e) > 4 {
-			continue
-		}
-		exponent := int(new(big.Int).SetBytes(e).Int64())
-		if exponent < 3 || exponent%2 == 0 {
-			continue
-		}
-		keys[k.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(n), E: exponent}
 	}
 	j := d.keys
 	j.mu.Lock()
@@ -135,7 +125,7 @@ func (r *Resolver) verifyLocally(ctx context.Context, token string, renewal bool
 		Crit          []string
 	}
 	var c claims
-	if json.Unmarshal(headerBytes, &header) != nil || header.Alg != "RS256" || header.Kid == "" || len(header.Crit) != 0 || json.Unmarshal(payload, &c) != nil {
+	if json.Unmarshal(headerBytes, &header) != nil || (header.Alg != "RS256" && header.Alg != "ES256") || header.Kid == "" || len(header.Crit) != 0 || json.Unmarshal(payload, &c) != nil {
 		return claims{}, nil, brokercore.Denied("token_format")
 	}
 	// The issuer picks the domain; its keys alone can then verify the token.
@@ -153,12 +143,18 @@ func (r *Resolver) verifyLocally(ctx context.Context, token string, renewal bool
 	if k.Pod.UID == "" || !pathSegment(k.Pod.Name) || !pathSegment(k.Namespace) || k.ServiceAccount.UID == "" || c.Subject != "system:serviceaccount:"+k.Namespace+":"+k.ServiceAccount.Name {
 		return claims{}, nil, brokercore.Denied("token_pod_claims")
 	}
-	key := r.signingKey(ctx, d, header.Kid)
-	digest := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
-	if key == nil {
+	var key crypto.PublicKey
+	if d.pinned != nil {
+		// Pinned keys: no fetch. A kid outside the set is a rotation the
+		// configuration has not taken yet, and refuses until it does.
+		if key = d.pinned[header.Kid]; key == nil {
+			return claims{}, nil, brokercore.Denied("token_keys_pinned_mismatch")
+		}
+	} else if key = r.signingKey(ctx, d, header.Kid); key == nil {
 		return claims{}, nil, brokercore.Denied("token_keys_unavailable")
 	}
-	if rsa.VerifyPKCS1v15(key, crypto.SHA256, digest[:], signature) != nil {
+	digest := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+	if !verifySignature(header.Alg, key, digest[:], signature) {
 		return claims{}, nil, brokercore.Denied("token_signature")
 	}
 	return c, d, nil
@@ -389,4 +385,20 @@ func (r *Resolver) attest(ctx context.Context, token string, peer netip.Addr, re
 	}
 	scope.WorkloadID, scope.NotAfter, scope.Pool, scope.IdentityKind = k.Pod.UID, notAfter, binding.Pool, brokercore.KindPodToken
 	return scope, nil
+}
+
+// verifySignature checks a JWS signature with the algorithm the key's type
+// requires: RS256 for RSA, ES256 (r||s, 64 bytes) for EC P-256. A token whose
+// header names the other algorithm fails.
+func verifySignature(alg string, key crypto.PublicKey, digest, signature []byte) bool {
+	switch k := key.(type) {
+	case *rsa.PublicKey:
+		return alg == "RS256" && rsa.VerifyPKCS1v15(k, crypto.SHA256, digest, signature) == nil
+	case *ecdsa.PublicKey:
+		if alg != "ES256" || len(signature) != 64 {
+			return false
+		}
+		return ecdsa.Verify(k, digest, new(big.Int).SetBytes(signature[:32]), new(big.Int).SetBytes(signature[32:]))
+	}
+	return false
 }

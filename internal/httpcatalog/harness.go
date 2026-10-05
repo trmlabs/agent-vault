@@ -40,7 +40,8 @@ type HarnessClient struct {
 
 // HarnessTrustDomain is the cluster whose service-account tokens the broker
 // accepts for this harness. Keys "in-cluster" reads the signing keys from the
-// broker's own cluster API; "remote" fetches the issuer's published keys.
+// broker's own cluster API; "remote" fetches the issuer's published keys;
+// "pinned" holds them in the broker's identity configuration, fetched never.
 type HarnessTrustDomain struct {
 	Issuer   string `json:"issuer"`
 	Keys     string `json:"keys"`
@@ -108,6 +109,7 @@ const (
 
 	KeysInCluster = "in-cluster"
 	KeysRemote    = "remote"
+	KeysPinned    = "pinned"
 
 	AuthorizePool   = "pool"
 	AuthorizePerson = "person"
@@ -131,8 +133,8 @@ func (h Harness) validate() error {
 	if td.Issuer == "" || err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || len(td.Issuer) > 512 {
 		return errors.New("trustDomain.issuer must be an HTTPS URL")
 	}
-	if td.Keys != KeysInCluster && td.Keys != KeysRemote {
-		return fmt.Errorf("trustDomain.keys %q: in-cluster or remote", td.Keys)
+	if td.Keys != KeysInCluster && td.Keys != KeysRemote && td.Keys != KeysPinned {
+		return fmt.Errorf("trustDomain.keys %q: in-cluster, remote or pinned", td.Keys)
 	}
 	if !audiencePat.MatchString(td.Audience) {
 		return errors.New("trustDomain.audience is required")
@@ -223,8 +225,8 @@ func (h Harness) validate() error {
 	}
 	// The broker reads Pods only in its own cluster, so an agent in another
 	// cluster is attested by a proxy there, whose keys are fetched remotely.
-	if h.Path.CrossCluster != (td.Keys == KeysRemote) {
-		return errors.New("a cross-cluster path uses remote keys, and only it does")
+	if h.Path.CrossCluster != (td.Keys != KeysInCluster) {
+		return errors.New("a cross-cluster path uses another cluster's keys (remote or pinned), and only it does")
 	}
 	if h.Path.CrossCluster && id.Kind != IdentityProxyAttested {
 		return errors.New("a cross-cluster harness must be proxy-attested")

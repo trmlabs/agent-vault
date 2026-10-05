@@ -2,6 +2,7 @@ package workloadidentity
 
 import (
 	"context"
+	"crypto"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -24,12 +25,15 @@ type TrustDomain struct {
 	Name     string `json:"name"`
 	Issuer   string `json:"issuer"`
 	Audience string `json:"audience"`
-	// Keys must be "remote". JWKSURL is the HTTPS address of the issuer's
-	// published keys (for GKE, the issuer URL followed by /jwks). CAFile, when
-	// set, replaces the system roots for that address.
-	Keys    string `json:"keys"`
-	JWKSURL string `json:"jwksURL"`
-	CAFile  string `json:"caFile,omitempty"`
+	// Keys is "remote" or "pinned". Remote: JWKSURL is the HTTPS address of
+	// the issuer's published keys (for GKE, the issuer URL followed by
+	// /jwks), and CAFile, when set, replaces the system roots for it.
+	// Pinned: JWKS holds the issuer's public key set itself, and the broker
+	// never fetches; a key the set lacks refuses until the set is updated.
+	Keys    string          `json:"keys"`
+	JWKSURL string          `json:"jwksURL,omitempty"`
+	CAFile  string          `json:"caFile,omitempty"`
+	JWKS    json.RawMessage `json:"jwks,omitempty"`
 	// MaxTokenLifetimeSeconds bounds accepted tokens (default 3600). A remote
 	// token is never checked against a live Pod in the broker's cluster, so
 	// its lifetime is the revocation window.
@@ -46,6 +50,7 @@ type domain struct {
 	remote      bool
 	keys        *signingKeys
 	fetch       func(context.Context, any) error
+	pinned      map[string]crypto.PublicKey // set for keys "pinned"; nil otherwise
 }
 
 // remoteKeys returns a fetch for a published key set: HTTPS only, no
@@ -113,8 +118,8 @@ func (r *Resolver) buildDomains(c Config) error {
 		if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || issuers[td.Issuer] {
 			return errors.New("trust domain issuer must be a distinct HTTPS URL")
 		}
-		if td.Audience == "" || td.Keys != "remote" {
-			return errors.New("trust domain needs an audience and remote keys")
+		if td.Audience == "" || (td.Keys != "remote" && td.Keys != "pinned") {
+			return errors.New("trust domain needs an audience and remote or pinned keys")
 		}
 		if td.MaxTokenLifetimeSeconds == 0 {
 			td.MaxTokenLifetimeSeconds = 3600
@@ -122,13 +127,26 @@ func (r *Resolver) buildDomains(c Config) error {
 		if td.MaxTokenLifetimeSeconds < 600 || td.MaxTokenLifetimeSeconds > 3600 {
 			return errors.New("trust domain maxTokenLifetimeSeconds must be between 600 and 3600")
 		}
-		fetch, err := remoteKeys(td, jwksFetchTimeout)
-		if err != nil {
-			return err
+		dom := &domain{name: td.Name, issuer: td.Issuer, audience: td.Audience, maxLifetime: td.MaxTokenLifetimeSeconds, remote: true, keys: &signingKeys{}}
+		if td.Keys == "pinned" {
+			if td.JWKSURL != "" || td.CAFile != "" {
+				return errors.New("a pinned trust domain takes no jwksURL or caFile")
+			}
+			pinned, err := parsePinnedJWKS(td.JWKS)
+			if err != nil {
+				return err
+			}
+			dom.pinned = pinned
+		} else {
+			if len(td.JWKS) != 0 {
+				return errors.New("a remote trust domain takes no pinned jwks")
+			}
+			if dom.fetch, err = remoteKeys(td, jwksFetchTimeout); err != nil {
+				return err
+			}
 		}
 		names[td.Name], issuers[td.Issuer] = true, true
-		r.domains = append(r.domains, &domain{name: td.Name, issuer: td.Issuer, audience: td.Audience,
-			maxLifetime: td.MaxTokenLifetimeSeconds, remote: true, keys: &signingKeys{}, fetch: fetch})
+		r.domains = append(r.domains, dom)
 	}
 	return nil
 }
