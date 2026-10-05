@@ -102,6 +102,8 @@ type adapterFixture struct {
 	seen     atomic.Value // http.Header of the last vendor request
 	release  chan struct{}
 	sessions *scopeResolver
+	proxyURL *url.URL
+	roots    *x509.CertPool
 }
 
 // scopeResolver lets a test change the admitted scope without touching the
@@ -201,7 +203,7 @@ func newAdapterFixtureWith(t *testing.T, basic bool, options ...func(*Options)) 
 			option(o)
 		}
 	})
-	f.proxy = p
+	f.proxy, f.proxyURL, f.roots = p, proxyURL, roots
 	vendorRoots := x509.NewCertPool()
 	vendorRoots.AddCert(f.vendor.Certificate())
 	p.upstream.TLSClientConfig.RootCAs = vendorRoots

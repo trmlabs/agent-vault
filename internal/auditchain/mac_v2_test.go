@@ -133,3 +133,42 @@ func hasKind(r Report, kind string) bool {
 	}
 	return false
 }
+
+// A trail written by a v2 broker and then, after an upgrade, a v3 one
+// verifies; a v2 row after a v3 row is a step down and does not.
+func TestUpgradeFromV2VerifiesAndNeverStepsDown(t *testing.T) {
+	writeMACVersion = 2
+	t.Cleanup(func() { writeMACVersion = MACVersionCurrent })
+	f := newFixture(t)
+	f.session(t, 1)
+	f.checkpoint(t)
+	writeMACVersion = MACVersionCurrent
+	f.restart(t)
+	if err := f.chain.Record(Event{Event: EventDenied, Outcome: "authentication", Decision: "identity_token_signature", Kid: "k1", Peer: "10.0.0.5"}); err != nil {
+		t.Fatal(err)
+	}
+	f.session(t, 2)
+	f.checkpoint(t)
+	out := f.out.String()
+	versions := map[int]int{}
+	for _, r := range rows(t, out) {
+		versions[r.MACVersion]++
+	}
+	if versions[2] == 0 || versions[3] == 0 || len(versions) != 2 {
+		t.Fatalf("trail versions %v, want v2 then v3", versions)
+	}
+	if report := verify(t, f.verifier(), out); len(report.Findings) != 0 {
+		t.Fatalf("upgraded trail: %v", kinds(report))
+	}
+	// A forged v2 row with a valid MAC after the v3 rows.
+	parsed := rows(t, out)
+	last := parsed[len(parsed)-1]
+	key, _ := f.keys.lookup(last.KeyVersion)
+	forged := Row{Type: RowType, Replica: last.Replica, Boot: last.Boot, Seq: last.Seq + 1, Time: last.Time,
+		Event: EventSessionOpen, Pool: "claude", KeyVersion: last.KeyVersion, Prev: last.MAC, MACVersion: 2}
+	forged.MAC = forged.computeMAC(key)
+	line, _ := json.Marshal(forged)
+	if report := verify(t, f.verifier(), out+string(line)+"\n"); !hasKind(report, FindingEdit) {
+		t.Fatalf("step down from v3 to v2 accepted: %v", kinds(report))
+	}
+}

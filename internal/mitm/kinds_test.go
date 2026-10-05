@@ -5,10 +5,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/netip"
+	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -154,7 +157,13 @@ func TestKeyRefusalNamesKidAndPeer(t *testing.T) {
 			if !strings.Contains(line, want+" peer=10.20.30.40") || (c.hashed && strings.Contains(line, c.kid)) {
 				t.Fatalf("log line %q", line)
 			}
-			f := newAdapterFixture(t, func(o *Options) { o.Attestor = refusingAttestor{refusal} })
+			var proxyLog bytes.Buffer
+			attestor := &tokenRecordingAttestor{err: refusal}
+			f := newAdapterFixture(t, func(o *Options) {
+				o.Attestor, o.Logger = attestor, slog.New(slog.NewTextHandler(&proxyLog, nil))
+			})
+			// A token shaped like a real one: header, payload, signature.
+			f.client = newTrustingClient(f.proxyURL, url.User(fakeJWT), f.roots)
 			// The tunnel is refused at CONNECT: 403, never 503 for a row the
 			// chain would not take.
 			_, _, err := f.do(t, "GET", "/v1/chat/x", "", nil)
@@ -164,6 +173,20 @@ func TestKeyRefusalNamesKidAndPeer(t *testing.T) {
 			e := f.audit.last()
 			if e.Event != "denied" || e.Decision != "identity_"+c.reason || e.Kid != c.wantKid || e.KidSHA256 != wantHash || e.Peer != "10.20.30.40" || e.Status != 403 {
 				t.Fatalf("audit row %+v", e)
+			}
+			// The token reached the attestor, and no part of it reached the
+			// proxy's log or the row.
+			token := attestor.token()
+			if token != fakeJWT {
+				t.Fatalf("the attestor saw %q", token)
+			}
+			for _, part := range strings.Split(token, ".") {
+				if strings.Contains(proxyLog.String(), part) || strings.Contains(fmt.Sprintf("%+v", f.audit.all()), part) {
+					t.Fatalf("token part %q in log %q or rows", part, proxyLog.String())
+				}
+			}
+			if !strings.Contains(proxyLog.String(), want+" peer=10.20.30.40") || (c.hashed && strings.Contains(proxyLog.String(), c.kid)) {
+				t.Fatalf("proxy log %q", proxyLog.String())
 			}
 		})
 	}
@@ -177,6 +200,25 @@ func TestKeyRefusalNamesKidAndPeer(t *testing.T) {
 }
 
 type refusingAttestor struct{ err error }
+
+// fakeJWT has a real token's three segments; none may reach a log or row.
+const fakeJWT = "eyJhbGciOiJSUzI1NiIsImtpZCI6ImsxIn0.eyJzdWIiOiJzeXN0ZW06c2VydmljZWFjY291bnQ6eDp5In0.c2lnbmF0dXJlLWJ5dGVz"
+
+// tokenRecordingAttestor refuses, keeping the token it was shown.
+type tokenRecordingAttestor struct {
+	err  error
+	mu   sync.Mutex
+	seen string
+}
+
+func (a *tokenRecordingAttestor) Attest(_ context.Context, token string, _ netip.Addr) (*brokercore.ProxyScope, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.seen = token
+	return nil, a.err
+}
+
+func (a *tokenRecordingAttestor) token() string { a.mu.Lock(); defer a.mu.Unlock(); return a.seen }
 
 func (a refusingAttestor) Attest(context.Context, string, netip.Addr) (*brokercore.ProxyScope, error) {
 	return nil, a.err

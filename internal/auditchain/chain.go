@@ -276,13 +276,17 @@ func (c *Chain) Run(ctx context.Context, interval, refresh time.Duration) {
 	}
 }
 
+// writeMACVersion is the MAC version new rows use; tests lower it to write
+// the rows an older broker wrote.
+var writeMACVersion = MACVersionCurrent
+
 func (c *Chain) appendLocked(r Row) (Row, error) {
 	if c.failed {
 		return Row{}, ErrAuditFailed
 	}
 	r.Type, r.Replica, r.Boot, r.Seq = RowType, c.opts.Replica, c.boot, c.seq
 	r.Time = c.opts.Now().UTC().Format(time.RFC3339Nano)
-	r.KeyVersion, r.Prev, r.MACVersion = c.key.Version, c.prev, MACVersionCurrent
+	r.KeyVersion, r.Prev, r.MACVersion = c.key.Version, c.prev, writeMACVersion
 	r.MAC = r.computeMAC(c.key.secret)
 	line, err := json.Marshal(r)
 	if err != nil {
