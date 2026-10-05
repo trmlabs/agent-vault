@@ -2,16 +2,20 @@ package taskrelay
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgproto3"
 
 	"github.com/Infisical/agent-vault/internal/workloadidentity"
 )
@@ -34,7 +38,7 @@ func sandboxPod(name, uid, ip string) map[string]any {
 }
 
 func sharedConfig() *SharedConfig {
-	return &SharedConfig{Namespaces: []string{"agent-sandboxes"}, OwnerKind: "Sandbox", OwnerAPIVersion: "agents.x-k8s.io/v1beta1",
+	return &SharedConfig{Profiles: map[string]string{"agent-sandboxes": "agent-sandbox-developers"}, OwnerKind: "Sandbox", OwnerAPIVersion: "agents.x-k8s.io/v1beta1",
 		ImageDigests: []string{sandboxDigest}, MaxPodSeconds: 3600}
 }
 
@@ -90,14 +94,20 @@ func (api *fakeAPI) send(t *testing.T, kind string, pod map[string]any) {
 	api.events <- string(b)
 }
 
-// The shared proxy attests the agent Pod at the connection's source, and
-// drops the tunnel once that Pod stops qualifying.
-func TestSharedProxyAttestsThenDropsTheAgent(t *testing.T) {
+type sharedFixture struct {
+	f        *relayFixture
+	api      *fakeAPI
+	attested chan string
+}
+
+// startShared runs the relay in shared mode in front of a broker that
+// records each CONNECT's attestation and echoes the tunnel.
+func startShared(t *testing.T, postgres bool) *sharedFixture {
+	t.Helper()
 	f := newRelayFixture(t)
-	api := newFakeAPI(t, f, sandboxPod("sandbox-a", "pod-a", "127.0.0.1"))
-	attested := make(chan string, 4)
+	sf := &sharedFixture{f: f, api: newFakeAPI(t, f, sandboxPod("sandbox-a", "pod-a", "127.0.0.1")), attested: make(chan string, 8)}
 	broker := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		attested <- r.Header.Get("Gatehouse-Attestation")
+		sf.attested <- r.Header.Get("Gatehouse-Attestation")
 		c, b, e := w.(http.Hijacker).Hijack()
 		if e != nil {
 			return
@@ -109,25 +119,54 @@ func TestSharedProxyAttestsThenDropsTheAgent(t *testing.T) {
 	}))
 	broker.TLS = &tls.Config{Certificates: []tls.Certificate{f.cert}}
 	broker.StartTLS()
-	defer broker.Close()
+	t.Cleanup(broker.Close)
 	f.c.Sandbox = SandboxConfig{}
-	f.c.Kubernetes.APIURL = api.srv.URL
+	f.c.Kubernetes.APIURL = sf.api.srv.URL
 	f.c.Shared = sharedConfig()
 	f.c.Deadline = time.Now().Add(time.Hour)
 	f.c.Connect = &ConnectConfig{Listen: freeAddress(t), Upstream: f.upstream(t, broker.Listener.Addr().String()), AllowedTargets: []string{"approved.test:443"}}
+	if postgres {
+		f.c.PostgresBindings = []PostgresConfig{{Listen: freeAddress(t), Upstream: f.upstream(t, broker.Listener.Addr().String()),
+			Database: "appdb", User: "workload", Placeholder: "placeholder"}}
+	}
 	f.start(t)
+	return sf
+}
 
-	c := f.dial(t, f.c.Connect.Listen)
-	io.WriteString(c, "CONNECT approved.test:443 HTTP/1.1\r\nHost: approved.test:443\r\n\r\n")
+// connect opens a tunnel through the shared proxy and returns its reader and
+// the status, with extra CONNECT header lines.
+func (sf *sharedFixture) connect(t *testing.T, extra string) (net.Conn, *bufio.Reader, int) {
+	t.Helper()
+	c := sf.f.dial(t, sf.f.c.Connect.Listen)
+	io.WriteString(c, "CONNECT approved.test:443 HTTP/1.1\r\nHost: approved.test:443\r\n"+extra+"\r\n")
 	b := bufio.NewReader(c)
 	response, e := http.ReadResponse(b, &http.Request{Method: "CONNECT"})
-	if e != nil || response.StatusCode != 200 {
-		t.Fatalf("connect: %v %v", e, response)
+	if e != nil {
+		return c, b, 0
 	}
 	defer response.Body.Close()
-	raw, _ := base64.RawURLEncoding.DecodeString(<-attested)
+	return c, b, response.StatusCode
+}
+
+func tunnelCloses(t *testing.T, c net.Conn, b *bufio.Reader) bool {
+	t.Helper()
+	c.SetReadDeadline(time.Now().Add(4 * time.Second))
+	_, e := b.ReadByte()
+	return e != nil
+}
+
+// The shared proxy attests the agent Pod at the connection's source, and
+// drops the tunnel once that Pod stops qualifying.
+func TestSharedProxyAttestsThenDropsTheAgent(t *testing.T) {
+	sf := startShared(t, false)
+	c, b, status := sf.connect(t, "")
+	if status != 200 {
+		t.Fatalf("connect: %d", status)
+	}
+	raw, _ := base64.RawURLEncoding.DecodeString(<-sf.attested)
 	var a workloadidentity.Attestation
-	if json.Unmarshal(raw, &a) != nil || a.PodUID != "pod-a" || a.OwnerUID != "sandbox-pod-a" || a.OwnerKind != "Sandbox" || a.Namespace != "agent-sandboxes" || a.NotAfter <= time.Now().Unix() {
+	if json.Unmarshal(raw, &a) != nil || a.PodUID != "pod-a" || a.Profile != "agent-sandbox-developers" || a.OwnerUID != "sandbox-pod-a" ||
+		a.OwnerKind != "Sandbox" || a.Namespace != "agent-sandboxes" || a.NotAfter <= time.Now().Unix() {
 		t.Fatalf("attestation %s", raw)
 	}
 	io.WriteString(c, "hello")
@@ -138,20 +177,64 @@ func TestSharedProxyAttestsThenDropsTheAgent(t *testing.T) {
 	// The Sandbox is deleted: its Pod starts terminating.
 	gone := sandboxPod("sandbox-a", "pod-a", "127.0.0.1")
 	gone["metadata"].(map[string]any)["deletionTimestamp"] = time.Now().UTC().Format(time.RFC3339)
-	api.send(t, "MODIFIED", gone)
-	c.SetReadDeadline(time.Now().Add(4 * time.Second))
-	if _, e := b.ReadByte(); e == nil {
+	sf.api.send(t, "MODIFIED", gone)
+	if !tunnelCloses(t, c, b) {
 		t.Fatal("a deleted agent's tunnel stayed open")
 	}
-	// A new connection from the same address is refused.
-	c2 := f.dial(t, f.c.Connect.Listen)
-	io.WriteString(c2, "CONNECT approved.test:443 HTTP/1.1\r\nHost: approved.test:443\r\n\r\n")
-	r2, e := http.ReadResponse(bufio.NewReader(c2), &http.Request{Method: "CONNECT"})
-	if e == nil {
-		defer r2.Body.Close()
-		if r2.StatusCode == 200 {
-			t.Fatal("a deleted agent was admitted")
+	if _, _, status := sf.connect(t, ""); status == 200 {
+		t.Fatal("a deleted agent was admitted")
+	}
+}
+
+// The recheck compares the controller too: the same Pod under a replaced
+// Sandbox is a different agent.
+func TestSharedProxyDropsTheAgentWhenItsSandboxChanges(t *testing.T) {
+	sf := startShared(t, false)
+	c, b, status := sf.connect(t, "")
+	if status != 200 {
+		t.Fatalf("connect: %d", status)
+	}
+	<-sf.attested
+	moved := sandboxPod("sandbox-a", "pod-a", "127.0.0.1")
+	moved["metadata"].(map[string]any)["ownerReferences"].([]any)[0].(map[string]any)["uid"] = "sandbox-replacement"
+	sf.api.send(t, "MODIFIED", moved)
+	if !tunnelCloses(t, c, b) {
+		t.Fatal("a tunnel survived its Sandbox UID changing")
+	}
+}
+
+// A client cannot speak for the proxy: an attestation or PROXY header it
+// sends is refused before anything reaches the broker.
+func TestSharedProxyRefusesClientAttestations(t *testing.T) {
+	sf := startShared(t, true)
+	for _, extra := range []string{"Gatehouse-Attestation: forged\r\n", "Gatehouse-Session: a.b.c\r\n", "Forwarded: for=10.0.0.9\r\n"} {
+		if _, _, status := sf.connect(t, extra); status != 403 {
+			t.Errorf("CONNECT with %q: %d", extra, status)
 		}
+	}
+	for _, start := range []string{"GHATTS1 forged\n", "GHSESS1 a.b.c\n", "PROXY TCP4 10.0.0.9 10.0.0.1 1 2\r\n"} {
+		c := sf.f.dial(t, sf.f.c.PostgresBindings[0].Listen)
+		io.WriteString(c, start)
+		c.SetReadDeadline(time.Now().Add(3 * time.Second))
+		reply, _ := io.ReadAll(c)
+		if bytes.Contains(reply, []byte{'R', 0, 0, 0, 8, 0, 0, 0, 3}) {
+			t.Errorf("PostgreSQL stream opening %q got a password request", start)
+		}
+	}
+	// Positive control: a valid startup does get the password request.
+	c := sf.f.dial(t, sf.f.c.PostgresBindings[0].Listen)
+	startup, _ := (&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber,
+		Parameters: map[string]string{"user": "workload", "database": "appdb"}}).Encode(nil)
+	c.Write(startup)
+	reply := make([]byte, 9)
+	c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, e := io.ReadFull(c, reply); e != nil || !bytes.Equal(reply, []byte{'R', 0, 0, 0, 8, 0, 0, 0, 3}) {
+		t.Fatalf("positive control: %v %q", e, reply)
+	}
+	select {
+	case got := <-sf.attested:
+		t.Fatalf("a forged request reached the broker: %q", got)
+	default:
 	}
 }
 
@@ -208,21 +291,30 @@ func TestSharedLookupRefusals(t *testing.T) {
 		},
 	}
 	for name, build := range cases {
-		cache := &podCache{config: sharedConfig(), now: time.Now, pods: map[string]*agentPod{}, byIP: map[netip.Addr]map[string]struct{}{}, contact: map[string]time.Time{}}
+		cache := &podCache{config: sharedConfig(), now: time.Now, pods: map[string]*agentPod{}, byIP: map[netip.Addr]map[string]struct{}{}, inSync: map[string]bool{}, lostAt: map[string]time.Time{}}
 		cache.replace("agent-sandboxes", decodePods(t, build(sandboxPod("sandbox-a", "pod-a", ip.String()))))
 		if a, ok := cache.lookup(ip); ok {
 			t.Errorf("%s: admitted %+v", name, a)
 		}
 	}
 	// The positive control, and a stale watch.
-	cache := &podCache{config: sharedConfig(), now: time.Now, pods: map[string]*agentPod{}, byIP: map[netip.Addr]map[string]struct{}{}, contact: map[string]time.Time{}}
+	cache := &podCache{config: sharedConfig(), now: time.Now, pods: map[string]*agentPod{}, byIP: map[netip.Addr]map[string]struct{}{}, inSync: map[string]bool{}, lostAt: map[string]time.Time{}}
 	cache.replace("agent-sandboxes", decodePods(t, []map[string]any{sandboxPod("sandbox-a", "pod-a", ip.String())}))
 	if _, ok := cache.lookup(ip); !ok {
 		t.Fatal("admissible agent refused")
 	}
-	cache.now = func() time.Time { return time.Now().Add(staleAfter + time.Second) }
+	// The watch goes down: Pods stay admissible for outOfSync, then not.
+	cache.lost("agent-sandboxes")
+	if _, ok := cache.lookup(ip); !ok {
+		t.Fatal("refused at once when the watch went down")
+	}
+	cache.now = func() time.Time { return time.Now().Add(outOfSync + time.Second) }
 	if _, ok := cache.lookup(ip); ok {
-		t.Fatal("admitted from a stale watch")
+		t.Fatal("admitted from a watch down for more than 10 seconds")
+	}
+	cache.heard("agent-sandboxes")
+	if _, ok := cache.lookup(ip); !ok {
+		t.Fatal("refused after the watch came back")
 	}
 }
 
@@ -260,7 +352,9 @@ func TestSharedConfigValidation(t *testing.T) {
 		"session file":         func(c *FixedConfig) { c.Connect.Upstream.SessionFile = "/var/run/session" },
 		"no TLS":               func(c *FixedConfig) { c.TLSCertFile = "" },
 		"no Kubernetes access": func(c *FixedConfig) { c.Kubernetes.ReviewerTokenFile = "" },
-		"no namespaces":        func(c *FixedConfig) { c.Shared.Namespaces = nil },
+		"no profiles":          func(c *FixedConfig) { c.Shared.Profiles = nil },
+		"bad namespace":        func(c *FixedConfig) { c.Shared.Profiles = map[string]string{"Agent_Sandboxes": "p"} },
+		"empty profile":        func(c *FixedConfig) { c.Shared.Profiles = map[string]string{"agent-sandboxes": ""} },
 		"no owner kind":        func(c *FixedConfig) { c.Shared.OwnerKind = "" },
 		"bad API version":      func(c *FixedConfig) { c.Shared.OwnerAPIVersion = "agents" },
 		"no image digests":     func(c *FixedConfig) { c.Shared.ImageDigests = nil },

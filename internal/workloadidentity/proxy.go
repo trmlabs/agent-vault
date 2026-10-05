@@ -21,8 +21,11 @@ import (
 // proxy runs the Pod check in its own cluster (source address, live Pod,
 // controller owner, images); the broker never sees the agent's address.
 type ProxyBinding struct {
-	// Namespaces the attested agent Pods may run in.
-	Namespaces []string `json:"namespaces"`
+	// Profiles maps each namespace the proxy serves to its harness profile
+	// and catalog pool. A namespace not listed is refused, so one proxy can
+	// serve customer and developer sandboxes without either reaching the
+	// other's entries.
+	Profiles []ProxyProfile `json:"profiles"`
 	// OwnerKind is the controller kind that must own each agent Pod (Sandbox).
 	OwnerKind string `json:"ownerKind"`
 	// ImageDigests every container of an attested Pod must run.
@@ -30,10 +33,28 @@ type ProxyBinding struct {
 	// SourceCIDRs the proxy's connections must come from: the private link's
 	// address range. A connection from anywhere else is refused.
 	SourceCIDRs []string `json:"sourceCIDRs"`
-	// MaxSessionSeconds caps a session from the proxy token's issue time (60 s
-	// to 8 h). A remote proxy token cannot be revoked by a live Pod read, so
-	// this bounds how long an open session outlives it.
+	// MaxSessionSeconds caps a session from the proxy token's issue time (60
+	// to 1800 s). A remote proxy token cannot be revoked by a live Pod read,
+	// so this bounds how long an open session outlives it.
 	MaxSessionSeconds int64 `json:"maxSessionSeconds"`
+}
+
+// ProxyProfile is one namespace a proxy serves: the harness profile its
+// attestation must name, and the catalog pool its agents are admitted into.
+type ProxyProfile struct {
+	Namespace string `json:"namespace"`
+	Profile   string `json:"profile"`
+	Pool      string `json:"pool"`
+}
+
+// profileFor returns the namespace's profile, or false.
+func (p *ProxyBinding) profileFor(namespace string) (ProxyProfile, bool) {
+	for _, pp := range p.Profiles {
+		if pp.Namespace == namespace {
+			return pp, true
+		}
+	}
+	return ProxyProfile{}, false
 }
 
 // Attestation is what a shared proxy states about the agent Pod behind one
@@ -47,6 +68,9 @@ type Attestation struct {
 	OwnerUID     string   `json:"ownerUID"` // the controller object, such as the Sandbox
 	ImageDigests []string `json:"imageDigests"`
 	NotAfter     int64    `json:"notAfter"` // Unix seconds: when the agent's admission ends
+	// Profile is the harness profile the proxy maps the namespace to; the
+	// broker refuses it unless its own map agrees.
+	Profile string `json:"profile"`
 }
 
 const maxAttestationBytes = 4096
@@ -85,7 +109,7 @@ func decodeAttestation(s string) (Attestation, error) {
 		return a, errors.New("invalid attestation")
 	}
 	if !pathSegment(a.Namespace) || !pathSegment(a.PodName) || !objectUID.MatchString(a.PodUID) || !kubernetesKind.MatchString(a.OwnerKind) ||
-		!objectUID.MatchString(a.OwnerUID) || len(a.ImageDigests) == 0 || len(a.ImageDigests) > 32 || a.NotAfter <= 0 {
+		!objectUID.MatchString(a.OwnerUID) || len(a.ImageDigests) == 0 || len(a.ImageDigests) > 32 || a.NotAfter <= 0 || !pathSegment(a.Profile) {
 		return a, errors.New("invalid attestation")
 	}
 	return a, nil
@@ -93,13 +117,15 @@ func decodeAttestation(s string) (Attestation, error) {
 
 // validate checks a proxy binding at load.
 func (p *ProxyBinding) validate() error {
-	if len(p.Namespaces) == 0 || len(p.Namespaces) > 16 {
-		return errors.New("proxy binding needs 1 to 16 agent namespaces")
+	if len(p.Profiles) == 0 || len(p.Profiles) > 64 {
+		return errors.New("proxy binding needs 1 to 64 namespace profiles")
 	}
-	for _, ns := range p.Namespaces {
-		if !pathSegment(ns) {
-			return errors.New("proxy binding namespace must be a DNS-style name")
+	seen := map[string]bool{}
+	for _, pp := range p.Profiles {
+		if !pathSegment(pp.Namespace) || !pathSegment(pp.Profile) || !pathSegment(pp.Pool) || seen[pp.Namespace] {
+			return errors.New("proxy binding profiles need a unique namespace, a profile and a pool")
 		}
+		seen[pp.Namespace] = true
 	}
 	if !kubernetesKind.MatchString(p.OwnerKind) {
 		return errors.New("proxy binding needs the agent Pods' controller kind")
@@ -121,8 +147,8 @@ func (p *ProxyBinding) validate() error {
 			return errors.New("proxy binding source range must be a non-default CIDR")
 		}
 	}
-	if p.MaxSessionSeconds < 60 || p.MaxSessionSeconds > 8*3600 {
-		return errors.New("proxy binding maxSessionSeconds must be between 60 and 28800")
+	if p.MaxSessionSeconds < 60 || p.MaxSessionSeconds > 1800 {
+		return errors.New("proxy binding maxSessionSeconds must be between 60 and 1800")
 	}
 	return nil
 }
@@ -145,8 +171,18 @@ func (r *Resolver) attestProxied(ctx context.Context, binding *Binding, c claims
 	if !p.fromSource(peer) {
 		return nil, deny
 	}
+	// A recheck may outlive the proxy token, but only by one token lifetime.
+	if renewal && r.now().Unix() > c.Expires+d.maxLifetime {
+		return nil, deny
+	}
 	a, err := decodeAttestation(encoded)
-	if err != nil || !slices.Contains(p.Namespaces, a.Namespace) || a.OwnerKind != p.OwnerKind {
+	if err != nil || a.OwnerKind != p.OwnerKind {
+		return nil, deny
+	}
+	// The namespace picks the profile and pool; the proxy must name the same
+	// profile, and an unlisted namespace is refused.
+	profile, ok := p.profileFor(a.Namespace)
+	if !ok || a.Profile != profile.Profile {
 		return nil, deny
 	}
 	for _, digest := range a.ImageDigests {
@@ -161,7 +197,7 @@ func (r *Resolver) attestProxied(ctx context.Context, binding *Binding, c claims
 	if !r.now().Before(notAfter) {
 		return nil, deny
 	}
-	if !r.profileAdmits(binding.Pool, d, IdentityProxyAttested, a.Namespace, a.OwnerKind, a.ImageDigests) {
+	if !r.proxyProfileAdmits(profile, d, a) {
 		return nil, deny
 	}
 	scope, err := r.grant(ctx, binding, "")
@@ -171,6 +207,6 @@ func (r *Resolver) attestProxied(ctx context.Context, binding *Binding, c claims
 	if ctx.Err() != nil || (c.Expires <= r.now().Unix() && !renewal) || !r.now().Before(notAfter) {
 		return nil, deny
 	}
-	scope.WorkloadID, scope.NotAfter, scope.Pool, scope.IdentityKind = a.PodUID, notAfter, binding.Pool, brokercore.KindProxyAttested
+	scope.WorkloadID, scope.NotAfter, scope.Pool, scope.IdentityKind = a.PodUID, notAfter, profile.Pool, brokercore.KindProxyAttested
 	return scope, nil
 }

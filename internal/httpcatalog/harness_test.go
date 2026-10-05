@@ -172,6 +172,18 @@ func TestIncompleteOrContradictoryHarnessIsRefused(t *testing.T) {
 		"cross cluster with in-cluster keys": func(c map[string]any) {
 			harnessAt(c, 2)["trustDomain"].(map[string]any)["keys"] = "in-cluster"
 		},
+		"proxy-attested over two namespaces": func(c map[string]any) {
+			harnessAt(c, 2)["identity"].(map[string]any)["namespaces"] = []any{"agent-sandboxes", "other"}
+		},
+		"one namespace in two proxy-attested harnesses": func(c map[string]any) {
+			second := map[string]any{}
+			b, _ := json.Marshal(harnessAt(c, 2))
+			_ = json.Unmarshal(b, &second)
+			second["name"] = "agent-sandbox-2"
+			second["authorization"] = map[string]any{"mode": "pool", "poolName": "sandboxes-2"}
+			c["harnesses"] = append(c["harnesses"].([]any), second)
+			c["pools"] = append(c["pools"].([]any), map[string]any{"name": "sandboxes-2", "namespace": "agent-sandboxes", "serviceAccount": "sandbox", "ceiling": "external"})
+		},
 		"remote keys on one cluster": func(c map[string]any) {
 			harnessAt(c, 2)["path"].(map[string]any)["crossCluster"] = false
 		},
@@ -192,5 +204,33 @@ func TestIncompleteOrContradictoryHarnessIsRefused(t *testing.T) {
 		} else {
 			t.Logf("%s: %v", name, err)
 		}
+	}
+}
+
+// One shared proxy serves customer and developer sandboxes as two profiles:
+// the customer one at the external ceiling with no entries, the developer
+// one with its own pool and grants.
+func TestCustomerAndDeveloperSandboxProfiles(t *testing.T) {
+	c := harnessCatalog()
+	orion := map[string]any{}
+	b, _ := json.Marshal(harnessAt(c, 2))
+	_ = json.Unmarshal(b, &orion)
+	orion["name"] = "agent-sandbox-orion"
+	orion["identity"].(map[string]any)["namespaces"] = []any{"orion-sandboxes"}
+	orion["authorization"] = map[string]any{"mode": "pool", "poolName": "orion"}
+	c["harnesses"] = append(c["harnesses"].([]any), orion)
+	c["pools"] = append(c["pools"].([]any), map[string]any{"name": "orion", "namespace": "orion-sandboxes", "serviceAccount": "sandbox", "ceiling": "external"})
+	catalog, err := parseCatalog(t, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool, _ := catalog.Pool("orion")
+	if pool.Ceiling != CeilingExternal || pool.Profile().Name != "agent-sandbox-orion" {
+		t.Fatalf("orion: %+v", pool)
+	}
+	// Granting the customer pool anything refuses the catalog.
+	c["entries"] = []any{json.RawMessage(`{` + strings.Replace(entryBase, `"pools":["p"]`, `"pools":["sandboxes","orion"]`, 1) + `}`)}
+	if _, err := parseCatalog(t, c); err == nil {
+		t.Fatal("an entry granted to the customer sandboxes' external pool was accepted")
 	}
 }

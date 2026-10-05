@@ -14,6 +14,7 @@ const (
 // agents must match. The broker catalog holds it, so it can change at a
 // catalog reload without a restart.
 type Profile struct {
+	Name         string
 	Issuer       string
 	Audience     string
 	Remote       bool
@@ -69,4 +70,20 @@ func (r *Resolver) profileAdmits(pool string, d *domain, kind, namespace, ownerK
 		}
 	}
 	return true
+}
+
+// proxyProfileAdmits requires a declared catalog profile for a proxy
+// admission: the one the binding maps the namespace to, from the trust
+// domain that verified the proxy's token. With no catalog profile, the proxy
+// admits nothing.
+func (r *Resolver) proxyProfileAdmits(pp ProxyProfile, d *domain, a Attestation) bool {
+	src := r.profiles.Load()
+	if src == nil || src.fn == nil {
+		return false
+	}
+	p, ok := src.fn(pp.Pool)
+	if !ok || p.Name != pp.Profile || len(p.Namespaces) != 1 {
+		return false
+	}
+	return r.profileAdmits(pp.Pool, d, IdentityProxyAttested, a.Namespace, a.OwnerKind, a.ImageDigests)
 }

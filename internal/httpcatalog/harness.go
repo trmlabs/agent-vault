@@ -207,6 +207,10 @@ func (h Harness) validate() error {
 		if h.Authorization.Mode != AuthorizePool {
 			return errors.New("person authorization needs a requester")
 		}
+		// The broker picks a proxy's profile by namespace, so each names one.
+		if len(id.Namespaces) != 1 {
+			return errors.New("a proxy-attested harness names exactly one namespace")
+		}
 	}
 	// The broker reads Pods only in its own cluster, so an agent in another
 	// cluster is attested by a proxy there, whose keys are fetched remotely.
@@ -228,6 +232,7 @@ func validateHarnesses(harnesses []Harness, pools map[string]Pool) (map[string]H
 	}
 	byPool := map[string]Harness{}
 	names := map[string]bool{}
+	attested := map[string]string{} // issuer and namespace to harness
 	for _, h := range harnesses {
 		if err := h.validate(); err != nil {
 			return nil, fmt.Errorf("harness %q: %w", h.Name, err)
@@ -249,6 +254,13 @@ func validateHarnesses(harnesses []Harness, pools map[string]Pool) (map[string]H
 		}
 		if pool.Namespace != "" && !contains(h.Identity.Namespaces, pool.Namespace) {
 			return nil, fmt.Errorf("harness %q does not list pool %q's namespace", h.Name, pool.Name)
+		}
+		if h.Identity.Kind == IdentityProxyAttested {
+			key := h.TrustDomain.Issuer + " " + h.Identity.Namespaces[0]
+			if other, ok := attested[key]; ok {
+				return nil, fmt.Errorf("harnesses %q and %q both claim namespace %q of one trust domain", other, h.Name, h.Identity.Namespaces[0])
+			}
+			attested[key] = h.Name
 		}
 		byPool[pool.Name] = h
 	}

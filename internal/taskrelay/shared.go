@@ -25,9 +25,11 @@ import (
 // the broker with an attestation of the Pod. The broker trusts this proxy's
 // service account alone, and only from the private link it is reached over.
 type SharedConfig struct {
-	// Namespaces the agent Pods run in. The proxy lists and watches Pods
-	// there, so its Role needs get, list and watch on pods in each.
-	Namespaces []string `json:"namespaces"`
+	// Profiles maps each namespace the agent Pods run in to its harness
+	// profile, which the attestation names; the broker refuses a profile its
+	// own map does not give that namespace. The proxy lists and watches Pods
+	// in each namespace, so its Role needs get, list and watch on pods there.
+	Profiles map[string]string `json:"profiles"`
 	// OwnerKind and OwnerAPIVersion name the controller that must own each
 	// agent Pod, such as Sandbox and agents.x-k8s.io/v1beta1.
 	OwnerKind       string `json:"ownerKind"`
@@ -43,11 +45,12 @@ type SharedConfig struct {
 
 const (
 	defaultSharedConnections = 4096
-	// watchSeconds is how long one watch request runs before it is renewed,
-	// and staleAfter how long a namespace may go without word from the API
-	// server before its Pods stop being admitted.
+	// watchSeconds is how long one watch request runs before it is renewed;
+	// outOfSync how long a namespace's watch may be down before its Pods stop
+	// being admitted; watchIdle how long a silent stream is trusted before it
+	// is treated as dead.
 	watchSeconds = 60
-	staleAfter   = 90 * time.Second
+	outOfSync    = 10 * time.Second
 	watchIdle    = 75 * time.Second
 )
 
@@ -56,19 +59,28 @@ var (
 	apiVersionPattern = regexp.MustCompile(`^([a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?/)?v[0-9]+((alpha|beta)[0-9]+)?$`)
 	digestPattern     = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 	dnsLabel          = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+	profileName       = regexp.MustCompile(`^[a-z0-9]([a-z0-9.-]{0,126}[a-z0-9])?$`)
 )
 
+// namespaces are the watched namespaces, in a fixed order.
+func (s *SharedConfig) namespaces() []string {
+	out := make([]string, 0, len(s.Profiles))
+	for ns := range s.Profiles {
+		out = append(out, ns)
+	}
+	slices.Sort(out)
+	return out
+}
+
 func (s *SharedConfig) validate() error {
-	if len(s.Namespaces) == 0 || len(s.Namespaces) > 16 || !kindPattern.MatchString(s.OwnerKind) || !apiVersionPattern.MatchString(s.OwnerAPIVersion) ||
+	if len(s.Profiles) == 0 || len(s.Profiles) > 64 || !kindPattern.MatchString(s.OwnerKind) || !apiVersionPattern.MatchString(s.OwnerAPIVersion) ||
 		len(s.ImageDigests) == 0 || len(s.ImageDigests) > 16 || s.MaxPodSeconds < 60 || s.MaxPodSeconds > 8*3600 || s.MaxConnections < 0 || s.MaxConnections > 65536 {
 		return errConfig
 	}
-	seen := map[string]bool{}
-	for _, ns := range s.Namespaces {
-		if !dnsLabel.MatchString(ns) || seen[ns] {
+	for ns, profile := range s.Profiles {
+		if !dnsLabel.MatchString(ns) || !profileName.MatchString(profile) {
 			return errConfig
 		}
-		seen[ns] = true
 	}
 	for _, d := range s.ImageDigests {
 		if !digestPattern.MatchString(d) {
@@ -182,7 +194,7 @@ func (p *agentPod) attest(s *SharedConfig, now time.Time) (workloadidentity.Atte
 	var a workloadidentity.Attestation
 	m := p.Metadata
 	if m.DeletionTimestamp != nil || m.UID == "" || p.Spec.HostNetwork || p.Status.Phase != "Running" || p.Status.StartTime == nil ||
-		len(p.Spec.EphemeralContainers) != 0 || len(p.Status.ContainerStatuses) == 0 || !slices.Contains(s.Namespaces, m.Namespace) {
+		len(p.Spec.EphemeralContainers) != 0 || len(p.Status.ContainerStatuses) == 0 || s.Profiles[m.Namespace] == "" {
 		return a, false
 	}
 	// The controller reference names the agent's own controller object. Only
@@ -220,21 +232,22 @@ func (p *agentPod) attest(s *SharedConfig, now time.Time) (workloadidentity.Atte
 		return a, false
 	}
 	return workloadidentity.Attestation{Namespace: m.Namespace, PodName: m.Name, PodUID: m.UID, OwnerKind: s.OwnerKind, OwnerUID: owner,
-		ImageDigests: images, NotAfter: end.Unix()}, true
+		ImageDigests: images, NotAfter: end.Unix(), Profile: s.Profiles[m.Namespace]}, true
 }
 
 // podCache holds the agent Pods of every watched namespace, kept current by
 // one list and watch per namespace: no API call per connection. A namespace
-// whose watch has not reported within staleAfter admits nothing.
+// whose watch has been down for more than outOfSync admits nothing.
 type podCache struct {
-	config  *SharedConfig
-	k8s     KubernetesConfig
-	client  *http.Client
-	now     func() time.Time
-	mu      sync.RWMutex
-	pods    map[string]*agentPod               // namespace/name
-	byIP    map[netip.Addr]map[string]struct{} // address to namespace/name
-	contact map[string]time.Time               // namespace to last word from the API server
+	config *SharedConfig
+	k8s    KubernetesConfig
+	client *http.Client
+	now    func() time.Time
+	mu     sync.RWMutex
+	pods   map[string]*agentPod               // namespace/name
+	byIP   map[netip.Addr]map[string]struct{} // address to namespace/name
+	inSync map[string]bool                    // namespace to whether its watch is open
+	lostAt map[string]time.Time               // namespace to when its watch last went down
 }
 
 func newPodCache(c FixedConfig) (*podCache, error) {
@@ -247,7 +260,7 @@ func newPodCache(c FixedConfig) (*podCache, error) {
 	client := &http.Client{Transport: &http.Transport{TLSClientConfig: t, Proxy: nil, MaxResponseHeaderBytes: 8192},
 		CheckRedirect: func(*http.Request, []*http.Request) error { return errDenied }}
 	return &podCache{config: c.Shared, k8s: c.Kubernetes, client: client, now: time.Now,
-		pods: map[string]*agentPod{}, byIP: map[netip.Addr]map[string]struct{}{}, contact: map[string]time.Time{}}, nil
+		pods: map[string]*agentPod{}, byIP: map[netip.Addr]map[string]struct{}{}, inSync: map[string]bool{}, lostAt: map[string]time.Time{}}, nil
 }
 
 // lookup returns the attestation of the one admissible agent Pod at peer.
@@ -259,7 +272,7 @@ func (c *podCache) lookup(peer netip.Addr) (workloadidentity.Attestation, bool) 
 	matches := 0
 	for key := range c.byIP[peer.Unmap()] {
 		p := c.pods[key]
-		if p == nil || now.Sub(c.contact[p.Metadata.Namespace]) > staleAfter {
+		if p == nil || !c.synced(p.Metadata.Namespace, now) {
 			continue
 		}
 		if a, ok := p.attest(c.config, now); ok {
@@ -310,19 +323,40 @@ func (c *podCache) replace(namespace string, pods []*agentPod) {
 			c.put(namespace+"/"+p.Metadata.Name, p)
 		}
 	}
-	c.contact[namespace] = c.now()
+	c.inSync[namespace] = true
 }
 
+// synced reports whether a namespace's Pods are current enough to admit:
+// its watch is open, or went down no more than outOfSync ago. A namespace
+// never listed is not.
+func (c *podCache) synced(namespace string, now time.Time) bool {
+	if c.inSync[namespace] {
+		return true
+	}
+	lost, ok := c.lostAt[namespace]
+	return ok && now.Sub(lost) <= outOfSync
+}
+
+// heard marks a namespace's watch open.
 func (c *podCache) heard(namespace string) {
 	c.mu.Lock()
-	c.contact[namespace] = c.now()
+	c.inSync[namespace] = true
+	c.mu.Unlock()
+}
+
+// lost marks a namespace's watch down from now.
+func (c *podCache) lost(namespace string) {
+	c.mu.Lock()
+	if c.inSync[namespace] {
+		c.inSync[namespace], c.lostAt[namespace] = false, c.now()
+	}
 	c.mu.Unlock()
 }
 
 // run keeps every namespace current until ctx ends.
 func (c *podCache) run(ctx context.Context) {
 	var wg sync.WaitGroup
-	for _, ns := range c.config.Namespaces {
+	for _, ns := range c.config.namespaces() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -343,7 +377,10 @@ func (c *podCache) run(ctx context.Context) {
 func (c *podCache) waitSynced(ctx context.Context) error {
 	for {
 		c.mu.RLock()
-		ready := len(c.contact) == len(c.config.Namespaces)
+		ready := true
+		for _, ns := range c.config.namespaces() {
+			ready = ready && c.inSync[ns]
+		}
 		c.mu.RUnlock()
 		if ready {
 			return nil
@@ -359,6 +396,7 @@ func (c *podCache) waitSynced(ctx context.Context) error {
 // sync lists one namespace, then watches it from that version until the
 // watch ends or fails; the caller lists again.
 func (c *podCache) sync(ctx context.Context, ns string) error {
+	defer c.lost(ns)
 	var list struct {
 		Metadata struct {
 			ResourceVersion string `json:"resourceVersion"`
@@ -424,7 +462,6 @@ func (c *podCache) sync(ctx context.Context, ns string) error {
 				default: // ERROR, such as 410 Gone: list again.
 					gone = true
 				}
-				c.contact[ns] = c.now()
 				c.mu.Unlock()
 				if gone {
 					return errDenied
@@ -434,6 +471,8 @@ func (c *podCache) sync(ctx context.Context, ns string) error {
 				}
 			}
 		})
+		// The watch ended; until the next one opens, the namespace counts as down.
+		c.lost(ns)
 		if e != nil {
 			return e
 		}

@@ -85,12 +85,13 @@ A binding with `proxy` trusts exactly one shared proxy: its `namespace`, `servic
 
 ```json
 {"namespace": "gatehouse-edge", "serviceAccount": "gatehouse-edge", "serviceAccountUID": "UID", "agentID": "A", "vaultID": "V",
- "pool": "agent-sandbox", "trustDomain": "agent-sandbox",
- "proxy": {"namespaces": ["agent-sandboxes"], "ownerKind": "Sandbox", "imageDigests": ["sha256:..."],
-           "sourceCIDRs": ["10.200.0.0/28"], "maxSessionSeconds": 3600}}
+ "trustDomain": "agent-sandbox",
+ "proxy": {"profiles": [{"namespace": "agent-sandboxes-staging", "profile": "agent-sandbox-orion-staging", "pool": "orion"},
+                        {"namespace": "developers-sandboxes-staging", "profile": "agent-sandbox-developers-staging", "pool": "sandbox-developers"}],
+           "ownerKind": "Sandbox", "imageDigests": ["sha256:..."], "sourceCIDRs": ["10.200.0.0/28"], "maxSessionSeconds": 1800}}
 ```
 
-The broker admits the attested Pod only when the connection comes from `sourceCIDRs` (the private link's range), the Pod's namespace is listed, its controller is `ownerKind`, every image is listed, and its deadline has not passed. The session ends at that deadline or `maxSessionSeconds` after the proxy token was issued, whichever is first. The scope's workload is the attested Pod UID. Any other binding presenting an attestation is refused, and the token-only path never admits a proxy binding. When the catalog declares a harness for the pool, every admission, pool or proxy, must also match it: issuer, audience, key source, identity kind, namespace, controller kind and images.
+The attested namespace picks the profile and pool: the proxy names the profile it maps the namespace to, and the broker refuses a namespace it does not list or a profile its own map does not give that namespace. Within one trust domain, a namespace belongs to one proxy binding. The broker admits the attested Pod only when the connection comes from `sourceCIDRs` (the private link's range), its controller is `ownerKind`, every image is listed, its deadline has not passed, and the catalog declares that profile, from the trust domain that verified the proxy's token; with no catalog profile a proxy admits nothing. The session ends at that deadline or `maxSessionSeconds` (at most 1800) after the proxy token was issued, whichever is first, and a recheck accepts an expired proxy token for at most one token lifetime past its expiry. The scope's workload is the attested Pod UID. Any other binding presenting an attestation is refused, and the token-only path never admits a proxy binding. When the catalog declares a harness for the pool, every admission, pool or proxy, must also match it: issuer, audience, key source, identity kind, namespace, controller kind and images.
 
 ## Listeners admit identity kinds
 

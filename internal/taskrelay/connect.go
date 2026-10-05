@@ -70,7 +70,7 @@ func (r *relay) connect(w http.ResponseWriter, req *http.Request) {
 		session = "Gatehouse-Session: " + session + "\r\n"
 	}
 	// A shared proxy states which agent Pod is behind this connection.
-	attestation, podUID, e := r.attest(req.RemoteAddr)
+	attestation, agent, e := r.attest(req.RemoteAddr)
 	if e != nil {
 		http.Error(w, "denied", http.StatusForbidden)
 		return
@@ -113,7 +113,7 @@ func (r *relay) connect(w http.ResponseWriter, req *http.Request) {
 	}
 	// Restore the bounded reader after parsing; buffered tunnel bytes are kept.
 	limited.N = 1<<63 - 1
-	stopWatch := r.watchPeer(req.RemoteAddr, podUID, func() { _ = conn.Close(); _ = up.Close() })
+	stopWatch := r.watchPeer(req.RemoteAddr, agent, func() { _ = conn.Close(); _ = up.Close() })
 	defer stopWatch()
 	copyTunnel(r.ctx, conn, buffer, up, reader, expiry)
 }

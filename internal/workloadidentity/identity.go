@@ -156,6 +156,7 @@ func newResolver(c Config, s Store, observer bool) (*Resolver, error) {
 		return nil, errors.New("workload identity maxTokenLifetimeSeconds must be between 600 and 3600")
 	}
 	seen := map[string]bool{}
+	proxyNamespaces := map[string]bool{}
 	for _, b := range c.Bindings {
 		if !pathSegment(b.Namespace) || !pathSegment(b.ServiceAccount) || b.ServiceAccountUID == "" || (!observer && (b.AgentID == "" || b.VaultID == "")) {
 			return nil, errors.New("workload identity binding requires namespace, account, account UID, agent and vault")
@@ -191,11 +192,19 @@ func newResolver(c Config, s Store, observer bool) (*Resolver, error) {
 			return nil, errors.New("workload identity binding names an unlisted trust domain")
 		}
 		if b.Proxy != nil {
-			if observer || b.PodUID != "" || len(b.OwnerUIDs) != 0 || b.ContainerName != "" || b.MaxPodSeconds != 0 || len(b.ImageDigests) != 0 || !pathSegment(b.Pool) {
-				return nil, errors.New("a proxy binding names its pool and takes no Pod, owner or image settings of its own")
+			if observer || b.PodUID != "" || len(b.OwnerUIDs) != 0 || b.ContainerName != "" || b.MaxPodSeconds != 0 || len(b.ImageDigests) != 0 || b.Pool != "" {
+				return nil, errors.New("a proxy binding takes its pools from its profiles and no Pod, owner or image settings of its own")
 			}
 			if err := b.Proxy.validate(); err != nil {
 				return nil, err
+			}
+			// Within one trust domain, a namespace names one profile.
+			for _, pp := range b.Proxy.Profiles {
+				key := b.TrustDomain + "/" + pp.Namespace
+				if proxyNamespaces[key] {
+					return nil, errors.New("a namespace is served by two proxy bindings of one trust domain")
+				}
+				proxyNamespaces[key] = true
 			}
 		}
 		if b.TrustDomain != "" && b.Proxy == nil {
