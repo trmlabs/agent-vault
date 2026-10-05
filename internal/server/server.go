@@ -100,6 +100,7 @@ type Server struct {
 	// pgBroker is the PostgreSQL credential-brokering TCP listener; nil when
 	// --postgres-port is 0 or no database services are configured.
 	cleanupObserverServer *http.Server
+	crossClusterAddr      string // loopback address of the cross-cluster listener, or ""
 	pgBroker              *pgproxy.Broker
 	readiness             []readinessCheck
 	pgLeaseCloser         interface{ Close(context.Context) error }
@@ -1127,6 +1128,25 @@ func (s *Server) Start() error {
 			defer cancel()
 			_ = s.pgBroker.Shutdown(ctx)
 		}()
+	}
+	if s.crossClusterAddr != "" {
+		if !s.credentialProxy || strictMITMLn == nil {
+			return fmt.Errorf("the cross-cluster listener requires the credential proxy")
+		}
+		crossLn, err := net.Listen("tcp", s.crossClusterAddr)
+		if err != nil {
+			return fmt.Errorf("listen cross-cluster: %w", err)
+		}
+		defer func() { _ = crossLn.Close() }()
+		httpMerged := newMergedListener(strictMITMLn)
+		strictMITMLn = httpMerged
+		var pgMerged *mergedListener
+		if pgLn != nil {
+			pgMerged = newMergedListener(pgLn)
+			pgLn = pgMerged
+		}
+		fmt.Printf("Agent Vault cross-cluster listener on %s (proxy-attested only)\n", crossLn.Addr())
+		go func() { _ = serveCrossCluster(crossLn, httpMerged, pgMerged) }()
 	}
 	observerLn, err := s.listenCleanupObserver()
 	if err != nil {

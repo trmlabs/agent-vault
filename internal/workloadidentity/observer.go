@@ -49,6 +49,11 @@ func ValidateObserverSeparation(observer, proxy Config) error {
 	if observer.Audience == "" || observer.Audience == proxy.Audience {
 		return fmt.Errorf("cleanup observer requires a separate audience")
 	}
+	for _, d := range proxy.TrustDomains {
+		if observer.Audience == d.Audience {
+			return fmt.Errorf("cleanup observer requires a separate audience")
+		}
+	}
 	for _, observed := range observer.Bindings {
 		for _, admitted := range proxy.Bindings {
 			if observed.Namespace == admitted.Namespace && observed.ServiceAccount == admitted.ServiceAccount {

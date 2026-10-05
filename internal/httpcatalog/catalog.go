@@ -93,8 +93,9 @@ type KeyRef struct {
 }
 
 type Catalog struct {
-	entries []Entry
-	pools   []Pool
+	entries   []Entry
+	pools     []Pool
+	harnesses []Harness
 }
 
 // Pool names a set of workers by their Kubernetes identity. When a catalog
@@ -107,7 +108,9 @@ type Pool struct {
 	// default), "claude-session" (a runner session token naming the person)
 	// or "workload" (CI and automation: Entitlements, never a person).
 	Identity string `json:"identity,omitempty"`
-	// Ceiling is the highest tier the pool may reach (default T0).
+	// Ceiling is the highest tier the pool may reach (default T0). "external"
+	// is below T0: the pool's workers may reach nothing, and no entry may
+	// grant it, until entries can be scoped to a tenant.
 	Ceiling string `json:"ceiling,omitempty"`
 	// CCPoolID is the runner pool a claude-session token must be issued for.
 	CCPoolID string `json:"ccpoolID,omitempty"`
@@ -115,6 +118,8 @@ type Pool struct {
 	BaseGroup string `json:"baseGroup,omitempty"`
 	// Entitlements are a workload pool's fixed groups.
 	Entitlements []string `json:"entitlements,omitempty"`
+
+	harness *Harness // the declared profile naming this pool, if any
 }
 
 // Pool returns the defined pool with this name.
@@ -224,8 +229,9 @@ func Load(path string) (Catalog, error) {
 
 func Parse(data []byte) (Catalog, error) {
 	var file struct {
-		Pools   []Pool  `json:"pools,omitempty"`
-		Entries []Entry `json:"entries"`
+		Harnesses []Harness `json:"harnesses,omitempty"`
+		Pools     []Pool    `json:"pools,omitempty"`
+		Entries   []Entry   `json:"entries"`
 	}
 	d := json.NewDecoder(bytes.NewReader(data))
 	d.DisallowUnknownFields()
@@ -249,6 +255,15 @@ func Parse(data []byte) (Catalog, error) {
 		}
 		poolNames[pool.Name] = true
 		pools[pool.Name] = pool
+	}
+	profiles, err := validateHarnesses(file.Harnesses, pools)
+	if err != nil {
+		return Catalog{}, err
+	}
+	for i := range file.Pools {
+		if h, ok := profiles[file.Pools[i].Name]; ok {
+			file.Pools[i].harness = &h
+		}
 	}
 	names := map[string]bool{}
 	users := map[KVRef]string{}
@@ -310,7 +325,7 @@ func Parse(data []byte) (Catalog, error) {
 			routes[route] = e.Name
 		}
 	}
-	return Catalog{entries: file.Entries, pools: file.Pools}, nil
+	return Catalog{entries: file.Entries, pools: file.Pools, harnesses: file.Harnesses}, nil
 }
 
 func (e *Entry) normalize() error {
@@ -828,8 +843,16 @@ var (
 	tierRank = map[string]int{"": 0, "T0": 0, "T1": 1, "T2": 2}
 )
 
+// CeilingExternal is the ceiling below T0, for workers serving people
+// outside the company.
+const CeilingExternal = "external"
+
 func (p Pool) validate() error {
-	if _, ok := tierRank[p.Ceiling]; !ok {
+	if p.Ceiling == CeilingExternal {
+		if p.Identity != "" && p.Identity != "none" {
+			return fmt.Errorf("an external pool has no verified identity")
+		}
+	} else if _, ok := tierRank[p.Ceiling]; !ok {
 		return fmt.Errorf("unknown ceiling %q", p.Ceiling)
 	}
 	for _, g := range append(append([]string(nil), p.Entitlements...), p.BaseGroup) {
@@ -885,6 +908,9 @@ const maxRequiredGroups = 8
 // grantable is the CI rule: an entry above T0 is never granted to a pool that
 // cannot carry it. Without defined pools only T0 entries may be granted.
 func grantable(e Entry, p Pool, defined bool) error {
+	if p.Ceiling == CeilingExternal {
+		return fmt.Errorf("a pool at the external ceiling holds no entries")
+	}
 	rank := tierRank[e.Tier]
 	if rank == 0 {
 		return nil

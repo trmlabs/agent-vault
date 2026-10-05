@@ -25,6 +25,8 @@ type AgentScope struct {
 	WorkloadID string
 	Pool       string    // catalog pool name; empty matches no catalog grant
 	NotAfter   time.Time // zero, or when the session must end (a pool Pod's deadline)
+	// IdentityKind is how the workload proved itself; see brokercore.KindPodToken.
+	IdentityKind string
 }
 
 // AgentAuthenticator validates the agent's Agent Vault token (presented in the

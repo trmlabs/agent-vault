@@ -19,7 +19,11 @@ import (
 	"github.com/Infisical/agent-vault/internal/brokercore"
 )
 
-const cancelCode = 80877102
+const (
+	cancelCode     = 80877102
+	sslRequestCode = 80877103
+	gssRequestCode = 80877104
+)
 
 type cancelTarget struct {
 	mu      sync.Mutex
@@ -60,6 +64,18 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig) {
 			_ = r.record("postgres", "denied:bad-startup")
 		}
 		return
+	}
+	// A shared proxy's plaintext listener declines TLS and GSS encryption, so
+	// a client set to sslmode=prefer goes on in plaintext; one that requires
+	// TLS stops. The next packet must be the startup.
+	if code := binary.BigEndian.Uint32(packet[4:8]); r.config.Shared != nil && r.config.TLSCertFile == "" && len(packet) == 8 && (code == sslRequestCode || code == gssRequestCode) {
+		if _, e = conn.Write([]byte{'N'}); e != nil {
+			return
+		}
+		if packet, e = readStartupPacket(conn); e != nil || len(packet) == 8 {
+			_ = r.record("postgres", "denied:bad-startup")
+			return
+		}
 	}
 	if binary.BigEndian.Uint32(packet[4:8]) == cancelCode {
 		r.cancelPostgres(peer, packet, binding)
@@ -134,6 +150,20 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig) {
 	stop := context.AfterFunc(r.ctx, func() { _ = up.Close() })
 	defer stop()
 	_ = up.SetDeadline(minTime(expiry, time.Now().Add(handshakeTimeout)))
+	// A shared proxy states which agent Pod is behind this connection, first
+	// on the broker-side stream, and drops it when that Pod stops qualifying.
+	attestation, agent, e := r.attest(peer)
+	if e != nil {
+		return
+	}
+	if attestation != "" {
+		if _, e = io.WriteString(up, "GHATTS1 "+attestation+"\n"); e != nil {
+			tell(errorFrame("08001", unreachableMessage))
+			return
+		}
+	}
+	stopWatch := r.watchPeer(peer, agent, func() { _ = conn.Close(); _ = up.Close() })
+	defer stopWatch()
 	// The runner session rides the broker-side stream ahead of the startup
 	// packet this sidecar authors; the worker's own bytes never carry it.
 	if session := readSession(c.Upstream); session != "" {

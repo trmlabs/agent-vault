@@ -29,6 +29,9 @@ type ProxyScope struct {
 	VaultRole  string
 	NotAfter   time.Time // zero, or the instant the session must end (a pool Pod's deadline)
 	Pool       string    // catalog pool name, set by the Attestor for pool workers; empty matches no catalog grant
+	// IdentityKind is how the workload proved itself (KindPodToken,
+	// KindTokenReview or KindProxyAttested); empty for a legacy session.
+	IdentityKind string
 }
 
 // ActorID returns the non-empty principal ID — UserID for user

@@ -23,6 +23,7 @@ import (
 	"github.com/Infisical/agent-vault/internal/ca"
 	"github.com/Infisical/agent-vault/internal/crypto"
 	"github.com/Infisical/agent-vault/internal/hashicorp"
+	"github.com/Infisical/agent-vault/internal/httpcatalog"
 	"github.com/Infisical/agent-vault/internal/infisical"
 	"github.com/Infisical/agent-vault/internal/mitm"
 	"github.com/Infisical/agent-vault/internal/netguard"
@@ -323,6 +324,19 @@ func attachServerExtensions(srv *server.Server, host string, mitmPort, postgresP
 		}
 		srv.EnableCredentialProxy()
 	}
+	if port := os.Getenv("AGENT_VAULT_CROSS_CLUSTER_PORT"); port != "" {
+		// Agents in another cluster arrive through their shared proxy and a
+		// private link, behind a TLS front that names the source in a PROXY
+		// header. Both protocol listeners must trust that header.
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 || !srv.CredentialProxyEnabled() || !boolEnvValue("AGENT_VAULT_MITM_PROXY_PROTOCOL") ||
+			(postgresPort > 0 && !boolEnvValue("AGENT_VAULT_DB_PROXY_PROTOCOL")) {
+			return fmt.Errorf("AGENT_VAULT_CROSS_CLUSTER_PORT needs a port, the credential proxy and PROXY headers on both protocol listeners")
+		}
+		if err := srv.EnableCrossCluster(net.JoinHostPort("127.0.0.1", port)); err != nil {
+			return err
+		}
+	}
 	sessions := srv.SessionResolver()
 	var proxyIdentity workloadidentity.Config
 	var proxyResolver *workloadidentity.Resolver
@@ -349,6 +363,9 @@ func attachServerExtensions(srv *server.Server, host string, mitmPort, postgresP
 	adapter, err := httpHeaderAdapter(context.Background(), srv, os.Getenv)
 	if err != nil {
 		return fmt.Errorf("http header adapter: %w", err)
+	}
+	if proxyResolver != nil && adapter != nil {
+		proxyResolver.SetProfiles(catalogProfiles(adapter.Catalog))
 	}
 	if err := attachMITMIfEnabled(srv, host, mitmPort, masterKey, db, maxRespBytes, maxReqBytes, adapter, sessions); err != nil {
 		return err
@@ -1171,4 +1188,22 @@ func cleanupObserverPort(path, value string) (int, error) {
 		return 0, fmt.Errorf("cleanup observer requires both policy file and a numeric port from 1 through 65535")
 	}
 	return port, nil
+}
+
+// catalogProfiles reads each pool's declared harness profile from the live
+// catalog, so every admission also matches it.
+func catalogProfiles(catalog interface{ Current() httpcatalog.Catalog }) workloadidentity.ProfileSource {
+	return func(name string) (workloadidentity.Profile, bool) {
+		pool, ok := catalog.Current().Pool(name)
+		if !ok {
+			return workloadidentity.Profile{}, false
+		}
+		p := pool.Profile()
+		if !p.Explicit {
+			return workloadidentity.Profile{}, false
+		}
+		return workloadidentity.Profile{Name: p.Name, Issuer: p.TrustDomain.Issuer, Audience: p.TrustDomain.Audience, Remote: p.TrustDomain.Keys == httpcatalog.KeysRemote,
+			Kind: p.Identity.Kind, OwnerKind: p.Identity.OwnerKind, Namespaces: p.Identity.Namespaces, ImageDigests: p.Identity.ImageDigests,
+			ImagePrefix: p.Identity.ImagePrefix}, true
+	}
 }

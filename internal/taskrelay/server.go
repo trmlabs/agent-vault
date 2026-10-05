@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Infisical/agent-vault/internal/workloadidentity"
 )
 
 const handshakeTimeout = 10 * time.Second
@@ -52,12 +54,34 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 	if e != nil {
 		return e
 	}
-	defer func() { _ = audit.file.Close() }()
+	defer func() {
+		if !audit.stdout {
+			_ = audit.file.Close()
+		}
+	}()
 	ctx, cancel := context.WithDeadline(parent, c.Deadline)
 	defer cancel()
-	r := &relay{config: c, pair: pair, audit: audit, ctx: ctx, cancel: cancel, slots: make(chan struct{}, maxConnections)}
+	limit := maxConnections
+	if c.Shared != nil {
+		limit = c.Shared.connections()
+	}
+	r := &relay{config: c, pair: pair, audit: audit, ctx: ctx, cancel: cancel, slots: make(chan struct{}, limit)}
+	if pair.cache != nil {
+		// Admit nothing until every agent namespace has been listed.
+		cacheDone := make(chan struct{})
+		go func() { defer close(cacheDone); pair.cache.run(ctx) }()
+		defer func() { cancel(); <-cacheDone }()
+		synced, stop := context.WithTimeout(ctx, 30*time.Second)
+		e := pair.cache.waitSynced(synced)
+		stop()
+		if e != nil {
+			return errDenied
+		}
+	}
 	var tlsConfig *tls.Config
-	if !c.Self {
+	// A shared proxy without a certificate serves plaintext on the Pod
+	// network; its upstreams to the broker are TLS regardless.
+	if !c.Self && c.TLSCertFile != "" {
 		cert, e := tls.LoadX509KeyPair(c.TLSCertFile, c.TLSKeyFile)
 		if e != nil {
 			return errConfig
@@ -78,7 +102,7 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 			result = errDenied
 		}
 	}()
-	listenerSlots := make(chan struct{}, maxConnections)
+	listenerSlots := make(chan struct{}, limit)
 	bind := func(address string) (net.Listener, error) {
 		plain, e := net.Listen("tcp", address)
 		if e != nil {
@@ -295,7 +319,68 @@ func (r *relay) admit(ctx context.Context, peer, protocol string) error {
 	if r.ctx.Err() != nil || r.pair.check(ctx, peer) != nil {
 		return errDenied
 	}
+	if r.pair.cache != nil {
+		a, ok := r.pair.attestation(peer)
+		if !ok {
+			return errDenied
+		}
+		if e := r.audit.recordAgent(protocol, "admitted", &a); e != nil {
+			r.cancel()
+			return e
+		}
+		return nil
+	}
 	return r.record(protocol, "admitted")
+}
+
+// attest returns, in shared mode, the encoded attestation of the agent Pod at
+// peer and its UID. Outside shared mode it returns empty strings and no error.
+func (r *relay) attest(peer string) (encoded string, agent agentIdentity, err error) {
+	if r.pair.cache == nil {
+		return "", agent, nil
+	}
+	a, ok := r.pair.attestation(peer)
+	if !ok {
+		return "", agent, errDenied
+	}
+	if encoded, err = workloadidentity.EncodeAttestation(a); err != nil {
+		return "", agent, errDenied
+	}
+	return encoded, agentIdentity{pod: a.PodUID, owner: a.OwnerUID}, nil
+}
+
+// agentIdentity is the Pod and controller UIDs a connection was admitted for.
+type agentIdentity struct{ pod, owner string }
+
+// watchPeer, in shared mode, rechecks the connection's agent Pod every
+// second and calls end once it is no longer the same admissible Pod under the
+// same controller: deleted, its Sandbox gone or replaced, past its deadline,
+// or its watch down. The returned function stops the watch.
+func (r *relay) watchPeer(peer string, admitted agentIdentity, end func()) func() {
+	if r.pair.cache == nil {
+		return func() {}
+	}
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(pairInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-r.ctx.Done():
+				end()
+				return
+			case <-ticker.C:
+				if a, ok := r.pair.attestation(peer); !ok || a.PodUID != admitted.pod || a.OwnerUID != admitted.owner {
+					end()
+					return
+				}
+			}
+		}
+	}()
+	var once sync.Once
+	return func() { once.Do(func() { close(done) }) }
 }
 func dialUpstream(ctx context.Context, c UpstreamConfig) (net.Conn, error) {
 	t, e := clientTLS(c.CAFile, c.ServerName)

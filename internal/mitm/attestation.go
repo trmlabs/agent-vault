@@ -133,6 +133,26 @@ func peerFromContext(ctx context.Context) (netip.Addr, error) {
 // Reattest when the Attestor has it, because the tunnel outlives its token.
 // A scope past its NotAfter is refused.
 func (p *Proxy) resolveScope(ctx context.Context, token, hint string, peer netip.Addr, peerErr error, recheck bool) (*brokercore.ProxyScope, error) {
+	scope, err := p.resolveAnyScope(ctx, token, hint, peer, peerErr, recheck)
+	if err != nil {
+		return nil, err
+	}
+	// Each listener admits only the identity kinds it was opened for.
+	if !brokercore.KindAdmitted(connKinds(ctx), scope.IdentityKind) {
+		return nil, brokercore.ErrInvalidSession
+	}
+	return scope, nil
+}
+
+// connKinds returns the identity kinds the request's listener admits.
+func connKinds(ctx context.Context) []string {
+	if pc, ok := ctx.Value(peerContextKey{}).(*peerConn); ok {
+		return brokercore.ConnKinds(pc.Conn)
+	}
+	return brokercore.ConnKinds(nil)
+}
+
+func (p *Proxy) resolveAnyScope(ctx context.Context, token, hint string, peer netip.Addr, peerErr error, recheck bool) (*brokercore.ProxyScope, error) {
 	if p.attestor == nil {
 		return p.sessions.ResolveForProxy(ctx, token, hint)
 	}

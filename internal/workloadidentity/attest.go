@@ -22,7 +22,10 @@ import (
 var _ brokercore.Attestor = (*Resolver)(nil)
 
 const (
-	jwksMaxAge         = time.Hour
+	jwksMaxAge = time.Hour
+	// jwksMaxStale bounds how long the last good keys stand while refetches
+	// fail: a key the cluster rotated out stops verifying within a day.
+	jwksMaxStale       = 24 * time.Hour
 	jwksRefetchBackoff = 30 * time.Second
 	jwksFetchTimeout   = 10 * time.Second
 )
@@ -40,8 +43,8 @@ type signingKeys struct {
 	flight    chan struct{} // closed when the running fetch ends
 }
 
-func (r *Resolver) signingKey(ctx context.Context, kid string) *rsa.PublicKey {
-	j := r.jwks
+func (r *Resolver) signingKey(ctx context.Context, d *domain, kid string) *rsa.PublicKey {
+	j := d.keys
 	for waited := false; ; waited = true {
 		j.mu.Lock()
 		now := r.now()
@@ -49,7 +52,11 @@ func (r *Resolver) signingKey(ctx context.Context, kid string) *rsa.PublicKey {
 		// An unknown kid or an old set triggers a refetch for key rotation, at
 		// most every 30 s; meanwhile the last good keys stand.
 		if (key != nil && now.Sub(j.fetched) < jwksMaxAge) || waited || (!j.attempted.IsZero() && now.Sub(j.attempted) < jwksRefetchBackoff) {
+			stale := now.Sub(j.fetched) > jwksMaxStale
 			j.mu.Unlock()
+			if stale {
+				return nil
+			}
 			return key
 		}
 		flight := j.flight
@@ -58,7 +65,7 @@ func (r *Resolver) signingKey(ctx context.Context, kid string) *rsa.PublicKey {
 			j.flight, j.attempted = flight, now
 			// The fetch serves every waiter, so the caller's cancellation
 			// does not end it.
-			go r.fetchSigningKeys(context.WithoutCancel(ctx), flight)
+			go r.fetchSigningKeys(context.WithoutCancel(ctx), d, flight)
 		}
 		j.mu.Unlock()
 		select {
@@ -71,7 +78,7 @@ func (r *Resolver) signingKey(ctx context.Context, kid string) *rsa.PublicKey {
 
 // fetchSigningKeys replaces the key set on success and leaves it alone on
 // failure, then releases the waiters.
-func (r *Resolver) fetchSigningKeys(ctx context.Context, flight chan struct{}) {
+func (r *Resolver) fetchSigningKeys(ctx context.Context, d *domain, flight chan struct{}) {
 	ctx, cancel := context.WithTimeout(ctx, jwksFetchTimeout)
 	defer cancel()
 	var set struct {
@@ -79,7 +86,7 @@ func (r *Resolver) fetchSigningKeys(ctx context.Context, flight chan struct{}) {
 			Kty, Kid, Alg, Use, N, E string
 		} `json:"keys"`
 	}
-	err := r.api(ctx, http.MethodGet, "/openid/v1/jwks", nil, &set)
+	err := d.fetch(ctx, &set)
 	keys := map[string]*rsa.PublicKey{}
 	for _, k := range set.Keys {
 		if k.Kty != "RSA" || k.Kid == "" || (k.Alg != "" && k.Alg != "RS256") || (k.Use != "" && k.Use != "sig") {
@@ -96,7 +103,7 @@ func (r *Resolver) fetchSigningKeys(ctx context.Context, flight chan struct{}) {
 		}
 		keys[k.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(n), E: exponent}
 	}
-	j := r.jwks
+	j := d.keys
 	j.mu.Lock()
 	if err == nil {
 		j.keys, j.fetched = keys, r.now()
@@ -106,22 +113,23 @@ func (r *Resolver) fetchSigningKeys(ctx context.Context, flight chan struct{}) {
 	close(flight)
 }
 
-// verifyLocally checks the token's signature against the cluster keys and its
-// claims against policy. It is authentication, not a pre-filter.
-func (r *Resolver) verifyLocally(ctx context.Context, token string, renewal bool) (claims, error) {
+// verifyLocally checks the token's signature against the keys of the trust
+// domain that issued it, and its claims against that domain's policy. It is
+// authentication, not a pre-filter.
+func (r *Resolver) verifyLocally(ctx context.Context, token string, renewal bool) (claims, *domain, error) {
 	deny := brokercore.ErrInvalidSession
 	if len(token) == 0 || len(token) > 32768 {
-		return claims{}, deny
+		return claims{}, nil, deny
 	}
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
-		return claims{}, deny
+		return claims{}, nil, deny
 	}
 	headerBytes, err1 := base64.RawURLEncoding.DecodeString(parts[0])
 	payload, err2 := base64.RawURLEncoding.DecodeString(parts[1])
 	signature, err3 := base64.RawURLEncoding.DecodeString(parts[2])
 	if err1 != nil || err2 != nil || err3 != nil {
-		return claims{}, deny
+		return claims{}, nil, deny
 	}
 	var header struct {
 		Alg, Kid, Typ string
@@ -129,24 +137,29 @@ func (r *Resolver) verifyLocally(ctx context.Context, token string, renewal bool
 	}
 	var c claims
 	if json.Unmarshal(headerBytes, &header) != nil || header.Alg != "RS256" || header.Kid == "" || len(header.Crit) != 0 || json.Unmarshal(payload, &c) != nil {
-		return claims{}, deny
+		return claims{}, nil, deny
+	}
+	// The issuer picks the domain; its keys alone can then verify the token.
+	d := r.domainFor(c.Issuer)
+	if d == nil {
+		return claims{}, nil, deny
 	}
 	now := r.now().Unix()
 	// A renewal recheck of an open session accepts an expired token; its Pod
 	// must still qualify below. A new connection needs an unexpired token.
-	if c.Issuer != r.config.Issuer || !exactly(c.Audience, r.config.Audience) || (c.Expires <= now && !renewal) || c.Issued <= 0 || c.Issued > now+60 || c.NotBefore > now+60 || c.Expires <= c.Issued || c.Expires-c.Issued > r.config.MaxTokenLifetimeSeconds {
-		return claims{}, deny
+	if !exactly(c.Audience, d.audience) || (c.Expires <= now && !renewal) || c.Issued <= 0 || c.Issued > now+60 || c.NotBefore > now+60 || c.Expires <= c.Issued || c.Expires-c.Issued > d.maxLifetime {
+		return claims{}, nil, deny
 	}
 	k := c.Kubernetes
 	if k.Pod.UID == "" || !pathSegment(k.Pod.Name) || !pathSegment(k.Namespace) || k.ServiceAccount.UID == "" || c.Subject != "system:serviceaccount:"+k.Namespace+":"+k.ServiceAccount.Name {
-		return claims{}, deny
+		return claims{}, nil, deny
 	}
-	key := r.signingKey(ctx, header.Kid)
+	key := r.signingKey(ctx, d, header.Kid)
 	digest := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
 	if key == nil || rsa.VerifyPKCS1v15(key, crypto.SHA256, digest[:], signature) != nil {
-		return claims{}, deny
+		return claims{}, nil, deny
 	}
-	return c, nil
+	return c, d, nil
 }
 
 type livePod struct {
@@ -156,6 +169,7 @@ type livePod struct {
 		Namespace         string  `json:"namespace"`
 		DeletionTimestamp *string `json:"deletionTimestamp"`
 		OwnerReferences   []struct {
+			Kind               string `json:"kind"`
 			UID                string `json:"uid"`
 			Controller         *bool  `json:"controller"`
 			BlockOwnerDeletion *bool  `json:"blockOwnerDeletion"`
@@ -201,6 +215,25 @@ func (p *livePod) imagesAllowed(digests []string) bool {
 		}
 	}
 	return true
+}
+
+// controllerKind is the kind of the Pod's controller owner, or "".
+func (p *livePod) controllerKind() string {
+	for _, owner := range p.Metadata.OwnerReferences {
+		if owner.Controller != nil && *owner.Controller {
+			return owner.Kind
+		}
+	}
+	return ""
+}
+
+// images lists the digest of every container and init container.
+func (p *livePod) images() []string {
+	var digests []string
+	for _, s := range append(append([]containerStatus(nil), p.Status.ContainerStatuses...), p.Status.InitContainerStatuses...) {
+		digests = append(digests, s.ImageID[strings.LastIndexByte(s.ImageID, '@')+1:])
+	}
+	return digests
 }
 
 // deadline returns when the Pod's admission ends, or the zero time if it is
@@ -297,7 +330,7 @@ func (r *Resolver) attest(ctx context.Context, token string, peer netip.Addr, re
 	peer = peer.Unmap()
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(r.config.TimeoutSeconds)*time.Second)
 	defer cancel()
-	c, err := r.verifyLocally(ctx, token, renewal)
+	c, d, err := r.verifyLocally(ctx, token, renewal)
 	if err != nil {
 		return nil, err
 	}
@@ -305,12 +338,20 @@ func (r *Resolver) attest(ctx context.Context, token string, peer netip.Addr, re
 	var binding *Binding
 	for i := range r.config.Bindings {
 		b := &r.config.Bindings[i]
-		if b.Namespace == k.Namespace && b.ServiceAccount == k.ServiceAccount.Name && b.ServiceAccountUID == k.ServiceAccount.UID {
+		if b.TrustDomain == d.name && b.Namespace == k.Namespace && b.ServiceAccount == k.ServiceAccount.Name && b.ServiceAccountUID == k.ServiceAccount.UID {
 			binding = b
 			break
 		}
 	}
 	if binding == nil {
+		return nil, deny
+	}
+	attestation := brokercore.AttestationFrom(ctx)
+	if binding.Proxy != nil {
+		return r.attestProxied(ctx, binding, c, d, peer, attestation, renewal)
+	}
+	// Only a proxy binding may vouch for another Pod.
+	if attestation != "" || d.remote {
 		return nil, deny
 	}
 	if len(binding.OwnerUIDs) == 0 {
@@ -321,7 +362,7 @@ func (r *Resolver) attest(ctx context.Context, token string, peer netip.Addr, re
 		return nil, deny
 	}
 	notAfter := pod.deadline(binding, c, peer, r.now())
-	if notAfter.IsZero() {
+	if notAfter.IsZero() || !r.profileAdmits(binding.Pool, d, IdentityPodToken, k.Namespace, pod.controllerKind(), pod.images()) {
 		return nil, deny
 	}
 	scope, err := r.grant(ctx, binding, "")
@@ -331,6 +372,6 @@ func (r *Resolver) attest(ctx context.Context, token string, peer netip.Addr, re
 	if ctx.Err() != nil || (c.Expires <= r.now().Unix() && !renewal) || !r.now().Before(notAfter) {
 		return nil, deny
 	}
-	scope.WorkloadID, scope.NotAfter, scope.Pool = k.Pod.UID, notAfter, binding.Pool
+	scope.WorkloadID, scope.NotAfter, scope.Pool, scope.IdentityKind = k.Pod.UID, notAfter, binding.Pool, brokercore.KindPodToken
 	return scope, nil
 }

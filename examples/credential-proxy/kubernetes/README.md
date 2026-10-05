@@ -68,6 +68,35 @@ One namespace/service-account binding maps to one agent and one vault. `serviceA
 
 The current PostgreSQL listener is restricted to loopback, and the proxy ingress protocols do not themselves encrypt the caller-to-broker hop. Infra must choose and verify an encrypted authenticated tunnel or equivalent protected ingress before separate pods can use these listeners. Do not publish either plaintext listener or send bearer proof over an unprotected network. The runtime design must also deny direct agent access to destinations, Vault, broker storage and runtime sockets; these identity examples do not supply that enforcement.
 
+## Other clusters (trust domains)
+
+The top-level `issuer`, `audience` and `apiServer` are the broker's own cluster. `trustDomains` lists other clusters, each verified locally against the signing keys it publishes:
+
+```json
+"trustDomains": [{"name": "agent-sandbox", "issuer": "https://container.googleapis.com/v1/projects/P/locations/L/clusters/C",
+  "audience": "gatehouse-edge", "keys": "remote", "jwksURL": "https://container.googleapis.com/v1/projects/P/locations/L/clusters/C/jwks"}]
+```
+
+A token's exact issuer picks its domain, and only that domain's keys can verify it. Keys are cached for an hour, refetched at most every 30 seconds for an unknown key ID, and a failed fetch keeps the last good set. `jwksURL` must be HTTPS; `caFile` optionally replaces the system roots for it. The broker cannot read another cluster's Pods, so a remote domain admits only a proxy binding (a shared proxy there checks the Pod), and its token lifetime (`maxTokenLifetimeSeconds`, 600 to 3600, default 3600) is the revocation window. A binding names its domain with `trustDomain`; empty is the broker's own cluster. The broker's egress must reach `jwksURL`.
+
+## Proxy-attested agents
+
+A binding with `proxy` trusts exactly one shared proxy: its `namespace`, `serviceAccount` and `serviceAccountUID`, in its `trustDomain`, with that domain's issuer and audience. The proxy runs the Pod check in its own cluster and sends an attestation of the agent Pod with each connection: the `Gatehouse-Attestation` header on CONNECT, or a `GHATTS1 <attestation>` line before any `GHSESS1` line on PostgreSQL.
+
+```json
+{"namespace": "gatehouse-edge", "serviceAccount": "gatehouse-edge", "serviceAccountUID": "UID", "agentID": "A", "vaultID": "V",
+ "trustDomain": "agent-sandbox",
+ "proxy": {"profiles": [{"namespace": "agent-sandboxes-staging", "profile": "agent-sandbox-orion-staging", "pool": "orion"},
+                        {"namespace": "developers-sandboxes-staging", "profile": "agent-sandbox-developers-staging", "pool": "sandbox-developers"}],
+           "ownerKind": "Sandbox", "imageDigests": ["sha256:..."], "sourceCIDRs": ["10.200.0.0/28"], "maxSessionSeconds": 1800}}
+```
+
+Each profile entry may add `imagePrefix`, an agent-sandbox repository or tenant path; the binding's `imageDigests` then lists only platform containers, and every pulled image (the attestation's `images`, repository and digest) must lie under the namespace's prefix or match a listed digest. The attested namespace picks the profile and pool: the proxy names the profile it maps the namespace to, and the broker refuses a namespace it does not list or a profile its own map does not give that namespace. Within one trust domain, a namespace belongs to one proxy binding. The broker admits the attested Pod only when the connection comes from `sourceCIDRs` (the private link's range), its controller is `ownerKind`, every image is listed, its deadline has not passed, and the catalog declares that profile, from the trust domain that verified the proxy's token; with no catalog profile a proxy admits nothing. The session ends at that deadline or `maxSessionSeconds` (at most 1800) after the proxy token was issued, whichever is first, and a recheck accepts an expired proxy token for at most one token lifetime past its expiry. The scope's workload is the attested Pod UID. Any other binding presenting an attestation is refused, and the token-only path never admits a proxy binding. When the catalog declares a harness for the pool, every admission, pool or proxy, must also match it: issuer, audience, key source, identity kind, namespace, controller kind and images.
+
+## Listeners admit identity kinds
+
+Every scope records how the workload proved itself: `pod-token`, `token-review` or `proxy-attested`. The HTTP proxy and PostgreSQL listeners (behind TLS 14443 and 15443) admit pool and legacy identities and refuse `proxy-attested`. Agents in another cluster arrive on the cross-cluster listener instead: set `AGENT_VAULT_CROSS_CLUSTER_PORT` (14325, always on 127.0.0.1, behind TLS front 16443 in the same Pod, which must send a PROXY header), which needs the credential proxy, `AGENT_VAULT_MITM_PROXY_PROTOCOL` and, with PostgreSQL, `AGENT_VAULT_DB_PROXY_PROTOCOL`. It carries both protocols on one port: after the front's PROXY header, a stream opening with `GHATTS1 ` goes to the PostgreSQL broker and one opening with `CONNECT ` to the HTTP proxy, each admitting only `proxy-attested`. Anything else is closed within 5 seconds.
+
 ## Verification and remaining limits
 
 TokenReview runs for each authorization decision, followed by a live Pod read that rejects missing pods, deletion timestamps, changed UIDs or an unexpected account. The Pod read closes TokenReview's deletion grace period. Any API error, timeout, untrusted certificate or incomplete identity denies the request. Current broker agent status and vault permission are checked after proof verification. No positive authentication result is cached.

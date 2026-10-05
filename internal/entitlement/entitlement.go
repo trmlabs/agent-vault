@@ -268,6 +268,11 @@ func Decide(ctx context.Context, cache *Cache, pool Pool, entry Entry, who Reque
 		tier = "T0"
 	}
 	d := Decision{Tier: tier, Groups: append([]string(nil), entry.Requires...)}
+	// A pool below T0 reaches nothing; the catalog grants it no entry either.
+	if pool.Ceiling == "external" {
+		d.Outcome = "pool_external"
+		return d
+	}
 	want, err1 := Tier(entry.Tier)
 	ceiling, err2 := Tier(pool.Ceiling)
 	if err1 != nil || err2 != nil {

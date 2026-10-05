@@ -9,6 +9,8 @@ import (
 	"net/textproto"
 	"strings"
 	"time"
+
+	"github.com/Infisical/agent-vault/internal/brokercore"
 )
 
 func (r *relay) connect(w http.ResponseWriter, req *http.Request) {
@@ -67,6 +69,15 @@ func (r *relay) connect(w http.ResponseWriter, req *http.Request) {
 	if session != "" {
 		session = "Gatehouse-Session: " + session + "\r\n"
 	}
+	// A shared proxy states which agent Pod is behind this connection.
+	attestation, agent, e := r.attest(req.RemoteAddr)
+	if e != nil {
+		http.Error(w, "denied", http.StatusForbidden)
+		return
+	}
+	if attestation != "" {
+		session += brokercore.AttestationHeader + ": " + attestation + "\r\n"
+	}
 	if _, e = fmt.Fprintf(up, "CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Authorization: Bearer %s\r\n%s\r\n", req.Host, req.Host, proof, session); e != nil {
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 		return
@@ -102,6 +113,8 @@ func (r *relay) connect(w http.ResponseWriter, req *http.Request) {
 	}
 	// Restore the bounded reader after parsing; buffered tunnel bytes are kept.
 	limited.N = 1<<63 - 1
+	stopWatch := r.watchPeer(req.RemoteAddr, agent, func() { _ = conn.Close(); _ = up.Close() })
+	defer stopWatch()
 	copyTunnel(r.ctx, conn, buffer, up, reader, expiry)
 }
 

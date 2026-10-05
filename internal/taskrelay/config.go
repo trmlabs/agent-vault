@@ -35,6 +35,8 @@ type FixedConfig struct {
 	// plaintext listeners only, and no Kubernetes pairing, because the broker
 	// verifies this Pod's token and address on every connection.
 	Self bool `json:"self,omitempty"`
+	// Shared runs the relay as one proxy for many agent Pods; see SharedConfig.
+	Shared *SharedConfig `json:"shared,omitempty"`
 }
 type SandboxConfig struct {
 	Namespace     string `json:"namespace"`
@@ -99,10 +101,18 @@ func LoadConfig(path string) (FixedConfig, error) {
 	if c.Self && c.Deadline.IsZero() {
 		c.Deadline = time.Now().Add(8 * time.Hour).Add(-time.Minute)
 	}
+	// A shared proxy serves many agents for as long as it runs; each agent's
+	// own deadline comes from its Pod.
+	if c.Shared != nil && c.Deadline.IsZero() {
+		c.Deadline = time.Now().Add(10 * 365 * 24 * time.Hour)
+	}
 	return c, c.Validate(time.Now())
 }
 
 func (c FixedConfig) Validate(now time.Time) error {
+	if c.Shared != nil {
+		return c.validateShared(now)
+	}
 	if c.Self {
 		return c.validateSelf(now)
 	}
