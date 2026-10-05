@@ -9,10 +9,10 @@ import (
 	"io"
 	"net/netip"
 	"regexp"
-	"slices"
 	"time"
 
 	"github.com/Infisical/agent-vault/internal/brokercore"
+	"github.com/Infisical/agent-vault/internal/imagerule"
 )
 
 // ProxyBinding makes a Binding a shared proxy's: the binding's namespace,
@@ -28,8 +28,10 @@ type ProxyBinding struct {
 	Profiles []ProxyProfile `json:"profiles"`
 	// OwnerKind is the controller kind that must own each agent Pod (Sandbox).
 	OwnerKind string `json:"ownerKind"`
-	// ImageDigests every container of an attested Pod must run.
-	ImageDigests []string `json:"imageDigests"`
+	// ImageDigests are exact digests any attested Pod may run, for containers
+	// the platform injects (such as a storage sidecar). Optional when every
+	// profile names an image prefix.
+	ImageDigests []string `json:"imageDigests,omitempty"`
 	// SourceCIDRs the proxy's connections must come from: the private link's
 	// address range. A connection from anywhere else is refused.
 	SourceCIDRs []string `json:"sourceCIDRs"`
@@ -45,6 +47,9 @@ type ProxyProfile struct {
 	Namespace string `json:"namespace"`
 	Profile   string `json:"profile"`
 	Pool      string `json:"pool"`
+	// ImagePrefix, when set, admits any image pulled from under this
+	// agent-sandbox repository path (see imagerule.ValidPrefix).
+	ImagePrefix string `json:"imagePrefix,omitempty"`
 }
 
 // profileFor returns the namespace's profile, or false.
@@ -61,13 +66,15 @@ func (p *ProxyBinding) profileFor(namespace string) (ProxyProfile, bool) {
 // connection. It is trusted only from the proxy binding's own authenticated
 // account, on the same connection as that account's token.
 type Attestation struct {
-	Namespace    string   `json:"namespace"`
-	PodName      string   `json:"podName"`
-	PodUID       string   `json:"podUID"`
-	OwnerKind    string   `json:"ownerKind"`
-	OwnerUID     string   `json:"ownerUID"` // the controller object, such as the Sandbox
-	ImageDigests []string `json:"imageDigests"`
-	NotAfter     int64    `json:"notAfter"` // Unix seconds: when the agent's admission ends
+	Namespace string `json:"namespace"`
+	PodName   string `json:"podName"`
+	PodUID    string `json:"podUID"`
+	OwnerKind string `json:"ownerKind"`
+	OwnerUID  string `json:"ownerUID"` // the controller object, such as the Sandbox
+	// Images are the references every container and init container pulled
+	// (repository@sha256:...), as the node reported them.
+	Images   []string `json:"images"`
+	NotAfter int64    `json:"notAfter"` // Unix seconds: when the agent's admission ends
 	// Profile is the harness profile the proxy maps the namespace to; the
 	// broker refuses it unless its own map agrees.
 	Profile string `json:"profile"`
@@ -109,8 +116,13 @@ func decodeAttestation(s string) (Attestation, error) {
 		return a, errors.New("invalid attestation")
 	}
 	if !pathSegment(a.Namespace) || !pathSegment(a.PodName) || !objectUID.MatchString(a.PodUID) || !kubernetesKind.MatchString(a.OwnerKind) ||
-		!objectUID.MatchString(a.OwnerUID) || len(a.ImageDigests) == 0 || len(a.ImageDigests) > 32 || a.NotAfter <= 0 || !pathSegment(a.Profile) {
+		!objectUID.MatchString(a.OwnerUID) || len(a.Images) == 0 || len(a.Images) > 32 || a.NotAfter <= 0 || !pathSegment(a.Profile) {
 		return a, errors.New("invalid attestation")
+	}
+	for _, image := range a.Images {
+		if _, _, ok := imagerule.Split(image); !ok {
+			return a, errors.New("invalid attestation")
+		}
 	}
 	return a, nil
 }
@@ -121,17 +133,31 @@ func (p *ProxyBinding) validate() error {
 		return errors.New("proxy binding needs 1 to 64 namespace profiles")
 	}
 	seen := map[string]bool{}
-	for _, pp := range p.Profiles {
+	for i, pp := range p.Profiles {
 		if !pathSegment(pp.Namespace) || !pathSegment(pp.Profile) || !pathSegment(pp.Pool) || seen[pp.Namespace] {
 			return errors.New("proxy binding profiles need a unique namespace, a profile and a pool")
 		}
 		seen[pp.Namespace] = true
+		if pp.ImagePrefix == "" {
+			if len(p.ImageDigests) == 0 {
+				return errors.New("a proxy profile without an image prefix needs the binding's image digests")
+			}
+			continue
+		}
+		if !imagerule.ValidPrefix(pp.ImagePrefix) {
+			return errors.New("proxy profile image prefix must be an agent-sandbox repository or tenant path")
+		}
+		for _, other := range p.Profiles[:i] {
+			if other.ImagePrefix != "" && imagerule.Overlap(other.ImagePrefix, pp.ImagePrefix) {
+				return errors.New("two proxy profiles claim overlapping image prefixes")
+			}
+		}
 	}
 	if !kubernetesKind.MatchString(p.OwnerKind) {
 		return errors.New("proxy binding needs the agent Pods' controller kind")
 	}
-	if len(p.ImageDigests) == 0 || len(p.ImageDigests) > 16 {
-		return errors.New("proxy binding requires 1 to 16 image digests")
+	if len(p.ImageDigests) > 16 {
+		return errors.New("proxy binding allows at most 16 image digests")
 	}
 	for _, digest := range p.ImageDigests {
 		if !imageDigest.MatchString(digest) {
@@ -185,8 +211,8 @@ func (r *Resolver) attestProxied(ctx context.Context, binding *Binding, c claims
 	if !ok || a.Profile != profile.Profile {
 		return nil, deny
 	}
-	for _, digest := range a.ImageDigests {
-		if !slices.Contains(p.ImageDigests, digest) {
+	for _, image := range a.Images {
+		if !imagerule.Allowed(image, profile.ImagePrefix, p.ImageDigests) {
 			return nil, deny
 		}
 	}

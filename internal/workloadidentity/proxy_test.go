@@ -52,7 +52,7 @@ func setupProxy(t *testing.T) *proxyFixture {
 		return profile, true
 	})
 	return &proxyFixture{pool: f, rc: rc, r: r, a: Attestation{Namespace: "agent-sandboxes", PodName: "sandbox-x1", PodUID: "agent-pod-uid",
-		OwnerKind: "Sandbox", OwnerUID: "sandbox-uid", ImageDigests: []string{workerDigest}, NotAfter: time.Now().Add(20 * time.Minute).Unix(),
+		OwnerKind: "Sandbox", OwnerUID: "sandbox-uid", Images: []string{"registry.example/worker@" + workerDigest}, NotAfter: time.Now().Add(20 * time.Minute).Unix(),
 		Profile: "agent-sandbox-developers"}}
 }
 
@@ -208,7 +208,7 @@ func TestProxyAttestedRefusals(t *testing.T) {
 		},
 		"image digest mismatch": func(t *testing.T, p *proxyFixture) input {
 			a := p.a
-			a.ImageDigests = []string{workerDigest, otherDigest}
+			a.Images = []string{"registry.example/worker@" + workerDigest, "registry.example/other@" + otherDigest}
 			return input{p.ctx(t, a), p.rc.token(p.rc.claims()), linkIP}
 		},
 		"agent past its deadline": func(t *testing.T, p *proxyFixture) input {
@@ -381,5 +381,89 @@ func TestProxyRecheckLimits(t *testing.T) {
 	}
 	if _, err := p.r.Reattest(p.ctx(t, a), p.rc.token(at(1800)), linkIP); err == nil {
 		t.Fatal("(d) session at 1800 s not ended")
+	}
+}
+
+const (
+	orionPrefix     = "us-central1-docker.pkg.dev/trm-agent-sandbox/agent-sandbox-images-staging/orion/"
+	developerPrefix = "us-central1-docker.pkg.dev/trm-agent-sandbox/agent-sandbox-developers-staging/"
+)
+
+// With image prefixes, each namespace runs what its tenant path pulled, and
+// the platform's own containers run listed digests.
+func TestProxyImagePrefixes(t *testing.T) {
+	p := setupProxy(t)
+	c := p.r.config
+	c.Bindings = append([]Binding(nil), c.Bindings...)
+	proxy := *c.Bindings[1].Proxy
+	proxy.Profiles = []ProxyProfile{
+		{Namespace: "agent-sandboxes", Profile: "agent-sandbox-developers", Pool: "sandboxes", ImagePrefix: developerPrefix},
+		{Namespace: "orion-sandboxes", Profile: "agent-sandbox-orion", Pool: "orion", ImagePrefix: orionPrefix}}
+	proxy.ImageDigests = []string{sidecarDigest} // a platform sidecar
+	c.Bindings[1].Proxy = &proxy
+	r, err := New(c, &fakeStore{status: "active", role: "proxy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.SetProfiles(func(pool string) (Profile, bool) {
+		profile := Profile{Issuer: remoteIssuer, Audience: "gatehouse-edge", Remote: true, Kind: IdentityProxyAttested, OwnerKind: "Sandbox",
+			ImageDigests: []string{sidecarDigest}}
+		switch pool {
+		case "sandboxes":
+			profile.Name, profile.Namespaces, profile.ImagePrefix = "agent-sandbox-developers", []string{"agent-sandboxes"}, developerPrefix
+		case "orion":
+			profile.Name, profile.Namespaces, profile.ImagePrefix = "agent-sandbox-orion", []string{"orion-sandboxes"}, orionPrefix
+		default:
+			return Profile{}, false
+		}
+		return profile, true
+	})
+	token := p.rc.token(p.rc.claims())
+	orion := p.a
+	orion.Namespace, orion.Profile = "orion-sandboxes", "agent-sandbox-orion"
+	for name, c := range map[string]struct {
+		a      Attestation
+		images []string
+		ok     bool
+	}{
+		"orion agent with the platform sidecar": {orion, []string{orionPrefix + "agent@" + workerDigest, "registry.example/gcsfuse@" + sidecarDigest}, true},
+		"developer agent":                       {p.a, []string{developerPrefix + "team/tool@" + otherDigest}, true},
+		"the proxy image as an agent":           {orion, []string{"us-central1-docker.pkg.dev/trm-agent-sandbox/agent-sandbox-images-staging/gatehouse/proxy@" + workerDigest}, false},
+		"a developer image in orion":            {orion, []string{developerPrefix + "tool@" + otherDigest}, false},
+		"an orion image in developers":          {p.a, []string{orionPrefix + "agent@" + workerDigest}, false},
+		"an unlisted platform image":            {orion, []string{orionPrefix + "agent@" + workerDigest, "registry.example/other@" + otherDigest}, false},
+		"a tag, not a pull":                     {orion, []string{orionPrefix + "agent:latest"}, false},
+	} {
+		a := c.a
+		a.Images = c.images
+		if _, err := r.Attest(p.ctx(t, a), token, linkIP); (err == nil) != c.ok {
+			t.Errorf("%s: err %v", name, err)
+		}
+	}
+	// The catalog profile must name the binding's prefix.
+	r.SetProfiles(func(pool string) (Profile, bool) {
+		return Profile{Name: "agent-sandbox-orion", Issuer: remoteIssuer, Audience: "gatehouse-edge", Remote: true, Kind: IdentityProxyAttested,
+			OwnerKind: "Sandbox", Namespaces: []string{"orion-sandboxes"}, ImagePrefix: developerPrefix, ImageDigests: []string{sidecarDigest}}, true
+	})
+	orion.Images = []string{orionPrefix + "agent@" + workerDigest}
+	if _, err := r.Attest(p.ctx(t, orion), token, linkIP); err == nil {
+		t.Error("admitted under a catalog profile with another prefix")
+	}
+	for name, mutate := range map[string]func(b *ProxyBinding){
+		"overlapping prefixes": func(b *ProxyBinding) {
+			b.Profiles[1].ImagePrefix = "us-central1-docker.pkg.dev/trm-agent-sandbox/agent-sandbox-developers-staging/"
+		},
+		"another project":       func(b *ProxyBinding) { b.Profiles[1].ImagePrefix = "us-central1-docker.pkg.dev/other/repo/orion/" },
+		"no prefix, no digests": func(b *ProxyBinding) { b.Profiles[1].ImagePrefix, b.ImageDigests = "", nil },
+	} {
+		cc := c
+		cc.Bindings = append([]Binding(nil), c.Bindings...)
+		bad := proxy
+		bad.Profiles = append([]ProxyProfile(nil), proxy.Profiles...)
+		mutate(&bad)
+		cc.Bindings[1].Proxy = &bad
+		if _, err := New(cc, &fakeStore{status: "active", role: "proxy"}); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
 	}
 }

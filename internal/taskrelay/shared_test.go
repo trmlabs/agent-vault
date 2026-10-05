@@ -11,6 +11,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -95,14 +98,21 @@ func (api *fakeAPI) send(t *testing.T, kind string, pod map[string]any) {
 }
 
 type sharedFixture struct {
-	f        *relayFixture
-	api      *fakeAPI
-	attested chan string
+	f         *relayFixture
+	api       *fakeAPI
+	attested  chan string
+	plaintext bool
 }
 
 // startShared runs the relay in shared mode in front of a broker that
 // records each CONNECT's attestation and echoes the tunnel.
 func startShared(t *testing.T, postgres bool) *sharedFixture {
+	t.Helper()
+	return startSharedWith(t, postgres, false)
+}
+
+// startSharedWith can run the listeners in plaintext, with no certificate.
+func startSharedWith(t *testing.T, postgres, plaintext bool) *sharedFixture {
 	t.Helper()
 	f := newRelayFixture(t)
 	sf := &sharedFixture{f: f, api: newFakeAPI(t, f, sandboxPod("sandbox-a", "pod-a", "127.0.0.1")), attested: make(chan string, 8)}
@@ -129,15 +139,43 @@ func startShared(t *testing.T, postgres bool) *sharedFixture {
 		f.c.PostgresBindings = []PostgresConfig{{Listen: freeAddress(t), Upstream: f.upstream(t, broker.Listener.Addr().String()),
 			Database: "appdb", User: "workload", Placeholder: "placeholder"}}
 	}
+	if plaintext {
+		sf.plaintext = true
+		f.c.TLSCertFile, f.c.TLSKeyFile = "", ""
+		f.c.Deadline = time.Time{}
+		path := filepath.Join(t.TempDir(), "relay.json")
+		b, _ := json.Marshal(f.c)
+		writeTestFile(t, path, b)
+		loaded, err := LoadConfig(path)
+		if err != nil {
+			t.Fatalf("a shared config with no deadline and no certificate: %v", err)
+		}
+		f.c = loaded
+	}
 	f.start(t)
 	return sf
+}
+
+// dial connects to a listener, in TLS unless the fixture is plaintext.
+func (sf *sharedFixture) dial(t *testing.T, address string) net.Conn {
+	t.Helper()
+	if !sf.plaintext {
+		return sf.f.dial(t, address)
+	}
+	c, err := net.DialTimeout("tcp", address, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.SetDeadline(time.Now().Add(4 * time.Second))
+	t.Cleanup(func() { c.Close() })
+	return c
 }
 
 // connect opens a tunnel through the shared proxy and returns its reader and
 // the status, with extra CONNECT header lines.
 func (sf *sharedFixture) connect(t *testing.T, extra string) (net.Conn, *bufio.Reader, int) {
 	t.Helper()
-	c := sf.f.dial(t, sf.f.c.Connect.Listen)
+	c := sf.dial(t, sf.f.c.Connect.Listen)
 	io.WriteString(c, "CONNECT approved.test:443 HTTP/1.1\r\nHost: approved.test:443\r\n"+extra+"\r\n")
 	b := bufio.NewReader(c)
 	response, e := http.ReadResponse(b, &http.Request{Method: "CONNECT"})
@@ -370,6 +408,146 @@ func TestSharedConfigValidation(t *testing.T) {
 		c.Connect = &connect
 		mutate(&c)
 		if e := c.Validate(time.Now()); e == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+// A shared proxy may serve plaintext on the Pod network: CONNECT works, any
+// other request is refused, a PostgreSQL client asking for TLS is told no and
+// goes on, and admissions are audited with the agent Pod and its images.
+func TestSharedProxyPlaintext(t *testing.T) {
+	sf := startSharedWith(t, true, true)
+	if _, _, status := sf.connect(t, ""); status != 200 {
+		t.Fatalf("plaintext CONNECT: %d", status)
+	}
+	<-sf.attested
+	for _, request := range []string{
+		"GET http://approved.test/ HTTP/1.1\r\nHost: approved.test\r\n\r\n",
+		"GET / HTTP/1.1\r\nHost: approved.test\r\n\r\n",
+		"POST http://approved.test:443/ HTTP/1.1\r\nHost: approved.test:443\r\nContent-Length: 0\r\n\r\n",
+	} {
+		c := sf.dial(t, sf.f.c.Connect.Listen)
+		io.WriteString(c, request)
+		response, err := http.ReadResponse(bufio.NewReader(c), nil)
+		if err == nil {
+			response.Body.Close()
+		}
+		if err == nil && response.StatusCode == 200 {
+			t.Errorf("non-CONNECT request admitted: %q", request)
+		}
+	}
+	// sslmode=prefer: SSLRequest, 'N', then the startup gets the password request.
+	c := sf.dial(t, sf.f.c.PostgresBindings[0].Listen)
+	c.Write([]byte{0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f})
+	answer := make([]byte, 1)
+	if _, err := io.ReadFull(c, answer); err != nil || answer[0] != 'N' {
+		t.Fatalf("SSLRequest answer %q %v", answer, err)
+	}
+	startup, _ := (&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber,
+		Parameters: map[string]string{"user": "workload", "database": "appdb"}}).Encode(nil)
+	c.Write(startup)
+	reply := make([]byte, 9)
+	if _, err := io.ReadFull(c, reply); err != nil || !bytes.Equal(reply, []byte{'R', 0, 0, 0, 8, 0, 0, 0, 3}) {
+		t.Fatalf("startup after SSLRequest: %v %q", err, reply)
+	}
+	audit, _ := os.ReadFile(sf.f.c.AuditFile)
+	if !bytes.Contains(audit, []byte(`"podUID":"pod-a"`)) || !bytes.Contains(audit, []byte(`"images":["registry.example/agent@`+sandboxDigest)) ||
+		!bytes.Contains(audit, []byte(`"namespace":"agent-sandboxes"`)) {
+		t.Fatalf("admission row lacks the agent: %s", audit)
+	}
+}
+
+// Upstreams to the broker are TLS in every mode; a shared config cannot
+// leave out the broker's name or CA, nor give a certificate without its key.
+func TestSharedUpstreamsStayTLS(t *testing.T) {
+	f := newRelayFixture(t)
+	base := func() FixedConfig {
+		c := f.c
+		c.Sandbox, c.Shared = SandboxConfig{}, sharedConfig()
+		c.TLSCertFile, c.TLSKeyFile = "", ""
+		c.Connect = &ConnectConfig{Listen: "0.0.0.0:8443", Upstream: f.upstream(t, "broker.internal:16443"), AllowedTargets: []string{"api.example.com:443"}}
+		return c
+	}
+	if err := base().Validate(time.Now()); err != nil {
+		t.Fatalf("plaintext listeners refused: %v", err)
+	}
+	for name, mutate := range map[string]func(c *FixedConfig){
+		"no broker CA":        func(c *FixedConfig) { c.Connect.Upstream.CAFile = "" },
+		"no broker name":      func(c *FixedConfig) { c.Connect.Upstream.ServerName = "" },
+		"certificate, no key": func(c *FixedConfig) { c.TLSCertFile = "/tls/tls.crt" },
+		"audit to stdout, paired": func(c *FixedConfig) {
+			c.Shared, c.Sandbox = nil, SandboxConfig{ContainerName: "worker", Namespace: "sandboxes", Name: "agent", UID: "pod-uid", PodIP: "127.0.0.1"}
+			c.TLSCertFile, c.TLSKeyFile, c.AuditFile = "/tls/tls.crt", "/tls/tls.key", StdoutAudit
+		},
+	} {
+		c := base()
+		connect := *c.Connect
+		c.Connect = &connect
+		mutate(&c)
+		if name == "audit to stdout, paired" {
+			// Paired relays keep a durable, synced audit file.
+			if _, err := openAudit(c, func(string) error { return nil }); err == nil {
+				t.Errorf("%s: accepted", name)
+			}
+			continue
+		}
+		if err := c.Validate(time.Now()); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	c := base()
+	c.AuditFile = StdoutAudit
+	if a, err := openAudit(c, func(string) error { return errDenied }); err != nil || !a.stdout {
+		t.Fatalf("shared audit to stdout: %v", err)
+	}
+}
+
+// Image prefixes: each namespace runs what its tenant path pulled; the proxy
+// image in the same repository never counts; platform digests run anywhere.
+func TestSharedImagePrefixes(t *testing.T) {
+	const orion = "us-central1-docker.pkg.dev/trm-agent-sandbox/agent-sandbox-images-staging/orion/"
+	ip := netip.MustParseAddr("10.8.0.4")
+	config := sharedConfig()
+	config.ImagePrefixes = map[string]string{"agent-sandboxes": orion}
+	for name, c := range map[string]struct {
+		images []string
+		ok     bool
+	}{
+		"tenant image":              {[]string{orion + "agent@" + otherDigest}, true},
+		"tenant image and platform": {[]string{orion + "agent@" + otherDigest, "registry.example/gcsfuse@" + sandboxDigest}, true},
+		"proxy image":               {[]string{"us-central1-docker.pkg.dev/trm-agent-sandbox/agent-sandbox-images-staging/gatehouse/proxy@" + otherDigest}, false},
+		"another tenant":            {[]string{"us-central1-docker.pkg.dev/trm-agent-sandbox/agent-sandbox-developers-staging/x@" + otherDigest}, false},
+	} {
+		pod := sandboxPod("sandbox-a", "pod-a", ip.String())
+		var statuses []any
+		for _, image := range c.images {
+			statuses = append(statuses, map[string]any{"imageID": image})
+		}
+		pod["status"].(map[string]any)["containerStatuses"] = statuses[:1]
+		pod["status"].(map[string]any)["initContainerStatuses"] = statuses[1:]
+		cache := &podCache{config: config, now: time.Now, pods: map[string]*agentPod{}, byIP: map[netip.Addr]map[string]struct{}{}, inSync: map[string]bool{}, lostAt: map[string]time.Time{}}
+		cache.replace("agent-sandboxes", decodePods(t, []map[string]any{pod}))
+		a, ok := cache.lookup(ip)
+		if ok != c.ok || (ok && len(a.Images) != len(c.images)) {
+			t.Errorf("%s: %v %+v", name, ok, a)
+		}
+	}
+	f := newRelayFixture(t)
+	for name, prefixes := range map[string]map[string]string{
+		"another project":    {"agent-sandboxes": "us-central1-docker.pkg.dev/other/agent-sandbox-images-staging/orion/"},
+		"no trailing slash":  {"agent-sandboxes": strings.TrimSuffix(orion, "/")},
+		"unmapped namespace": {"other-sandboxes": orion},
+		"overlap":            {"agent-sandboxes": orion, "orion-sandboxes": "us-central1-docker.pkg.dev/trm-agent-sandbox/agent-sandbox-images-staging/"},
+	} {
+		c := f.c
+		c.Sandbox = SandboxConfig{}
+		s := *sharedConfig()
+		s.Profiles = map[string]string{"agent-sandboxes": "a", "orion-sandboxes": "b"}
+		s.ImagePrefixes = prefixes
+		c.Shared = &s
+		c.Connect = &ConnectConfig{Listen: "0.0.0.0:8443", Upstream: f.upstream(t, "broker.internal:16443"), AllowedTargets: []string{"api.example.com:443"}}
+		if err := c.Validate(time.Now()); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
 	}

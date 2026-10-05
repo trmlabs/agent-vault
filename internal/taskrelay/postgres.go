@@ -19,7 +19,11 @@ import (
 	"github.com/Infisical/agent-vault/internal/brokercore"
 )
 
-const cancelCode = 80877102
+const (
+	cancelCode     = 80877102
+	sslRequestCode = 80877103
+	gssRequestCode = 80877104
+)
 
 type cancelTarget struct {
 	mu      sync.Mutex
@@ -60,6 +64,18 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig) {
 			_ = r.record("postgres", "denied:bad-startup")
 		}
 		return
+	}
+	// A shared proxy's plaintext listener declines TLS and GSS encryption, so
+	// a client set to sslmode=prefer goes on in plaintext; one that requires
+	// TLS stops. The next packet must be the startup.
+	if code := binary.BigEndian.Uint32(packet[4:8]); r.config.Shared != nil && r.config.TLSCertFile == "" && len(packet) == 8 && (code == sslRequestCode || code == gssRequestCode) {
+		if _, e = conn.Write([]byte{'N'}); e != nil {
+			return
+		}
+		if packet, e = readStartupPacket(conn); e != nil || len(packet) == 8 {
+			_ = r.record("postgres", "denied:bad-startup")
+			return
+		}
 	}
 	if binary.BigEndian.Uint32(packet[4:8]) == cancelCode {
 		r.cancelPostgres(peer, packet, binding)

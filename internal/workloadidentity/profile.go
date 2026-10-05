@@ -1,6 +1,10 @@
 package workloadidentity
 
-import "slices"
+import (
+	"slices"
+
+	"github.com/Infisical/agent-vault/internal/imagerule"
+)
 
 // Identity kinds a harness profile names.
 const (
@@ -22,6 +26,7 @@ type Profile struct {
 	OwnerKind    string
 	Namespaces   []string
 	ImageDigests []string
+	ImagePrefix  string // proxy-attested only: images pulled from under this path
 }
 
 // ProfileSource returns the declared profile for a pool, or false when the
@@ -65,7 +70,7 @@ func (r *Resolver) profileAdmits(pool string, d *domain, kind, namespace, ownerK
 		return false
 	}
 	for _, image := range images {
-		if !slices.Contains(p.ImageDigests, image) {
+		if !imagerule.Allowed(image, p.ImagePrefix, p.ImageDigests) {
 			return false
 		}
 	}
@@ -85,5 +90,5 @@ func (r *Resolver) proxyProfileAdmits(pp ProxyProfile, d *domain, a Attestation)
 	if !ok || p.Name != pp.Profile || len(p.Namespaces) != 1 {
 		return false
 	}
-	return r.profileAdmits(pp.Pool, d, IdentityProxyAttested, a.Namespace, a.OwnerKind, a.ImageDigests)
+	return p.ImagePrefix == pp.ImagePrefix && r.profileAdmits(pp.Pool, d, IdentityProxyAttested, a.Namespace, a.OwnerKind, a.Images)
 }

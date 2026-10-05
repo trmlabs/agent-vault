@@ -1203,6 +1203,7 @@ func catalogProfiles(catalog interface{ Current() httpcatalog.Catalog }) workloa
 			return workloadidentity.Profile{}, false
 		}
 		return workloadidentity.Profile{Name: p.Name, Issuer: p.TrustDomain.Issuer, Audience: p.TrustDomain.Audience, Remote: p.TrustDomain.Keys == httpcatalog.KeysRemote,
-			Kind: p.Identity.Kind, OwnerKind: p.Identity.OwnerKind, Namespaces: p.Identity.Namespaces, ImageDigests: p.Identity.ImageDigests}, true
+			Kind: p.Identity.Kind, OwnerKind: p.Identity.OwnerKind, Namespaces: p.Identity.Namespaces, ImageDigests: p.Identity.ImageDigests,
+			ImagePrefix: p.Identity.ImagePrefix}, true
 	}
 }

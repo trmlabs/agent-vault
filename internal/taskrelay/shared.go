@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Infisical/agent-vault/internal/imagerule"
 	"github.com/Infisical/agent-vault/internal/workloadidentity"
 )
 
@@ -34,8 +35,13 @@ type SharedConfig struct {
 	// agent Pod, such as Sandbox and agents.x-k8s.io/v1beta1.
 	OwnerKind       string `json:"ownerKind"`
 	OwnerAPIVersion string `json:"ownerAPIVersion"`
-	// ImageDigests every container of an agent Pod must run.
-	ImageDigests []string `json:"imageDigests"`
+	// ImagePrefixes maps a namespace to the agent-sandbox repository path its
+	// agents' images are pulled from (see imagerule.ValidPrefix). ImageDigests
+	// are exact digests allowed in every namespace, for containers the
+	// platform injects. Each container must match one or the other, judged on
+	// the image the node pulled, never the Pod spec.
+	ImagePrefixes map[string]string `json:"imagePrefixes,omitempty"`
+	ImageDigests  []string          `json:"imageDigests,omitempty"`
 	// MaxPodSeconds bounds an agent Pod's admission from its start (60 s to 8 h).
 	MaxPodSeconds int64 `json:"maxPodSeconds"`
 	// MaxConnections bounds the open connections of one replica (default
@@ -57,7 +63,6 @@ const (
 var (
 	kindPattern       = regexp.MustCompile(`^[A-Z][A-Za-z0-9]{0,62}$`)
 	apiVersionPattern = regexp.MustCompile(`^([a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?/)?v[0-9]+((alpha|beta)[0-9]+)?$`)
-	digestPattern     = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 	dnsLabel          = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 	profileName       = regexp.MustCompile(`^[a-z0-9]([a-z0-9.-]{0,126}[a-z0-9])?$`)
 )
@@ -74,16 +79,30 @@ func (s *SharedConfig) namespaces() []string {
 
 func (s *SharedConfig) validate() error {
 	if len(s.Profiles) == 0 || len(s.Profiles) > 64 || !kindPattern.MatchString(s.OwnerKind) || !apiVersionPattern.MatchString(s.OwnerAPIVersion) ||
-		len(s.ImageDigests) == 0 || len(s.ImageDigests) > 16 || s.MaxPodSeconds < 60 || s.MaxPodSeconds > 8*3600 || s.MaxConnections < 0 || s.MaxConnections > 65536 {
+		len(s.ImageDigests) > 16 || s.MaxPodSeconds < 60 || s.MaxPodSeconds > 8*3600 || s.MaxConnections < 0 || s.MaxConnections > 65536 {
 		return errConfig
 	}
 	for ns, profile := range s.Profiles {
 		if !dnsLabel.MatchString(ns) || !profileName.MatchString(profile) {
 			return errConfig
 		}
+		// A namespace with no prefix runs listed digests only.
+		if s.ImagePrefixes[ns] == "" && len(s.ImageDigests) == 0 {
+			return errConfig
+		}
+	}
+	for ns, prefix := range s.ImagePrefixes {
+		if s.Profiles[ns] == "" || !imagerule.ValidPrefix(prefix) {
+			return errConfig
+		}
+		for other, otherPrefix := range s.ImagePrefixes {
+			if other != ns && imagerule.Overlap(prefix, otherPrefix) {
+				return errConfig
+			}
+		}
 	}
 	for _, d := range s.ImageDigests {
-		if !digestPattern.MatchString(d) {
+		if !imagerule.ValidDigest(d) {
 			return errConfig
 		}
 	}
@@ -103,7 +122,10 @@ func (c FixedConfig) validateShared(now time.Time) error {
 	if c.Self || c.Browser != nil || c.Sandbox != (SandboxConfig{}) || c.Shared.validate() != nil {
 		return errConfig
 	}
-	if !safeName.MatchString(c.TaskID) || !c.Deadline.After(now) || c.AuditFile == "" || c.TLSCertFile == "" || c.TLSKeyFile == "" ||
+	// Plaintext listeners are allowed (no certificate and no key) on the Pod
+	// network; the HTTP listener takes CONNECT only, so HTTPS stays end to
+	// end, and every upstream to the broker is TLS.
+	if !safeName.MatchString(c.TaskID) || !c.Deadline.After(now) || c.AuditFile == "" || (c.TLSCertFile == "") != (c.TLSKeyFile == "") ||
 		c.Kubernetes.CAFile == "" || c.Kubernetes.ReviewerTokenFile == "" {
 		return errConfig
 	}
@@ -214,12 +236,11 @@ func (p *agentPod) attest(s *SharedConfig, now time.Time) (workloadidentity.Atte
 	}
 	var images []string
 	for _, c := range append(append([]struct{ ImageID string }(nil), p.Status.ContainerStatuses...), p.Status.InitContainerStatuses...) {
-		digest := c.ImageID[strings.LastIndexByte(c.ImageID, '@')+1:]
-		if !slices.Contains(s.ImageDigests, digest) {
+		if !imagerule.Allowed(c.ImageID, s.ImagePrefixes[m.Namespace], s.ImageDigests) {
 			return a, false
 		}
-		if !slices.Contains(images, digest) {
-			images = append(images, digest)
+		if image := strings.TrimPrefix(c.ImageID, "docker-pullable://"); !slices.Contains(images, image) {
+			images = append(images, image)
 		}
 	}
 	end := p.Status.StartTime.Add(time.Duration(s.MaxPodSeconds) * time.Second)
@@ -232,7 +253,7 @@ func (p *agentPod) attest(s *SharedConfig, now time.Time) (workloadidentity.Atte
 		return a, false
 	}
 	return workloadidentity.Attestation{Namespace: m.Namespace, PodName: m.Name, PodUID: m.UID, OwnerKind: s.OwnerKind, OwnerUID: owner,
-		ImageDigests: images, NotAfter: end.Unix(), Profile: s.Profiles[m.Namespace]}, true
+		Images: images, NotAfter: end.Unix(), Profile: s.Profiles[m.Namespace]}, true
 }
 
 // podCache holds the agent Pods of every watched namespace, kept current by

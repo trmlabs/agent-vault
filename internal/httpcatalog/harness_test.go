@@ -234,3 +234,47 @@ func TestCustomerAndDeveloperSandboxProfiles(t *testing.T) {
 		t.Fatal("an entry granted to the customer sandboxes' external pool was accepted")
 	}
 }
+
+// A proxy-attested harness may admit images by an agent-sandbox repository
+// path instead of digests; two harnesses may never claim overlapping paths.
+func TestHarnessImagePrefixes(t *testing.T) {
+	const orion = "us-central1-docker.pkg.dev/trm-agent-sandbox/agent-sandbox-images-staging/orion/"
+	c := harnessCatalog()
+	id := harnessAt(c, 2)["identity"].(map[string]any)
+	id["imagePrefix"] = orion
+	delete(id, "imageDigests")
+	if _, err := parseCatalog(t, c); err != nil {
+		t.Fatalf("prefix without digests refused: %v", err)
+	}
+	for name, mutate := range map[string]func(c map[string]any){
+		"prefix on a pod-token harness": func(c map[string]any) {
+			harnessAt(c, 0)["identity"].(map[string]any)["imagePrefix"] = "us-central1-docker.pkg.dev/trm-agent-sandbox/cursor/"
+		},
+		"another project": func(c map[string]any) {
+			harnessAt(c, 2)["identity"].(map[string]any)["imagePrefix"] = "us-central1-docker.pkg.dev/other/agent-sandbox-images-staging/orion/"
+		},
+		"the whole project": func(c map[string]any) {
+			harnessAt(c, 2)["identity"].(map[string]any)["imagePrefix"] = "us-central1-docker.pkg.dev/trm-agent-sandbox/"
+		},
+		"overlapping prefixes": func(c map[string]any) {
+			second := map[string]any{}
+			b, _ := json.Marshal(harnessAt(c, 2))
+			_ = json.Unmarshal(b, &second)
+			second["name"] = "agent-sandbox-2"
+			second["identity"].(map[string]any)["namespaces"] = []any{"other-sandboxes"}
+			second["identity"].(map[string]any)["imagePrefix"] = "us-central1-docker.pkg.dev/trm-agent-sandbox/agent-sandbox-images-staging/"
+			second["authorization"] = map[string]any{"mode": "pool", "poolName": "sandboxes-2"}
+			c["harnesses"] = append(c["harnesses"].([]any), second)
+			c["pools"] = append(c["pools"].([]any), map[string]any{"name": "sandboxes-2", "namespace": "other-sandboxes", "serviceAccount": "sandbox", "ceiling": "external"})
+		},
+	} {
+		cc := harnessCatalog()
+		ccid := harnessAt(cc, 2)["identity"].(map[string]any)
+		ccid["imagePrefix"] = orion
+		delete(ccid, "imageDigests")
+		mutate(cc)
+		if _, err := parseCatalog(t, cc); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}

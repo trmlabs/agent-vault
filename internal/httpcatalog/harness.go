@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+
+	"github.com/Infisical/agent-vault/internal/imagerule"
 )
 
 // Harness is one agent runtime's profile: how its agents prove who they are,
@@ -58,11 +60,15 @@ type HarnessTrustDomain struct {
 // OwnerKind is the Kubernetes kind of the controller that must own the
 // agent's Pod. ImageDigests are the images every container must run.
 type HarnessIdentity struct {
-	Kind         string            `json:"kind"`
-	OwnerKind    string            `json:"ownerKind"`
-	Namespaces   []string          `json:"namespaces"`
-	ImageDigests []string          `json:"imageDigests"`
-	Requester    *HarnessRequester `json:"requester,omitempty"` // optional
+	Kind         string   `json:"kind"`
+	OwnerKind    string   `json:"ownerKind"`
+	Namespaces   []string `json:"namespaces"`
+	ImageDigests []string `json:"imageDigests,omitempty"`
+	// ImagePrefix, proxy-attested only, admits any image pulled from under
+	// this agent-sandbox repository path; ImageDigests then holds only the
+	// platform's own containers, and may be empty.
+	ImagePrefix string            `json:"imagePrefix,omitempty"`
+	Requester   *HarnessRequester `json:"requester,omitempty"` // optional
 }
 
 // HarnessRequester is where the person behind a session comes from:
@@ -150,8 +156,11 @@ func (h Harness) validate() error {
 		}
 		seen[ns] = true
 	}
-	if len(id.ImageDigests) == 0 || len(id.ImageDigests) > 16 {
-		return errors.New("identity.imageDigests needs 1 to 16 digests")
+	if id.ImagePrefix != "" && (id.Kind != IdentityProxyAttested || !imagerule.ValidPrefix(id.ImagePrefix)) {
+		return errors.New("identity.imagePrefix is for proxy-attested harnesses: an agent-sandbox repository or tenant path ending in /")
+	}
+	if (id.ImagePrefix == "" && len(id.ImageDigests) == 0) || len(id.ImageDigests) > 16 {
+		return errors.New("identity.imageDigests needs 1 to 16 digests, or 0 to 16 beside an image prefix")
 	}
 	for _, d := range id.ImageDigests {
 		if !digestPattern.MatchString(d) {
@@ -233,6 +242,7 @@ func validateHarnesses(harnesses []Harness, pools map[string]Pool) (map[string]H
 	byPool := map[string]Harness{}
 	names := map[string]bool{}
 	attested := map[string]string{} // issuer and namespace to harness
+	prefixes := map[string]string{} // harness to image prefix
 	for _, h := range harnesses {
 		if err := h.validate(); err != nil {
 			return nil, fmt.Errorf("harness %q: %w", h.Name, err)
@@ -254,6 +264,14 @@ func validateHarnesses(harnesses []Harness, pools map[string]Pool) (map[string]H
 		}
 		if pool.Namespace != "" && !contains(h.Identity.Namespaces, pool.Namespace) {
 			return nil, fmt.Errorf("harness %q does not list pool %q's namespace", h.Name, pool.Name)
+		}
+		if h.Identity.ImagePrefix != "" {
+			for other, prefix := range prefixes {
+				if imagerule.Overlap(prefix, h.Identity.ImagePrefix) {
+					return nil, fmt.Errorf("harnesses %q and %q claim overlapping image prefixes", other, h.Name)
+				}
+			}
+			prefixes[h.Name] = h.Identity.ImagePrefix
 		}
 		if h.Identity.Kind == IdentityProxyAttested {
 			key := h.TrustDomain.Issuer + " " + h.Identity.Namespaces[0]

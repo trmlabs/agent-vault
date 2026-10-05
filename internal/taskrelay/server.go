@@ -54,7 +54,11 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 	if e != nil {
 		return e
 	}
-	defer func() { _ = audit.file.Close() }()
+	defer func() {
+		if !audit.stdout {
+			_ = audit.file.Close()
+		}
+	}()
 	ctx, cancel := context.WithDeadline(parent, c.Deadline)
 	defer cancel()
 	limit := maxConnections
@@ -75,7 +79,9 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 		}
 	}
 	var tlsConfig *tls.Config
-	if !c.Self {
+	// A shared proxy without a certificate serves plaintext on the Pod
+	// network; its upstreams to the broker are TLS regardless.
+	if !c.Self && c.TLSCertFile != "" {
 		cert, e := tls.LoadX509KeyPair(c.TLSCertFile, c.TLSKeyFile)
 		if e != nil {
 			return errConfig
@@ -312,6 +318,17 @@ func (r *relay) record(protocol, outcome string) error {
 func (r *relay) admit(ctx context.Context, peer, protocol string) error {
 	if r.ctx.Err() != nil || r.pair.check(ctx, peer) != nil {
 		return errDenied
+	}
+	if r.pair.cache != nil {
+		a, ok := r.pair.attestation(peer)
+		if !ok {
+			return errDenied
+		}
+		if e := r.audit.recordAgent(protocol, "admitted", &a); e != nil {
+			r.cancel()
+			return e
+		}
+		return nil
 	}
 	return r.record(protocol, "admitted")
 }
