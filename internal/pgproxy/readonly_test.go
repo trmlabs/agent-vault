@@ -416,3 +416,32 @@ func TestUnsafeLexerParameter(t *testing.T) {
 		}
 	}
 }
+
+// Inside one unsynced extended-protocol batch, a statement with a backslash
+// cannot follow an Execute: there is no answer to wait for that would show
+// whether the Execute changed how the server reads it.
+func TestPooledRefusesBackslashAfterUnsyncedExecute(t *testing.T) {
+	_, addr, _ := readOnlyBroker(t, false, &PoolOptions{QueueFactor: 20})
+	s := openAgentSession(t, addr, "agent-vault-token", "appdb")
+	defer s.close()
+	s.fe.Send(&pgproto3.Parse{Query: "SELECT 1"})
+	s.fe.Send(&pgproto3.Bind{})
+	s.fe.Send(&pgproto3.Execute{})
+	s.fe.Send(&pgproto3.Parse{Query: `SELECT 'a\b'`})
+	s.fe.Send(&pgproto3.Sync{})
+	if err := s.fe.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		msg, err := s.fe.Receive()
+		if err != nil {
+			t.Fatalf("session ended without the refusal: %v", err)
+		}
+		if e, ok := msg.(*pgproto3.ErrorResponse); ok {
+			if e.Code != "0A000" {
+				t.Fatalf("refusal %s %s", e.Code, e.Message)
+			}
+			return
+		}
+	}
+}
