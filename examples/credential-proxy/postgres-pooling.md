@@ -22,7 +22,7 @@ The broker refuses, with SQLSTATE 25006 and a message that names the read-only l
 - `CREATE ... TEMP` or `TEMPORARY` (tables, views, sequences, `CREATE TABLE AS`, also under `EXPLAIN ANALYZE`) and `SELECT ... INTO TEMP`.
 - Anything that names `pg_temp`, anywhere in the text, and a startup `search_path` that names it.
 - Statements that could create one where the broker cannot see it: `DO` blocks, `set_config`, `UPDATE pg_settings`, Unicode-escaped names (`U&"..."`), escape strings in a `search_path` change, and the fast-path `FunctionCall` message.
-- `SET` of `standard_conforming_strings`, `client_encoding` or `NAMES`, which would make the server read later text differently from the broker.
+- `SET` of `standard_conforming_strings`, `client_encoding` or `NAMES`, which could make the server read later text differently from the broker. A lone `SET` to a value the startup allowlist accepts (`on`, or a server encoding such as `UTF8`) is allowed, so drivers that set them on connect keep working.
 
 Pooled, the refusal is an `ERROR` and the session continues. Unpooled, the broker reads each client message whole before relaying it, and a refusal ends the session with a `FATAL`. Either way the statement never reaches the database, and the broker writes a `denied` audit row with outcome `read_only_temp`. Read-write logins are unchanged. An existing function in the database that creates a temporary table when called is not covered; the database's own privileges govern what functions a read-only login can call.
 

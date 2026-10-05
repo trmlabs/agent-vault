@@ -1,7 +1,10 @@
 package pgproxy
 
 import (
+	"regexp"
 	"strings"
+
+	"github.com/Infisical/agent-vault/internal/brokercore"
 )
 
 // needsSession reports whether SQL text might leave session state on a
@@ -213,13 +216,33 @@ func createsTemporary(sql string) bool {
 		}
 		if words[0] == "set" {
 			for _, w := range words[1:min(len(words), 3)] {
-				if w == "standard_conforming_strings" || w == "client_encoding" || w == "names" {
+				if (w == "standard_conforming_strings" || w == "client_encoding" || w == "names") && !safeEncodingSet(sql) {
 					return true
 				}
 			}
 		}
 	}
 	return false
+}
+
+// encodingSet matches one plain SET of the settings that decide how the
+// server reads later text, such as Sequelize's SET standard_conforming_strings=on.
+var encodingSet = regexp.MustCompile(`(?i)^\s*set\s+(?:session\s+)?(standard_conforming_strings|client_encoding|names)\s*(?:=|\s+to\s+|\s)\s*'?([A-Za-z0-9_-]+)'?\s*;?\s*$`)
+
+// safeEncodingSet reports whether sql is only a SET to a value the startup
+// allowlist accepts: standard_conforming_strings on, or a server encoding.
+// Anything else, including another statement in the same text, is unsafe.
+func safeEncodingSet(sql string) bool {
+	m := encodingSet.FindStringSubmatch(sql)
+	if m == nil {
+		return false
+	}
+	name := strings.ToLower(m[1])
+	if name == "names" {
+		name = "client_encoding"
+	}
+	_, ok := brokercore.StartupValue(name, m[2])
+	return ok
 }
 
 func identChar(c byte) bool {
