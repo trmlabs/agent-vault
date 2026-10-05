@@ -84,6 +84,12 @@ func connectUpstreamWith(ctx context.Context, dial DialFunc, svc *DatabaseServic
 	for key, value := range serverParams {
 		params[key] = value
 	}
+	// A read-only login also runs every transaction read-only, a database-side
+	// backstop behind the broker's statement allowlist. The allowlist refuses
+	// turning it off.
+	if svc.ReadOnly {
+		params["default_transaction_read_only"] = "on"
+	}
 
 	frontend.Send(&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber, Parameters: params})
 	if err := frontend.Flush(); err != nil {

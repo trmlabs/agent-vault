@@ -62,6 +62,7 @@ type pooledSession struct {
 	txnStart   time.Time
 	txnFailed  bool
 	killed     bool
+	started    bool // a statement other than a safe encoding SET has run
 	dataRows   int
 	draining   bool // Shutdown asked the session to end at its next idle point
 	flushedSeq int  // ReadyForQuery messages written to the client
@@ -83,13 +84,19 @@ var clientWriteTimeout = 30 * time.Second
 var (
 	errRoleChange     = errors.New("role change on a pooled connection")
 	errStatementLimit = errors.New("prepared statement limit reached")
-	errReadOnlyTemp   = errors.New("temporary object on a read-only login")
+	errReadOnly       = errors.New("statement not allowed on a read-only login")
+	errLexerChange    = errors.New("encoding change on a pooled connection")
 )
 
-// readOnlyTempMessage is the refusal a read-only login gets for a statement
-// that could create a temporary object, on either path.
-const readOnlyTempMessage = "Agent Vault: this database login is read-only; temporary tables, views and sequences are refused, " +
-	"as are DO blocks, set_config, pg_temp and encoding changes that could create them"
+// readOnlyMessage is the refusal a read-only login gets for a statement
+// outside its allowlist, on either path.
+const readOnlyMessage = "Agent Vault: this database login is read-only; only reads, transaction control and a few settings " +
+	"(such as search_path and statement_timeout) are allowed, and temporary tables are refused"
+
+// lexerChangeMessage is the refusal for a change to how the server reads
+// later text.
+const lexerChangeMessage = "Agent Vault: changing standard_conforming_strings or client_encoding is refused; " +
+	"only on and UTF8, before any other statement, are allowed"
 
 type clientStatement struct {
 	query  string
@@ -210,8 +217,10 @@ func poolRefusal(err error) (code, message, outcome string) {
 		return "53300", "Agent Vault: no session-mode connection available for session state (SET, temp tables, LISTEN, advisory locks)", "pinned_share"
 	case errors.Is(err, errRoleChange):
 		return "42501", "Agent Vault: ALTER ROLE, ALTER USER and ALTER DATABASE are refused on a pooled connection", "role_change"
-	case errors.Is(err, errReadOnlyTemp):
-		return "25006", readOnlyTempMessage, "read_only_temp"
+	case errors.Is(err, errReadOnly):
+		return "25006", readOnlyMessage, "read_only"
+	case errors.Is(err, errLexerChange):
+		return "42501", lexerChangeMessage, "encoding_change"
 	case errors.Is(err, errStatementLimit):
 		return "54000", "Agent Vault: this session holds too many prepared statements; deallocate some", "statement_limit"
 	default:
@@ -317,11 +326,18 @@ func (s *pooledSession) refuse(msg pgproto3.FrontendMessage, sql string) error {
 	if sql != "" && changesRole(sql) {
 		return errRoleChange
 	}
+	started := s.started
+	if sql != "" {
+		var refused bool
+		if refused, started = changesLexer(sql, s.started); refused {
+			return errLexerChange
+		}
+	}
 	if s.svc.ReadOnly {
 		// A fast-path FunctionCall names its function by OID, so it could
 		// call set_config unseen.
-		if _, call := msg.(*pgproto3.FunctionCall); call || sql != "" && createsTemporary(sql) {
-			return errReadOnlyTemp
+		if _, call := msg.(*pgproto3.FunctionCall); call || sql != "" && !readOnlyAllowed(sql) {
+			return errReadOnly
 		}
 	}
 	if parse, ok := msg.(*pgproto3.Parse); ok && parse.Name != "" {
@@ -337,6 +353,7 @@ func (s *pooledSession) refuse(msg pgproto3.FrontendMessage, sql string) error {
 			return errStatementLimit
 		}
 	}
+	s.started = started
 	return nil
 }
 
@@ -641,6 +658,16 @@ func (s *pooledSession) readServer(conn *serverConn, done chan struct{}) {
 			clear(conn.prepared)
 		case *pgproto3.ParameterStatus:
 			conn.seen[m.Name] = m.Value
+			if unsafeLexerParameter(m.Name, m.Value) {
+				// The classifier missed a change, such as a function that
+				// calls set_config. Nothing more this client sends can be
+				// read safely, so the session ends before the next statement.
+				s.mu.Unlock()
+				s.b.auditDenied(s.event, "encoding_change")
+				s.writeClient(brokerError("FATAL", "42501", "encoding_change", lexerChangeMessage))
+				s.kill()
+				return
+			}
 		case *pgproto3.DataRow:
 			s.dataRows++
 			flush = s.dataRows%64 == 0

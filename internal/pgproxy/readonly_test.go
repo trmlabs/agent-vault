@@ -10,67 +10,147 @@ import (
 	"github.com/jackc/pgx/v5/pgproto3"
 )
 
-func TestCreatesTemporaryFailsClosed(t *testing.T) {
+// readOnlyRefuses is what a read-only session refuses on its first text.
+func readOnlyRefuses(sql string) bool {
+	lexer, _ := changesLexer(sql, false)
+	return lexer || !readOnlyAllowed(sql)
+}
+
+// sequelizeConnect is what Sequelize 6 sends on every new connection: the
+// session settings, then its type lookup.
+const (
+	sequelizeConnect = "SET client_min_messages TO warning;SET TIME ZONE INTERVAL '+00:00' HOUR TO MINUTE;"
+	sequelizeTypes   = "WITH ranges AS (  SELECT pg_range.rngtypid, pg_type.typname AS rngtypname,         pg_type.typarray AS rngtyparray, pg_range.rngsubtype    FROM pg_range LEFT OUTER JOIN pg_type ON pg_type.oid = pg_range.rngtypid)SELECT pg_type.typname, pg_type.typtype, pg_type.oid, pg_type.typarray,       ranges.rngtypname, ranges.rngtypid, ranges.rngtyparray  FROM pg_type LEFT OUTER JOIN ranges ON pg_type.oid = ranges.rngsubtype WHERE (pg_type.typtype IN('b', 'e'));"
+)
+
+func TestReadOnlyAllowlist(t *testing.T) {
 	for sql, want := range map[string]bool{
-		// What a read-only login does: unaffected.
-		"SELECT 1":                                          false,
-		"SET standard_conforming_strings=on;":               false, // Sequelize's connect
-		"set standard_conforming_strings to 'on'":           false,
-		"SET client_encoding TO 'UTF8'":                     false,
-		"SET NAMES 'UTF8'":                                  false,
-		"SELECT temp FROM weather":                          false, // a column named temp
+		// What a read-only login does, including the internal API through
+		// Sequelize and node-postgres: allowed.
+		sequelizeConnect:                      false,
+		sequelizeTypes:                        false,
+		"SET standard_conforming_strings=on;": false, // Sequelize, when the server reports otherwise
+		"SELECT 1":                            false,
+		"SELECT temp FROM weather":            false, // a column named temp
 		"SELECT * FROM t WHERE label = 'create temp table'": false, // keywords only inside a string
 		"SELECT \"temp\" FROM t":                            false,
-		"WITH x AS (SELECT 1) SELECT * FROM x":              false,
-		"SET search_path TO app, public":                    false,
-		"SET LOCAL statement_timeout = 5000":                false,
-		"SHOW client_encoding":                              false,
-		"SELECT E'a\\nb'":                                   false, // escapes are fine away from a search path
-		"BEGIN READ ONLY; SELECT 1; COMMIT":                 false,
-		"EXPLAIN SELECT * FROM t":                           false,
-		"DECLARE c CURSOR FOR SELECT 1":                     false,
-		"":                                                  false,
+		"SELECT \"id\", \"name\" FROM \"public\".\"users\" AS \"users\" WHERE \"users\".\"id\" = $1 LIMIT 1": false,
+		"WITH x AS (SELECT 1) SELECT * FROM x":       false,
+		"VALUES (1), (2)":                            false,
+		"TABLE t":                                    false,
+		"SHOW client_encoding":                       false,
+		"EXPLAIN SELECT * FROM t":                    false,
+		"EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM t": false,
+		"START TRANSACTION; SELECT 1; COMMIT;":       false,
+		"BEGIN READ ONLY; SAVEPOINT a; SELECT 1; RELEASE SAVEPOINT a; ROLLBACK TO SAVEPOINT a; COMMIT": false,
+		"SET TRANSACTION ISOLATION LEVEL REPEATABLE READ":                                              false,
+		"SET search_path TO app, public":                                                               false,
+		"SET LOCAL statement_timeout = 5000":                                                           false,
+		"SET application_name = 'probe'":                                                               false,
+		"RESET statement_timeout":                                                                      false,
+		"DECLARE c CURSOR FOR SELECT 1; FETCH 10 FROM c; CLOSE c":                                      false,
+		"SELECT E'a\\nb'": false,
+		"":                false,
+		// Reported bypasses: quoted names and computed values.
+		`SELECT "set_config"('search_path', 'pg' || '_temp', false)`:                    true,
+		`SELECT "pg_catalog"."set_config"('search_path', 'pg' || '_temp', false)`:       true,
+		`UPDATE "pg_settings" SET setting = 'pg' || '_temp' WHERE name = 'search_path'`: true,
+		`SELECT "SET_CONFIG"('a', 'b', false)`:                                          true,
+		"SELECT set_config('search_path', 'pg_'||'temp', false)":                        true,
+		"SELECT * FROM pg_settings":                                                     true, // named at all
 		// Temporary objects, however spelled.
-		"CREATE TEMP TABLE scratch (id int)":                                  true,
-		"create temporary table scratch (id int)":                             true,
-		"CREATE GLOBAL TEMPORARY TABLE x (id int)":                            true,
-		"CREATE LOCAL TEMP TABLE x (id int)":                                  true,
-		"CREATE TEMP VIEW v AS SELECT 1":                                      true,
-		"CREATE OR REPLACE TEMP VIEW v AS SELECT 1":                           true,
-		"CREATE TEMPORARY SEQUENCE s":                                         true,
-		"CREATE TEMP TABLE x AS SELECT 1":                                     true,
-		"/* hi */ CREATE/**/TEMP TABLE x (id int)":                            true,
-		"SELECT 1; CREATE TEMP TABLE x (id int)":                              true,
-		"SELECT * INTO TEMP scratch FROM t":                                   true,
-		"SELECT * INTO LOCAL TEMPORARY scratch FROM t":                        true,
-		"EXPLAIN ANALYZE CREATE TEMP TABLE x AS SELECT 1":                     true,
-		"CREATE TABLE pg_temp.x (id int)":                                     true,
-		"CREATE TABLE \"pg_temp\".x (id int)":                                 true,
-		"CREATE TABLE PG_TEMP_3.x (id int)":                                   true,
-		"CREATE FUNCTION pg_temp.f() RETURNS int AS 'SELECT 1'":               true,
-		"SET search_path TO pg_temp, public":                                  true,
-		"SET search_path = 'pg_temp'":                                         true,
-		"CREATE TABLE U&\"pg\\005ftemp\".x (id int)":                          true,
-		"SET search_path = E'pg\\137temp'":                                    true,
-		"SET SCHEMA E'pg\\137temp'":                                           true,
-		"SELECT set_config('search_path', 'pg_'||'temp', false)":              true,
-		"SELECT pg_catalog.set_config('a', 'b', false)":                       true,
-		"UPDATE pg_settings SET setting = 'x' WHERE name = 'y'":               true,
-		"DO $$ BEGIN EXECUTE 'CREATE TEMP' || 'ORARY TABLE x()'; END $$":      true,
-		"do language plpgsql $$ BEGIN NULL; END $$":                           true,
-		"SET standard_conforming_strings = off":                               true,
-		"SET SESSION client_encoding TO 'SJIS'":                               true,
-		"SET NAMES 'SJIS'":                                                    true,
-		"SET standard_conforming_strings = 'off'":                             true,
-		"SET standard_conforming_strings TO DEFAULT":                          true,
-		"SET standard_conforming_strings = on; SET client_encoding TO 'SJIS'": true,
-		"SET client_encoding = 'UTF8'; CREATE TEMP TABLE x (id int)":          true,
-		"SELECT 'unterminated":                                                true,
-		"SELECT 1 /* unterminated":                                            true,
+		"CREATE TEMP TABLE scratch (id int)":                             true,
+		"create temporary table scratch (id int)":                        true,
+		"CREATE GLOBAL TEMPORARY TABLE x (id int)":                       true,
+		"CREATE OR REPLACE TEMP VIEW v AS SELECT 1":                      true,
+		"CREATE TEMPORARY SEQUENCE s":                                    true,
+		"/* hi */ CREATE/**/TEMP TABLE x (id int)":                       true,
+		"SELECT 1; CREATE TEMP TABLE x (id int)":                         true,
+		"SELECT * INTO TEMP scratch FROM t":                              true,
+		"SELECT * INTO scratch FROM t":                                   true,
+		"EXPLAIN ANALYZE CREATE TEMP TABLE x AS SELECT 1":                true,
+		"CREATE TABLE t (x int)":                                         true,
+		"CREATE TABLE \"pg_temp\".x (id int)":                            true,
+		"CREATE TABLE PG_TEMP_3.x (id int)":                              true,
+		"SET search_path TO pg_temp, public":                             true,
+		"SET search_path = 'pg_temp'":                                    true,
+		"CREATE TABLE U&\"pg\\005ftemp\".x (id int)":                     true,
+		"SET search_path = E'pg\\137temp'":                               true,
+		"SET SCHEMA E'pg\\137temp'":                                      true,
+		"DO $$ BEGIN EXECUTE 'CREATE TEMP' || 'ORARY TABLE x()'; END $$": true,
+		// Writes and anything else outside the allowlist.
+		"INSERT INTO t VALUES (1)": true,
+		"UPDATE t SET x = 1":       true,
+		"DELETE FROM t":            true,
+		"WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d": true,
+		"SELECT * FROM t FOR UPDATE":                            true,
+		"EXPLAIN ANALYZE INSERT INTO t VALUES (1)":              true,
+		"EXPLAIN DELETE FROM t":                                 true,
+		"BEGIN READ WRITE":                                      true,
+		"START TRANSACTION READ WRITE":                          true,
+		"SET TRANSACTION READ WRITE":                            true,
+		"SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE": true,
+		"SET default_transaction_read_only = off":               true,
+		"SET transaction_read_only = off":                       true,
+		"RESET ALL":                                             true,
+		"RESET default_transaction_read_only":                   true,
+		"SET ROLE postgres":                                     true,
+		"SET SESSION AUTHORIZATION postgres":                    true,
+		"SET work_mem = '1GB'":                                  true,
+		"LISTEN jobs":                                           true,
+		"CALL refresh_things()":                                 true,
+		"COPY t TO STDOUT":                                      true,
+		"PREPARE p AS SELECT 1":                                 true,
+		"DISCARD ALL":                                           true,
+		"ALTER ROLE CURRENT_USER PASSWORD 'x'":                  true,
+		"SET standard_conforming_strings = off":                 true,
+		"SET client_encoding TO 'SJIS'":                         true,
+		"SELECT 'unterminated":                                  true,
+		"SELECT 1 /* unterminated":                              true,
 	} {
-		if got := createsTemporary(sql); got != want {
-			t.Errorf("createsTemporary(%q) = %v, want %v", sql, got, want)
+		if got := readOnlyRefuses(sql); got != want {
+			t.Errorf("read-only refuses %q = %v, want %v", sql, got, want)
 		}
+	}
+}
+
+// Every pooled session, read-write included, refuses a change to how the
+// server reads text: only on and UTF8, and only before any other statement.
+func TestChangesLexer(t *testing.T) {
+	for _, tc := range []struct {
+		sql     string
+		started bool
+		refuse  bool
+	}{
+		{"SET standard_conforming_strings=on;", false, false},
+		{"set standard_conforming_strings to 'on'", false, false},
+		{"SET client_encoding TO 'UTF8'", false, false},
+		{"SET NAMES 'utf8'", false, false},
+		{"SET standard_conforming_strings=on;SET client_min_messages TO warning;", false, false},
+		{"SET client_min_messages TO warning; SHOW client_encoding; RESET client_encoding", true, false},
+		{"SELECT 'SET client_encoding TO SJIS'", true, false},
+		{"SET standard_conforming_strings = off", false, true},
+		{"SET standard_conforming_strings = 'off'", false, true},
+		{"SET standard_conforming_strings TO DEFAULT", false, true},
+		{"SET LOCAL standard_conforming_strings = on", false, true},
+		{"SET client_encoding TO 'SJIS'", false, true},
+		{"SET client_encoding TO 'BIG5'", false, true},
+		{"SET NAMES 'SJIS'", false, true},
+		{"SET NAMES 'BIG5'", false, true},
+		{"SET SESSION client_encoding TO 'LATIN1'", false, true},
+		{"SET standard_conforming_strings = on", true, true},     // after another statement
+		{"SELECT 1; SET client_encoding TO 'UTF8'", false, true}, // in the same text
+		{"SET client_encoding = 'UTF8'; SET client_encoding = 'SJIS'", false, true},
+	} {
+		if got, _ := changesLexer(tc.sql, tc.started); got != tc.refuse {
+			t.Errorf("changesLexer(%q, started=%v) = %v, want %v", tc.sql, tc.started, got, tc.refuse)
+		}
+	}
+	if _, next := changesLexer("SET client_encoding TO 'UTF8'", false); next {
+		t.Error("a safe encoding SET counted as another statement")
+	}
+	if _, next := changesLexer("SELECT 1", false); !next {
+		t.Error("a query did not start the session")
 	}
 }
 
@@ -124,12 +204,12 @@ func TestReadOnlyUnpooledRefusesTemporaryTables(t *testing.T) {
 	}
 	waitFor(t, 2*time.Second, func() bool {
 		for _, o := range deniedOutcomes(audit) {
-			if o == "read_only_temp" {
+			if o == "read_only" {
 				return true
 			}
 		}
 		return false
-	}, "the refusal is audited as read_only_temp")
+	}, "the refusal is audited as read_only")
 }
 
 // A fast-path FunctionCall names its function by OID, so a read-only login
@@ -285,6 +365,54 @@ func TestFrameTrackerFollowsSplitMessages(t *testing.T) {
 		_, _ = tr.Write(stream[:len(stream)-1])
 		if tr.atBoundary() {
 			t.Fatalf("size %d: boundary reported mid-message", size)
+		}
+	}
+}
+
+// A read-write pooled session refuses a mid-session encoding change, so the
+// broker's lexer and the server always read text the same way, and keeps the
+// session open.
+func TestReadWritePooledRefusesEncodingChanges(t *testing.T) {
+	upstream, addr, audit := readOnlyBroker(t, false, &PoolOptions{QueueFactor: 20})
+	s := openAgentSession(t, addr, "agent-vault-token", "appdb")
+	defer s.close()
+	if code := queryCode(t, s, "SET standard_conforming_strings=on"); code != "" {
+		t.Fatalf("connect-time safe SET answered %q", code)
+	}
+	for _, sql := range []string{"SET standard_conforming_strings = off", "SET client_encoding TO 'SJIS'", "SET NAMES 'BIG5'"} {
+		if code := queryCode(t, s, sql); code != "42501" {
+			t.Fatalf("%q answered %q, want 42501", sql, code)
+		}
+	}
+	if code := queryCode(t, s, "CREATE TEMP TABLE scratch (id int)"); code != "" {
+		t.Fatalf("read-write session lost a temporary table: %q", code)
+	}
+	// Even the safe value is refused once another statement has run.
+	if code := queryCode(t, s, "SET client_encoding TO 'UTF8'"); code != "42501" {
+		t.Fatalf("late encoding SET answered %q, want 42501", code)
+	}
+	for _, q := range upstream.received() {
+		if strings.Contains(q, "SJIS") || strings.Contains(q, "BIG5") || strings.Contains(q, "= off") {
+			t.Fatalf("refused statement reached the database: %q", q)
+		}
+	}
+	waitFor(t, 2*time.Second, func() bool { return len(deniedOutcomes(audit)) == 4 }, "four audited refusals")
+}
+
+func TestUnsafeLexerParameter(t *testing.T) {
+	for _, tc := range []struct {
+		name, value string
+		unsafe      bool
+	}{
+		{"standard_conforming_strings", "on", false},
+		{"standard_conforming_strings", "off", true},
+		{"client_encoding", "UTF8", false},
+		{"client_encoding", "SJIS", true},
+		{"client_encoding", "BIG5", true},
+		{"TimeZone", "UTC", false},
+	} {
+		if got := unsafeLexerParameter(tc.name, tc.value); got != tc.unsafe {
+			t.Errorf("%s=%s: unsafe %v, want %v", tc.name, tc.value, got, tc.unsafe)
 		}
 	}
 }
