@@ -86,7 +86,13 @@ func (p *Proxy) adapterDeny(w http.ResponseWriter, event auditchain.Event, statu
 // adapterUnauthenticatedDeny replaces the SQL audit for refusals that happen
 // before identity is known, so every refusal lands in the signed trail.
 func (p *Proxy) adapterUnauthenticatedDeny(w http.ResponseWriter, r *http.Request, a requestlog.Attempt, status int) {
-	p.adapterDeny(w, auditchain.Event{Agent: a.ActorID, PodUID: a.WorkloadID, Method: auditMethod(r.Method)}, status, "refused")
+	p.adapterIdentityDeny(w, r, a, status, "")
+}
+
+// adapterIdentityDeny records a refusal with the identity check that refused
+// it, as a fixed code in the row's decision field ("" when none applies).
+func (p *Proxy) adapterIdentityDeny(w http.ResponseWriter, r *http.Request, a requestlog.Attempt, status int, reason string) {
+	p.adapterDeny(w, auditchain.Event{Agent: a.ActorID, PodUID: a.WorkloadID, Method: auditMethod(r.Method), Decision: reason}, status, "refused")
 }
 
 func auditMethod(m string) string {

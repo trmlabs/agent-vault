@@ -124,7 +124,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		p.recordAuthFailure(r)
 		if p.strictCredentialProxy {
-			p.strictUnauthenticatedDeny(w, r, http.StatusForbidden)
+			p.strictIdentityDeny(w, r, err)
 			return
 		}
 		writeAuthError(w, err)
@@ -209,7 +209,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				w.Header().Set("Connection", "close")
 				if p.strictCredentialProxy {
-					p.strictUnauthenticatedDeny(w, r, http.StatusForbidden)
+					p.strictIdentityDeny(w, r, err)
 					return
 				}
 				writeAuthError(w, err)

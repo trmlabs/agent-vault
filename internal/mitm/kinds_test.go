@@ -116,3 +116,28 @@ func TestRefusalLogIsRateLimitedByReason(t *testing.T) {
 		t.Fatalf("folded count missing: %s", buf.String())
 	}
 }
+
+type refusingAttestor struct{ err error }
+
+func (a refusingAttestor) Attest(context.Context, string, netip.Addr) (*brokercore.ProxyScope, error) {
+	return nil, a.err
+}
+
+// A refused identity's audit row names the check that refused it; the
+// caller still gets a bare 403.
+func TestIdentityRefusalIsAuditedWithItsReason(t *testing.T) {
+	f := newAdapterFixture(t, func(o *Options) { o.Attestor = refusingAttestor{brokercore.Denied("proxy_source")} })
+	code, body, _ := f.do(t, "GET", "/v1/chat/x", "", nil)
+	if code == 200 || strings.Contains(body, "proxy_source") {
+		t.Fatalf("caller saw %d %q", code, body)
+	}
+	if e := f.audit.last(); e.Event != "denied" || e.Decision != "identity_proxy_source" || e.Status != 403 {
+		t.Fatalf("audit row %+v", e)
+	}
+	// A refusal without a code keeps the plain row.
+	g := newAdapterFixture(t, func(o *Options) { o.Attestor = refusingAttestor{brokercore.ErrInvalidSession} })
+	g.do(t, "GET", "/v1/chat/x", "", nil)
+	if e := g.audit.last(); e.Event != "denied" || e.Decision != "" {
+		t.Fatalf("plain refusal row %+v", e)
+	}
+}

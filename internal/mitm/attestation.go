@@ -139,7 +139,8 @@ func (p *Proxy) resolveScope(ctx context.Context, token, hint string, peer netip
 	}
 	// Each listener admits only the identity kinds it was opened for.
 	if !brokercore.KindAdmitted(connKinds(ctx), scope.IdentityKind) {
-		return nil, brokercore.ErrInvalidSession
+		p.logRefusal("listener_kind")
+		return nil, brokercore.Denied("listener_kind")
 	}
 	return scope, nil
 }
@@ -179,12 +180,16 @@ func (p *Proxy) resolveAnyScope(ctx context.Context, token, hint string, peer ne
 		scope, err = p.attestor.Attest(ctx, token, peer)
 	}
 	if err != nil || scope == nil {
-		p.logRefusal(brokercore.DenialReason(err))
-		return nil, brokercore.ErrInvalidSession
+		reason := brokercore.DenialReason(err)
+		p.logRefusal(reason)
+		if reason == "" {
+			return nil, brokercore.ErrInvalidSession
+		}
+		return nil, brokercore.Denied(reason)
 	}
 	if !scope.NotAfter.IsZero() && !time.Now().Before(scope.NotAfter) {
 		p.logRefusal("deadline")
-		return nil, brokercore.ErrInvalidSession
+		return nil, brokercore.Denied("deadline")
 	}
 	return scope, nil
 }
