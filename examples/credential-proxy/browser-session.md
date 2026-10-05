@@ -14,7 +14,9 @@ email, password and automated-auth private key that agents hold today.
 | Seed | The agent fetches `https://<api host>/.gatehouse/browser-seed` through Gatehouse. The answer is a Playwright storage state: the app's Auth0 localStorage entries with the placeholder as the access token, an unsigned ID token carrying the user's non-secret claims (`sub`, `org_id`, email), and the `auth0.<client>.is.authenticated` cookie. It expires at the worker Pod's deadline, at most 8 hours. |
 | App | The app's own host (`appHost`) serves GET and HEAD with no credential. |
 | API | Requests to the API host carry `Authorization: Bearer <placeholder>`, or none. Gatehouse replaces the placeholder with the real token. Any other credential is refused. |
-| Login | Gatehouse logs the user in with Auth0's password-realm grant through a confidential client. It reads the password and client secret from Vault for each login, caches the token until a quarter of its life is left, and logs in again after the API refuses it. |
+| Sign-in | Gatehouse signs the user in by the entry's `auth0.login` method (below). It reads the sign-in secrets from Vault for each sign-in and caches the token until a quarter of its life is left. Requests that need a sign-in share one attempt, which runs on its own (up to 90 seconds) even if the request that started it gives up. After any attempt, successful or not, the entry makes no other for a minute: a failure answers 503 for that minute, and a failed renewal keeps the last token serving until it expires. It keeps no refresh token. |
+| Paths | Only the entry's `pathPrefixes` reach the API, never all of it. Credential and account-admin routes are refused everywhere (see Path guard). |
+| Rate | The per-Pod proxy limit applies: by default 20 requests a second with a burst of 200, and 64 in flight, per Pod and entry. Over it, 429 with outcome `rate_limited`. |
 | Cookies | Never pass, in either direction: a cookie the app or API sets after a bearer call would be a session credential of its own. |
 | Screening | Every response is screened for the real token. A response that carries it is cut off. |
 
@@ -28,22 +30,56 @@ the staging app, with a seed from `TestBrowserSeedFile`. The client reports a
 signed-in user, returns the placeholder from `getTokenSilently`, returns `sub`
 and `org_id` from `getIdTokenClaims`, and makes no network call.
 
+## Sign-in methods
+
+| `auth0.login` | How | When |
+|---|---|---|
+| `password-realm` (default) | Auth0's password-realm grant through a confidential client (`auth0.realm`, `auth0.tokenClient`). | An app whose Auth0 application is not organization-enabled. |
+| `automated-auth` | TRM's automated-auth service drives the app's Universal Login with the entry's organization. | An organization-enabled app. Auth0 refuses the password-realm grant for those, and the TRM Enterprise API refuses a token without `org_id`. |
+
+With `automated-auth`, Gatehouse calls `POST <url>/v1/auth/login` with the service key, the profile, the organization and the user's email and password, all from Vault except the profile and organization. It then:
+
+- reads only the top-level `accessToken`, `idToken` and `expiresAt` of the answer. The browser seed the service also returns is never parsed, and the answer is never logged; its error text can name the user.
+- refuses the token unless the access token is a JWT whose `org_id` is the entry's `orgID`, whose `aud` includes the entry's audience, and which has at least two minutes left. An ID token, when present, must name the same user and organization.
+- builds the seed's ID token from the ID token's claims, or from the access token's `sub` and `org_id` when the service returns none (its password sign-in does not).
+- revokes the refresh token at `https://<auth0.domain>/oauth/revoke` with the app's public client ID, retrying once. The audit trail records binding `<entry>/revoke` with outcome `refresh_revoked` or `revoke_failed`; alert on `revoke_failed`. A failed revocation does not fail the sign-in, since Gatehouse keeps the token nowhere, but it stays valid in Auth0 until it expires.
+
+The service URL is https only. Plain http to a Kubernetes Service name is accepted only by binaries built with the `e2e` tag, for the Kind fixture. Gatehouse dials only the service and Auth0 addresses the catalog names, through the guarded dialer, and never follows a redirect. A sign-in drives a real login page and can take tens of seconds (limit 60); the first API call of a session waits for it.
+
+## Path guard
+
+A browser-session entry acts as its test user, often an admin of its organization. The guard keeps a worker from using that session to mint a credential of its own or change the account.
+
+- `pathPrefixes` are required and never `/`. A prefix may not contain a denied segment or lie within a `deniedPaths` template.
+- Denied segments, refused anywhere in a path, in any case, with `-` and `_` ignored: `apikey(s)`, `password`, `change-password`, `reset-password`, `mfa`, `otp`, `totp`, `invitations`, `invites`, `oauth`, `token(s)`, `sso`, `saml`, `scim`, `connections`, `roles`, `ip-allowlist`, `authentication`, `admin`, `user-management`, `bulk-operations`, `rotate-secret`, `webhooks`, `credentials`, `secrets`, `keys`, `client-secret`, `permissions`, `impersonate`, `sessions`. Outcome `denied_path`, 403.
+- `users-organizations` is read-only anywhere in a path: GET, HEAD and OPTIONS pass, every other method gets 403 with outcome `read_only_path`. The app reads it at start-up; the same routes invite and create users.
+- `deniedPaths` and `readOnlyPaths` are templates per entry: segments are names or a single `*`. Each covers its path and everything below it. Under a denied one every method is refused (`denied_path`); under a read-only one only GET, HEAD and OPTIONS pass (`read_only_path`).
+- A denied request is refused before any sign-in or upstream call.
+
 ## Catalog entry
 
+The TRM Enterprise staging app, all values public:
+
 ```json
-{"name": "staging-app", "kind": "browser-session", "host": "api.staging.example",
- "placeholder": "__vault_STAGING_APP__", "pools": ["database-developers"],
+{"name": "enterprise-staging", "kind": "browser-session", "host": "api.trmlabs-staging.com",
+ "placeholder": "__vault_ENTERPRISE_STAGING__", "pools": ["<one pool>"],
+ "pathPrefixes": ["<the API paths the workers need>"],
+ "readOnlyPaths": ["/users-organizations"],
+ "deniedPaths": ["/v1/parent-organizations/*/users", "/v1/parent-organizations/*/invitations",
+                 "/v1/parent-organizations/*/environments/*/groups/*/members", "/v1/users/*/email", "/v1/intel-vault"],
  "browserSession": {
-   "appHost": "app.staging.example",
-   "auth0": {"domain": "tenant.us.auth0.com", "clientID": "<the app's public client ID>",
-             "audience": "<the app's API audience>", "realm": "Username-Password-Authentication",
-             "tokenClient": {"mount": "gatehouse", "path": "browser/staging-login-client"}},
-   "user": {"mount": "gatehouse", "path": "browser/staging-qa-user"}}}
+   "appHost": "my.trmlabs-staging.com",
+   "auth0": {"domain": "auth.trmlabs-staging.com", "clientID": "oXEx4sYBQfNWgRX64ZowzXGkNQ0sFgny",
+             "audience": "https://my.trmlabs-staging.com/", "login": "automated-auth"},
+   "automatedAuth": {"url": "https://automated-auth.staging.us-saas.clever-hertz.com", "profile": "trm-b2b-staging",
+                     "orgID": "org_M2CBUrwlctYqzmNG", "key": {"mount": "gatehouse", "path": "browser/automated-auth"}},
+   "user": {"mount": "gatehouse", "path": "browser/enterprise-staging/user"}}}
 ```
 
-- `tokenClient` holds `client_id` and `client_secret`: a confidential Auth0 client allowed the password-realm grant for that connection only.
-- `user` holds `email` and `password`.
-- Both live only in Vault. The entry's `pathPrefixes` default to `/`; `forwardHeaders` adds request headers to the browser set.
+- `key` holds `private_key`, the automated-auth service key. `user` holds `email` and `password`. They live only in Vault.
+- One pool per entry, and a test user in one entry only, so its session and audit trail belong to one pool.
+- A `password-realm` entry drops `automatedAuth` and sets `auth0.realm` and `auth0.tokenClient` (`client_id` and `client_secret` of a confidential client allowed the grant for that connection only).
+- `forwardHeaders` adds request headers to the browser set.
 
 ## From the agent
 
@@ -59,6 +95,6 @@ HTTPS call: `NODE_EXTRA_CA_CERTS` for Node, the NSS store for Chromium.
 
 ## Before staging
 
-- An Auth0 confidential client with the password-realm grant, limited to the test-user connection, in the staging tenant.
-- The broker's egress allows the Auth0 tenant's addresses.
+- For `password-realm`, an Auth0 confidential client with the grant, limited to the test-user connection, in the staging tenant. For `automated-auth`, the service's profile for the app and its key in Vault.
+- The broker's egress (`AGENT_VAULT_NETWORK_ALLOWLIST`, `AGENT_VAULT_EGRESS_RANGES` and the namespace's network policy) allows the Auth0 tenant's addresses and, for `automated-auth`, the service's.
 - Test users only. SSO and MFA employee accounts cannot use this, and the catalog never lists production.
