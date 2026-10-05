@@ -417,7 +417,8 @@ var refusalsByReason = map[string]refusal{
 	"credential":      {"08006", "Gatehouse could not get a database credential; retry shortly"},
 	"restarting":      {"57P01", "Gatehouse is restarting; reconnect"},
 	"role_change":     {"42501", "Gatehouse refuses ALTER ROLE, ALTER USER and ALTER DATABASE on a shared database connection"},
-	"read_only_temp":  {"25006", "this database login is read-only: Gatehouse refuses temporary tables, views and sequences, and DO, set_config, pg_temp and encoding changes that could create them"},
+	"read_only":       {"25006", "this database login is read-only: Gatehouse allows only reads, transaction control and a few settings such as search_path, and refuses temporary tables"},
+	"encoding_change": {"42501", "Gatehouse refuses changing standard_conforming_strings or client_encoding mid-session; only on and UTF8 at connect"},
 	"statement_limit": {"54000", "this session holds too many prepared statements; deallocate some"},
 }
 
