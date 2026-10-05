@@ -390,11 +390,6 @@ func attachPostgresBrokerIfEnabled(srv *server.Server, host string, postgresPort
 	if postgresPort <= 0 {
 		return nil
 	}
-	client := srv.HashicorpClient()
-	if client == nil {
-		logger.Debug("postgres broker disabled: no HashiCorp Vault client (set VAULT_ADDR)")
-		return nil
-	}
 	services, err := server.LoadDatabaseServices(os.Getenv)
 	if err != nil {
 		return fmt.Errorf("postgres broker: %w", err)
@@ -405,6 +400,12 @@ func attachPostgresBrokerIfEnabled(srv *server.Server, host string, postgresPort
 	if !boolEnvValue("AGENT_VAULT_DB_BROKER") && len(services) == 0 {
 		logger.Debug("postgres broker disabled: set AGENT_VAULT_DB_BROKER=1 or configure AGENT_VAULT_DB_SERVICES")
 		return nil
+	}
+	// A broker that was asked for but has no Vault login fails startup, rather
+	// than starting without it and reporting ready with no way to mint.
+	client := srv.HashicorpClient()
+	if client == nil {
+		return fmt.Errorf("postgres broker requires a working HashiCorp Vault client (set VAULT_ADDR)")
 	}
 	if host == "localhost" {
 		host = "127.0.0.1"
