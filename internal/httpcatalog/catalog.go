@@ -88,8 +88,9 @@ type KeyRef struct {
 }
 
 type Catalog struct {
-	entries []Entry
-	pools   []Pool
+	entries   []Entry
+	pools     []Pool
+	harnesses []Harness
 }
 
 // Pool names a set of workers by their Kubernetes identity. When a catalog
@@ -110,6 +111,8 @@ type Pool struct {
 	BaseGroup string `json:"baseGroup,omitempty"`
 	// Entitlements are a workload pool's fixed groups.
 	Entitlements []string `json:"entitlements,omitempty"`
+
+	harness *Harness // the declared profile naming this pool, if any
 }
 
 // Pool returns the defined pool with this name.
@@ -219,8 +222,9 @@ func Load(path string) (Catalog, error) {
 
 func Parse(data []byte) (Catalog, error) {
 	var file struct {
-		Pools   []Pool  `json:"pools,omitempty"`
-		Entries []Entry `json:"entries"`
+		Harnesses []Harness `json:"harnesses,omitempty"`
+		Pools     []Pool    `json:"pools,omitempty"`
+		Entries   []Entry   `json:"entries"`
 	}
 	d := json.NewDecoder(bytes.NewReader(data))
 	d.DisallowUnknownFields()
@@ -244,6 +248,15 @@ func Parse(data []byte) (Catalog, error) {
 		}
 		poolNames[pool.Name] = true
 		pools[pool.Name] = pool
+	}
+	profiles, err := validateHarnesses(file.Harnesses, pools)
+	if err != nil {
+		return Catalog{}, err
+	}
+	for i := range file.Pools {
+		if h, ok := profiles[file.Pools[i].Name]; ok {
+			file.Pools[i].harness = &h
+		}
 	}
 	names := map[string]bool{}
 	routes := map[string]string{}
@@ -298,7 +311,7 @@ func Parse(data []byte) (Catalog, error) {
 			routes[route] = e.Name
 		}
 	}
-	return Catalog{entries: file.Entries, pools: file.Pools}, nil
+	return Catalog{entries: file.Entries, pools: file.Pools, harnesses: file.Harnesses}, nil
 }
 
 func (e *Entry) normalize() error {

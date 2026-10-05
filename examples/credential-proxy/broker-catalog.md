@@ -31,6 +31,29 @@ entries:
 
 Entry kinds: `postgres` (port 5432 by default; `sslmode` is `verify-full`, the only mode the catalog accepts; `access` is `read` by default and must be `write` exactly for a `-readwrite` role; the broker needs `AGENT_VAULT_CATALOG_ENVIRONMENT`, and `validate` needs `--environment`, such as `staging`, and every role must then be `staging.<region>.<cluster>.<name>-readonly` or `-readwrite`; with no environment set, a catalog with any `postgres` entry is refused), HTTP (no kind; see the HTTP header adapter guide), `git` and `github-api` (see the git adapter guide). When `pools` is defined, an entry can grant only defined pool names. Grants match the scope's pool, which the broker's attestation sets from the worker Pod's approved controller. The agent ID stays the broker's own identifier for revocation, Vault roles, cleanup and audit. A scope with no pool matches no grant. Audit rows carry both `pool` and `agent`.
 
+## Harness profiles
+
+A harness is one kind of agent runtime: Cursor workers, Claude sessions, agent-sandbox. Each is one `harnesses` entry that answers three questions: how its agents prove who they are, how they reach the broker, and whether access is decided for the pool or for the person. A new runtime needs a new entry, and code only if it brings a new identity kind.
+
+```yaml
+harnesses:
+  - name: cursor
+    trustDomain: {issuer: https://container.googleapis.com/v1/projects/P/locations/L/clusters/C, keys: in-cluster, audience: gatehouse}
+    identity: {kind: pod-token, ownerKind: ReplicaSet, namespaces: [cursor-agents], imageDigests: [sha256:...]}
+    path: {kind: sidecar}
+    authorization: {mode: pool, poolName: cursor-agents}
+```
+
+| Field | Values |
+|---|---|
+| `trustDomain` | `issuer` (HTTPS), `keys` (`in-cluster`: the broker's own cluster API; `remote`: the issuer's published keys), `audience` |
+| `identity.kind` | `pod-token` (the Pod's own token, live Pod and source address), `session-jwt` (the same, plus a runner session naming the person, pinned to its first Pod), `proxy-attested` (a shared proxy in the agent's cluster checks the Pod and presents its own token) |
+| `identity` | `ownerKind` (the controller kind that must own the agent Pod), `namespaces`, `imageDigests`, optional `requester` (`session-jwt` or `signed-assertion`) |
+| `path` | `kind` (`sidecar` or `shared-proxy`), `crossCluster` |
+| `authorization` | `mode` (`pool` or `person`), `poolName` |
+
+Every field is required except `requester` and `crossCluster`, and the catalog is refused when an entry is incomplete or contradictory: a `pod-token` harness runs a sidecar and decides for the pool; `session-jwt` decides for the person; `proxy-attested` runs a shared proxy; a cross-cluster path uses remote keys and is proxy-attested; `person` needs a requester. `signed-assertion` is refused until the broker verifies assertions. Once a catalog declares harnesses, each pool belongs to exactly one, its namespace is listed, and its `identity` agrees with the mode (`claude-session` exactly for `person`). A catalog without harnesses keeps today's behavior: each pool's profile is derived from its `identity`.
+
 ## Validation
 
 `agent-vault broker-catalog validate catalog.yaml --require-pools --allowed-host-suffix .postgresbridge.com --allowed-host-suffix serpapi.com` runs the broker's own parser. It checks the schema, exact hosts with no wildcards or IP addresses, unique routes, methods, key locations and pool grants, and keeps every host inside the allowed domains. Run it in CI before Atlantis applies. For CI without access to this repository, `Dockerfile.catalog-validator` builds the same command into a small image (glibc base with a shell, so it can serve as a CI job container), at the broker's reviewed commit, through the same build, review, publish and Artifact Registry mirror path as the broker image; pin it by digest.
