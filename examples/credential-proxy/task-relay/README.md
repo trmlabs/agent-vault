@@ -111,6 +111,17 @@ pairing, deadline, journal and connection limits. If any listener cannot start,
 the relay closes the others and exits. It starts accepting requests only after
 all listeners and browser policy are ready.
 
+### Shared proxy for many agents
+
+For a runtime whose agent Pods hold no token of their own (agent-sandbox), one relay Deployment serves every agent in the listed namespaces. Set `shared` instead of `sandbox` and `self`; `deadline` may be omitted:
+
+```json
+"shared": {"namespaces": ["agent-sandboxes"], "ownerKind": "Sandbox", "ownerAPIVersion": "agents.x-k8s.io/v1beta1",
+           "imageDigests": ["sha256:..."], "maxPodSeconds": 3600, "maxConnections": 4096}
+```
+
+The relay lists and watches Pods in those namespaces (its Role needs `get`, `list` and `watch` on `pods` there), so admitting a connection costs no API call. It matches each connection's source address to exactly one Pod that is Running, not deleting, not on the host network, with no ephemeral container, controlled by `ownerKind` at `ownerAPIVersion` with `blockOwnerDeletion`, running only listed images, and inside `maxPodSeconds` (or its `activeDeadlineSeconds`). It then presents its own projected token with an attestation of that Pod: the `Gatehouse-Attestation` CONNECT header, or a `GHATTS1` line ahead of the PostgreSQL startup. Every second it rechecks each open connection's Pod and closes the connection when the Pod changes, stops qualifying or its namespace's watch has been silent for 90 seconds. Listeners serve TLS on any address; session files and the browser are refused. The broker side is a proxy binding (see the identity reference). Scale with replicas; `maxConnections` bounds one replica.
+
 ## Client and protocol contract
 
 | Surface | Sandbox sends | Relay behavior |

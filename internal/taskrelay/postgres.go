@@ -134,6 +134,20 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig) {
 	stop := context.AfterFunc(r.ctx, func() { _ = up.Close() })
 	defer stop()
 	_ = up.SetDeadline(minTime(expiry, time.Now().Add(handshakeTimeout)))
+	// A shared proxy states which agent Pod is behind this connection, first
+	// on the broker-side stream, and drops it when that Pod stops qualifying.
+	attestation, podUID, e := r.attest(peer)
+	if e != nil {
+		return
+	}
+	if attestation != "" {
+		if _, e = io.WriteString(up, "GHATTS1 "+attestation+"\n"); e != nil {
+			tell(errorFrame("08001", unreachableMessage))
+			return
+		}
+	}
+	stopWatch := r.watchPeer(peer, podUID, func() { _ = conn.Close(); _ = up.Close() })
+	defer stopWatch()
 	// The runner session rides the broker-side stream ahead of the startup
 	// packet this sidecar authors; the worker's own bytes never carry it.
 	if session := readSession(c.Upstream); session != "" {
