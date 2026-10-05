@@ -13,7 +13,13 @@ var (
 	// A whole repository, or a repository and one tenant segment, in the
 	// agent-sandbox project's Artifact Registry only.
 	prefix = regexp.MustCompile(`^us-central1-docker\.pkg\.dev/trm-agent-sandbox/[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?/([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?/)?$`)
-	ref    = regexp.MustCompile(`^[a-z0-9][a-z0-9._/-]{0,511}@sha256:[0-9a-f]{64}$`)
+	// An image reference by the OCI distribution grammar: an optional
+	// registry host (and port), then path components of lowercase letters
+	// and digits joined by single separators, so ".", ".." and empty
+	// components never parse.
+	domainPart = `[a-z0-9]([a-z0-9-]*[a-z0-9])?`
+	pathPart   = `[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*`
+	ref        = regexp.MustCompile(`^(` + domainPart + `(\.` + domainPart + `)*(:[0-9]{1,5})?/)?` + pathPart + `(/` + pathPart + `)*@sha256:[0-9a-f]{64}$`)
 )
 
 // ValidDigest reports whether d is sha256: and 64 lowercase hex characters.
@@ -34,7 +40,7 @@ func Split(imageID string) (repository, d string, ok bool) {
 	if digest.MatchString(imageID) {
 		return "", imageID, true
 	}
-	if !ref.MatchString(imageID) {
+	if len(imageID) > 600 || !ref.MatchString(imageID) {
 		return "", "", false
 	}
 	i := strings.LastIndexByte(imageID, '@')

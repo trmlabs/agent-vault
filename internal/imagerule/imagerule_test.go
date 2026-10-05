@@ -40,6 +40,16 @@ func TestAllowedMatchesThePulledImage(t *testing.T) {
 		"docker.io/library/busybox@" + d2: false,
 		"us-central1-docker.pkg.dev/trm-agent-sandbox/agent-sandbox-images-staging/orion/agent:latest": false, // a tag, not a pull
 		"": false,
+		// Components outside the OCI grammar never parse, so none can climb
+		// out of the prefix or pad it.
+		"us-central1-docker.pkg.dev/trm-agent-sandbox/agent-sandbox-images-staging/orion/../gatehouse/proxy@" + d2: false,
+		"us-central1-docker.pkg.dev/trm-agent-sandbox/agent-sandbox-images-staging/orion/./agent@" + d2:            false,
+		"us-central1-docker.pkg.dev/trm-agent-sandbox/agent-sandbox-images-staging/orion//agent@" + d2:             false,
+		"us-central1-docker.pkg.dev/trm-agent-sandbox/agent-sandbox-images-staging/orion/agent/@" + d2:             false,
+		"us-central1-docker.pkg.dev/trm-agent-sandbox/agent-sandbox-images-staging/orion/-agent@" + d2:             false,
+		"us-central1-docker.pkg.dev/trm-agent-sandbox/agent-sandbox-images-staging/orion/my_tool.v2@" + d2:         true,
+		"localhost:5000/orion/agent@" + d2: false,
+		"docker-pullable://us-central1-docker.pkg.dev/trm-agent-sandbox/agent-sandbox-images-staging/orion/agent@" + d2: true,
 	} {
 		if Allowed(id, orion, []string{d1}) != ok {
 			t.Errorf("%s: %v", id, !ok)
