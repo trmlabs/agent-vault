@@ -46,10 +46,14 @@ type Binding struct {
 	// ListAgents is valid only in observer policy. It lets the admission
 	// controller read every agent's outstanding cleanup by agent and Pod UID.
 	ListAgents bool `json:"listAgents,omitempty"`
+	// TrustDomain names the listed trust domain whose tokens this binding
+	// admits; empty is the broker's own cluster.
+	TrustDomain string `json:"trustDomain,omitempty"`
 }
 
-// Config selects one Kubernetes trust domain and explicit workload grants.
-// Empty API/CA/reviewer paths select the standard in-cluster endpoints.
+// Config selects the broker's own Kubernetes trust domain, any remote ones,
+// and explicit workload grants. Empty API/CA/reviewer paths select the
+// standard in-cluster endpoints.
 type Config struct {
 	APIServer               string    `json:"apiServer"`
 	CAFile                  string    `json:"caFile"`
@@ -59,6 +63,8 @@ type Config struct {
 	TimeoutSeconds          int       `json:"timeoutSeconds"`
 	MaxTokenLifetimeSeconds int64     `json:"maxTokenLifetimeSeconds"`
 	Bindings                []Binding `json:"bindings"`
+	// TrustDomains are other clusters, each verified by its published keys.
+	TrustDomains []TrustDomain `json:"trustDomains,omitempty"`
 }
 
 // Store supplies current broker identity and grant state for every decision.
@@ -74,7 +80,9 @@ type Resolver struct {
 	client *http.Client
 	store  Store
 	now    func() time.Time
-	jwks   *signingKeys
+	jwks   *signingKeys // the broker's own cluster's keys: domains[0].keys
+	// domains are the trust domains, the broker's own cluster first.
+	domains []*domain
 }
 
 var _ brokercore.SessionResolver = (*Resolver)(nil)
@@ -124,6 +132,9 @@ func newResolver(c Config, s Store, observer bool) (*Resolver, error) {
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
 		return nil, errors.New("workload identity apiServer must be an HTTPS origin")
 	}
+	if observer && len(c.TrustDomains) != 0 {
+		return nil, errors.New("observer policy must not list trust domains")
+	}
 	if (!observer && s == nil) || c.CAFile == "" || c.ReviewerTokenFile == "" || c.Issuer == "" || c.Audience == "" || len(c.Bindings) == 0 {
 		return nil, errors.New("workload identity requires trust, reviewer token, issuer, audience, store and bindings")
 	}
@@ -171,7 +182,15 @@ func newResolver(c Config, s Store, observer bool) (*Resolver, error) {
 		if !observer && b.ListAgents {
 			return nil, errors.New("proxy policy must not contain observer access")
 		}
-		key := b.Namespace + ":" + b.ServiceAccount
+		if b.TrustDomain != "" && !listedDomain(c.TrustDomains, b.TrustDomain) {
+			return nil, errors.New("workload identity binding names an unlisted trust domain")
+		}
+		if b.TrustDomain != "" {
+			// The broker cannot read a remote cluster's Pods, so neither the
+			// TokenReview path nor the pool Pod check can admit its tokens.
+			return nil, errors.New("a remote trust domain admits only proxy bindings")
+		}
+		key := b.TrustDomain + "/" + b.Namespace + ":" + b.ServiceAccount
 		if seen[key] {
 			return nil, errors.New("ambiguous workload identity binding")
 		}
@@ -188,10 +207,24 @@ func newResolver(c Config, s Store, observer bool) (*Resolver, error) {
 	c.APIServer = strings.TrimSuffix(c.APIServer, "/")
 	c.Bindings = append([]Binding(nil), c.Bindings...)
 	transport := &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool}}
-	return &Resolver{config: c, store: s, now: time.Now, jwks: &signingKeys{}, client: &http.Client{
+	r := &Resolver{config: c, store: s, now: time.Now, client: &http.Client{
 		Timeout: time.Duration(c.TimeoutSeconds) * time.Second, Transport: transport,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-	}}, nil
+	}}
+	if err := r.buildDomains(c); err != nil {
+		return nil, err
+	}
+	r.jwks = r.domains[0].keys
+	return r, nil
+}
+
+func listedDomain(domains []TrustDomain, name string) bool {
+	for _, d := range domains {
+		if d.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func pathSegment(s string) bool {

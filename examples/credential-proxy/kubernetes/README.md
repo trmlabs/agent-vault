@@ -68,6 +68,17 @@ One namespace/service-account binding maps to one agent and one vault. `serviceA
 
 The current PostgreSQL listener is restricted to loopback, and the proxy ingress protocols do not themselves encrypt the caller-to-broker hop. Infra must choose and verify an encrypted authenticated tunnel or equivalent protected ingress before separate pods can use these listeners. Do not publish either plaintext listener or send bearer proof over an unprotected network. The runtime design must also deny direct agent access to destinations, Vault, broker storage and runtime sockets; these identity examples do not supply that enforcement.
 
+## Other clusters (trust domains)
+
+The top-level `issuer`, `audience` and `apiServer` are the broker's own cluster. `trustDomains` lists other clusters, each verified locally against the signing keys it publishes:
+
+```json
+"trustDomains": [{"name": "agent-sandbox", "issuer": "https://container.googleapis.com/v1/projects/P/locations/L/clusters/C",
+  "audience": "gatehouse-edge", "keys": "remote", "jwksURL": "https://container.googleapis.com/v1/projects/P/locations/L/clusters/C/jwks"}]
+```
+
+A token's exact issuer picks its domain, and only that domain's keys can verify it. Keys are cached for an hour, refetched at most every 30 seconds for an unknown key ID, and a failed fetch keeps the last good set. `jwksURL` must be HTTPS; `caFile` optionally replaces the system roots for it. The broker cannot read another cluster's Pods, so a remote domain admits only a proxy binding (a shared proxy there checks the Pod), and its token lifetime (`maxTokenLifetimeSeconds`, 600 to 3600, default 3600) is the revocation window. A binding names its domain with `trustDomain`; empty is the broker's own cluster. The broker's egress must reach `jwksURL`.
+
 ## Verification and remaining limits
 
 TokenReview runs for each authorization decision, followed by a live Pod read that rejects missing pods, deletion timestamps, changed UIDs or an unexpected account. The Pod read closes TokenReview's deletion grace period. Any API error, timeout, untrusted certificate or incomplete identity denies the request. Current broker agent status and vault permission are checked after proof verification. No positive authentication result is cached.
