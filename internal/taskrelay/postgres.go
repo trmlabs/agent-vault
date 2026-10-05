@@ -405,21 +405,22 @@ type refusal struct{ code, message string }
 // refusalsByReason maps the broker's reason code (brokercore.RefusalReasonField)
 // to the relay's fixed words. Broker message text is never forwarded.
 var refusalsByReason = map[string]refusal{
-	"actor_limit":     {"53300", workerCapMessage},
-	"database_limit":  {"53300", databaseBudgetMessage},
-	"pool_budget":     {"53300", databaseBudgetMessage},
-	"capacity":        {"53300", "Gatehouse is at capacity; retry shortly"},
-	"pinned_share":    {"53300", "no session-mode database connection is free for session state (SET, temp tables, LISTEN, advisory locks); retry shortly"},
-	"not_ready":       {"57P03", "Gatehouse is starting; retry in a few seconds"},
-	"no_database":     {"3D000", "this database isn't in the Gatehouse catalog for your pool"},
-	"authentication":  {"28000", notVerifiedMessage},
-	"upstream":        {"08006", "Gatehouse could not reach the database; retry"},
-	"credential":      {"08006", "Gatehouse could not get a database credential; retry shortly"},
-	"restarting":      {"57P01", "Gatehouse is restarting; reconnect"},
-	"role_change":     {"42501", "Gatehouse refuses ALTER ROLE, ALTER USER and ALTER DATABASE on a shared database connection"},
-	"read_only":       {"25006", "this database login is read-only: Gatehouse allows only reads, transaction control and a few settings such as search_path, and refuses temporary tables"},
-	"encoding_change": {"42501", "Gatehouse refuses changing standard_conforming_strings or client_encoding mid-session; only on and UTF8 at connect"},
-	"statement_limit": {"54000", "this session holds too many prepared statements; deallocate some"},
+	"actor_limit":      {"53300", workerCapMessage},
+	"database_limit":   {"53300", databaseBudgetMessage},
+	"pool_budget":      {"53300", databaseBudgetMessage},
+	"capacity":         {"53300", "Gatehouse is at capacity; retry shortly"},
+	"pinned_share":     {"53300", "no session-mode database connection is free for session state (SET, temp tables, LISTEN, advisory locks); retry shortly"},
+	"not_ready":        {"57P03", "Gatehouse is starting; retry in a few seconds"},
+	"no_database":      {"3D000", "this database isn't in the Gatehouse catalog for your pool"},
+	"authentication":   {"28000", notVerifiedMessage},
+	"upstream":         {"08006", "Gatehouse could not reach the database; retry"},
+	"credential":       {"08006", "Gatehouse could not get a database credential; retry shortly"},
+	"restarting":       {"57P01", "Gatehouse is restarting; reconnect"},
+	"role_change":      {"42501", "Gatehouse refuses ALTER ROLE, ALTER USER and ALTER DATABASE on a shared database connection"},
+	"read_only":        {"25006", "this database login is read-only: Gatehouse allows only reads, transaction control and a few settings such as search_path, and refuses temporary tables"},
+	"encoding_change":  {"42501", "Gatehouse refuses changing standard_conforming_strings or client_encoding mid-session; only on and UTF8 at connect"},
+	"pipelined_escape": {"0A000", "Gatehouse refuses a statement with a backslash after an Execute in the same batch; send Sync first"},
+	"statement_limit":  {"54000", "this session holds too many prepared statements; deallocate some"},
 }
 
 // refusalsByCode covers a broker refusal whose reason has no entry of its own:

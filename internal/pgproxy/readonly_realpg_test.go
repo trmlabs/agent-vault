@@ -19,6 +19,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgproto3"
 )
 
 func TestRealPostgres_ReadOnlyLoginRefusesTemporaryObjects(t *testing.T) {
@@ -196,6 +197,25 @@ func TestRealPostgres_ReadOnlyLoginRefusesTemporaryObjects(t *testing.T) {
 		var defaults int
 		if err := admin.QueryRow(ctx, "SELECT count(*) FROM pg_db_role_setting WHERE setrole = (SELECT oid FROM pg_roles WHERE rolname = $1)", role).Scan(&defaults); err != nil || defaults != 0 {
 			t.Fatalf("role defaults %d %v", defaults, err)
+		}
+		// Pipelined: the change and a statement hidden from the broker's
+		// lexer arrive together. The second is held until the first is
+		// answered, and the answer's ParameterStatus ends the session, so
+		// the hidden ALTER ROLE never runs.
+		raw := openAgentSession(t, addr, "agent-token", "core")
+		raw.fe.Send(&pgproto3.Query{String: "SELECT set_config('standard_conforming_' || 'strings', 'off', false)"})
+		raw.fe.Send(&pgproto3.Query{String: `SELECT 'x\' , ' ; ALTER ROLE CURRENT_USER SET work_mem = 7777; --'`})
+		if err := raw.fe.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		for {
+			if _, err := raw.fe.Receive(); err != nil {
+				break
+			}
+		}
+		raw.close()
+		if err := admin.QueryRow(ctx, "SELECT count(*) FROM pg_db_role_setting WHERE setrole = (SELECT oid FROM pg_roles WHERE rolname = $1)", role).Scan(&defaults); err != nil || defaults != 0 {
+			t.Fatalf("pipelined hidden ALTER ROLE ran: role defaults %d %v", defaults, err)
 		}
 		next := connect(addr)
 		var scs string
