@@ -54,6 +54,7 @@ type pooledSession struct {
 	pinned     bool
 	pending    int  // Query, Sync and FunctionCall not yet answered by ReadyForQuery
 	unsynced   bool // extended-protocol messages sent since the last Sync
+	executed   bool // an Execute sent since the last Sync
 	txStatus   byte
 	statements map[string]clientStatement
 	swallow    []swallowEntry
@@ -80,10 +81,11 @@ const (
 var clientWriteTimeout = 30 * time.Second
 
 var (
-	errRoleChange     = errors.New("role change on a pooled connection")
-	errStatementLimit = errors.New("prepared statement limit reached")
-	errReadOnly       = errors.New("statement not allowed on a read-only login")
-	errLexerChange    = errors.New("encoding change on a pooled connection")
+	errRoleChange      = errors.New("role change on a pooled connection")
+	errStatementLimit  = errors.New("prepared statement limit reached")
+	errReadOnly        = errors.New("statement not allowed on a read-only login")
+	errLexerChange     = errors.New("encoding change on a pooled connection")
+	errPipelinedEscape = errors.New("backslash statement after an unsynced Execute")
 )
 
 // readOnlyMessage is the refusal a read-only login gets for a statement
@@ -214,6 +216,8 @@ func poolRefusal(err error) (code, message, outcome string) {
 		return "25006", readOnlyMessage, "read_only"
 	case errors.Is(err, errLexerChange):
 		return "42501", lexerChangeMessage, "encoding_change"
+	case errors.Is(err, errPipelinedEscape):
+		return "0A000", "Agent Vault: a statement containing a backslash cannot follow an Execute in the same batch on a pooled connection; send Sync first", "pipelined_escape"
 	case errors.Is(err, errStatementLimit):
 		return "54000", "Agent Vault: this session holds too many prepared statements; deallocate some", "statement_limit"
 	default:
@@ -247,6 +251,8 @@ func (s *pooledSession) run(ctx context.Context) {
 		}
 		if refused := s.refuse(msg, sql); refused != nil {
 			err = &refusalError{refused}
+		} else if err = s.settleBeforeEscapes(ctx, sql); err != nil {
+			// refused mid-batch, or the session ended while waiting
 		} else {
 			pin := sql != "" && needsSession(sql)
 			for {
@@ -324,6 +330,39 @@ func (s *pooledSession) refuse(msg pgproto3.FrontendMessage, sql string) error {
 	return nil
 }
 
+// settleBeforeEscapes holds a statement whose text contains a backslash until
+// the server has answered everything sent before it. Only a backslash reads
+// differently when an earlier statement turned standard_conforming_strings off
+// or chose a client-only encoding, perhaps through a function the classifier
+// cannot see. The broker learns of that change from the server's
+// ParameterStatus, which ends the session, so waiting for the answers means a
+// pipelined statement is never lexed under a setting the broker has not seen.
+// After an Execute inside an unsynced batch there is no answer to wait for,
+// so the statement is refused.
+func (s *pooledSession) settleBeforeEscapes(ctx context.Context, sql string) error {
+	if !strings.ContainsRune(sql, '\\') {
+		return nil
+	}
+	for {
+		s.mu.Lock()
+		killed, bound, pending, executed := s.killed, s.conn != nil, s.pending, s.executed
+		s.mu.Unlock()
+		switch {
+		case killed:
+			return errors.New("session terminated")
+		case bound && executed:
+			return &refusalError{errPipelinedEscape}
+		case !bound || pending == 0:
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
 type refusalError struct{ err error }
 
 func (e *refusalError) Error() string { return e.err.Error() }
@@ -384,7 +423,7 @@ func (s *pooledSession) bind(ctx context.Context, pin bool) error {
 		return errors.New("session terminated")
 	}
 	s.conn, s.pinned, s.txStatus = conn, pin, 'I'
-	s.pending, s.unsynced, s.swallow = 0, false, nil
+	s.pending, s.unsynced, s.executed, s.swallow = 0, false, false, nil
 	s.serverDone = make(chan struct{})
 	s.bindCancel(conn)
 	go s.readServer(conn, s.serverDone)
@@ -497,7 +536,7 @@ func (s *pooledSession) forward(msg pgproto3.FrontendMessage) error {
 	case *pgproto3.Sync:
 		s.pending++
 		s.sendSeq++
-		s.unsynced = false
+		s.unsynced, s.executed = false, false
 		f.Send(m)
 	case *pgproto3.FunctionCall:
 		s.pending++
@@ -546,7 +585,10 @@ func (s *pooledSession) forward(msg pgproto3.FrontendMessage) error {
 			break
 		}
 		f.Send(m)
-	case *pgproto3.Execute, *pgproto3.Flush:
+	case *pgproto3.Execute:
+		s.unsynced, s.executed = true, true
+		f.Send(m)
+	case *pgproto3.Flush:
 		s.unsynced = true
 		f.Send(m)
 	default:
