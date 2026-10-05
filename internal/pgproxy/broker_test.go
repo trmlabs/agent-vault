@@ -126,7 +126,8 @@ type fakeUpstream struct {
 	lastIdleTxn string
 	forbidParam string // a param key that must never be forwarded upstream
 	forbidSeen  bool
-	accepted    int // upstream connections accepted
+	accepted    int      // upstream connections accepted
+	queries     []string // simple-protocol query text received
 }
 
 func startFakeUpstream(t *testing.T, mode upstreamAuthMode, password string) *fakeUpstream {
@@ -272,6 +273,9 @@ func (fu *fakeUpstream) handle(conn net.Conn) {
 		}
 		switch q := m.(type) {
 		case *pgproto3.Query:
+			fu.mu.Lock()
+			fu.queries = append(fu.queries, q.String)
+			fu.mu.Unlock()
 			// Answer any query with a single row echoing the authenticated user,
 			// so the test can prove the upstream saw the Vault username.
 			be.Send(&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{{Name: []byte("current_user"), DataTypeOID: 25, Format: 0}}})

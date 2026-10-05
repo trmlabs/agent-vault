@@ -13,6 +13,19 @@ With pooling on, the broker multiplexes many client sessions onto a few server c
 - **Ending.** A client that disconnects inside a transaction, or with statements in flight, has its server connection closed, never reused. A terminated session (revoked access, the Pod's deadline) cancels its running statement first, on a connection already detached from the pool. A client idle inside a transaction for 5 minutes loses its session (the server's `idle_in_transaction_session_timeout`), and one that stops reading for 30 seconds is disconnected, so neither can hold a server connection.
 - **Cancel** requests reach whichever server connection the session holds at that moment.
 
+## Read-only logins
+
+PostgreSQL lets every login create temporary tables, views and sequences unless the database revokes `TEMP` from `PUBLIC`. On a read-only login the broker refuses them itself, so no database change is needed, pooled or not. A login is read-only when its catalog entry has `access: read` (the default), or, for services outside the catalog, when its Vault role name ends in `-readonly`.
+
+The broker refuses, with SQLSTATE 25006 and a message that names the read-only login:
+
+- `CREATE ... TEMP` or `TEMPORARY` (tables, views, sequences, `CREATE TABLE AS`, also under `EXPLAIN ANALYZE`) and `SELECT ... INTO TEMP`.
+- Anything that names `pg_temp`, anywhere in the text, and a startup `search_path` that names it.
+- Statements that could create one where the broker cannot see it: `DO` blocks, `set_config`, `UPDATE pg_settings`, Unicode-escaped names (`U&"..."`), escape strings in a `search_path` change, and the fast-path `FunctionCall` message.
+- `SET` of `standard_conforming_strings`, `client_encoding` or `NAMES`, which would make the server read later text differently from the broker.
+
+Pooled, the refusal is an `ERROR` and the session continues. Unpooled, the broker reads each client message whole before relaying it, and a refusal ends the session with a `FATAL`. Either way the statement never reaches the database, and the broker writes a `denied` audit row with outcome `read_only_temp`. Read-write logins are unchanged. An existing function in the database that creates a temporary table when called is not covered; the database's own privileges govern what functions a read-only login can call.
+
 ## Entitlement tiers
 
 The pool key holds everything that decides privileges: the worker pool, the binding, the Vault mount and role, and the upstream address and database. Two entitlement tiers are two bindings with two database roles, so their clients never share a server connection. A binding whose role changes in the catalog gets new connections and a new credential.

@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -584,6 +585,16 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		return
 	}
 	event.Binding = databaseBinding(scope.VaultID, svc)
+	if svc.ReadOnly {
+		// A search path that names pg_temp first makes an unqualified
+		// CREATE TABLE temporary.
+		for key, value := range startup.Parameters {
+			if strings.EqualFold(key, "search_path") && strings.Contains(strings.ToLower(value), "pg_temp") {
+				refuse("read_only_temp", "25006", readOnlyTempMessage)
+				return
+			}
+		}
+	}
 	if b.pools != nil {
 		// Multiplexed: the pool owns the database budget, credentials and
 		// server connections, so this session takes none of its own.
@@ -716,7 +727,20 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	go func() { defer close(renewDone); b.renewLoop(relayCtx, lease, svc, terminate) }()
 	defer func() { relayCancel(); <-renewDone }()
 
-	relay(conn, upstream.conn)
+	if !svc.ReadOnly {
+		relay(conn, upstream.conn)
+		return
+	}
+	if refused, clean := relayReadOnly(conn, upstream.conn); refused {
+		b.logger.Warn("pgproxy: temporary object refused on a read-only login; ending session",
+			slog.String("service", svc.Name), slog.String("actor", scope.ActorID))
+		b.auditDenied(event, "read_only_temp")
+		if clean {
+			_ = conn.SetWriteDeadline(time.Now().Add(clientWriteTimeout))
+			writeClientError(backend, "25006", readOnlyTempMessage)
+		}
+		terminate()
+	}
 }
 
 // renewLoop keeps the lease alive for the life of the connection and enforces

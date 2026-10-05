@@ -144,6 +144,7 @@ func (r storeDatabaseResolver) ResolveDatabase(ctx context.Context, scope pgprox
 			Role:     row.Role,
 			SSLMode:  row.SSLMode,
 			MaxConns: row.MaxConns,
+			ReadOnly: readOnlyRole(row.Role),
 		}
 	}
 	svc, err := selectDatabaseService(services, scope.VaultName, requestedDatabase)
@@ -331,11 +332,17 @@ func LoadDatabaseServices(getenv func(string) string) (map[string][]pgproxy.Data
 				Role:     entry.Role,
 				SSLMode:  entry.SSLMode,
 				MaxConns: entry.MaxConns,
+				ReadOnly: readOnlyRole(entry.Role),
 			})
 		}
 	}
 	return out, nil
 }
+
+// readOnlyRole reports whether a Vault role is a read-only login. Services
+// outside the catalog carry no access setting, so the role's name decides,
+// under the naming the catalog enforces (<name>-readonly or -readwrite).
+func readOnlyRole(role string) bool { return strings.HasSuffix(role, "-readonly") }
 
 var databaseServiceName = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,63}$`)
 
