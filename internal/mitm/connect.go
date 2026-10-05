@@ -198,11 +198,14 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// ConnState tracks when the connection leaves the hijacked state and
 	// closes the listener so Serve returns.
 	listener := newOneShotListener(tlsConn)
+	// Requests inside the tunnel arrive on its own TLS connection, so they
+	// take the listener's identity kinds from the CONNECT.
+	kinds := connKinds(r.Context())
 	srv := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// A tunnel can outlive its token or grant. Recheck each request
 			// against the original proxy identity before injecting credentials.
-			scope, err := p.resolveScope(brokercore.WithAttestation(r.Context(), brokercore.AttestationFrom(attested)), token, hint, peer, peerErr, true)
+			scope, err := p.resolveScope(withKinds(brokercore.WithAttestation(r.Context(), brokercore.AttestationFrom(attested)), kinds), token, hint, peer, peerErr, true)
 			if err != nil {
 				w.Header().Set("Connection", "close")
 				if p.strictCredentialProxy {

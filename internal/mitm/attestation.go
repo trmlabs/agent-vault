@@ -144,8 +144,20 @@ func (p *Proxy) resolveScope(ctx context.Context, token, hint string, peer netip
 	return scope, nil
 }
 
-// connKinds returns the identity kinds the request's listener admits.
+type kindsKey struct{}
+
+// withKinds carries the CONNECT listener's identity kinds into the requests
+// of its tunnel, which are served on their own connection.
+func withKinds(ctx context.Context, kinds []string) context.Context {
+	return context.WithValue(ctx, kindsKey{}, kinds)
+}
+
+// connKinds returns the identity kinds the request's listener admits: the
+// tunnel's, for a request inside a CONNECT tunnel.
 func connKinds(ctx context.Context) []string {
+	if kinds, ok := ctx.Value(kindsKey{}).([]string); ok {
+		return kinds
+	}
 	if pc, ok := ctx.Value(peerContextKey{}).(*peerConn); ok {
 		return brokercore.ConnKinds(pc.Conn)
 	}

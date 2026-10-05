@@ -127,6 +127,9 @@ func setupProxy(t *testing.T, sr brokercore.SessionResolver, cp brokercore.Crede
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
+	if testListenerWrap != nil {
+		l = testListenerWrap(l)
+	}
 	go func() { _ = p.Serve(l) }()
 
 	t.Cleanup(func() {
