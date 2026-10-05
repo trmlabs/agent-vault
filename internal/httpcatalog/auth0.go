@@ -172,6 +172,26 @@ func (a *Auth0Tokens) Invalidate(e *Entry) {
 	st.token, st.held = BrowserToken{}, false
 }
 
+// Prune drops the token and sign-in state of every entry the catalog no
+// longer holds, or holds with different sign-in settings, so a removed
+// entry's token does not stay in memory until the broker restarts. A
+// sign-in in progress for one finishes for its waiters and is then dropped.
+func (a *Auth0Tokens) Prune(c Catalog) {
+	keep := map[string]bool{}
+	for i := range c.entries {
+		if e := &c.entries[i]; e.BrowserSession != nil {
+			keep[cacheKey(e)] = true
+		}
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for key := range a.states {
+		if !keep[key] {
+			delete(a.states, key)
+		}
+	}
+}
+
 func cacheKey(e *Entry) string {
 	b := e.BrowserSession
 	parts := []string{e.Name, b.Auth0.Domain, b.Auth0.Audience, b.Auth0.Login, b.Auth0.Realm, b.Auth0.TokenClient.Mount, b.Auth0.TokenClient.Path,

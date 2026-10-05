@@ -109,10 +109,12 @@ func httpHeaderAdapter(ctx context.Context, srv *server.Server, getenv func(stri
 	}
 	adapter.Sessions = sessionBinder(srv.CleanupStore())
 	dial := netguard.SafeDialContext(netguard.AllowPrivateFromEnv())
-	adapter.BrowserTokens = &httpcatalog.Auth0Tokens{Keys: keys, Client: auth0Client(source, dial), AutomatedAuth: automatedAuthClient(source, dial),
+	browserTokens := &httpcatalog.Auth0Tokens{Keys: keys, Client: auth0Client(source, dial), AutomatedAuth: automatedAuthClient(source, dial),
 		Revoked: func(binding, outcome string, status int) {
 			_ = chain.Record(auditchain.Event{Event: auditchain.EventHTTPResponse, Binding: binding + "/revoke", Outcome: outcome, Method: http.MethodPost, Status: status})
 		}}
+	adapter.BrowserTokens = browserTokens
+	source.OnChange(browserTokens.Prune)
 	githubEntries, gcpEntries := false, false
 	for _, e := range source.Current().Entries() {
 		githubEntries = githubEntries || e.Kind == "git" || e.Kind == "github-api"
