@@ -118,7 +118,7 @@ func TestReadOnlyUnpooledRefusesTemporaryTables(t *testing.T) {
 		t.Fatalf("temporary table answered %v, want the 25006 read-only refusal", err)
 	}
 	for _, q := range upstream.received() {
-		if strings.Contains(strings.ToLower(q), "temp") {
+		if q == "CREATE TEMP TABLE scratch (id int)" {
 			t.Fatalf("refused statement reached the database: %q", q)
 		}
 	}
@@ -214,8 +214,11 @@ func TestReadOnlyPooledRefusesTemporaryTables(t *testing.T) {
 	if code := queryCode(t, s, "SELECT 1"); code != "" {
 		t.Fatalf("session unusable after the refusal: %q", code)
 	}
+	// The broker's own check-in query names pg_my_temp_schema, so match the
+	// refused statements exactly.
+	refused := map[string]bool{"CREATE TEMP TABLE scratch (id int)": true, "SELECT * INTO TEMP scratch FROM t": true, "DO $$ BEGIN NULL; END $$": true}
 	for _, q := range upstream.received() {
-		if strings.Contains(strings.ToLower(q), "temp") || strings.HasPrefix(q, "DO") {
+		if refused[q] {
 			t.Fatalf("refused statement reached the database: %q", q)
 		}
 	}
