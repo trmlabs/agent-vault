@@ -248,12 +248,13 @@ type automatedFake struct {
 	revokes   atomic.Int32
 	status    atomic.Int32
 	revokeErr atomic.Bool
-	org       atomic.Value // org_id in the access token
-	idOrg     atomic.Value // org_id in the ID token; "" sends none
-	aud       atomic.Value // the access token's aud, as JSON
-	lifetime  atomic.Int64 // seconds
-	jwt       atomic.Bool  // the access token is a JWT
-	kept      atomic.Int32 // sign-in and revoke requests that left their connection open
+	org       atomic.Value                  // org_id in the access token
+	idOrg     atomic.Value                  // org_id in the ID token; "" sends none
+	aud       atomic.Value                  // the access token's aud, as JSON
+	lifetime  atomic.Int64                  // seconds
+	jwt       atomic.Bool                   // the access token is a JWT
+	kept      atomic.Int32                  // sign-in and revoke requests that left their connection open
+	hold      atomic.Pointer[chan struct{}] // sign-ins wait for it to close, when set
 }
 
 // fakeAutomatedAuth plays automated-auth and the app's Auth0 tenant.
@@ -279,6 +280,9 @@ func fakeAutomatedAuth(t *testing.T) (*automatedFake, *http.Client) {
 			return
 		}
 		f.logins.Add(1)
+		if hold := f.hold.Load(); hold != nil {
+			<-*hold
+		}
 		var body map[string]string
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		want := map[string]string{"privateKey": automatedSecrets["private_key"], "profile": "trm-b2b-staging", "orgId": "org_synthetic",
@@ -297,7 +301,8 @@ func fakeAutomatedAuth(t *testing.T) (*automatedFake, *http.Client) {
 		exp := time.Now().Add(time.Duration(f.lifetime.Load()) * time.Second)
 		access := fmt.Sprintf("synthetic-access-token-%d", n)
 		if f.jwt.Load() {
-			payload, _ := json.Marshal(map[string]any{"sub": "auth0|qa-user", "org_id": f.org.Load(), "aud": json.RawMessage(f.aud.Load().(string)), "exp": exp.Unix()})
+			payload, _ := json.Marshal(map[string]any{"sub": "auth0|qa-user", "org_id": f.org.Load(), "aud": json.RawMessage(f.aud.Load().(string)), "exp": exp.Unix(),
+				"https://trmlabs.com/email": automatedSecrets["email"], "permissions": []string{"read:cases"}})
 			access = "eyJhbGciOiJSUzI1NiJ9." + base64.RawURLEncoding.EncodeToString(payload) + "." + access
 		}
 		out := map[string]any{"accessToken": access, "refreshToken": syntheticRefresh, "target": "https://app.example.com/",
@@ -473,7 +478,7 @@ func TestAutomatedAuthClaimsFromAccessToken(t *testing.T) {
 	fake.idOrg.Store("")
 	tokens := &Auth0Tokens{Keys: &Keys{Vault: automatedVault{}}, Client: client, AutomatedAuth: client}
 	token, err := tokens.Token(context.Background(), automatedEntry(t))
-	if err != nil || !reflect.DeepEqual(token.Claims, map[string]any{"sub": "auth0|qa-user", "org_id": "org_synthetic"}) {
+	if err != nil || !reflect.DeepEqual(token.Claims, map[string]any{"sub": "auth0|qa-user", "org_id": "org_synthetic", "email": automatedSecrets["email"]}) {
 		t.Fatalf("claims: %v %v", token.Claims, err)
 	}
 }
@@ -555,5 +560,138 @@ func TestAutomatedAuthNeverFollowsARedirect(t *testing.T) {
 	tokens := &Auth0Tokens{Keys: &Keys{Vault: automatedVault{}}, AutomatedAuth: client}
 	if _, err := tokens.Token(context.Background(), automatedEntry(t)); !errors.Is(err, ErrBrowserLogin) || elsewhere.Load() != 0 {
 		t.Fatalf("redirect followed: err=%v requests elsewhere=%d", err, elsewhere.Load())
+	}
+}
+
+// clock is a test clock safe to read from sign-ins running in the background.
+type clock struct{ at atomic.Int64 }
+
+func newClock() *clock                   { c := &clock{}; c.at.Store(time.Now().UnixNano()); return c }
+func (c *clock) now() time.Time          { return time.Unix(0, c.at.Load()) }
+func (c *clock) advance(d time.Duration) { c.at.Add(int64(d)) }
+
+// Concurrent requests share one sign-in, and after any attempt the entry
+// makes no other for a minute: a failure answers at once without a login.
+func TestSignInCapAfterFailure(t *testing.T) {
+	fake, client := fakeAutomatedAuth(t)
+	fake.status.Store(http.StatusBadGateway)
+	c := newClock()
+	tokens := &Auth0Tokens{Keys: &Keys{Vault: automatedVault{}}, Client: client, AutomatedAuth: client, Now: c.now}
+	entry := automatedEntry(t)
+	var wg sync.WaitGroup
+	var failed atomic.Int32
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := tokens.Token(context.Background(), entry); errors.Is(err, ErrBrowserLogin) {
+				failed.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if fake.logins.Load() != 1 || failed.Load() != 20 {
+		t.Fatalf("20 concurrent requests: %d sign-ins, %d failed", fake.logins.Load(), failed.Load())
+	}
+	fake.status.Store(0)
+	c.advance(reloginInterval - time.Second)
+	if _, err := tokens.Token(context.Background(), entry); !errors.Is(err, ErrBrowserLogin) || fake.logins.Load() != 1 {
+		t.Fatalf("inside the minute: %v, %d sign-ins", err, fake.logins.Load())
+	}
+	c.advance(time.Second)
+	if _, err := tokens.Token(context.Background(), entry); err != nil || fake.logins.Load() != 2 {
+		t.Fatalf("after the minute: %v, %d sign-ins", err, fake.logins.Load())
+	}
+}
+
+// Successful sign-ins are shared and capped too; a failed renewal keeps the
+// last token serving until it expires, without a second attempt that minute.
+func TestSignInCapAfterSuccess(t *testing.T) {
+	fake, client := fakeAutomatedAuth(t)
+	c := newClock()
+	tokens := &Auth0Tokens{Keys: &Keys{Vault: automatedVault{}}, Client: client, AutomatedAuth: client, Now: c.now}
+	entry := automatedEntry(t)
+	hold := make(chan struct{})
+	fake.hold.Store(&hold)
+	var wg sync.WaitGroup
+	got := make(chan string, 20)
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			tok, err := tokens.Token(context.Background(), entry)
+			if err != nil {
+				got <- "error"
+				return
+			}
+			got <- tok.Value()
+		}()
+	}
+	for fake.logins.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	close(hold)
+	wg.Wait()
+	close(got)
+	first := ""
+	for v := range got {
+		if first == "" {
+			first = v
+		}
+		if v == "error" || v != first {
+			t.Fatalf("waiters got different results: %q %q", first, v)
+		}
+	}
+	if fake.logins.Load() != 1 {
+		t.Fatalf("%d sign-ins for 20 waiters", fake.logins.Load())
+	}
+	fake.hold.Store(nil)
+	fake.status.Store(http.StatusBadGateway)
+	c.advance(46 * time.Minute) // renewal due
+	if tok, err := tokens.Token(context.Background(), entry); err != nil || tok.Value() != first || fake.logins.Load() != 2 {
+		t.Fatalf("failed renewal: %v, %d sign-ins", err, fake.logins.Load())
+	}
+	c.advance(30 * time.Second)
+	if tok, err := tokens.Token(context.Background(), entry); err != nil || tok.Value() != first || fake.logins.Load() != 2 {
+		t.Fatalf("inside the minute: %v, %d sign-ins", err, fake.logins.Load())
+	}
+	c.advance(30 * time.Second)
+	if tok, _ := tokens.Token(context.Background(), entry); tok.Value() != first || fake.logins.Load() != 3 {
+		t.Fatalf("after the minute: %d sign-ins", fake.logins.Load())
+	}
+}
+
+// A request that gives up ends only its own wait: the sign-in it started
+// runs on, and its result serves the requests after it.
+func TestSignInSurvivesACancelledRequest(t *testing.T) {
+	fake, client := fakeAutomatedAuth(t)
+	tokens := &Auth0Tokens{Keys: &Keys{Vault: automatedVault{}}, Client: client, AutomatedAuth: client}
+	entry := automatedEntry(t)
+	hold := make(chan struct{})
+	fake.hold.Store(&hold)
+	ctx, cancel := context.WithCancel(context.Background())
+	first := make(chan error, 1)
+	go func() {
+		_, err := tokens.Token(ctx, entry)
+		first <- err
+	}()
+	for fake.logins.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := <-first; !errors.Is(err, ErrBrowserLogin) {
+		t.Fatalf("cancelled request: %v", err)
+	}
+	second := make(chan error, 1)
+	go func() {
+		_, err := tokens.Token(context.Background(), entry)
+		second <- err
+	}()
+	close(hold)
+	if err := <-second; err != nil || fake.logins.Load() != 1 {
+		t.Fatalf("after the cancel: %v, %d sign-ins", err, fake.logins.Load())
+	}
+	if _, err := tokens.Token(context.Background(), entry); err != nil || fake.logins.Load() != 1 {
+		t.Fatalf("cached: %v, %d sign-ins", err, fake.logins.Load())
 	}
 }

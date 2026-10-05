@@ -102,12 +102,13 @@ func (a *Auth0Tokens) automatedAuthLogin(ctx context.Context, e *Entry) (Browser
 	if life < 2*time.Minute {
 		return BrowserToken{}, ErrBrowserLogin
 	}
-	// The seed's ID token needs sub and org_id, which the app reads. An ID
-	// token, when the service returns one, adds the user's name and email; it
-	// must name the same user and organization.
+	// The seed's ID token needs sub and org_id, which the app reads. They
+	// come from the access token because automated-auth's password sign-in
+	// returns no idToken; one, when present, must name the same user and
+	// organization.
 	claims := map[string]any{"sub": access.Sub, "org_id": access.OrgID}
-	if access.OrgName != "" {
-		claims["org_name"] = access.OrgName
+	if access.Email != "" {
+		claims["email"] = access.Email // shown in the app's header
 	}
 	if out.IDToken != "" {
 		id, err := idTokenClaims(out.IDToken)
@@ -120,11 +121,11 @@ func (a *Auth0Tokens) automatedAuthLogin(ctx context.Context, e *Entry) (Browser
 }
 
 type accessClaims struct {
-	Sub     string          `json:"sub"`
-	OrgID   string          `json:"org_id"`
-	OrgName string          `json:"org_name"`
-	Aud     json.RawMessage `json:"aud"`
-	Exp     int64           `json:"exp"`
+	Sub   string          `json:"sub"`
+	OrgID string          `json:"org_id"`
+	Email string          `json:"https://trmlabs.com/email"` // set by the staging tenant's login action
+	Aud   json.RawMessage `json:"aud"`
+	Exp   int64           `json:"exp"`
 }
 
 // hasAudience reports whether aud, a string or a list, names audience.

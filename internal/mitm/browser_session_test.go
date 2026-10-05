@@ -562,3 +562,36 @@ func TestBrowserRateLimited(t *testing.T) {
 		t.Fatalf("over the limit: %v %q", resp, f.audit.last().Outcome)
 	}
 }
+
+// Through the proxy, 20 concurrent workers against a failing sign-in make
+// one attempt, and the next request inside the minute makes none.
+func TestBrowserFailedSignInIsCapped(t *testing.T) {
+	f := newBrowserFixtureWith(t, true, nil)
+	f.loginErr.Store(true)
+	var wg sync.WaitGroup
+	var unavailable atomic.Int32
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r, _ := http.NewRequest("GET", "https://api.example.com"+httpcatalog.BrowserSeedPath, nil)
+			resp, err := f.client.Do(r)
+			if err != nil {
+				return
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusServiceUnavailable {
+				unavailable.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if f.logins.Load() != 1 || unavailable.Load() != 20 {
+		t.Fatalf("%d sign-ins, %d answered 503", f.logins.Load(), unavailable.Load())
+	}
+	f.loginErr.Store(false)
+	if resp, _ := f.do(t, "GET", "https://api.example.com"+httpcatalog.BrowserSeedPath, nil); resp == nil || resp.StatusCode != http.StatusServiceUnavailable || f.logins.Load() != 1 {
+		t.Fatalf("inside the minute: %v, %d sign-ins", resp, f.logins.Load())
+	}
+}
