@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -550,5 +551,41 @@ func TestSharedImagePrefixes(t *testing.T) {
 		if err := c.Validate(time.Now()); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
+	}
+}
+
+// The staging proxy's configuration (#2926), exactly: no deadline, no
+// certificate, audit to stdout, image prefixes covering every namespace and
+// no digests. With no listeners it is refused; with one it loads.
+func TestStagingSharedConfig(t *testing.T) {
+	dir := t.TempDir()
+	write := func(withListener bool) string {
+		config := map[string]any{
+			"taskID": "gatehouse-proxy-staging", "auditFile": "/dev/stdout",
+			"kubernetes": map[string]any{"apiURL": "https://kubernetes.default.svc", "caFile": "/etc/task-relay/kube/ca.crt",
+				"reviewerTokenFile": "/var/run/task-relay/proofs/api"},
+			"shared": map[string]any{
+				"profiles": map[string]any{"agent-sandboxes-staging": "agent-sandbox-orion-staging",
+					"developers-sandboxes-staging": "agent-sandbox-developers-staging"},
+				"imagePrefixes": map[string]any{
+					"agent-sandboxes-staging":      "us-central1-docker.pkg.dev/trm-agent-sandbox/agent-sandbox-images-staging/orion/",
+					"developers-sandboxes-staging": "us-central1-docker.pkg.dev/trm-agent-sandbox/agent-sandbox-developers-staging/"},
+				"imageDigests": []any{}, "ownerKind": "Sandbox", "ownerAPIVersion": "agents.x-k8s.io/v1beta1", "maxPodSeconds": 28800},
+		}
+		if withListener {
+			config["connect"] = map[string]any{"listen": "0.0.0.0:14443", "allowedTargets": []any{"api.example.com:443"},
+				"upstream": map[string]any{"address": "10.65.1.2:16443", "serverName": "gatehouse-broker.staging.gatehouse.internal",
+					"caFile": "/etc/task-relay/trust/ca.crt", "proofFile": "/var/run/task-relay/proofs/gatehouse", "audience": "gatehouse-broker-staging"}}
+		}
+		path := filepath.Join(dir, fmt.Sprintf("relay-%v.json", withListener))
+		b, _ := json.Marshal(config)
+		writeTestFile(t, path, b)
+		return path
+	}
+	if _, err := LoadConfig(write(false)); err == nil {
+		t.Error("a shared proxy with no listener loaded")
+	}
+	if _, err := LoadConfig(write(true)); err != nil {
+		t.Errorf("the staging shared config with one listener refused: %v", err)
 	}
 }
