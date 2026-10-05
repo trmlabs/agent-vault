@@ -10,8 +10,10 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
@@ -29,31 +31,40 @@ import (
 	"github.com/Infisical/agent-vault/internal/auditchain"
 	"github.com/Infisical/agent-vault/internal/brokercore"
 	"github.com/Infisical/agent-vault/internal/httpcatalog"
+	"github.com/Infisical/agent-vault/internal/ratelimit"
 )
 
 const browserPlaceholder = "__vault_STAGING_APP__"
 
 // Synthetic test-user secrets; never real credentials.
-type browserVault struct{}
+type browserVault struct{ down *atomic.Bool }
 
-func (browserVault) ReadWithDataWithContext(context.Context, string, map[string][]string) (*vaultapi.Secret, error) {
+func (v browserVault) ReadWithDataWithContext(context.Context, string, map[string][]string) (*vaultapi.Secret, error) {
+	if v.down != nil && v.down.Load() {
+		return nil, errors.New("vault unreachable")
+	}
 	return &vaultapi.Secret{Data: map[string]interface{}{"data": map[string]interface{}{
-		"email": "qa-user@example.test", "password": "synthetic-password-9c1",
+		"email": "qa-user@example.test", "password": "synthetic-password-9c1", "private_key": "synthetic-automated-auth-key-7e3",
 		"client_id": "synthetic-confidential-client", "client_secret": "synthetic-client-secret-4f2"},
 		"metadata": map[string]interface{}{"version": float64(1)}}}, nil
 }
 
 type browserFixture struct {
-	client   *http.Client
-	audit    *adapterAudit
-	sessions *scopeResolver
-	logins   atomic.Int32
-	mu       sync.Mutex
-	seen     map[string]http.Header // last request headers per host
-	apiCalls atomic.Int32
-	reject   atomic.Int32 // status the API answers with, when set
-	refusal  atomic.Value // WWW-Authenticate on a refusal, when set
-	clock    atomic.Int64 // nanoseconds the token cache's clock runs ahead
+	client    *http.Client
+	audit     *adapterAudit
+	sessions  *scopeResolver
+	logins    atomic.Int32
+	mu        sync.Mutex
+	seen      map[string]http.Header // last request headers per host
+	apiCalls  atomic.Int32
+	reject    atomic.Int32 // status the API answers with, when set
+	refusal   atomic.Value // WWW-Authenticate on a refusal, when set
+	clock     atomic.Int64 // nanoseconds the token cache's clock runs ahead
+	loginErr  atomic.Bool  // automated-auth refuses the login, naming the user
+	vaultDown atomic.Bool  // every Vault read fails
+	revokes   atomic.Int32 // refresh-token revocations Auth0 received
+	revokeErr atomic.Bool  // Auth0 refuses revocations
+	proxy     *Proxy
 }
 
 func (f *browserFixture) headers(host string) http.Header {
@@ -63,12 +74,16 @@ func (f *browserFixture) headers(host string) http.Header {
 }
 
 // One TLS server plays the app, its API and Auth0, told apart by Host.
-func newBrowserFixture(t *testing.T) *browserFixture {
+func newBrowserFixture(t *testing.T) *browserFixture { return newBrowserFixtureWith(t, false, nil) }
+
+// newBrowserFixtureWith logs the test user in through automated-auth when
+// automated is set, and sends the proxy's log to logger when one is given.
+func newBrowserFixtureWith(t *testing.T, automated bool, logger *slog.Logger) *browserFixture {
 	t.Helper()
 	f := &browserFixture{audit: &adapterAudit{}, seen: map[string]http.Header{}}
 	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	template := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "upstream"},
-		DNSNames: []string{"app.example.com", "api.example.com", "auth.example.com"}, NotBefore: time.Now().Add(-time.Hour),
+		DNSNames: []string{"app.example.com", "api.example.com", "auth.example.com", "automated-auth.example.com"}, NotBefore: time.Now().Add(-time.Hour),
 		NotAfter: time.Now().Add(time.Hour), KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
 	der, _ := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
 	cert, _ := x509.ParseCertificate(der)
@@ -84,16 +99,40 @@ func newBrowserFixture(t *testing.T) *browserFixture {
 		f.mu.Unlock()
 		switch host {
 		case "auth.example.com":
+			if r.URL.Path == "/oauth/revoke" {
+				f.revokes.Add(1)
+				var revoke map[string]string
+				if json.NewDecoder(r.Body).Decode(&revoke) != nil || revoke["client_id"] != "spaClient1" || revoke["token"] != "synthetic-refresh-token-5d8" || f.revokeErr.Load() {
+					w.WriteHeader(http.StatusServiceUnavailable)
+				}
+				return
+			}
 			f.logins.Add(1)
 			claims, _ := json.Marshal(map[string]any{"sub": "auth0|qa-user", "org_id": "org_synthetic", "email": "qa-user@example.test", "nonce": "n"})
 			_ = json.NewEncoder(w).Encode(map[string]any{"access_token": fmt.Sprintf("synthetic-real-access-token-%d", f.logins.Load()),
 				"id_token": "eyJhbGciOiJSUzI1NiJ9." + base64.RawURLEncoding.EncodeToString(claims) + ".sig", "expires_in": 3600, "token_type": "Bearer"})
+		case "automated-auth.example.com":
+			f.logins.Add(1)
+			var login map[string]string
+			if json.NewDecoder(r.Body).Decode(&login) != nil || login["privateKey"] != "synthetic-automated-auth-key-7e3" ||
+				login["orgId"] != "org_synthetic" || login["password"] != "synthetic-password-9c1" || f.loginErr.Load() {
+				w.WriteHeader(http.StatusBadGateway)
+				fmt.Fprint(w, `{"error":{"code":"token_extraction_failed","message":"no token for qa-user@example.test"}}`)
+				return
+			}
+			payload, _ := json.Marshal(map[string]any{"sub": "auth0|qa-user", "org_id": "org_synthetic", "aud": []string{"https://api.example.com"},
+				"exp": time.Now().Add(time.Hour).Unix()})
+			access := "eyJhbGciOiJSUzI1NiJ9." + base64.RawURLEncoding.EncodeToString(payload) + fmt.Sprintf(".synthetic-real-access-token-%d", f.logins.Load())
+			token, _ := json.Marshal(map[string]any{"body": map[string]any{"access_token": access, "refresh_token": "synthetic-refresh-token-5d8"}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"accessToken": access, "refreshToken": "synthetic-refresh-token-5d8",
+				"expiresAt": time.Now().Add(time.Hour).UTC().Format(time.RFC3339), "browserAuthSeed": map[string]any{"localStorageEntries": []map[string]string{
+					{"key": "@@auth0spajs@@::spaClient1::https://api.example.com::openid profile email offline_access", "value": string(token)}}}})
 		case "app.example.com":
 			w.Header().Set("Set-Cookie", "app_session=synthetic-app-session; Secure")
 			fmt.Fprint(w, "<html>app</html>")
 		case "api.example.com":
 			f.apiCalls.Add(1)
-			want := fmt.Sprintf("Bearer synthetic-real-access-token-%d", f.logins.Load())
+			want := fmt.Sprintf("synthetic-real-access-token-%d", f.logins.Load())
 			if status := f.reject.Load(); status != 0 {
 				if challenge, _ := f.refusal.Load().(string); challenge != "" {
 					w.Header().Set("WWW-Authenticate", challenge)
@@ -101,7 +140,7 @@ func newBrowserFixture(t *testing.T) *browserFixture {
 				w.WriteHeader(int(status))
 				return
 			}
-			if r.Header.Get("Authorization") != want {
+			if got := r.Header.Get("Authorization"); !strings.HasPrefix(got, "Bearer ") || !strings.HasSuffix(got, want) {
 				w.WriteHeader(http.StatusUnauthorized)
 				return
 			}
@@ -127,24 +166,37 @@ func newBrowserFixture(t *testing.T) *browserFixture {
 	dial := func(ctx context.Context, network, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, network, addr)
 	}
+	login := `,"realm":"Username-Password-Authentication","tokenClient":{"mount":"gatehouse","path":"browser/client"}},`
+	if automated {
+		login = `,"login":"automated-auth"},"automatedAuth":{"url":"https://automated-auth.example.com","profile":"trm-b2b-staging","orgID":"org_synthetic",
+			"key":{"mount":"gatehouse","path":"browser/automated-auth"}},`
+	}
 	catalog, err := httpcatalog.Parse([]byte(`{"entries":[{"name":"staging-app","kind":"browser-session","host":"api.example.com",
-		"placeholder":"` + browserPlaceholder + `","pools":["database-developers"],"browserSession":{"appHost":"app.example.com",
-		"auth0":{"domain":"auth.example.com","clientID":"spaClient1","audience":"https://api.example.com","realm":"Username-Password-Authentication",
-		"tokenClient":{"mount":"gatehouse","path":"browser/client"}},"user":{"mount":"gatehouse","path":"browser/qa-user"}}}]}`))
+		"placeholder":"` + browserPlaceholder + `","pools":["database-developers"],"pathPrefixes":["/v1","/organizations","/users","/users-organizations"],"readOnlyPaths":["/v1/reports"],
+		"deniedPaths":["/v1/parent-organizations/*/users","/v1/intel-vault"],
+		"browserSession":{"appHost":"app.example.com","auth0":{"domain":"auth.example.com","clientID":"spaClient1","audience":"https://api.example.com"` + login + `
+		"user":{"mount":"gatehouse","path":"browser/qa-user"}}}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	authClient := &http.Client{Transport: &http.Transport{DialContext: dial, TLSClientConfig: &tls.Config{RootCAs: upstreamRoots}}}
-	tokens := &httpcatalog.Auth0Tokens{Keys: &httpcatalog.Keys{Vault: browserVault{}}, Client: authClient,
+	tokens := &httpcatalog.Auth0Tokens{Keys: &httpcatalog.Keys{Vault: browserVault{down: &f.vaultDown}}, Client: authClient, AutomatedAuth: authClient,
+		Revoked: func(binding, outcome string, status int) {
+			_ = f.audit.Record(auditchain.Event{Event: auditchain.EventHTTPResponse, Binding: binding + "/revoke", Outcome: outcome, Status: status})
+		},
 		Now: func() time.Time { return time.Now().Add(time.Duration(f.clock.Load())) }}
 	f.sessions = &scopeResolver{scope: &brokercore.ProxyScope{VaultID: "vault-1", AgentID: "pool-agent", Pool: "database-developers",
 		WorkloadID: "pod-uid-1", VaultRole: "proxy", NotAfter: time.Now().Add(30 * time.Minute).Truncate(time.Second)}}
 	proxyURL, roots, p := setupProxy(t, f.sessions, &fakeCredProvider{}, func(o *Options) {
 		o.StrictCredentialProxy = true
 		o.HeaderAdapter = &HeaderAdapter{Catalog: catalog, Keys: &adapterKeys{value: "unused"}, Audit: f.audit, BrowserTokens: tokens}
+		if logger != nil {
+			o.Logger = logger
+		}
 	})
 	p.upstream.TLSClientConfig.RootCAs = upstreamRoots
 	p.upstream.DialContext = dial
+	f.proxy = p
 	f.client = newTrustingClient(proxyURL, url.User("workload-token"), roots)
 	t.Cleanup(f.client.CloseIdleConnections)
 	return f
@@ -168,7 +220,8 @@ func (f *browserFixture) do(t *testing.T, method, rawURL string, mutate func(*ht
 	}
 	defer func() { _ = resp.Body.Close() }()
 	data, _ := io.ReadAll(resp.Body)
-	for _, secret := range []string{"synthetic-real-access-token", "synthetic-password", "synthetic-client-secret", "synthetic-api-session", "synthetic-app-session"} {
+	for _, secret := range []string{"synthetic-real-access-token", "synthetic-password", "synthetic-client-secret", "synthetic-api-session", "synthetic-app-session",
+		"synthetic-refresh-token", "synthetic-automated-auth-key"} {
 		if strings.Contains(string(data), secret) || strings.Contains(fmt.Sprint(resp.Header), secret) {
 			t.Fatalf("%s reached the browser", secret)
 		}
@@ -360,5 +413,152 @@ func TestBrowserSeedFile(t *testing.T) {
 	}
 	if err := os.WriteFile(out, []byte(body), 0o600); err != nil { // #nosec G703 -- path chosen by the person running the check
 		t.Fatal(err)
+	}
+}
+
+// lockedBuffer collects the proxy's log across its goroutines.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// With an automated-auth login the worker still gets only the placeholder
+// seed, the API gets the real token, and neither the log nor the audit trail
+// carries the service key, the password, or either token.
+func TestBrowserAutomatedAuthKeepsSecretsBrokerSide(t *testing.T) {
+	logs := &lockedBuffer{}
+	f := newBrowserFixtureWith(t, true, slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	resp, body := f.do(t, "GET", "https://api.example.com"+httpcatalog.BrowserSeedPath, nil)
+	if resp == nil || resp.StatusCode != 200 || !strings.Contains(body, browserPlaceholder) || !strings.Contains(body, "org_synthetic") {
+		t.Fatalf("seed: %v %s", resp, body)
+	}
+	if resp, body := f.do(t, "GET", "https://api.example.com/v1/cases", bearerPlaceholder); resp == nil || resp.StatusCode != 200 || body != `{"cases":[]}` {
+		t.Fatalf("api: %v %q", resp, body)
+	}
+	if f.logins.Load() != 1 || f.headers("automated-auth.example.com").Get("Content-Type") != "application/json" {
+		t.Fatalf("logins: %d", f.logins.Load())
+	}
+	if f.revokes.Load() != 1 || !f.audited("staging-app/revoke", "refresh_revoked") {
+		t.Fatalf("refresh token not revoked: %d", f.revokes.Load())
+	}
+	// A refused login, whose answer names the user, fails closed.
+	f.loginErr.Store(true)
+	f.clock.Store(int64(time.Hour))
+	if resp, _ := f.do(t, "GET", "https://api.example.com/v1/cases", bearerPlaceholder); resp == nil || resp.StatusCode != http.StatusServiceUnavailable ||
+		f.audit.last().Outcome != "token_unavailable" {
+		t.Fatalf("refused login: %v %+v", resp, f.audit.last())
+	}
+	events, _ := json.Marshal(f.audit.all())
+	for _, secret := range []string{"synthetic-automated-auth-key", "synthetic-password", "synthetic-real-access-token", "synthetic-refresh-token", "qa-user@example.test"} {
+		if strings.Contains(string(events), secret) || strings.Contains(logs.String(), secret) {
+			t.Fatalf("%s in the audit trail or log", secret)
+		}
+	}
+	if len(f.audit.all()) < 5 {
+		t.Fatalf("audit trail too short to prove anything: %d events", len(f.audit.all()))
+	}
+}
+
+func (f *browserFixture) audited(binding, outcome string) bool {
+	for _, e := range f.audit.all() {
+		if e.Binding == binding && e.Outcome == outcome {
+			return true
+		}
+	}
+	return false
+}
+
+// A failed revocation is retried once, then audited as revoke_failed; the
+// sign-in still succeeds, since the broker keeps the refresh token nowhere.
+func TestBrowserAutomatedAuthRevokeFailureAudited(t *testing.T) {
+	f := newBrowserFixtureWith(t, true, nil)
+	f.revokeErr.Store(true)
+	if resp, body := f.do(t, "GET", "https://api.example.com"+httpcatalog.BrowserSeedPath, nil); resp == nil || resp.StatusCode != 200 {
+		t.Fatalf("seed: %v %s", resp, body)
+	}
+	if f.revokes.Load() != 2 || !f.audited("staging-app/revoke", "revoke_failed") || f.audited("staging-app/revoke", "refresh_revoked") {
+		t.Fatalf("revocation: %d attempts, %+v", f.revokes.Load(), f.audit.all())
+	}
+}
+
+// Vault unreachable: the sign-in fails closed with 503 and calls nothing.
+func TestBrowserAutomatedAuthVaultErrorIs503(t *testing.T) {
+	f := newBrowserFixtureWith(t, true, nil)
+	f.vaultDown.Store(true)
+	if resp, _ := f.do(t, "GET", "https://api.example.com"+httpcatalog.BrowserSeedPath, nil); resp == nil || resp.StatusCode != http.StatusServiceUnavailable ||
+		f.audit.last().Outcome != "token_unavailable" || f.logins.Load() != 0 {
+		t.Fatalf("vault down: %v %+v logins=%d", resp, f.audit.last(), f.logins.Load())
+	}
+}
+
+// The path guard refuses credential and account-admin routes anywhere in
+// the path, and writes to read-only routes, before any sign-in or upstream
+// call.
+func TestBrowserPathGuard(t *testing.T) {
+	f := newBrowserFixture(t)
+	for _, tc := range []struct {
+		method, path string
+		status       int
+		outcome      string
+	}{
+		{"GET", "/organizations/123/apiKey", 403, "denied_path"},
+		{"POST", "/organizations/123/APIKEY", 403, "denied_path"},
+		{"GET", "/organizations/123/api%4Bey", 403, "denied_path"},
+		{"GET", "/organizations/123%2FapiKey", 403, "denied_path"},
+		{"POST", "/users/mfa", 403, "denied_path"},
+		{"POST", "/users/change-password", 403, "denied_path"},
+		{"POST", "/v1/oauth/clients/x/rotate-secret", 403, "denied_path"},
+		{"GET", "/v1/parent-organizations/1/users/2/roles", 403, "denied_path"},
+		{"DELETE", "/v1/sessions/1", 403, "denied_path"},
+		{"GET", "/v1/parent-organizations/7/users", 403, "denied_path"},
+		{"GET", "/v1/parent-organizations/7/users/3/teams", 403, "denied_path"},
+		{"GET", "/v1/intel-vault/files/2", 403, "denied_path"},
+		{"GET", "/v1/parent-organizations/7/environments", 200, "completed"},
+		{"POST", "/users-organizations", 403, "read_only_path"},
+		{"PATCH", "/v1/users-organizations/users/2", 403, "read_only_path"},
+		{"DELETE", "/v1/reports/7", 403, "read_only_path"},
+		{"GET", "/users-organizations", 200, "completed"},
+		{"GET", "/v1/reports/7", 200, "completed"},
+		{"POST", "/v1/cases", 200, "completed"},
+	} {
+		calls := f.apiCalls.Load()
+		resp, _ := f.do(t, tc.method, "https://api.example.com"+tc.path, bearerPlaceholder)
+		forwarded := f.apiCalls.Load() != calls
+		if resp == nil || resp.StatusCode != tc.status || f.audit.last().Outcome != tc.outcome || forwarded != (tc.status == 200) {
+			t.Errorf("%s %s: %v %q forwarded=%v", tc.method, tc.path, resp, f.audit.last().Outcome, forwarded)
+		}
+	}
+}
+
+// The per-Pod proxy rate limit (default 20 requests a second, a burst of
+// 200 and 64 in flight per Pod and entry) applies to browser sessions.
+func TestBrowserRateLimited(t *testing.T) {
+	f := newBrowserFixture(t)
+	cfg := ratelimit.DefaultsFor(ratelimit.ProfileDefault)
+	proxyTier := cfg.Tiers[ratelimit.TierProxy]
+	proxyTier.Rate, proxyTier.Burst = 0.001, 2
+	cfg.Tiers[ratelimit.TierProxy] = proxyTier
+	f.proxy.rateLimit = ratelimit.New(cfg)
+	for i := 0; i < 2; i++ {
+		if resp, _ := f.do(t, "GET", "https://api.example.com/v1/cases", bearerPlaceholder); resp == nil || resp.StatusCode != 200 {
+			t.Fatalf("request %d: %v", i, resp)
+		}
+	}
+	calls := f.apiCalls.Load()
+	if resp, _ := f.do(t, "GET", "https://api.example.com/v1/cases", bearerPlaceholder); resp == nil || resp.StatusCode != http.StatusTooManyRequests ||
+		f.audit.last().Outcome != "rate_limited" || f.apiCalls.Load() != calls {
+		t.Fatalf("over the limit: %v %q", resp, f.audit.last().Outcome)
 	}
 }

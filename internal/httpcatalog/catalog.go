@@ -25,7 +25,12 @@ type Entry struct {
 	Host         string   `json:"host"`
 	Port         int      `json:"port,omitempty"` // default 443
 	PathPrefixes []string `json:"pathPrefixes"`
-	Methods      []string `json:"methods"`
+	// DeniedPaths and ReadOnlyPaths are browser-session path templates (see
+	// browser_paths.go): every method is refused at or below a denied one,
+	// and all but GET, HEAD and OPTIONS below a read-only one.
+	DeniedPaths   []string `json:"deniedPaths,omitempty"`
+	ReadOnlyPaths []string `json:"readOnlyPaths,omitempty"`
+	Methods       []string `json:"methods"`
 	// Header carries the key. Scheme, when set, prefixes it ("Bearer").
 	Header string `json:"header"`
 	Scheme string `json:"scheme,omitempty"`
@@ -246,6 +251,7 @@ func Parse(data []byte) (Catalog, error) {
 		pools[pool.Name] = pool
 	}
 	names := map[string]bool{}
+	users := map[KVRef]string{}
 	routes := map[string]string{}
 	kinds := map[string]string{}
 	for i := range file.Entries {
@@ -274,6 +280,12 @@ func Parse(data []byte) (Catalog, error) {
 		}
 		kinds[hostKey] = e.Kind
 		if e.BrowserSession != nil {
+			// A test user signs in for one entry only, so its session and
+			// audit trail belong to that entry's pool.
+			if other, ok := users[e.BrowserSession.User]; ok {
+				return Catalog{}, fmt.Errorf("browser-session entries %q and %q share a test user", other, e.Name)
+			}
+			users[e.BrowserSession.User] = e.Name
 			// The app host belongs to its entry alone.
 			appKey := fmt.Sprintf("%s:%d", e.BrowserSession.AppHost, e.Port)
 			if _, ok := kinds[appKey]; ok {
@@ -318,6 +330,9 @@ func (e *Entry) normalize() error {
 	}
 	if e.Port < 1 || e.Port > 65535 {
 		return errors.New("invalid port")
+	}
+	if e.Kind != "browser-session" && (len(e.DeniedPaths) > 0 || len(e.ReadOnlyPaths) > 0) {
+		return errors.New("deniedPaths and readOnlyPaths apply to browser-session entries only")
 	}
 	switch e.Kind {
 	case "postgres":
@@ -731,6 +746,19 @@ func (c Catalog) HasAuth0Domain(host string) bool {
 	return false
 }
 
+// HasAutomatedAuth reports whether addr (host:port) is the automated-auth
+// service of a browser-session entry: the only other place the broker's own
+// logins may reach.
+func (c Catalog) HasAutomatedAuth(addr string) bool {
+	addr = strings.ToLower(addr)
+	for _, e := range c.entries {
+		if e.BrowserSession != nil && e.BrowserSession.AutomatedAuth != nil && e.BrowserSession.AutomatedAuth.Addr() == addr {
+			return true
+		}
+	}
+	return false
+}
+
 // Entries returns a copy of the catalog, for wiring and diagnostics.
 func (c Catalog) Entries() []Entry { return append([]Entry(nil), c.entries...) }
 
@@ -764,7 +792,7 @@ func clusterLocal(host string) bool {
 }
 
 // plaintextDatabases lets a database entry for a Kubernetes Service host use
-// sslmode disable. Only a binary built with the e2e tag can set it (see
+// sslmode disable, and an automated-auth service on one use plain http. Only a binary built with the e2e tag can set it (see
 // plaintext_e2e.go), for the Kind fixture database, which serves no TLS.
 var plaintextDatabases atomic.Bool
 

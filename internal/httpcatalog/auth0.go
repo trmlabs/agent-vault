@@ -30,17 +30,24 @@ func (t BrowserToken) String() string {
 func (t BrowserToken) GoString() string           { return t.String() }
 func (t BrowserToken) Format(f fmt.State, _ rune) { _, _ = f.Write([]byte(t.String())) }
 
-// Auth0Tokens logs test users in with Auth0's password-realm grant through a
-// confidential client and caches each access token until a quarter of its
-// life remains. The user's password and the client secret come from Vault on
-// each login and are never cached here. The login asks for no refresh token
-// and never follows a redirect: the request body holds both secrets.
+// Auth0Tokens logs test users in and caches each access token until a
+// quarter of its life remains. An entry logs in with Auth0's password-realm
+// grant through a confidential client, or, when it names one, through TRM's
+// automated-auth service (see automatedAuthLogin). The user's password and
+// the client secret or service key come from Vault on each login and are
+// never cached here. The login keeps no refresh token and never follows a
+// redirect: the request body holds the secrets.
 type Auth0Tokens struct {
 	Keys interface {
 		Get(context.Context, KeyRef) (Secret, error)
 	}
-	Client *http.Client // must dial only the Auth0 domains in the catalog
-	Now    func() time.Time
+	Client        *http.Client // must dial only the Auth0 domains in the catalog
+	AutomatedAuth *http.Client // must dial only the automated-auth services in the catalog
+	// Revoked reports each refresh-token revocation after an automated-auth
+	// sign-in, for the audit trail: outcome "refresh_revoked" or
+	// "revoke_failed", and Auth0's status (0 without an answer).
+	Revoked func(binding, outcome string, status int)
+	Now     func() time.Time
 
 	mu     sync.Mutex
 	cache  map[string]BrowserToken
@@ -95,7 +102,7 @@ func (a *Auth0Tokens) Token(ctx context.Context, e *Entry) (BrowserToken, error)
 		return t, nil
 	}
 	a.mu.Unlock()
-	t, err := a.login(ctx, e.BrowserSession)
+	t, err := a.login(ctx, e)
 	if err != nil {
 		return BrowserToken{}, err
 	}
@@ -119,10 +126,21 @@ func (a *Auth0Tokens) Invalidate(e *Entry) {
 
 func cacheKey(e *Entry) string {
 	b := e.BrowserSession
-	return strings.Join([]string{e.Name, b.Auth0.Domain, b.Auth0.Audience, b.User.Mount, b.User.Path}, "\x00")
+	parts := []string{e.Name, b.Auth0.Domain, b.Auth0.Audience, b.Auth0.Login, b.User.Mount, b.User.Path}
+	if s := b.AutomatedAuth; s != nil {
+		parts = append(parts, s.URL, s.Profile, s.OrgID, s.Key.Mount, s.Key.Path)
+	}
+	return strings.Join(parts, "\x00")
 }
 
-func (a *Auth0Tokens) login(ctx context.Context, b *BrowserSessionBinding) (BrowserToken, error) {
+func (a *Auth0Tokens) login(ctx context.Context, e *Entry) (BrowserToken, error) {
+	b := e.BrowserSession
+	if b.Auth0.Login == "automated-auth" {
+		return a.automatedAuthLogin(ctx, e)
+	}
+	if b.AutomatedAuth != nil {
+		return BrowserToken{}, ErrBrowserLogin
+	}
 	values := map[string]string{}
 	for name, ref := range map[string]KeyRef{
 		"username": b.User.Field("email"), "password": b.User.Field("password"),

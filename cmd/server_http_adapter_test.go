@@ -52,7 +52,7 @@ func TestGitHubAppSignerRequiresAKeyLocation(t *testing.T) {
 // 443, and never follow a redirect.
 func TestAuth0ClientDialsOnlyCatalogDomains(t *testing.T) {
 	catalog, err := httpcatalog.Parse([]byte(`{"entries":[{"name":"staging-app","kind":"browser-session","host":"api.example.com",
-		"placeholder":"__vault_STAGING_APP__","pools":["pool-a"],"browserSession":{"appHost":"app.example.com",
+		"placeholder":"__vault_STAGING_APP__","pools":["pool-a"],"pathPrefixes":["/v1"],"browserSession":{"appHost":"app.example.com",
 		"auth0":{"domain":"auth.example.com","clientID":"spaClient1","audience":"https://api.example.com","realm":"Username-Password-Authentication",
 		"tokenClient":{"mount":"gatehouse","path":"browser/client"}},"user":{"mount":"gatehouse","path":"browser/qa-user"}}}]}`))
 	if err != nil {
@@ -75,6 +75,39 @@ func TestAuth0ClientDialsOnlyCatalogDomains(t *testing.T) {
 		}
 	}
 	if len(dialed) != 2 {
+		t.Fatalf("dialed %v", dialed)
+	}
+	if client.CheckRedirect == nil || client.CheckRedirect(nil, nil) != http.ErrUseLastResponse {
+		t.Fatal("redirects followed")
+	}
+}
+
+// The broker's automated-auth logins reach only a service address the catalog
+// names, and never follow a redirect.
+func TestAutomatedAuthClientDialsOnlyCatalogServices(t *testing.T) {
+	catalog, err := httpcatalog.Parse([]byte(`{"entries":[{"name":"staging-app","kind":"browser-session","host":"api.example.com",
+		"placeholder":"__vault_STAGING_APP__","pools":["pool-a"],"pathPrefixes":["/v1"],"browserSession":{"appHost":"app.example.com",
+		"auth0":{"domain":"auth.example.com","clientID":"spaClient1","audience":"https://api.example.com","login":"automated-auth"},
+		"automatedAuth":{"url":"https://automated-auth.automated-auth.svc.cluster.local:8443","profile":"trm-b2b-staging","orgID":"org_synthetic",
+		"key":{"mount":"gatehouse","path":"browser/automated-auth"}},"user":{"mount":"gatehouse","path":"browser/qa-user"}}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dialed []string
+	client := automatedAuthClient(catalog, func(_ context.Context, _, addr string) (net.Conn, error) {
+		dialed = append(dialed, addr)
+		return nil, net.ErrClosed
+	})
+	dial := client.Transport.(*http.Transport).DialContext
+	if _, err := dial(context.Background(), "tcp", "automated-auth.automated-auth.svc.cluster.local:8443"); err != net.ErrClosed {
+		t.Errorf("catalog service refused: %v", err)
+	}
+	for _, addr := range []string{"automated-auth.automated-auth.svc.cluster.local:443", "auth.example.com:443", "collector.example.net:8443"} {
+		if _, err := dial(context.Background(), "tcp", addr); err == nil || err == net.ErrClosed {
+			t.Errorf("%s dialed", addr)
+		}
+	}
+	if len(dialed) != 1 {
 		t.Fatalf("dialed %v", dialed)
 	}
 	if client.CheckRedirect == nil || client.CheckRedirect(nil, nil) != http.ErrUseLastResponse {

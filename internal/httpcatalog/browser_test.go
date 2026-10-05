@@ -33,7 +33,7 @@ func (fieldVault) ReadWithDataWithContext(context.Context, string, map[string][]
 
 func browserEntryJSON(extra string) string {
 	return `{"name":"staging-app","kind":"browser-session","host":"api.example.com","placeholder":"__vault_STAGING_APP__",
-		"pools":["database-developers"]` + extra + `,"browserSession":{"appHost":"app.example.com",
+		"pools":["database-developers"],"pathPrefixes":["/v1"]` + extra + `,"browserSession":{"appHost":"app.example.com",
 		"auth0":{"domain":"example.com","clientID":"spaClient1","audience":"https://api.example.com","realm":"Username-Password-Authentication",
 		"tokenClient":{"mount":"gatehouse","path":"browser/client"}},"user":{"mount":"gatehouse","path":"browser/qa-user"}}}`
 }
@@ -44,7 +44,7 @@ func TestBrowserSessionEntry(t *testing.T) {
 		t.Fatal(err)
 	}
 	e := c.Entries()[0]
-	if e.Port != 443 || e.PathPrefixes[0] != "/" || e.BrowserSession.Auth0.Scope != "openid profile email offline_access" {
+	if e.Port != 443 || e.BrowserSession.Auth0.Login != "password-realm" || e.BrowserSession.Auth0.Scope != "openid profile email offline_access" {
 		t.Fatalf("defaults: %+v", e)
 	}
 	if !c.HasHost("app.example.com", 443) || !c.HasHost("api.example.com", 443) || c.HasHost("example.com", 443) {

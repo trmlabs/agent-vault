@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Infisical/agent-vault/internal/auditchain"
 	"github.com/Infisical/agent-vault/internal/githubapp"
 	"github.com/Infisical/agent-vault/internal/hashicorp"
 	"github.com/Infisical/agent-vault/internal/httpcatalog"
@@ -107,7 +108,11 @@ func httpHeaderAdapter(ctx context.Context, srv *server.Server, getenv func(stri
 		return nil, err
 	}
 	adapter.Sessions = sessionBinder(srv.CleanupStore())
-	adapter.BrowserTokens = &httpcatalog.Auth0Tokens{Keys: keys, Client: auth0Client(source, netguard.SafeDialContext(netguard.AllowPrivateFromEnv()))}
+	dial := netguard.SafeDialContext(netguard.AllowPrivateFromEnv())
+	adapter.BrowserTokens = &httpcatalog.Auth0Tokens{Keys: keys, Client: auth0Client(source, dial), AutomatedAuth: automatedAuthClient(source, dial),
+		Revoked: func(binding, outcome string, status int) {
+			_ = chain.Record(auditchain.Event{Event: auditchain.EventHTTPResponse, Binding: binding + "/revoke", Outcome: outcome, Method: http.MethodPost, Status: status})
+		}}
 	githubEntries, gcpEntries := false, false
 	for _, e := range source.Current().Entries() {
 		githubEntries = githubEntries || e.Kind == "git" || e.Kind == "github-api"
@@ -159,6 +164,22 @@ func auth0Client(catalog interface{ Current() httpcatalog.Catalog }, dial func(c
 		return dial(ctx, network, addr)
 	}
 	return &http.Client{Timeout: 10 * time.Second,
+		Transport:     &http.Transport{DialContext: pinned, TLSHandshakeTimeout: 5 * time.Second},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+}
+
+// automatedAuthClient is how browser-session test users sign in through TRM's
+// automated-auth service: over the guarded dialer, to a service address the
+// current catalog names and nowhere else, never following a redirect. The
+// service drives a real login page, so a sign-in takes tens of seconds.
+func automatedAuthClient(catalog interface{ Current() httpcatalog.Catalog }, dial func(context.Context, string, string) (net.Conn, error)) *http.Client {
+	pinned := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if !catalog.Current().HasAutomatedAuth(addr) {
+			return nil, errors.New("automated-auth login: service not in the catalog")
+		}
+		return dial(ctx, network, addr)
+	}
+	return &http.Client{Timeout: 60 * time.Second,
 		Transport:     &http.Transport{DialContext: pinned, TLSHandshakeTimeout: 5 * time.Second},
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 }

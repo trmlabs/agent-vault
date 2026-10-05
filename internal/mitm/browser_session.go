@@ -41,6 +41,12 @@ func (p *Proxy) forwardBrowser(w http.ResponseWriter, r *http.Request, target st
 	case errors.Is(matchErr, httpcatalog.ErrMethod):
 		deny(http.StatusMethodNotAllowed, "method")
 		return
+	case errors.Is(matchErr, httpcatalog.ErrDeniedPath):
+		deny(http.StatusForbidden, "denied_path")
+		return
+	case errors.Is(matchErr, httpcatalog.ErrReadOnlyPath):
+		deny(http.StatusForbidden, "read_only_path")
+		return
 	case matchErr != nil:
 		deny(http.StatusForbidden, "pool")
 		return
