@@ -139,7 +139,7 @@ func (p *Proxy) resolveScope(ctx context.Context, token, hint string, peer netip
 	}
 	// Each listener admits only the identity kinds it was opened for.
 	if !brokercore.KindAdmitted(connKinds(ctx), scope.IdentityKind) {
-		p.logRefusal("listener_kind")
+		p.logRefusal("listener_kind", nil)
 		return nil, brokercore.Denied("listener_kind")
 	}
 	return scope, nil
@@ -181,14 +181,15 @@ func (p *Proxy) resolveAnyScope(ctx context.Context, token, hint string, peer ne
 	}
 	if err != nil || scope == nil {
 		reason := brokercore.DenialReason(err)
-		p.logRefusal(reason)
+		p.logRefusal(reason, brokercore.DenialKey(err))
 		if reason == "" {
 			return nil, brokercore.ErrInvalidSession
 		}
-		return nil, brokercore.Denied(reason)
+		// The refusal itself, so its kid and peer reach the audit row.
+		return nil, err
 	}
 	if !scope.NotAfter.IsZero() && !time.Now().Before(scope.NotAfter) {
-		p.logRefusal("deadline")
+		p.logRefusal("deadline", nil)
 		return nil, brokercore.Denied("deadline")
 	}
 	return scope, nil
@@ -196,6 +197,8 @@ func (p *Proxy) resolveAnyScope(ctx context.Context, token, hint string, peer ne
 
 // refusalLogEvery bounds the refusal log: one line per reason per interval,
 // with the count since the last, so a flood of bad callers stays one line.
+// A signing-key refusal's line names the kid and peer of the refusal that
+// opens the interval; every refusal's own are in its audit row.
 const refusalLogEvery = 10 * time.Second
 
 type refusalLog struct {
@@ -205,8 +208,9 @@ type refusalLog struct {
 }
 
 // logRefusal records why an identity was refused: a fixed code, never a
-// token, name or address.
-func (p *Proxy) logRefusal(reason string) {
+// token or name. A signing-key refusal adds the token's kid, in its safe
+// form, and the connection's peer address.
+func (p *Proxy) logRefusal(reason string, key *brokercore.KeyDenial) {
 	if reason == "" {
 		reason = "unspecified"
 	}
@@ -224,7 +228,16 @@ func (p *Proxy) logRefusal(reason string) {
 	count := l.counts[reason]
 	l.last[reason], l.counts[reason] = now, 0
 	l.mu.Unlock()
-	if p.logger != nil {
-		p.logger.Warn("workload identity refused", "reason", reason, "count", count)
+	if p.logger == nil {
+		return
 	}
+	args := []any{"reason", reason, "count", count}
+	if key != nil {
+		args = append(args, "kid", key.Kid)
+		if key.KidSHA256 != "" {
+			args = append(args, "kid_sha256", key.KidSHA256)
+		}
+		args = append(args, "peer", key.Peer)
+	}
+	p.logger.Warn("workload identity refused", args...)
 }

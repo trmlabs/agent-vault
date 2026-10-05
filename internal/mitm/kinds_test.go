@@ -3,6 +3,8 @@ package mitm
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -103,17 +105,74 @@ func TestRefusalLogIsRateLimitedByReason(t *testing.T) {
 	var buf bytes.Buffer
 	p := &Proxy{logger: slog.New(slog.NewTextHandler(&buf, nil))}
 	for i := 0; i < 5; i++ {
-		p.logRefusal("proxy_source")
+		p.logRefusal("proxy_source", nil)
 	}
-	p.logRefusal("catalog_profile")
+	p.logRefusal("catalog_profile", nil)
 	out := buf.String()
 	if strings.Count(out, "reason=proxy_source") != 1 || strings.Count(out, "reason=catalog_profile") != 1 {
 		t.Fatalf("log: %s", out)
 	}
 	p.refusals.last["proxy_source"] = time.Now().Add(-refusalLogEvery)
-	p.logRefusal("proxy_source")
+	p.logRefusal("proxy_source", nil)
 	if !strings.Contains(buf.String(), "reason=proxy_source count=5") {
 		t.Fatalf("folded count missing: %s", buf.String())
+	}
+}
+
+// A signing-key refusal's line and audit row name the token's kid and the
+// connection's peer. A kid that is not a plain identifier is
+// chosen by whoever made the token, so it is recorded as "invalid" plus a hash
+// prefix, and its row is still written: the caller gets 403, not 503.
+func TestKeyRefusalNamesKidAndPeer(t *testing.T) {
+	peer := netip.MustParseAddr("10.20.30.40")
+	for _, c := range []struct {
+		name, reason, kid, wantKid string
+		hashed                     bool
+	}{
+		{"pinned", "token_keys_pinned_mismatch", "ZQVpb7vyW0cXKr--ggHnuB24sV1iYirOsQNSZKxruVI", "ZQVpb7vyW0cXKr--ggHnuB24sV1iYirOsQNSZKxruVI", false},
+		{"in-cluster", "token_keys_in_cluster_unknown", "k.1_a", "k.1_a", false},
+		{"signature", "token_signature", "k1", "k1", false},
+		{"quote", "token_signature", `k"1`, "invalid", true},
+		{"space", "token_keys_pinned_mismatch", "k 1", "invalid", true},
+		{"long", "token_keys_unavailable", strings.Repeat("k", 600), "invalid", true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			refusal := brokercore.WithPeer(brokercore.DeniedKey(c.reason, c.kid), peer)
+			sum := sha256.Sum256([]byte(c.kid))
+			wantHash := ""
+			if c.hashed {
+				wantHash = hex.EncodeToString(sum[:])[:12]
+			}
+			var buf bytes.Buffer
+			p := &Proxy{logger: slog.New(slog.NewTextHandler(&buf, nil))}
+			p.logRefusal(brokercore.DenialReason(refusal), brokercore.DenialKey(refusal))
+			line := buf.String()
+			want := "reason=" + c.reason + " count=1 kid=" + c.wantKid
+			if c.hashed {
+				want += " kid_sha256=" + wantHash
+			}
+			if !strings.Contains(line, want+" peer=10.20.30.40") || (c.hashed && strings.Contains(line, c.kid)) {
+				t.Fatalf("log line %q", line)
+			}
+			f := newAdapterFixture(t, func(o *Options) { o.Attestor = refusingAttestor{refusal} })
+			// The tunnel is refused at CONNECT: 403, never 503 for a row the
+			// chain would not take.
+			_, _, err := f.do(t, "GET", "/v1/chat/x", "", nil)
+			if err == nil || !strings.HasSuffix(err.Error(), ": Forbidden") || strings.Contains(err.Error(), c.reason) {
+				t.Fatalf("caller saw %v", err)
+			}
+			e := f.audit.last()
+			if e.Event != "denied" || e.Decision != "identity_"+c.reason || e.Kid != c.wantKid || e.KidSHA256 != wantHash || e.Peer != "10.20.30.40" || e.Status != 403 {
+				t.Fatalf("audit row %+v", e)
+			}
+		})
+	}
+	// Refusals that are not at the signing key keep their plain line.
+	var buf bytes.Buffer
+	p := &Proxy{logger: slog.New(slog.NewTextHandler(&buf, nil))}
+	p.logRefusal("proxy_source", brokercore.DenialKey(brokercore.WithPeer(brokercore.Denied("proxy_source"), peer)))
+	if strings.Contains(buf.String(), "kid=") || strings.Contains(buf.String(), "peer=") {
+		t.Fatalf("plain refusal line %q", buf.String())
 	}
 }
 

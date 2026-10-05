@@ -68,9 +68,13 @@ type Event struct {
 	Decision      string
 	Groups        string
 	CacheAgeSec   int64
-	Method        string
-	Status        int
-	Duration      int64 // milliseconds
+	// Signing-key refusals: see Row.
+	Kid       string
+	KidSHA256 string
+	Peer      string
+	Method    string
+	Status    int
+	Duration  int64 // milliseconds
 }
 
 var (
@@ -150,9 +154,9 @@ func (c *Chain) Admit() error {
 	return nil
 }
 
-// Record appends a caller event. An error means the row may not exist, so the
-// caller must not start or continue the action it describes.
-func (c *Chain) Record(e Event) error {
+// Validate reports whether Record would accept the event: a known event and
+// method, and every text field a bounded identifier.
+func (e Event) Validate() error {
 	switch e.Event {
 	case EventSessionOpen, EventSessionClose, EventDenied, EventHTTPRequest, EventHTTPResponse, EventTransaction, EventStateLeak:
 	default:
@@ -169,15 +173,25 @@ func (c *Chain) Record(e Event) error {
 	if e.CacheAgeSec < 0 {
 		return ErrInvalidEvent
 	}
-	for _, v := range []string{e.Pool, e.Agent, e.PodUID, e.Binding, e.Session, e.Outcome, e.Requester, e.RequesterKind, e.RequesterOID, e.TokenSHA256, e.Tier, e.Decision, e.Groups} {
+	for _, v := range []string{e.Pool, e.Agent, e.PodUID, e.Binding, e.Session, e.Outcome, e.Requester, e.RequesterKind, e.RequesterOID, e.TokenSHA256, e.Tier, e.Decision, e.Groups, e.Kid, e.KidSHA256, e.Peer} {
 		if !identifier(v, true) {
 			return ErrInvalidEvent
 		}
+	}
+	return nil
+}
+
+// Record appends a caller event. An error means the row may not exist, so the
+// caller must not start or continue the action it describes.
+func (c *Chain) Record(e Event) error {
+	if err := e.Validate(); err != nil {
+		return err
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	_, err := c.appendLocked(Row{Event: e.Event, Pool: e.Pool, Agent: e.Agent, PodUID: e.PodUID, Binding: e.Binding, Session: e.Session, Outcome: e.Outcome, Requester: e.Requester,
 		RequesterKind: e.RequesterKind, RequesterOID: e.RequesterOID, TokenSHA256: e.TokenSHA256, Tier: e.Tier, Decision: e.Decision, Groups: e.Groups, CacheAgeSec: e.CacheAgeSec,
+		Kid: e.Kid, KidSHA256: e.KidSHA256, Peer: e.Peer,
 		Method: e.Method, Status: e.Status, Duration: e.Duration})
 	return err
 }

@@ -143,19 +143,30 @@ func (r *Resolver) verifyLocally(ctx context.Context, token string, renewal bool
 	if k.Pod.UID == "" || !pathSegment(k.Pod.Name) || !pathSegment(k.Namespace) || k.ServiceAccount.UID == "" || c.Subject != "system:serviceaccount:"+k.Namespace+":"+k.ServiceAccount.Name {
 		return claims{}, nil, brokercore.Denied("token_pod_claims")
 	}
+	// Each key refusal names the token's kid, so an operator can tell a
+	// rotation from a forgery; each trust-domain mode has its own code.
 	var key crypto.PublicKey
-	if d.pinned != nil {
+	switch {
+	case d.pinned != nil:
 		// Pinned keys: no fetch. A kid outside the set is a rotation the
 		// configuration has not taken yet, and refuses until it does.
 		if key = d.pinned[header.Kid]; key == nil {
-			return claims{}, nil, brokercore.Denied("token_keys_pinned_mismatch")
+			return claims{}, nil, brokercore.DeniedKey("token_keys_pinned_mismatch", header.Kid)
 		}
-	} else if key = r.signingKey(ctx, d, header.Kid); key == nil {
-		return claims{}, nil, brokercore.Denied("token_keys_unavailable")
+	case d.name == "":
+		// The broker's own cluster: the kid is not in its current key set,
+		// or the set could not be read.
+		if key = r.signingKey(ctx, d, header.Kid); key == nil {
+			return claims{}, nil, brokercore.DeniedKey("token_keys_in_cluster_unknown", header.Kid)
+		}
+	default:
+		if key = r.signingKey(ctx, d, header.Kid); key == nil {
+			return claims{}, nil, brokercore.DeniedKey("token_keys_unavailable", header.Kid)
+		}
 	}
 	digest := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
 	if !verifySignature(header.Alg, key, digest[:], signature) {
-		return claims{}, nil, brokercore.Denied("token_signature")
+		return claims{}, nil, brokercore.DeniedKey("token_signature", header.Kid)
 	}
 	return c, d, nil
 }
@@ -335,7 +346,7 @@ func (r *Resolver) attest(ctx context.Context, token string, peer netip.Addr, re
 	defer cancel()
 	c, d, err := r.verifyLocally(ctx, token, renewal)
 	if err != nil {
-		return nil, err
+		return nil, brokercore.WithPeer(err, peer)
 	}
 	k := c.Kubernetes
 	var binding *Binding

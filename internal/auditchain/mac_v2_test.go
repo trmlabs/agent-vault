@@ -43,9 +43,13 @@ func TestV1InputIsUnchanged(t *testing.T) {
 	if !bytes.HasPrefix(r.macInput(), []byte("gatehouse-audit-v1\x00")) {
 		t.Fatal("a row without a MAC version no longer uses the v1 input")
 	}
-	r.MACVersion = MACVersionCurrent
+	r.MACVersion = 2
 	if !bytes.HasPrefix(r.macInput(), []byte("gatehouse-audit-v2\x00")) {
 		t.Fatal("a v2 row does not use the v2 input")
+	}
+	r.MACVersion = MACVersionCurrent
+	if !bytes.HasPrefix(r.macInput(), []byte("gatehouse-audit-v3\x00")) {
+		t.Fatal("a current row does not use the v3 input")
 	}
 }
 
@@ -53,7 +57,8 @@ func authzFixture(t *testing.T) (*fixture, string) {
 	t.Helper()
 	f := newFixture(t)
 	if err := f.chain.Record(Event{Event: EventDenied, Pool: "claude", Binding: "vault/core", Outcome: "not_entitled",
-		RequesterKind: "person", RequesterOID: "oid-1", TokenSHA256: "ab", Tier: "T1", Decision: "not_entitled", Groups: "g1", CacheAgeSec: 3}); err != nil {
+		RequesterKind: "person", RequesterOID: "oid-1", TokenSHA256: "ab", Tier: "T1", Decision: "not_entitled", Groups: "g1", CacheAgeSec: 3,
+		Kid: "invalid", KidSHA256: "0123456789ab", Peer: "10.0.0.5"}); err != nil {
 		t.Fatal(err)
 	}
 	f.checkpoint(t)
@@ -70,7 +75,10 @@ func TestAuthorizationFieldEditsAreDetected(t *testing.T) {
 		"kind":      {`"requesterKind":"person"`, `"requesterKind":"workload"`},
 		"token":     {`"tokenSHA256":"ab"`, `"tokenSHA256":"cd"`},
 		"cache age": {`"cacheAgeSec":3`, `"cacheAgeSec":4`},
-		"version":   {`"macVersion":2`, `"macVersion":1`},
+		"kid":       {`"kid":"invalid"`, `"kid":"k1"`},
+		"kid hash":  {`"kidSHA256":"0123456789ab"`, `"kidSHA256":"ba9876543210"`},
+		"peer":      {`"peer":"10.0.0.5"`, `"peer":"10.0.0.6"`},
+		"version":   {`"macVersion":3`, `"macVersion":2`},
 	} {
 		t.Run(name, func(t *testing.T) {
 			f, out := authzFixture(t)
@@ -95,6 +103,8 @@ func TestAuthorizationFieldEditsAreDetected(t *testing.T) {
 func TestV1RowsCannotCarryAuthorizationOrDowngrade(t *testing.T) {
 	for name, forge := range map[string]func(*Row){
 		"v1 row with a decision": func(r *Row) { r.Decision = "entitled" },
+		"v2 row with a peer":     func(r *Row) { r.MACVersion, r.Peer = 2, "10.0.0.5" },
+		"v2 row with a kid":      func(r *Row) { r.MACVersion, r.Kid = 2, "k1" },
 		"plain downgrade":        func(*Row) {},
 		"unknown version":        func(r *Row) { r.MACVersion = 9 },
 	} {

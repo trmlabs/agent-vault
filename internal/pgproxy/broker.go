@@ -542,7 +542,16 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		b.logger.Warn("pgproxy: agent authentication failed", slog.String("error", err.Error()))
 		// Anyone can reach this point, so these rows are rate-limited.
 		if b.denied.allow(time.Now(), b.logger) {
-			b.auditDenied(auditchain.Event{}, "authentication")
+			// The refusing check, and for a signing-key refusal the token's
+			// kid and the peer; never the token.
+			event := auditchain.Event{}
+			if reason := brokercore.DenialReason(err); reason != "" {
+				event.Decision = "identity_" + reason
+			}
+			if key := brokercore.DenialKey(err); key != nil {
+				event.Kid, event.KidSHA256, event.Peer = key.Kid, key.KidSHA256, key.Peer
+			}
+			b.auditDenied(event, "authentication")
 		}
 		writeClientError(backend, "28000", "authentication", "Agent Vault: authentication failed")
 		return

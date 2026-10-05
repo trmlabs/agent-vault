@@ -8,8 +8,10 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"math/big"
+	"strings"
 	"testing"
 	"time"
 
@@ -154,4 +156,52 @@ func TestProxyAttestedUnderPinnedKeys(t *testing.T) {
 	if p.rc.calls.Load() != 0 {
 		t.Fatal("a pinned domain fetched keys")
 	}
+}
+
+// Each signing-key refusal has its trust-domain mode's own code and names the
+// token's kid and the connection's peer, never any part of the token. A kid
+// that is not a plain identifier is recorded as "invalid" plus a hash prefix.
+func TestKeyRefusalsNameKidAndPeer(t *testing.T) {
+	f := setupPool(t)
+	ctx := context.Background()
+	check := func(t *testing.T, err error, token, reason, kid string) {
+		t.Helper()
+		key := brokercore.DenialKey(err)
+		if brokercore.DenialReason(err) != reason || key == nil || key.Peer != workerIP.String() {
+			t.Fatalf("refusal %v, key %+v", err, key)
+		}
+		sum := sha256.Sum256([]byte(kid))
+		want := brokercore.KeyDenial{Kid: kid, Peer: workerIP.String()}
+		if kid == "" || len(kid) > 128 || strings.ContainsAny(kid, "\" ") {
+			want.Kid, want.KidSHA256 = "invalid", hex.EncodeToString(sum[:])[:12]
+		}
+		if *key != want {
+			t.Fatalf("key %+v, want %+v", key, want)
+		}
+		msg := err.Error()
+		if !strings.Contains(msg, "kid="+want.Kid) || !strings.Contains(msg, "peer="+workerIP.String()) {
+			t.Fatalf("error %q", msg)
+		}
+		for _, part := range strings.Split(token, ".") {
+			if strings.Contains(msg, part) {
+				t.Fatalf("error %q carries part of the token", msg)
+			}
+		}
+	}
+	// The broker's own cluster: an unknown kid has its own code.
+	token := f.tokenWithKid(f.c, "unknown-kid")
+	_, err := f.r.Attest(ctx, token, workerIP)
+	check(t, err, token, "token_keys_in_cluster_unknown", "unknown-kid")
+
+	rc := newRemoteCluster(t)
+	r := withDomains(t, f, pinnedDomain(rc, rsaJWK(rc.kid, &rc.key.PublicKey)))
+	for _, kid := range []string{"rotated-kid", `k"1`, "k 1", strings.Repeat("k", 600)} {
+		token := (&poolFixture{key: rc.key, kid: kid}).token(rc.claims())
+		_, err := r.Attest(ctx, token, workerIP)
+		check(t, err, token, "token_keys_pinned_mismatch", kid)
+	}
+	other, _ := rsa.GenerateKey(rand.Reader, 2048)
+	token = (&poolFixture{key: other, kid: rc.kid}).token(rc.claims())
+	_, err = r.Attest(ctx, token, workerIP)
+	check(t, err, token, "token_signature", rc.kid)
 }

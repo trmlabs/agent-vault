@@ -98,7 +98,7 @@ func (p *Proxy) strictUnauthenticatedDeny(w http.ResponseWriter, r *http.Request
 func (p *Proxy) strictIdentityDeny(w http.ResponseWriter, r *http.Request, err error) {
 	reason := brokercore.DenialReason(err)
 	if p.adapter != nil && p.adapter.valid() && reason != "" {
-		p.adapterIdentityDeny(w, r, strictAttempt(nil, nil, r.Method, "", "", "deny"), http.StatusForbidden, "identity_"+reason)
+		p.adapterIdentityDeny(w, r, strictAttempt(nil, nil, r.Method, "", "", "deny"), http.StatusForbidden, "identity_"+reason, brokercore.DenialKey(err))
 		return
 	}
 	p.strictUnauthenticatedDeny(w, r, http.StatusForbidden)

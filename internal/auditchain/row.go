@@ -54,13 +54,19 @@ type Row struct {
 	Decision      string `json:"decision,omitempty"`
 	Groups        string `json:"groups,omitempty"` // required groups checked
 	CacheAgeSec   int64  `json:"cacheAgeSec,omitempty"`
-	Method        string `json:"method,omitempty"`     // HTTP rows only
-	Status        int    `json:"status,omitempty"`     // HTTP response rows: upstream or broker status
-	Duration      int64  `json:"durationMs,omitempty"` // transaction rows: milliseconds from first message to completion
-	SignedSeq     uint64 `json:"signedSeq,omitempty"`  // checkpoint: the chain head it signs
-	SignedMAC     string `json:"signedMAC,omitempty"`
-	Signature     string `json:"signature,omitempty"` // checkpoint: Transit "vault:vN:..." signature
-	PrevKey       int    `json:"prevKeyVersion,omitempty"`
+	// Identity refusals at the token's signing key: the kid the token
+	// claimed ("invalid" plus a 12-hex SHA-256 prefix when it is not a plain
+	// identifier) and the connection's peer address. Never the token.
+	Kid       string `json:"kid,omitempty"`
+	KidSHA256 string `json:"kidSHA256,omitempty"`
+	Peer      string `json:"peer,omitempty"`
+	Method    string `json:"method,omitempty"`     // HTTP rows only
+	Status    int    `json:"status,omitempty"`     // HTTP response rows: upstream or broker status
+	Duration  int64  `json:"durationMs,omitempty"` // transaction rows: milliseconds from first message to completion
+	SignedSeq uint64 `json:"signedSeq,omitempty"`  // checkpoint: the chain head it signs
+	SignedMAC string `json:"signedMAC,omitempty"`
+	Signature string `json:"signature,omitempty"` // checkpoint: Transit "vault:vN:..." signature
+	PrevKey   int    `json:"prevKeyVersion,omitempty"`
 	// chain_start: the previous boot and its last persisted checkpoint row,
 	// so a deleted boot or a truncated tail is detectable.
 	PrevBoot          uint64 `json:"prevBoot,omitempty"`
@@ -69,19 +75,21 @@ type Row struct {
 	KeyVersion        int    `json:"keyVersion"`
 	Prev              string `json:"prev"`
 	// MACVersion selects the MAC input: absent (0) is v1, written before the
-	// authorization fields existed; MACVersionCurrent covers every field.
+	// authorization fields existed; 2 adds them; MACVersionCurrent (3) adds
+	// the signing-key refusal fields and covers every field.
 	MACVersion int    `json:"macVersion,omitempty"`
 	MAC        string `json:"mac"`
 }
 
 // MACVersionCurrent is the MAC input every new row uses.
-const MACVersionCurrent = 2
+const MACVersionCurrent = 3
 
 // macInput encodes every field except MAC with explicit lengths, so no two
 // distinct rows share an input regardless of field contents. Version 2 adds
-// the authorization fields and the version itself; version 1 is kept only to
-// verify rows written before it, and a v1 row that carries any v2-only field
-// fails verification (see v2Only).
+// the authorization fields and the version itself, and version 3 the
+// signing-key refusal fields. Older versions are kept only to verify rows
+// written before them, and a row carrying a field its version's MAC does not
+// cover fails verification (see v2Only and v3Only).
 func (r Row) macInput() []byte {
 	fields := []string{
 		r.Type, r.Replica, strconv.FormatUint(r.Boot, 10), strconv.FormatUint(r.Seq, 10), r.Time, r.Event,
@@ -95,7 +103,11 @@ func (r Row) macInput() []byte {
 	}
 	fields = append(fields, strconv.Itoa(r.MACVersion),
 		r.RequesterKind, r.RequesterOID, r.TokenSHA256, r.Tier, r.Decision, r.Groups, strconv.FormatInt(r.CacheAgeSec, 10))
-	return lengthPrefixed("gatehouse-audit-v2", fields...)
+	if r.MACVersion < 3 {
+		return lengthPrefixed("gatehouse-audit-v2", fields...)
+	}
+	fields = append(fields, r.Kid, r.KidSHA256, r.Peer)
+	return lengthPrefixed("gatehouse-audit-v3", fields...)
 }
 
 // v2Only reports whether a row sets a field that only the v2 MAC covers.
@@ -103,6 +115,9 @@ func (r Row) v2Only() bool {
 	return r.RequesterKind != "" || r.RequesterOID != "" || r.TokenSHA256 != "" || r.Tier != "" ||
 		r.Decision != "" || r.Groups != "" || r.CacheAgeSec != 0
 }
+
+// v3Only reports whether a row sets a field that only the v3 MAC covers.
+func (r Row) v3Only() bool { return r.Kid != "" || r.KidSHA256 != "" || r.Peer != "" }
 
 func (r Row) computeMAC(key []byte) string {
 	h := hmac.New(sha256.New, key)

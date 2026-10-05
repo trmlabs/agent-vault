@@ -37,7 +37,13 @@ type adapterAudit struct {
 }
 
 func (a *adapterAudit) Admit() error { a.mu.Lock(); defer a.mu.Unlock(); return a.admitErr }
+
+// Record refuses what the real chain refuses, so a row the chain would reject
+// fails here too.
 func (a *adapterAudit) Record(e auditchain.Event) error {
+	if err := e.Validate(); err != nil {
+		return err
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.events = append(a.events, e)

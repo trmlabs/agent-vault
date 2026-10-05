@@ -4,12 +4,14 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/Infisical/agent-vault/internal/auditchain"
+	"github.com/Infisical/agent-vault/internal/brokercore"
 )
 
 type recordingAudit struct {
@@ -26,6 +28,9 @@ func (a *recordingAudit) Record(e auditchain.Event) error {
 	defer a.mu.Unlock()
 	if e.Event == a.failEvent {
 		return errors.New("audit write failed")
+	}
+	if err := e.Validate(); err != nil {
+		return err
 	}
 	a.events = append(a.events, e)
 	return nil
@@ -121,6 +126,14 @@ func TestBrokerAuditsDenials(t *testing.T) {
 	}
 	if got := unauth.recorded(); len(got) != 1 || got[0].Outcome != "authentication" || got[0].Pool != "" || got[0].PodUID != "" {
 		t.Fatalf("authentication denial: %+v", got)
+	} // A signing-key refusal's row names the check, the token's kid and the peer.
+	keyed := &recordingAudit{}
+	refusal := brokercore.WithPeer(brokercore.DeniedKey("token_keys_pinned_mismatch", `k"1`), netip.MustParseAddr("10.20.30.40"))
+	addr = auditedBroker(t, keyed, &fakeMinter{}, "unused:5432", refusal)
+	_, _ = runAgentQuery(t, addr, "token", "appdb", "SELECT 1")
+	if got := keyed.recorded(); len(got) != 1 || got[0].Decision != "identity_token_keys_pinned_mismatch" || got[0].Kid != "invalid" ||
+		len(got[0].KidSHA256) != 12 || got[0].Peer != "10.20.30.40" {
+		t.Fatalf("key refusal row: %+v", got)
 	}
 }
 
