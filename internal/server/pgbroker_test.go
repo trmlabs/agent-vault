@@ -34,6 +34,22 @@ func TestLoadDatabaseServices_Inline(t *testing.T) {
 	}
 }
 
+// Services outside the catalog are read-only logins when their role is, by
+// the catalog's naming, so the broker refuses temporary objects on them.
+func TestLoadDatabaseServices_ReadOnlyFollowsTheRoleName(t *testing.T) {
+	env := map[string]string{
+		"AGENT_VAULT_DB_SERVICES": `{"default":[{"name":"core","upstream":"127.0.0.1:5433","mount":"database","role":"staging.us.crunchy.core-readonly"},
+			{"name":"rw","upstream":"127.0.0.1:5433","mount":"database","role":"staging.us.crunchy.core-readwrite"}]}`,
+	}
+	got, err := LoadDatabaseServices(getenvFrom(env))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if svcs := got["default"]; len(svcs) != 2 || !svcs[0].ReadOnly || svcs[1].ReadOnly {
+		t.Fatalf("services = %+v", svcs)
+	}
+}
+
 func TestLoadDatabaseServices_File(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "svcs.json")
@@ -154,7 +170,7 @@ func TestStoreDatabaseResolver(t *testing.T) {
 	for _, svc := range []store.DatabaseService{
 		{VaultID: "vid-multi", Name: "reads", Upstream: "h:1", Database: "analytics", Mount: "database", Role: "ro", SSLMode: "require", MaxConns: 5},
 		{VaultID: "vid-multi", Name: "writes", Upstream: "h:2", Database: "ledger", Mount: "database", Role: "rw"},
-		{VaultID: "vid-solo", Name: "only", Upstream: "h:9", Mount: "database", Role: "ro"},
+		{VaultID: "vid-solo", Name: "only", Upstream: "h:9", Mount: "database", Role: "staging.us.crunchy.only-readonly"},
 	} {
 		if _, err := ms.UpsertDatabaseService(ctx, svc); err != nil {
 			t.Fatalf("seed %s: %v", svc.Name, err)
@@ -177,7 +193,7 @@ func TestStoreDatabaseResolver(t *testing.T) {
 		t.Fatalf("database-name resolve = %+v, %v", svc, err)
 	}
 	// Sole service still matches its name.
-	if svc, err := r.ResolveDatabase(ctx, pgproxy.AgentScope{VaultID: "vid-solo"}, "only"); err != nil || svc.Name != "only" {
+	if svc, err := r.ResolveDatabase(ctx, pgproxy.AgentScope{VaultID: "vid-solo"}, "only"); err != nil || svc.Name != "only" || !svc.ReadOnly {
 		t.Fatalf("solo resolve = %+v, %v", svc, err)
 	}
 	// No match in a multi-service vault.

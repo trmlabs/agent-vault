@@ -63,7 +63,11 @@ func (r *relay) connect(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "denied", http.StatusForbidden)
 		return
 	}
-	if _, e = fmt.Fprintf(up, "CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Authorization: Bearer %s\r\n\r\n", req.Host, req.Host, proof); e != nil {
+	session := readSession(c.Upstream)
+	if session != "" {
+		session = "Gatehouse-Session: " + session + "\r\n"
+	}
+	if _, e = fmt.Fprintf(up, "CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Authorization: Bearer %s\r\n%s\r\n", req.Host, req.Host, proof, session); e != nil {
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -106,4 +110,21 @@ func minTime(a, b time.Time) time.Time {
 		return a
 	}
 	return b
+}
+
+// readSession reads the runner session token fresh for each connection. It
+// returns "" when none is configured or the file holds no single-line token.
+func readSession(c UpstreamConfig) string {
+	if c.SessionFile == "" {
+		return ""
+	}
+	b, e := readBoundedFile(c.SessionFile, 8<<10) // the broker reads no more
+	if e != nil {
+		return ""
+	}
+	token := strings.TrimSpace(string(b))
+	if strings.Count(token, ".") != 2 || strings.ContainsAny(token, " \t\r\n") {
+		return ""
+	}
+	return token
 }

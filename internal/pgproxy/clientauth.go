@@ -3,6 +3,7 @@ package pgproxy
 import (
 	"context"
 	"fmt"
+	"github.com/Infisical/agent-vault/internal/brokercore"
 	"net"
 
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -100,7 +101,14 @@ func sendClientReady(backend *pgproto3.Backend, sess *upstreamSession) error {
 // writeClientError sends a FATAL ErrorResponse to the agent before any raw
 // relay begins, so a failed handshake surfaces as a clean Postgres error rather
 // than a dropped connection. Messages are deliberately generic.
-func writeClientError(backend *pgproto3.Backend, code, message string) {
-	backend.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Code: code, Message: message})
+func writeClientError(backend *pgproto3.Backend, code, reason, message string) {
+	backend.Send(brokerError("FATAL", code, reason, message))
 	_ = backend.Flush()
+}
+
+// brokerError is an ErrorResponse the broker authors, carrying its reason code
+// so a relay can replace the message with fixed words.
+func brokerError(severity, code, reason, message string) *pgproto3.ErrorResponse {
+	return &pgproto3.ErrorResponse{Severity: severity, Code: code, Message: message,
+		UnknownFields: map[byte]string{brokercore.RefusalReasonField: reason}}
 }

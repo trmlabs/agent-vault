@@ -2,52 +2,11 @@ package pgproxy
 
 import (
 	"net"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 )
-
-func TestValidStartupValue(t *testing.T) {
-	cases := []struct {
-		key, value string
-		want       bool
-	}{
-		{"statement_timeout", "30000", true},
-		{"statement_timeout", "1", true},
-		{"statement_timeout", "2147483647", true},
-		{"statement_timeout", "", false},
-		{"statement_timeout", "0", false},
-		{"statement_timeout", "-1", false},
-		{"statement_timeout", "+1", false},
-		{"statement_timeout", "30s", false},
-		{"statement_timeout", " 30000", false},
-		{"statement_timeout", "2147483648", false},
-		{"statement_timeout", "99999999999", false},
-		{"statement_timeout", "abc -c role=admin", false},
-		{"application_name", "agent-under-test", true},
-		{"application_name", strings.Repeat("a", 63), true},
-		{"application_name", strings.Repeat("a", 64), false},
-		{"application_name", "injected\nlog", false},
-		{"application_name", "client\x01", false},
-		{"application_name", "客户端", false},
-		{"client_encoding", "UTF8", true},
-		{"client_encoding", "utf8", false},
-		{"client_encoding", "LATIN1", false},
-		{"search_path", "public, analytics", true},
-		{"search_path", "public\x00; drop table t", false},
-		{"search_path", strings.Repeat("s", 257), false},
-		{"TimeZone", "UTC", true},
-		{"TimeZone", "UTC\r\nrole=admin", false},
-		{"extra_float_digits", "3", true},
-	}
-	for _, c := range cases {
-		if got := validStartupValue(c.key, c.value); got != c.want {
-			t.Errorf("validStartupValue(%q, %q) = %v, want %v", c.key, c.value, got, c.want)
-		}
-	}
-}
 
 // runAgentStartup completes agent authentication through the broker with the
 // given startup parameters and returns once the broker reports ReadyForQuery.

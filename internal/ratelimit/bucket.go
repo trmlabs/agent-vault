@@ -10,12 +10,12 @@ import (
 // eviction when the map exceeds maxKeys. Each bucket refills at rate
 // tokens/sec and can accumulate up to burst tokens. Thread-safe.
 type tokenBucketMap struct {
-	mu       sync.Mutex
-	buckets  map[string]*bucket
-	rate     float64
-	burst    float64
-	maxKeys  int
-	now      func() time.Time // injectable for tests
+	mu      sync.Mutex
+	buckets map[string]*bucket
+	rate    float64
+	burst   float64
+	maxKeys int
+	now     func() time.Time // injectable for tests
 }
 
 type bucket struct {

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Infisical/agent-vault/internal/auditchain"
 	"github.com/Infisical/agent-vault/internal/brokercore"
 	"github.com/Infisical/agent-vault/internal/ratelimit"
 )
@@ -112,7 +113,11 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		writeProxyAuthChallenge(w, "Proxy-Authorization required")
 		return
 	}
-	_, err = p.sessions.ResolveForProxy(r.Context(), token, hint)
+	peer, peerErr := peerFromContext(r.Context())
+	// The runner session token, set by the sidecar on CONNECT only; requests
+	// inside the tunnel cannot supply or replace it.
+	session := r.Header.Get(SessionHeader)
+	connectScope, err := p.resolveScope(r.Context(), token, hint, peer, peerErr, false)
 	if err != nil {
 		p.recordAuthFailure(r)
 		if p.strictCredentialProxy {
@@ -122,6 +127,26 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		writeAuthError(w, err)
 		return
 	}
+	// With a catalog, refuse an unlisted host before minting a certificate
+	// for it or opening a tunnel.
+	if p.strictCredentialProxy && p.adapter.valid() && !p.adapter.Catalog.Current().HasHost(host, port) {
+		p.adapterDeny(w, auditchain.Event{Pool: connectScope.Pool, Agent: connectScope.AgentID, PodUID: connectScope.WorkloadID}, http.StatusForbidden, "unlisted")
+		return
+	}
+
+	// A replica shutting down takes no new tunnels; the client retries on
+	// another one.
+	release, ok := p.reserveTunnel()
+	if !ok {
+		w.Header().Set("Connection", "close")
+		if p.strictCredentialProxy {
+			p.strictUnauthenticatedDeny(w, r, http.StatusServiceUnavailable)
+			return
+		}
+		http.Error(w, "proxy shutting down", http.StatusServiceUnavailable)
+		return
+	}
+	defer release()
 
 	hj, ok := w.(http.Hijacker)
 	if !ok {
@@ -174,7 +199,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// A tunnel can outlive its token or grant. Recheck each request
 			// against the original proxy identity before injecting credentials.
-			scope, err := p.sessions.ResolveForProxy(r.Context(), token, hint)
+			scope, err := p.resolveScope(r.Context(), token, hint, peer, peerErr, true)
 			if err != nil {
 				w.Header().Set("Connection", "close")
 				if p.strictCredentialProxy {
@@ -184,7 +209,8 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 				writeAuthError(w, err)
 				return
 			}
-			p.forwardHandler(target, host, port, scope).ServeHTTP(w, r)
+			r.Header.Del(SessionHeader)
+			p.forwardHandler(target, host, port, scope).ServeHTTP(w, r.WithContext(withSessionToken(r.Context(), session)))
 		}),
 		// ReadHeaderTimeout and ReadTimeout bound the request side
 		// (slow-loris defense). IdleTimeout caps keep-alives between
@@ -204,7 +230,21 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 			}
 		},
 	}
+	// The identity check runs at connect and per request; a tunnel, including a
+	// response still streaming, must not outlive the worker Pod's deadline.
+	if !connectScope.NotAfter.IsZero() {
+		deadline := time.AfterFunc(time.Until(connectScope.NotAfter), func() { _ = tlsConn.Close() })
+		defer deadline.Stop()
+	}
+	defer p.trackTunnel(srv)()
 	_ = srv.Serve(listener)
+	// Serve can stop before taking the connection (a forced close during
+	// shutdown); nothing else owns it then.
+	select {
+	case c := <-listener.yield:
+		_ = c.Close()
+	default:
+	}
 }
 
 // recordAuthFailure records one auth-failure event against the per-IP

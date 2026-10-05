@@ -74,9 +74,14 @@ func (b *Broker) cancelQuery(ctx context.Context, request *pgproto3.CancelReques
 	if !target.active {
 		return
 	}
-	// Pin to the established backend's peer: resolving a load-balanced hostname
-	// again could cancel a different server's coincidentally matching PID.
-	conn, err := b.opts.Dialer(ctx, "tcp", target.addr)
+	b.cancelUpstream(ctx, target.addr, &target.svc, &target.key)
+}
+
+// cancelUpstream sends a cancel request for one server backend. It dials the
+// established backend's peer address: resolving a load-balanced hostname
+// again could cancel a different server's coincidentally matching PID.
+func (b *Broker) cancelUpstream(ctx context.Context, addr string, svc *DatabaseService, key *pgproto3.CancelRequest) {
+	conn, err := b.opts.Dialer(ctx, "tcp", addr)
 	if err != nil {
 		return
 	}
@@ -86,11 +91,11 @@ func (b *Broker) cancelQuery(ctx context.Context, request *pgproto3.CancelReques
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
 	}
-	secured, _, err := negotiateUpstreamTLS(ctx, conn, &target.svc)
+	secured, _, err := negotiateUpstreamTLS(ctx, conn, svc)
 	if err != nil {
 		return
 	}
-	packet, err := target.key.Encode(nil)
+	packet, err := key.Encode(nil)
 	if err != nil {
 		return
 	}

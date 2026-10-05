@@ -7,9 +7,9 @@ import (
 	"os"
 	"strings"
 
-	"github.com/charmbracelet/huh"
 	"github.com/Infisical/agent-vault/internal/broker"
 	"github.com/Infisical/agent-vault/internal/session"
+	"github.com/charmbracelet/huh"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 	"gopkg.in/yaml.v3"
@@ -21,7 +21,6 @@ const (
 	mergeReplace mergeStrategy = iota
 	mergeAppend
 )
-
 
 // runInteractiveServiceSet is the entry point for the interactive service builder.
 // It is called from serviceSetCmd when no -f flag is provided.

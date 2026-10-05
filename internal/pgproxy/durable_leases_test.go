@@ -37,6 +37,11 @@ func durableFixture(t *testing.T) (*hashicorp.Client, *store.SQLStore, *durableV
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
+	return durableFixtureOn(t, st)
+}
+
+func durableFixtureOn(t *testing.T, st *store.SQLStore) (*hashicorp.Client, *store.SQLStore, *durableVaultFixture) {
+	t.Helper()
 	f := &durableVaultFixture{live: make(map[string]bool), journal: st}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
@@ -149,11 +154,11 @@ func TestDurableLeaseCleanupFailureBlocksBindingAndPreservesOtherSession(t *test
 	m := newDurableForTest(t, client, st)
 	ctx := context.Background()
 	svc := &DatabaseService{Name: "db", Mount: "database", Role: "reader"}
-	first, err := m.Mint(ctx, "vault", svc)
+	first, err := m.Mint(ctx, AgentScope{VaultID: "vault"}, svc)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := m.Mint(ctx, "vault", svc)
+	second, err := m.Mint(ctx, AgentScope{VaultID: "vault"}, svc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +168,7 @@ func TestDurableLeaseCleanupFailureBlocksBindingAndPreservesOtherSession(t *test
 	if err = m.Revoke(ctx, first.ID); err == nil {
 		t.Fatal("cleanup outage accepted")
 	}
-	if _, err = m.Mint(ctx, "vault", svc); err == nil {
+	if _, err = m.Mint(ctx, AgentScope{VaultID: "vault"}, svc); err == nil {
 		t.Fatal("unreconciled binding reopened")
 	}
 	f.mu.Lock()
@@ -172,7 +177,7 @@ func TestDurableLeaseCleanupFailureBlocksBindingAndPreservesOtherSession(t *test
 	}
 	f.failRevoke = false
 	f.mu.Unlock()
-	third, err := m.Mint(ctx, "vault", svc)
+	third, err := m.Mint(ctx, AgentScope{VaultID: "vault"}, svc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +207,7 @@ func TestDurableLeaseLostIssuanceResponseRecoversOnRestart(t *testing.T) {
 	f.loseResponse = true
 	f.failRevoke = true
 	f.mu.Unlock()
-	if _, err := m.Mint(ctx, "vault", svc); err == nil {
+	if _, err := m.Mint(ctx, AgentScope{VaultID: "vault"}, svc); err == nil {
 		t.Fatal("interrupted response accepted")
 	}
 	if err := m.Close(ctx); err == nil {
@@ -213,7 +218,7 @@ func TestDurableLeaseLostIssuanceResponseRecoversOnRestart(t *testing.T) {
 		t.Fatal("lost unknown issuance recovery record", err)
 	}
 	m2 := newDurableForTest(t, client, st)
-	if _, err := m2.Mint(ctx, "vault", svc); err == nil {
+	if _, err := m2.Mint(ctx, AgentScope{VaultID: "vault"}, svc); err == nil {
 		t.Fatal("restart admitted unreconciled binding")
 	}
 	f.mu.Lock()
@@ -223,13 +228,13 @@ func TestDurableLeaseLostIssuanceResponseRecoversOnRestart(t *testing.T) {
 	f.failRevoke = false
 	f.loseResponse = false
 	f.mu.Unlock()
-	if _, err = m2.Mint(ctx, "vault", svc); err == nil {
+	if _, err = m2.Mint(ctx, AgentScope{VaultID: "vault"}, svc); err == nil {
 		t.Fatal("unknown issuance automatically cleared")
 	}
 	if err = m2.ConfirmDatabaseCleanup(ctx, records[0].Accessor, "test: observed fixture credential absence"); err != nil {
 		t.Fatal(err)
 	}
-	lease, err := m2.Mint(ctx, "vault", svc)
+	lease, err := m2.Mint(ctx, AgentScope{VaultID: "vault"}, svc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,7 +259,7 @@ func TestDurableLeaseConfirmationCannotRaceIssuance(t *testing.T) {
 	}
 	issued := make(chan result, 1)
 	go func() {
-		lease, err := m.Mint(context.Background(), "vault", &DatabaseService{Name: "db", Mount: "database", Role: "reader"})
+		lease, err := m.Mint(context.Background(), AgentScope{VaultID: "vault"}, &DatabaseService{Name: "db", Mount: "database", Role: "reader"})
 		issued <- result{lease, err}
 	}()
 	select {
@@ -292,16 +297,21 @@ func TestDurableLeaseConfirmationCannotRaceIssuance(t *testing.T) {
 	}
 }
 
-func TestDurableLeaseSingletonAndAuthorityLoss(t *testing.T) {
+// Replicas share the journal; each loses authority on its own.
+func TestDurableLeaseReplicasCoexistAndAuthorityLoss(t *testing.T) {
 	client, st, _ := durableFixture(t)
 	m, err := NewDurableLeaseMinter(context.Background(), client, st, DurableLeaseOptions{OwnerTTL: 3 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer m.Close(context.Background())
-	if other, err := NewDurableLeaseMinter(context.Background(), client, st, DurableLeaseOptions{}); err == nil {
-		_ = other.Close(context.Background())
-		t.Fatal("two brokers acquired journal")
+	other, err := NewDurableLeaseMinter(context.Background(), client, st, DurableLeaseOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close(context.Background())
+	if m.owner == other.owner {
+		t.Fatal("replicas share an owner ID")
 	}
 	if err := st.ReleaseDatabaseCleanupOwner(context.Background(), m.owner); err != nil {
 		t.Fatal(err)
@@ -311,7 +321,15 @@ func TestDurableLeaseSingletonAndAuthorityLoss(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("owner loss did not stop authority")
 	}
-	if _, err = m.Mint(context.Background(), "vault", &DatabaseService{Name: "db", Mount: "database", Role: "reader"}); err == nil {
+	if !m.Fenced() || other.Fenced() || other.AuthorityDone() == nil {
+		t.Fatal("authority loss crossed replicas")
+	}
+	select {
+	case <-other.AuthorityDone():
+		t.Fatal("other replica lost authority")
+	default:
+	}
+	if _, err = m.Mint(context.Background(), AgentScope{VaultID: "vault"}, &DatabaseService{Name: "db", Mount: "database", Role: "reader"}); err == nil {
 		t.Fatal("minted after authority lost")
 	}
 }
@@ -319,7 +337,7 @@ func TestDurableLeaseSingletonAndAuthorityLoss(t *testing.T) {
 func TestDurableLeaseRenewalIsBoundedByChildExpiry(t *testing.T) {
 	client, st, _ := durableFixture(t)
 	m := newDurableForTest(t, client, st)
-	lease, err := m.Mint(context.Background(), "vault", &DatabaseService{Name: "db", Mount: "database", Role: "reader"})
+	lease, err := m.Mint(context.Background(), AgentScope{VaultID: "vault"}, &DatabaseService{Name: "db", Mount: "database", Role: "reader"})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -33,7 +34,7 @@ func TestObservationStates(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			observation := base
 			tc.change(&observation)
-			h, err := New(func(context.Context, string) error { return nil }, func(context.Context) (Observation, error) { return observation, tc.err })
+			h, err := New(func(context.Context, string) (Access, error) { return Access{}, nil }, func(context.Context) (Observation, error) { return observation, tc.err })
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -62,7 +63,7 @@ func TestUnauthorizedNeverReadsState(t *testing.T) {
 	for _, header := range []string{"", "Bearer ", "Basic synthetic", "Bearer one,two", "Bearer " + strings.Repeat("x", 32769), "Bearer denied"} {
 		t.Run(header[:min(len(header), 20)], func(t *testing.T) {
 			called := false
-			h, _ := New(func(context.Context, string) error { return errors.New("denied") }, func(context.Context) (Observation, error) { called = true; return Observation{}, nil })
+			h, _ := New(func(context.Context, string) (Access, error) { return Access{ListAgents: true}, errors.New("denied") }, func(context.Context) (Observation, error) { called = true; return Observation{}, nil })
 			req := httptest.NewRequest("GET", "/v1/runtime/cleanup-status", nil)
 			if header != "" {
 				req.Header.Set("Authorization", header)
@@ -78,7 +79,7 @@ func TestUnauthorizedNeverReadsState(t *testing.T) {
 
 func TestRejectMutationAndCancelledAuthorization(t *testing.T) {
 	for _, method := range []string{"POST", "DELETE", "PUT"} {
-		h, _ := New(func(context.Context, string) error { t.Fatal("authorization reached"); return nil }, func(context.Context) (Observation, error) { t.Fatal("snapshot reached"); return Observation{}, nil })
+		h, _ := New(func(context.Context, string) (Access, error) { t.Fatal("authorization reached"); return Access{}, nil }, func(context.Context) (Observation, error) { t.Fatal("snapshot reached"); return Observation{}, nil })
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, httptest.NewRequest(method, "/v1/runtime/cleanup-status", nil))
 		if w.Code != 405 {
@@ -87,7 +88,7 @@ func TestRejectMutationAndCancelledAuthorization(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	h, _ := New(func(context.Context, string) error { cancel(); return nil }, func(context.Context) (Observation, error) { t.Fatal("cancelled read"); return Observation{}, nil })
+	h, _ := New(func(context.Context, string) (Access, error) { cancel(); return Access{}, nil }, func(context.Context) (Observation, error) { t.Fatal("cancelled read"); return Observation{}, nil })
 	req := httptest.NewRequest("GET", "/v1/runtime/cleanup-status", nil).WithContext(ctx)
 	req.Header.Set("Authorization", "Bearer synthetic")
 	w := httptest.NewRecorder()
@@ -104,7 +105,7 @@ func TestProxyGrantsReportedOnlyWhenConfigured(t *testing.T) {
 	ready := func(context.Context) (Observation, error) {
 		return Observation{Initialized: true, Healthy: true, Consistent: true}, nil
 	}
-	allow := func(context.Context, string) error { return nil }
+	allow := func(context.Context, string) (Access, error) { return Access{}, nil }
 	read := func(h http.Handler) map[string]any {
 		req := httptest.NewRequest(http.MethodGet, "/v1/runtime/cleanup-status", nil)
 		req.Header.Set("Authorization", "Bearer proof")
@@ -138,5 +139,242 @@ func TestProxyGrantsReportedOnlyWhenConfigured(t *testing.T) {
 	}
 	if _, err := New(allow, ready, nil); err == nil {
 		t.Fatal("nil grants check accepted")
+	}
+}
+
+func getStatus(t *testing.T, h http.Handler, target string) (int, map[string]any, string) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	req.Header.Set("Authorization", "Bearer synthetic-proof")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var body map[string]any
+	if rec.Body.Len() > 0 {
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return rec.Code, body, rec.Body.String()
+}
+
+func agentHandler(t *testing.T, observation Observation, err error) http.Handler {
+	t.Helper()
+	h, newErr := New(func(context.Context, string) (Access, error) { return Access{}, nil }, func(context.Context) (Observation, error) { return observation, err })
+	if newErr != nil {
+		t.Fatal(newErr)
+	}
+	return h
+}
+
+// Two workers: agent-b's pending and unknown work is broker-wide state, but
+// does not block agent-a, and its identifier never reaches agent-a's answer.
+func TestAgentStatusGatesOnlyOnItsOwnWork(t *testing.T) {
+	h := agentHandler(t, Observation{Initialized: true, Healthy: true, Consistent: true, ActiveConnections: 1, UnfinishedCleanup: 2, UnknownCleanup: 1,
+		Attributed: map[Attribution]Counts{{ActorID: "agent-b"}: {ActiveConnections: 1, UnfinishedCleanup: 2, UnknownCleanup: 1}}}, nil)
+	code, body, _ := getStatus(t, h, "/v1/runtime/cleanup-status")
+	if code != 503 || body["status"] != "unknown" || body["agent"] != nil {
+		t.Fatalf("broker-wide answer changed: %d %v", code, body)
+	}
+	code, body, raw := getStatus(t, h, "/v1/runtime/cleanup-status?agent=agent-a")
+	agent, _ := body["agent"].(map[string]any)
+	if code != 200 || agent["status"] != "ready" || agent["activeConnections"] != 0.0 || agent["unfinishedCleanup"] != 0.0 || body["status"] != "unknown" {
+		t.Fatalf("agent-a blocked by another agent: %d %v", code, body)
+	}
+	if strings.Contains(raw, "agent-b") || strings.Contains(raw, "agent-a") {
+		t.Fatal("agent identifier disclosed")
+	}
+	code, body, _ = getStatus(t, h, "/v1/runtime/cleanup-status?agent=agent-b")
+	agent, _ = body["agent"].(map[string]any)
+	if code != 503 || agent["status"] != "unknown" || agent["unknownCleanup"] != 1.0 {
+		t.Fatalf("agent-b unknown issuance hidden: %d %v", code, body)
+	}
+}
+
+// Legacy cleanup records and unauthenticated connections carry no actor, so
+// they block every agent, including one the broker has never seen.
+func TestAgentStatusCountsUnattributedAgainstEveryAgent(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		unattributed Counts
+		status       string
+		code         int
+	}{
+		{"connection", Counts{ActiveConnections: 1}, "pending", 200},
+		{"legacy record", Counts{UnfinishedCleanup: 1}, "pending", 200},
+		{"legacy unknown issuance", Counts{UnfinishedCleanup: 1, UnknownCleanup: 1}, "unknown", 503},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			u := tc.unattributed
+			h := agentHandler(t, Observation{Initialized: true, Healthy: true, Consistent: true, ActiveConnections: u.ActiveConnections, UnfinishedCleanup: u.UnfinishedCleanup, UnknownCleanup: u.UnknownCleanup, Unattributed: u}, nil)
+			for _, id := range []string{"agent-a", "never-seen"} {
+				code, body, _ := getStatus(t, h, "/v1/runtime/cleanup-status?agent="+id)
+				agent, _ := body["agent"].(map[string]any)
+				if code != tc.code || agent["status"] != tc.status {
+					t.Fatalf("%s: %d %v", id, code, body)
+				}
+			}
+		})
+	}
+}
+
+// A snapshot that cannot account for every item by actor, or cannot be read at
+// all, never yields a per-agent ready.
+func TestAgentStatusFailsClosedOnUnpartitionedSnapshot(t *testing.T) {
+	healthy := Observation{Initialized: true, Healthy: true, Consistent: true}
+	for _, tc := range []struct {
+		name        string
+		observation Observation
+		err         error
+	}{
+		{"totals without partition", Observation{Initialized: true, Healthy: true, Consistent: true, UnfinishedCleanup: 1}, nil},
+		{"partition exceeds totals", Observation{Initialized: true, Healthy: true, Consistent: true, Attributed: map[Attribution]Counts{{ActorID: "agent-b"}: {ActiveConnections: 1}}}, nil},
+		{"negative actor count", Observation{Initialized: true, Healthy: true, Consistent: true, ActiveConnections: 0, Attributed: map[Attribution]Counts{{ActorID: "agent-b"}: {ActiveConnections: -1}}, Unattributed: Counts{ActiveConnections: 1}}, nil},
+		{"admission race", Observation{Initialized: true, Healthy: true}, nil},
+		{"journal unavailable", healthy, errors.New("sensitive accessor")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			code, body, raw := getStatus(t, agentHandler(t, tc.observation, tc.err), "/v1/runtime/cleanup-status?agent=agent-a")
+			agent, _ := body["agent"].(map[string]any)
+			if code != 503 || agent["status"] != "unknown" || strings.Contains(raw, "sensitive") {
+				t.Fatalf("%d %v", code, body)
+			}
+		})
+	}
+}
+
+func TestAgentQueryRejectedBeforeReadingState(t *testing.T) {
+	for _, query := range []string{"agent=", "agent=a&agent=b", "agent=a&extra=1", "other=a", "agent=a%20b", "agent=a/b", "agent=" + strings.Repeat("a", 129), "agent=%zz", "agents=all&agent=a", "agents=some", "agents=all&agents=all", "agents="} {
+		t.Run(query[:min(len(query), 24)], func(t *testing.T) {
+			h, _ := New(func(context.Context, string) (Access, error) { t.Fatal("authorization reached"); return Access{}, nil }, func(context.Context) (Observation, error) { t.Fatal("snapshot reached"); return Observation{}, nil })
+			req := httptest.NewRequest(http.MethodGet, "/v1/runtime/cleanup-status?"+query, nil)
+			req.Header.Set("Authorization", "Bearer synthetic-proof")
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != 400 || rec.Body.Len() != 0 {
+				t.Fatalf("code %d", rec.Code)
+			}
+		})
+	}
+}
+
+// The deployed single-worker manager sends no agent parameter. Its response
+// keeps exactly the fields and codes it had before attribution, and an agent
+// that owns all the work sees the same counts as the totals.
+func TestSingleWorkerResponseUnchanged(t *testing.T) {
+	for _, tc := range []struct {
+		owned  Counts
+		status string
+		code   int
+	}{
+		{Counts{}, "ready", 200},
+		{Counts{ActiveConnections: 2, UnfinishedCleanup: 1}, "pending", 200},
+		{Counts{UnfinishedCleanup: 1, UnknownCleanup: 1}, "unknown", 503},
+	} {
+		o := Observation{Initialized: true, Healthy: true, Consistent: true, ActiveConnections: tc.owned.ActiveConnections, UnfinishedCleanup: tc.owned.UnfinishedCleanup, UnknownCleanup: tc.owned.UnknownCleanup,
+			Attributed: map[Attribution]Counts{{ActorID: "only-agent", WorkloadID: "pod-1"}: tc.owned}}
+		h := agentHandler(t, o, nil)
+		code, body, _ := getStatus(t, h, "/v1/runtime/cleanup-status")
+		if code != tc.code || body["status"] != tc.status || len(body) != 6 || body["unfinishedCleanup"] != float64(tc.owned.UnfinishedCleanup) {
+			t.Fatalf("legacy response changed: %d %v", code, body)
+		}
+		code, body, _ = getStatus(t, h, "/v1/runtime/cleanup-status?agent=only-agent")
+		agent, _ := body["agent"].(map[string]any)
+		if code != tc.code || agent["status"] != tc.status || agent["activeConnections"] != float64(tc.owned.ActiveConnections) || agent["unknownCleanup"] != float64(tc.owned.UnknownCleanup) {
+			t.Fatalf("single agent diverged from totals: %d %v", code, body)
+		}
+	}
+}
+
+func listHandler(t *testing.T, access Access, observation Observation, err error, read *bool) http.Handler {
+	t.Helper()
+	h, newErr := New(func(context.Context, string) (Access, error) { return access, nil }, func(context.Context) (Observation, error) {
+		*read = true
+		return observation, err
+	})
+	if newErr != nil {
+		t.Fatal(newErr)
+	}
+	return h
+}
+
+// Only the admission controller's binding may read the agent list. Any other
+// verified observer is refused before state is read.
+func TestAgentListRequiresControllerAccess(t *testing.T) {
+	read := false
+	h := listHandler(t, Access{}, Observation{Initialized: true, Healthy: true, Consistent: true}, nil, &read)
+	code, _, raw := getStatus(t, h, "/v1/runtime/cleanup-status?agents=all")
+	if code != 403 || read || raw != "" {
+		t.Fatalf("list served without access: %d read=%v %q", code, read, raw)
+	}
+	if code, _, _ = getStatus(t, h, "/v1/runtime/cleanup-status?agent=agent-a"); code != 200 {
+		t.Fatalf("single-agent view needs no list access: %d", code)
+	}
+	code, body, _ := getStatus(t, listHandler(t, Access{ListAgents: true}, Observation{Initialized: true, Healthy: true, Consistent: true}, nil, &read), "/v1/runtime/cleanup-status?agents=all")
+	if code != 200 || body["status"] != "ready" || body["agents"] == nil || len(body["agents"].([]any)) != 0 || body["unattributedCleanup"] != 0.0 {
+		t.Fatalf("empty list: %d %v", code, body)
+	}
+}
+
+// Entries are per agent and Pod, sorted, nonzero only, and never include the
+// unattributed work, which appears once at the top level.
+func TestAgentListReportsUnattributedOnce(t *testing.T) {
+	o := Observation{Initialized: true, Healthy: true, Consistent: true, ActiveConnections: 3, UnfinishedCleanup: 4, UnknownCleanup: 1,
+		Attributed: map[Attribution]Counts{
+			{ActorID: "agent-b", WorkloadID: "pod-2"}: {ActiveConnections: 1},
+			{ActorID: "agent-a", WorkloadID: "pod-9"}: {UnfinishedCleanup: 1},
+			{ActorID: "agent-a"}:                      {UnfinishedCleanup: 1},
+			{ActorID: "agent-a", WorkloadID: "pod-1"}: {ActiveConnections: 1, UnfinishedCleanup: 1},
+			{ActorID: "agent-c", WorkloadID: "idle"}:  {},
+		},
+		Unattributed: Counts{ActiveConnections: 1, UnfinishedCleanup: 1, UnknownCleanup: 1}}
+	read := false
+	code, body, _ := getStatus(t, listHandler(t, Access{ListAgents: true}, o, nil, &read), "/v1/runtime/cleanup-status?agents=all")
+	if code != 503 || body["status"] != "unknown" {
+		t.Fatalf("list changed the broker-wide answer: %d %v", code, body)
+	}
+	if body["unattributedConnections"] != 1.0 || body["unattributedCleanup"] != 1.0 || body["unattributedUnknownCleanup"] != 1.0 {
+		t.Fatalf("unattributed totals: %v", body)
+	}
+	var got []string
+	for _, entry := range body["agents"].([]any) {
+		e := entry.(map[string]any)
+		got = append(got, fmt.Sprintf("%s/%s:%v,%v,%v", e["agentID"], e["workloadUID"], e["activeConnections"], e["unfinishedCleanup"], e["unknownCleanup"]))
+	}
+	want := []string{"agent-a/:0,1,0", "agent-a/pod-1:1,1,0", "agent-a/pod-9:0,1,0", "agent-b/pod-2:1,0,0"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("entries = %v", got)
+	}
+}
+
+// A list that cannot account for every item, or a snapshot that cannot be
+// read, is withheld rather than returned partial.
+func TestAgentListFailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		observation Observation
+		err         error
+	}{
+		{"totals without partition", Observation{Initialized: true, Healthy: true, Consistent: true, UnfinishedCleanup: 1}, nil},
+		{"empty actor in partition", Observation{Initialized: true, Healthy: true, Consistent: true, ActiveConnections: 1, Attributed: map[Attribution]Counts{{WorkloadID: "pod"}: {ActiveConnections: 1}}}, nil},
+		{"admission race", Observation{Initialized: true, Healthy: true}, nil},
+		{"journal unavailable", Observation{Initialized: true, Healthy: true, Consistent: true}, errors.New("sensitive accessor")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			read := false
+			code, body, raw := getStatus(t, listHandler(t, Access{ListAgents: true}, tc.observation, tc.err, &read), "/v1/runtime/cleanup-status?agents=all")
+			if _, listed := body["agents"]; code != 503 || body["status"] != "unknown" || listed || strings.Contains(raw, "sensitive") {
+				t.Fatalf("%d %v", code, body)
+			}
+		})
+	}
+}
+
+func TestAgentStatusSumsEveryWorkload(t *testing.T) {
+	h := agentHandler(t, Observation{Initialized: true, Healthy: true, Consistent: true, ActiveConnections: 1, UnfinishedCleanup: 2,
+		Attributed: map[Attribution]Counts{{ActorID: "agent-a", WorkloadID: "pod-1"}: {ActiveConnections: 1}, {ActorID: "agent-a", WorkloadID: "pod-2"}: {UnfinishedCleanup: 2}}}, nil)
+	code, body, raw := getStatus(t, h, "/v1/runtime/cleanup-status?agent=agent-a")
+	agent, _ := body["agent"].(map[string]any)
+	if code != 200 || agent["status"] != "pending" || agent["activeConnections"] != 1.0 || agent["unfinishedCleanup"] != 2.0 || strings.Contains(raw, "pod-") {
+		t.Fatalf("%d %v", code, body)
 	}
 }

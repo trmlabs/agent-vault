@@ -1,6 +1,7 @@
 package netguard
 
 import (
+	"context"
 	"net"
 	"testing"
 )
@@ -229,5 +230,94 @@ func TestParseCIDRList(t *testing.T) {
 	}
 	if !got[2].Contains(net.ParseIP("fd00::1")) || got[2].Contains(net.ParseIP("fd00::2")) {
 		t.Error("range[2] should be fd00::1/128, not a wider IPv6 prefix")
+	}
+}
+
+func TestEgressRangesConfineEveryDestination(t *testing.T) {
+	t.Setenv("AGENT_VAULT_NETWORK_ALLOWLIST", "")
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			c, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+	dial := func(ranges string) error {
+		t.Setenv("AGENT_VAULT_EGRESS_RANGES", ranges)
+		conn, err := SafeDialContext(true)(context.Background(), "tcp", listener.Addr().String())
+		if err == nil {
+			_ = conn.Close()
+		}
+		return err
+	}
+	if err := dial(""); err != nil {
+		t.Fatalf("no ranges must keep the previous behavior: %v", err)
+	}
+	if err := dial("127.0.0.0/8"); err != nil {
+		t.Fatalf("destination inside the ranges refused: %v", err)
+	}
+	if err := dial("10.0.0.0/8,203.0.113.0/24"); err == nil {
+		t.Fatal("destination outside the ranges allowed")
+	}
+	if err := dial("not-a-cidr"); err == nil {
+		t.Fatal("unparseable ranges allowed everything")
+	}
+}
+
+// Names are checked by the addresses they resolve to, and the connection goes
+// to the checked address, so a name cannot be rebound past the ranges.
+func TestEgressRangesCheckResolvedAddressesOfNames(t *testing.T) {
+	t.Setenv("AGENT_VAULT_NETWORK_ALLOWLIST", "")
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			c, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+	_, port, _ := net.SplitHostPort(listener.Addr().String())
+	// localhost may resolve to ::1 first; serve the same port there too.
+	if v6, err := net.Listen("tcp", net.JoinHostPort("::1", port)); err == nil {
+		defer v6.Close()
+		go func() {
+			for {
+				c, err := v6.Accept()
+				if err != nil {
+					return
+				}
+				_ = c.Close()
+			}
+		}()
+	}
+	dial := func(ranges string) (net.Conn, error) {
+		t.Setenv("AGENT_VAULT_EGRESS_RANGES", ranges)
+		return SafeDialContext(true)(context.Background(), "tcp", net.JoinHostPort("localhost", port))
+	}
+	if conn, err := dial("10.0.0.0/8"); err == nil {
+		_ = conn.Close()
+		t.Fatal("a name resolving outside the ranges was dialed")
+	}
+	conn, err := dial("127.0.0.0/8,::1/128")
+	if err != nil {
+		t.Fatalf("a name resolving inside the ranges was refused: %v", err)
+	}
+	defer conn.Close()
+	remote, _ := net.ResolveTCPAddr("tcp", conn.RemoteAddr().String())
+	if !remote.IP.IsLoopback() {
+		t.Fatalf("connected to %v, not the checked address", remote.IP)
 	}
 }

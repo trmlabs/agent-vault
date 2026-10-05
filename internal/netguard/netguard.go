@@ -174,6 +174,15 @@ func SafeDialContext(allowPrivate bool) func(ctx context.Context, network, addr 
 	if !allowPrivate {
 		allowed = AllowlistFromEnv()
 	}
+	// AGENT_VAULT_EGRESS_RANGES, when set, confines every destination, public
+	// or private, to the approved data-plane ranges: the broker's own
+	// least-privilege layer beneath the catalog's host allowlist.
+	egressSetting := os.Getenv("AGENT_VAULT_EGRESS_RANGES")
+	egress := ParseCIDRList(egressSetting, "AGENT_VAULT_EGRESS_RANGES")
+	if strings.TrimSpace(egressSetting) != "" && len(egress) == 0 {
+		// Set but unparseable: allow nothing rather than everything.
+		egress = []net.IPNet{{IP: net.IPv4zero, Mask: net.CIDRMask(32, 32)}}
+	}
 
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
@@ -189,7 +198,7 @@ func SafeDialContext(allowPrivate bool) func(ctx context.Context, network, addr 
 
 		// Check all resolved IPs before connecting.
 		for _, ipAddr := range ips {
-			if isBlockedIP(ipAddr.IP, allowPrivate, allowed) {
+			if isBlockedIP(ipAddr.IP, allowPrivate, allowed) || !withinEgress(ipAddr.IP, egress) {
 				return nil, fmt.Errorf("netguard: connection to %s (%s) blocked by network policy",
 					host, ipAddr.IP.String())
 			}
@@ -199,4 +208,19 @@ func SafeDialContext(allowPrivate bool) func(ctx context.Context, network, addr 
 		// DNS rebinding (TOCTOU: a second resolution could return a different IP).
 		return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
 	}
+}
+
+// withinEgress reports whether ip is inside one of the approved egress
+// ranges. With no ranges configured, every address not otherwise blocked is
+// allowed, as before.
+func withinEgress(ip net.IP, egress []net.IPNet) bool {
+	if len(egress) == 0 {
+		return true
+	}
+	for _, n := range egress {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }

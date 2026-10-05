@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -44,6 +45,9 @@ func CountSourceTables(src *SQLStore) ([]TableCount, error) {
 		"dynamic_secret_leases",
 		"request_logs",
 		"ca_state",
+	}
+	for _, t := range brokerTables {
+		tables = append(tables, t.table)
 	}
 
 	var counts []TableCount
@@ -140,6 +144,12 @@ func MigrateData(ctx context.Context, src, dst *SQLStore, progressFn func(table 
 		{"dynamic_secret_leases", copyDynamicSecretLeases},
 		{"request_logs", copyRequestLogs},
 		{"ca_state", copyCAState},
+	}
+	for _, t := range brokerTables {
+		steps = append(steps, struct {
+			name string
+			fn   copyFunc
+		}{t.table, copyAsIs(t.table, t.reset)})
 	}
 
 	for _, step := range steps {
@@ -1288,4 +1298,57 @@ func parseEncryptedKeyJSON(data []byte) (nonce, ciphertext []byte, err error) {
 		return nil, nil, fmt.Errorf("decoding ciphertext: %w", err)
 	}
 	return nonce, ciphertext, nil
+}
+
+// brokerTables are the credential broker's tables. Their columns have the same
+// types in both dialects, so rows copy as they are. Pending database cleanup
+// records must survive the move: each is a credential still to revoke. They
+// arrive without an owner, so the first live broker claims and revokes them.
+var brokerTables = []struct {
+	table string
+	reset map[string]any
+}{
+	{"database_service_seed_history", nil},
+	{"credential_proxy_audit", nil},
+	{"database_cleanup", map[string]any{"owner": ""}},
+	{"audit_chain_replica", nil},
+}
+
+func copyAsIs(table string, reset map[string]any) func(context.Context, *SQLStore, *sql.Tx, Dialect) (int, error) {
+	return func(ctx context.Context, src *SQLStore, tx *sql.Tx, dstDialect Dialect) (int, error) {
+		rows, err := src.db.QueryContext(ctx, "SELECT * FROM "+table) // #nosec G202 -- fixed table names
+		if err != nil {
+			return 0, err
+		}
+		defer func() { _ = rows.Close() }()
+		columns, err := rows.Columns()
+		if err != nil {
+			return 0, err
+		}
+		insert := dstDialect.Rebind("INSERT INTO " + table + " (" + strings.Join(columns, ", ") + ") VALUES (" + // #nosec G202 -- names from the source schema
+			strings.TrimSuffix(strings.Repeat("?, ", len(columns)), ", ") + ")")
+		n := 0
+		for rows.Next() {
+			values := make([]any, len(columns))
+			pointers := make([]any, len(columns))
+			for i := range values {
+				pointers[i] = &values[i]
+			}
+			if err := rows.Scan(pointers...); err != nil {
+				return n, err
+			}
+			for i, column := range columns {
+				if v, ok := reset[column]; ok {
+					values[i] = v
+				} else if b, ok := values[i].([]byte); ok {
+					values[i] = string(b)
+				}
+			}
+			if _, err := tx.ExecContext(ctx, insert, values...); err != nil {
+				return n, err
+			}
+			n++
+		}
+		return n, rows.Err()
+	}
 }

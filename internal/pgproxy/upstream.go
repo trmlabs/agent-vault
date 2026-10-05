@@ -6,10 +6,11 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"slices"
-	"strconv"
 	"time"
 
+	"github.com/Infisical/agent-vault/internal/brokercore"
 	"github.com/jackc/pgx/v5/pgproto3"
 )
 
@@ -30,6 +31,12 @@ type upstreamSession struct {
 // upstream session mirrors what the agent asked for. On any failure the dialed
 // connection is closed.
 func connectUpstream(ctx context.Context, dial DialFunc, svc *DatabaseService, lease *Lease, clientParams map[string]string) (*upstreamSession, error) {
+	return connectUpstreamWith(ctx, dial, svc, lease, clientParams, nil)
+}
+
+// connectUpstreamWith also sends serverParams, settings the broker itself
+// chooses for the connection, as startup parameters.
+func connectUpstreamWith(ctx context.Context, dial DialFunc, svc *DatabaseService, lease *Lease, clientParams, serverParams map[string]string) (*upstreamSession, error) {
 	rawConn, err := dial(ctx, "tcp", svc.Addr)
 	if err != nil {
 		return nil, fmt.Errorf("dial upstream %s: %w", svc.Addr, err)
@@ -65,10 +72,23 @@ func connectUpstream(ctx context.Context, dial DialFunc, svc *DatabaseService, l
 	if database != "" {
 		params["database"] = database
 	}
+	// user and database come from the service and the credential. Other
+	// startup parameters pass only as brokercore.StartupValue allows, the
+	// relay's rule too: a startup parameter overrides ALTER ROLE ... SET, so
+	// values are bounded as well as keys. Anything else is dropped.
 	for key, value := range clientParams {
-		if forwardableStartupParam(key) && validStartupValue(key, value) {
-			params[key] = value
+		if name, v, ok := brokercore.StartupParameter(key, value); ok {
+			params[name] = v
 		}
+	}
+	for key, value := range serverParams {
+		params[key] = value
+	}
+	// A read-only login also runs every transaction read-only, a database-side
+	// backstop behind the broker's statement allowlist. The allowlist refuses
+	// turning it off.
+	if svc.ReadOnly {
+		params["default_transaction_read_only"] = "on"
 	}
 
 	frontend.Send(&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber, Parameters: params})
@@ -224,6 +244,23 @@ func sslMode(mode string) string {
 	}
 }
 
+// privatePeer reports whether the connection's remote end is a loopback or
+// private (RFC 1918, IPv6 unique local) address, or not an IP address at all
+// (a local socket). Plaintext never goes to a public address, whatever the
+// sslmode says.
+func privatePeer(conn net.Conn) bool {
+	tcp, ok := conn.RemoteAddr().(*net.TCPAddr)
+	if !ok {
+		return true
+	}
+	addr, ok := netip.AddrFromSlice(tcp.IP)
+	if !ok {
+		return false
+	}
+	addr = addr.Unmap()
+	return addr.IsLoopback() || addr.IsPrivate()
+}
+
 // negotiateUpstreamTLS performs the PostgreSQL SSL negotiation according to the
 // service's sslmode and returns the connection to use (raw or TLS-wrapped) and
 // whether the channel is encrypted:
@@ -240,6 +277,9 @@ func negotiateUpstreamTLS(ctx context.Context, conn net.Conn, svc *DatabaseServi
 	}
 	mode := sslMode(svc.SSLMode)
 	if mode == "disable" {
+		if !privatePeer(conn) {
+			return nil, false, fmt.Errorf("plaintext refused: the database is not on a private address")
+		}
 		return conn, false, nil
 	}
 	// SSLRequest: 4-byte length (8) + the 80877103 request code.
@@ -256,6 +296,9 @@ func negotiateUpstreamTLS(ctx context.Context, conn net.Conn, svc *DatabaseServi
 	if resp[0] != 'S' {
 		if mode == "require" || mode == "verify-full" {
 			return nil, false, fmt.Errorf("upstream does not support TLS but sslmode=%s requires it", mode)
+		}
+		if !privatePeer(conn) {
+			return nil, false, fmt.Errorf("plaintext refused: the database is not on a private address")
 		}
 		return conn, false, nil // prefer: fall back to plaintext
 	}
@@ -275,89 +318,4 @@ func negotiateUpstreamTLS(ctx context.Context, conn net.Conn, svc *DatabaseServi
 		return nil, false, fmt.Errorf("upstream TLS handshake: %w", err)
 	}
 	return tlsConn, true, nil
-}
-
-// forwardableStartupParam reports whether an agent-supplied startup parameter
-// key is safe to forward to the upstream. user/database are set from the
-// resolved service and Vault credential; only well-known single-value client
-// runtime GUCs are passed through. "options" is deliberately excluded:
-// PostgreSQL interprets it as backend command-line arguments, letting the agent
-// set arbitrary session GUCs the operator's Vault role may have meant to fix.
-//
-// The key gate alone is not enough. A startup parameter overrides a role-level
-// "ALTER ROLE ... SET", so a permitted key with an unbounded value (for example
-// statement_timeout=0) reaches the same outcome "options" is excluded for.
-// connectUpstream therefore also requires validStartupValue to accept the
-// value; a parameter that fails either gate is dropped, never forwarded.
-// internal/taskrelay/postgres.go applies the same bounds for its stricter
-// allowlist. Keep the two in step when changing either.
-func forwardableStartupParam(key string) bool {
-	switch key {
-	case "application_name",
-		"statement_timeout",
-		"client_encoding",
-		"DateStyle",
-		"TimeZone",
-		"extra_float_digits",
-		"search_path",
-		"standard_conforming_strings":
-		return true
-	default:
-		return false
-	}
-}
-
-// validStartupValue reports whether the value of a forwardable startup
-// parameter is within the bounds the broker will pass upstream. Bounding here
-// (not only at the relay) means an agent that reaches the broker's PostgreSQL
-// listener directly cannot use the startup packet to clear or extend a
-// role-level limit such as statement_timeout. It closes that path only: once the
-// session is up, bytes are relayed verbatim and an in-session SET is governed
-// by the role's SQL permissions, as at the relay. A value that fails is dropped
-// silently, matching how a non-forwardable key is dropped: the upstream then
-// applies its own default.
-//   - statement_timeout: 1 to 10 ASCII digits parsing to 1..2147483647. This
-//     refuses "0" (no timeout), signs, units and any embedded options.
-//   - application_name: at most 63 bytes of printable ASCII, so log lines
-//     cannot carry control characters or oversized names.
-//   - client_encoding: exactly UTF8, the only encoding the relay accepts.
-//   - every other forwardable key: no control characters and at most 256
-//     bytes. These GUCs are bounded in effect but free-form in syntax; the
-//     upstream parser decides validity, this only refuses injection shapes.
-func validStartupValue(key, value string) bool {
-	switch key {
-	case "statement_timeout":
-		if value == "" || len(value) > 10 {
-			return false
-		}
-		for i := 0; i < len(value); i++ {
-			if value[i] < '0' || value[i] > '9' {
-				return false
-			}
-		}
-		n, err := strconv.ParseUint(value, 10, 31)
-		return err == nil && n > 0
-	case "application_name":
-		if len(value) > 63 {
-			return false
-		}
-		for i := 0; i < len(value); i++ {
-			if value[i] < 0x20 || value[i] > 0x7e {
-				return false
-			}
-		}
-		return true
-	case "client_encoding":
-		return value == "UTF8"
-	default:
-		if len(value) > 256 {
-			return false
-		}
-		for i := 0; i < len(value); i++ {
-			if value[i] < 0x20 || value[i] == 0x7f {
-				return false
-			}
-		}
-		return true
-	}
 }

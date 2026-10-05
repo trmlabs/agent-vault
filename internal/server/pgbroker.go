@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"regexp"
 	"strconv"
@@ -40,7 +41,34 @@ func (a agentAuthAdapter) Authenticate(ctx context.Context, token, vaultHint str
 	if err != nil {
 		return nil, err
 	}
-	return &pgproxy.AgentScope{VaultID: scope.VaultID, VaultName: scope.VaultName, ActorID: scope.ActorID(), WorkloadID: scope.WorkloadID}, nil
+	return agentScope(scope), nil
+}
+
+// AuthenticatePeer admits pool workers by token plus peer address. A loopback
+// peer (no PROXY header from the TLS terminator) keeps the token-only check.
+func (a agentAuthAdapter) AuthenticatePeer(ctx context.Context, token, vaultHint string, peer netip.Addr, renewal bool) (*pgproxy.AgentScope, error) {
+	attestor, ok := a.resolver.(brokercore.Attestor)
+	if !ok || !peer.IsValid() || peer.IsLoopback() {
+		return a.Authenticate(ctx, token, vaultHint)
+	}
+	var scope *brokercore.ProxyScope
+	var err error
+	if again, ok := a.resolver.(brokercore.Reattestor); ok && renewal {
+		scope, err = again.Reattest(ctx, token, peer)
+	} else {
+		scope, err = attestor.Attest(ctx, token, peer)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if vaultHint != "" && vaultHint != scope.VaultName {
+		return nil, brokercore.ErrVaultHintMismatch
+	}
+	return agentScope(scope), nil
+}
+
+func agentScope(scope *brokercore.ProxyScope) *pgproxy.AgentScope {
+	return &pgproxy.AgentScope{VaultID: scope.VaultID, VaultName: scope.VaultName, ActorID: scope.ActorID(), WorkloadID: scope.WorkloadID, NotAfter: scope.NotAfter, Pool: scope.Pool}
 }
 
 // DatabaseServiceConfig is one configured upstream database within a vault, as
@@ -116,6 +144,7 @@ func (r storeDatabaseResolver) ResolveDatabase(ctx context.Context, scope pgprox
 			Role:     row.Role,
 			SSLMode:  row.SSLMode,
 			MaxConns: row.MaxConns,
+			ReadOnly: readOnlyRole(row.Role),
 		}
 	}
 	svc, err := selectDatabaseService(services, scope.VaultName, requestedDatabase)
@@ -231,7 +260,7 @@ func NewVaultLeaseMinter(client *hashicorp.Client) pgproxy.LeaseMinter {
 	return vaultLeaseMinter{client: client}
 }
 
-func (m vaultLeaseMinter) Mint(ctx context.Context, _ string, svc *pgproxy.DatabaseService) (*pgproxy.Lease, error) {
+func (m vaultLeaseMinter) Mint(ctx context.Context, _ pgproxy.AgentScope, svc *pgproxy.DatabaseService) (*pgproxy.Lease, error) {
 	issuedAt := time.Now()
 	cred, err := m.client.ReadDatabaseCredential(ctx, svc.Mount, svc.Role)
 	if err != nil {
@@ -303,11 +332,17 @@ func LoadDatabaseServices(getenv func(string) string) (map[string][]pgproxy.Data
 				Role:     entry.Role,
 				SSLMode:  entry.SSLMode,
 				MaxConns: entry.MaxConns,
+				ReadOnly: readOnlyRole(entry.Role),
 			})
 		}
 	}
 	return out, nil
 }
+
+// readOnlyRole reports whether a Vault role is a read-only login. Services
+// outside the catalog carry no access setting, so the role's name decides,
+// under the naming the catalog enforces (<name>-readonly or -readwrite).
+func readOnlyRole(role string) bool { return strings.HasSuffix(role, "-readonly") }
 
 var databaseServiceName = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,63}$`)
 

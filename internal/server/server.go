@@ -65,7 +65,7 @@ type Server struct {
 	store         Store
 	encKey        []byte // 32-byte encryption key, held in memory while running
 	notifier      *notify.Notifier
-	initialized   bool                // true when at least one owner account exists
+	initialized   atomic.Bool         // true when at least one owner account exists; replicas share registration
 	lastInitCheck atomic.Int64        // unix-millis of last DB check for initialization (throttle)
 	baseURL       string              // externally-reachable base URL (e.g. "https://sb.example.com")
 	skillCLI      []byte              // embedded CLI skill content (served at GET /v1/skills/cli)
@@ -101,7 +101,10 @@ type Server struct {
 	// --postgres-port is 0 or no database services are configured.
 	cleanupObserverServer *http.Server
 	pgBroker              *pgproxy.Broker
+	readiness             []readinessCheck
 	pgLeaseCloser         interface{ Close(context.Context) error }
+	shutdownTimeout       time.Duration // 0: the default 5s
+	storeOK               atomic.Int64  // Unix ms of the last good store ping; 0 before the first
 }
 
 // lockVaultServices acquires the per-vault mutation lock via the store's
@@ -140,6 +143,28 @@ func (s *Server) HashicorpClient() *hashicorp.Client { return s.hashicorpClient 
 // SIGINT/SIGTERM/Shutdown stops it alongside the HTTP server. Must be called
 // before Start.
 func (s *Server) AttachPostgresBroker(b *pgproxy.Broker) { s.pgBroker = b }
+
+// SetShutdownTimeout sets how long a graceful stop waits for in-flight work,
+// such as tunnel requests the proxy drains. Zero keeps the default 5s.
+func (s *Server) SetShutdownTimeout(d time.Duration) { s.shutdownTimeout = d }
+
+func (s *Server) shutdownBudget() time.Duration {
+	if s.shutdownTimeout > 0 {
+		return s.shutdownTimeout
+	}
+	return 5 * time.Second
+}
+
+// AttachReadiness adds a named check to GET /readyz. Every check must pass for
+// the replica to receive traffic; names, never values, appear in the response.
+func (s *Server) AttachReadiness(name string, check func() bool) {
+	s.readiness = append(s.readiness, readinessCheck{name: name, check: check})
+}
+
+type readinessCheck struct {
+	name  string
+	check func() bool
+}
 
 // AttachHashicorpSyncer pre-wires a syncer instead of letting Start build one
 // from the attached client. Used by tests to inject a fake fetcher; in prod
@@ -822,7 +847,6 @@ func New(addr string, store Store, encKey []byte, notifier *notify.Notifier, ini
 		store:          store,
 		encKey:         encKey,
 		notifier:       notifier,
-		initialized:    initialized,
 		baseURL:        strings.TrimRight(baseURL, "/"),
 		logger:         logger,
 		rateLimit:      rl,
@@ -841,6 +865,8 @@ func New(addr string, store Store, encKey []byte, notifier *notify.Notifier, ini
 	// /health, /v1/status, and other public static routes rely on the
 	// server-wide TierGlobal backstop; no per-route limit is useful.
 	mux.HandleFunc("GET /health", s.handleHealth)
+	mux.HandleFunc("GET /readyz", s.handleReady)
+	mux.HandleFunc("GET /ready", s.handleReady)
 	mux.HandleFunc("GET /v1/status", s.handleStatus)
 	mux.HandleFunc("POST /v1/auth/register", ipAuth(limitBody(s.handleRegister)))
 	mux.HandleFunc("POST /v1/auth/verify", ipAuth(limitBody(s.handleVerify)))
@@ -1001,6 +1027,7 @@ func New(addr string, store Store, encKey []byte, notifier *notify.Notifier, ini
 	mux.HandleFunc("GET /account/{path...}", s.handleSPA)
 	mux.HandleFunc("GET /{$}", s.handleSPA)
 
+	s.initialized.Store(initialized)
 	return s
 }
 
@@ -1010,7 +1037,7 @@ func New(addr string, store Store, encKey []byte, notifier *notify.Notifier, ini
 // false, throttled to once every 2 seconds to avoid per-request queries.
 func (s *Server) requireInitialized(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !s.initialized {
+		if !s.initialized.Load() {
 			now := time.Now().UnixMilli()
 			if now-s.lastInitCheck.Load() < 2000 {
 				jsonStatus(w, http.StatusServiceUnavailable, map[string]string{
@@ -1021,7 +1048,7 @@ func (s *Server) requireInitialized(next http.HandlerFunc) http.HandlerFunc {
 			}
 			s.lastInitCheck.Store(now)
 			if count, err := s.store.CountUsers(r.Context()); err == nil && count > 0 {
-				s.initialized = true
+				s.initialized.Store(true)
 			} else {
 				jsonStatus(w, http.StatusServiceUnavailable, map[string]string{
 					"error":   "not_initialized",
@@ -1037,6 +1064,16 @@ func (s *Server) requireInitialized(next http.HandlerFunc) http.HandlerFunc {
 // Start starts the server and blocks until shutdown.
 // It listens for SIGINT/SIGTERM to shut down gracefully.
 func (s *Server) Start() error {
+	// Vault logins are revoked last, after the database cleanup below has
+	// revoked its sessions with them, on a short budget inside the Pod's
+	// termination grace.
+	if s.hashicorpClient != nil {
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), vaultCloseTimeout)
+			defer cancel()
+			s.hashicorpClient.CloseContext(ctx)
+		}()
+	}
 	// Release journal ownership on every exit, including startup failures.
 	if s.pgLeaseCloser != nil {
 		defer func() {
@@ -1063,7 +1100,7 @@ func (s *Server) Start() error {
 		defer func() { _ = strictMITMLn.Close() }()
 	}
 	// Non-fatal: registry already holds env-based config from New().
-	if s.initialized {
+	if s.initialized.Load() {
 		if _, err := s.applyRateLimitSettingToRegistry(context.Background()); err != nil {
 			s.logger.Warn("ratelimit setting load failed", "err", err.Error())
 		}
@@ -1105,6 +1142,9 @@ func (s *Server) Start() error {
 	pruneCtx, stopWorkers := context.WithCancel(context.Background())
 	defer stopWorkers()
 	go s.runTouchCachePruner(pruneCtx)
+	if s.store.DialectName() == "postgres" {
+		go s.watchStore(pruneCtx)
+	}
 
 	// Each external-store syncer's done channel closes once its Run has
 	// returned AND drained its in-flight refresh goroutines. We block on all
@@ -1152,7 +1192,7 @@ func (s *Server) Start() error {
 	}
 	go func() {
 		fmt.Printf("Agent Vault server listening on %s\n", s.baseURL)
-		if !s.initialized {
+		if !s.initialized.Load() {
 			fmt.Printf("Run `agent-vault auth register` or visit %s to create the owner account\n", s.baseURL)
 		}
 		if err := s.httpServer.Serve(httpLn); err != nil && err != http.ErrServerClosed {
@@ -1215,7 +1255,7 @@ func (s *Server) Start() error {
 	case <-stop:
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), s.shutdownBudget())
 	defer cancel()
 
 	fmt.Println("shutting down server...")
@@ -1272,6 +1312,11 @@ func (s *Server) Start() error {
 }
 
 var errTooManyPendingCodes = errors.New("too many pending verification codes")
+
+// vaultCloseTimeout bounds revoking the Vault logins at shutdown. A drain of
+// AGENT_VAULT_SHUTDOWN_SECONDS, the 5 s database cleanup and this must fit in
+// the Pod's termination grace.
+const vaultCloseTimeout = 5 * time.Second
 
 const passwordResetTTL = 15 * time.Minute
 
@@ -1489,7 +1534,7 @@ func isSecureRequest(r *http.Request, baseURL string) bool {
 // sessionCookie builds an av_session cookie with all hardening flags set.
 // Secure is set based on TLS state or the server's configured baseURL.
 func sessionCookie(r *http.Request, baseURL, value string, maxAge int) *http.Cookie {
-	return &http.Cookie{
+	return &http.Cookie{ //nolint:gosec // G124: HttpOnly and SameSite are fixed; Secure follows TLS, as a plain-HTTP local server cannot set it
 		Name:     "av_session",
 		Value:    value,
 		Path:     "/",
