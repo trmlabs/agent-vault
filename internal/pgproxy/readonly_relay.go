@@ -52,6 +52,7 @@ func copyClientReadOnly(upstream io.Writer, client io.Reader) bool {
 	r := bufio.NewReaderSize(client, 32<<10)
 	w := bufio.NewWriterSize(upstream, 32<<10)
 	var header [5]byte
+	started := false
 	for {
 		if _, err := io.ReadFull(r, header[:]); err != nil {
 			return false
@@ -76,7 +77,8 @@ func copyClientReadOnly(upstream io.Writer, client io.Reader) bool {
 			if !ok {
 				return false // malformed: end the session
 			}
-			if createsTemporary(sql) {
+			refused := false
+			if refused, started = changesLexer(sql, started); refused || !readOnlyAllowed(sql) {
 				return true
 			}
 			if _, err := w.Write(header[:]); err != nil {

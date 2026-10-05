@@ -590,7 +590,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		// CREATE TABLE temporary.
 		for key, value := range startup.Parameters {
 			if strings.EqualFold(key, "search_path") && strings.Contains(strings.ToLower(value), "pg_temp") {
-				refuse("read_only_temp", "25006", readOnlyTempMessage)
+				refuse("read_only", "25006", readOnlyMessage)
 				return
 			}
 		}
@@ -732,12 +732,12 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		return
 	}
 	if refused, clean := relayReadOnly(conn, upstream.conn); refused {
-		b.logger.Warn("pgproxy: temporary object refused on a read-only login; ending session",
+		b.logger.Warn("pgproxy: statement refused on a read-only login; ending session",
 			slog.String("service", svc.Name), slog.String("actor", scope.ActorID))
-		b.auditDenied(event, "read_only_temp")
+		b.auditDenied(event, "read_only")
 		if clean {
 			_ = conn.SetWriteDeadline(time.Now().Add(clientWriteTimeout))
-			writeClientError(backend, "25006", readOnlyTempMessage)
+			writeClientError(backend, "25006", readOnlyMessage)
 		}
 		terminate()
 	}

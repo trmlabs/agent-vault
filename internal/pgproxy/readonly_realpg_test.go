@@ -106,11 +106,42 @@ func TestRealPostgres_ReadOnlyLoginRefusesTemporaryObjects(t *testing.T) {
 		"CREATE TABLE pg_temp.scratch (id int)",
 		"DO $$ BEGIN EXECUTE 'CREATE TEMP' || 'ORARY TABLE scratch (id int)'; END $$",
 		"SELECT set_config('search_path', 'pg_' || 'temp', false)",
-		"SET standard_conforming_strings = off",
+		`SELECT "set_config"('search_path', 'pg' || '_temp', false)`,
+		`SELECT "pg_catalog"."set_config"('search_path', 'pg' || '_temp', false)`,
+		`UPDATE "pg_settings" SET setting = 'pg' || '_temp' WHERE name = 'search_path'`,
+		"CREATE TABLE t (x int)",
+		"SET default_transaction_read_only = off",
+		"BEGIN READ WRITE",
+	}
+
+	// What the internal API sends through Sequelize and node-postgres, on a
+	// read-only login, pooled and not.
+	reads := func(t *testing.T, conn *pgx.Conn) {
+		t.Helper()
+		for _, sql := range []string{
+			"SET client_min_messages TO warning;SET TIME ZONE INTERVAL '+00:00' HOUR TO MINUTE;",
+			"WITH ranges AS (SELECT pg_range.rngtypid, pg_type.typname AS rngtypname, pg_type.typarray AS rngtyparray, pg_range.rngsubtype FROM pg_range " +
+				"LEFT OUTER JOIN pg_type ON pg_type.oid = pg_range.rngtypid) SELECT pg_type.typname, pg_type.typtype, pg_type.oid, pg_type.typarray, " +
+				"ranges.rngtypname, ranges.rngtypid, ranges.rngtyparray FROM pg_type LEFT OUTER JOIN ranges ON pg_type.oid = ranges.rngsubtype WHERE (pg_type.typtype IN('b', 'e'));",
+			"START TRANSACTION; SELECT count(*) FROM " + table + "; COMMIT;",
+		} {
+			if _, err := conn.Exec(ctx, sql, pgx.QueryExecModeSimpleProtocol); err != nil {
+				t.Fatalf("read path %q: %v", sql[:min(len(sql), 40)], err)
+			}
+		}
+		var n int
+		if err := conn.QueryRow(ctx, `SELECT count(*) FROM "`+table+`" WHERE "id" > $1`, 0).Scan(&n); err != nil || n != 2 {
+			t.Fatalf("parameterized read: %d %v", n, err)
+		}
+		var readOnly string
+		if err := conn.QueryRow(ctx, "SHOW default_transaction_read_only").Scan(&readOnly); err != nil || readOnly != "on" {
+			t.Fatalf("default_transaction_read_only = %q %v, want on", readOnly, err)
+		}
 	}
 
 	t.Run("pooled", func(t *testing.T) {
 		conn := connect(broker(true, &PoolOptions{QueueFactor: 10}))
+		reads(t, conn)
 		for _, sql := range attempts {
 			if _, err := conn.Exec(ctx, sql); code(err) != "25006" {
 				t.Fatalf("%q answered %v, want 25006", sql, err)
@@ -127,6 +158,7 @@ func TestRealPostgres_ReadOnlyLoginRefusesTemporaryObjects(t *testing.T) {
 
 	t.Run("unpooled", func(t *testing.T) {
 		addr := broker(true, nil)
+		reads(t, connect(addr))
 		for _, sql := range attempts {
 			conn := connect(addr)
 			var n int
@@ -143,6 +175,32 @@ func TestRealPostgres_ReadOnlyLoginRefusesTemporaryObjects(t *testing.T) {
 		}
 		if n := tempObjects(); n != 0 {
 			t.Fatalf("%d temporary objects exist", n)
+		}
+	})
+
+	// Read-write pooled: an encoding change is refused, and one the classifier
+	// cannot see (set_config with a computed name) ends the session when the
+	// server reports it, before the next statement is read.
+	t.Run("read-write pooled", func(t *testing.T) {
+		addr := broker(false, &PoolOptions{QueueFactor: 10})
+		conn := connect(addr)
+		for _, sql := range []string{"SET client_encoding TO 'SJIS'", "SET NAMES 'BIG5'", "SET standard_conforming_strings = off"} {
+			if _, err := conn.Exec(ctx, sql); code(err) != "42501" {
+				t.Fatalf("%q answered %v, want 42501", sql, err)
+			}
+		}
+		_, _ = conn.Exec(ctx, "SELECT set_config('standard_conforming_' || 'strings', 'off', false)")
+		if err := conn.Ping(ctx); err == nil {
+			t.Fatal("session survived standard_conforming_strings off")
+		}
+		var defaults int
+		if err := admin.QueryRow(ctx, "SELECT count(*) FROM pg_db_role_setting WHERE setrole = (SELECT oid FROM pg_roles WHERE rolname = $1)", role).Scan(&defaults); err != nil || defaults != 0 {
+			t.Fatalf("role defaults %d %v", defaults, err)
+		}
+		next := connect(addr)
+		var scs string
+		if err := next.QueryRow(ctx, "SHOW standard_conforming_strings").Scan(&scs); err != nil || scs != "on" {
+			t.Fatalf("next session standard_conforming_strings = %q %v", scs, err)
 		}
 	})
 }

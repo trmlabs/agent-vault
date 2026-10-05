@@ -15,16 +15,17 @@ With pooling on, the broker multiplexes many client sessions onto a few server c
 
 ## Read-only logins
 
-PostgreSQL lets every login create temporary tables, views and sequences unless the database revokes `TEMP` from `PUBLIC`. On a read-only login the broker refuses them itself, so no database change is needed, pooled or not. A login is read-only when its catalog entry has `access: read` (the default), or, for services outside the catalog, when its Vault role name ends in `-readonly`.
+PostgreSQL lets every login create temporary tables, views and sequences unless the database revokes `TEMP` from `PUBLIC`. On a read-only login the broker enforces read-only itself, so no database change is needed, pooled or not. A login is read-only when its catalog entry has `access: read` (the default), or, for services outside the catalog, when its Vault role name ends in `-readonly`.
 
-The broker refuses, with SQLSTATE 25006 and a message that names the read-only login:
+- **Allowlist.** Every statement must be a read: `SELECT`, `VALUES`, `TABLE`, `WITH` or `EXPLAIN` (with or without `ANALYZE`) of a read, `SHOW`, or a cursor over a read (`DECLARE`, `FETCH`, `MOVE`, `CLOSE`). Transaction control is allowed (`BEGIN`, `START TRANSACTION`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `RELEASE`, `SET TRANSACTION`) unless it asks for `READ WRITE`. `SET` and `RESET` are allowed for `search_path`, `statement_timeout`, `lock_timeout`, `idle_in_transaction_session_timeout`, `application_name`, `TimeZone`, `DateStyle`, `IntervalStyle`, `extra_float_digits`, `client_min_messages` and `bytea_output`, which covers what Sequelize and node-postgres send. A read that names a write keyword anywhere (`INSERT`, `UPDATE`, `DELETE`, `MERGE`, `INTO`, `CREATE`, a `FOR UPDATE` lock) is refused.
+- **Text refusals behind it.** Text naming `pg_temp`, `set_config` or `pg_settings` in any spelling or quoting, Unicode escapes (`U&"..."`), escape strings in a `search_path` change, the fast-path `FunctionCall` message, and a startup `search_path` naming `pg_temp` are refused.
+- **Database backstop.** The broker opens a read-only login's database connections with `default_transaction_read_only = on`, which the allowlist keeps on.
 
-- `CREATE ... TEMP` or `TEMPORARY` (tables, views, sequences, `CREATE TABLE AS`, also under `EXPLAIN ANALYZE`) and `SELECT ... INTO TEMP`.
-- Anything that names `pg_temp`, anywhere in the text, and a startup `search_path` that names it.
-- Statements that could create one where the broker cannot see it: `DO` blocks, `set_config`, `UPDATE pg_settings`, Unicode-escaped names (`U&"..."`), escape strings in a `search_path` change, and the fast-path `FunctionCall` message.
-- `SET` of `standard_conforming_strings`, `client_encoding` or `NAMES`, which could make the server read later text differently from the broker. A lone `SET` to a value the startup allowlist accepts (`on`, or a server encoding such as `UTF8`) is allowed, so drivers that set them on connect keep working.
+A refusal is SQLSTATE 25006 with a message that names the read-only login, and a `denied` audit row with outcome `read_only`. Pooled, the session continues; unpooled, the broker reads each client message whole before relaying it, and a refusal ends the session. Read-write logins are unchanged. A function already in the database that writes or creates a temporary table could still be called from a `SELECT`; the database's own privileges and the read-only transaction govern it.
 
-Pooled, the refusal is an `ERROR` and the session continues. Unpooled, the broker reads each client message whole before relaying it, and a refusal ends the session with a `FATAL`. Either way the statement never reaches the database, and the broker writes a `denied` audit row with outcome `read_only_temp`. Read-write logins are unchanged. An existing function in the database that creates a temporary table when called is not covered; the database's own privileges govern what functions a read-only login can call.
+## Encoding settings
+
+`standard_conforming_strings` and `client_encoding` decide how the server reads string literals. If either changed mid-session, the broker's lexer and the server could split a statement differently, so a refused statement could hide inside a literal. On every pooled session, read-write included, a `SET` of `standard_conforming_strings`, `client_encoding` or `NAMES` is refused with SQLSTATE 42501 (audit outcome `encoding_change`), except `standard_conforming_strings` to `on` or `client_encoding` to `UTF8` before the session's first other statement, as drivers send on connect. If the server reports either setting changed to anything else, for example by a function, the broker ends the session before reading the client's next statement.
 
 ## Entitlement tiers
 
