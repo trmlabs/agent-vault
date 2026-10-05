@@ -1057,11 +1057,15 @@ func (s *pooledSession) killWith(n *closeNotice) {
 		}
 		s.b.pools.release(conn, false)
 	}
-	if n != nil && s.writeMu.TryLock() {
-		_ = s.client.SetWriteDeadline(time.Now().Add(noticeWriteTimeout))
-		s.backend.Send(brokerError("FATAL", n.code, n.reason, n.message))
-		_ = s.backend.Flush()
-		s.writeMu.Unlock()
+	if n != nil {
+		notified := false
+		if s.writeMu.TryLock() {
+			_ = s.client.SetWriteDeadline(time.Now().Add(noticeWriteTimeout))
+			s.backend.Send(brokerError("FATAL", n.code, n.reason, n.message))
+			notified = s.backend.Flush() == nil
+			s.writeMu.Unlock()
+		}
+		s.b.logSessionEnd(s.svc.Name, *n, notified)
 	}
 	_ = s.client.Close()
 }

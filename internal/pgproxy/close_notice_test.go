@@ -1,9 +1,12 @@
 package pgproxy
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -204,4 +207,45 @@ func TestPooledCloseCancelsBeforeTheNotice(t *testing.T) {
 	release()
 	s.fe = pgproto3.NewFrontend(s.conn, s.conn) // the timed-out read left the decoder mid-wait
 	wantNotice(t, s, "08006", "authorization_ended")
+}
+
+// Each session the broker ends itself is logged with its reason and whether
+// the notice reached the client, so a run can count named and unnamed ends.
+func TestBrokerEndedSessionsAreLogged(t *testing.T) {
+	var mu sync.Mutex
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(writerFunc(func(p []byte) (int, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return logs.Write(p)
+	}), nil))
+	logged := func(want string) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return strings.Contains(logs.String(), want)
+	}
+	for _, pooled := range []bool{false, true} {
+		up := noticeUpstreamWithTransactions(t)
+		opts := Options{Logger: logger, Auth: &fakeAuth{scope: &AgentScope{VaultID: "v", ActorID: "a", WorkloadID: "pod-1", Pool: "cursor"}},
+			Databases: &fakeResolver{svc: &DatabaseService{Name: "logged", Addr: up.addr(), Mount: "database", Role: "readonly", SSLMode: "disable", MaxConns: 4}},
+			Leases:    &fakeMinter{lease: newLease()}}
+		if pooled {
+			opts.Pool = &PoolOptions{QueueFactor: 20}
+		}
+		b, addr := startBroker(t, opts)
+		s := openAgentSession(t, addr, "token", "db")
+		if _, err := s.query("BEGIN"); err != nil {
+			t.Fatal(err)
+		}
+		done := shutdownBroker(b, 5*time.Second)
+		wantNotice(t, s, "08006", "restart_cut")
+		<-done
+		s.close()
+		waitFor(t, 2*time.Second, func() bool {
+			return logged("session ended by the broker") && logged("reason=restart_cut") && logged("notified=true") && logged("service=logged")
+		}, "the ended session was not logged")
+		mu.Lock()
+		logs.Reset()
+		mu.Unlock()
+	}
 }

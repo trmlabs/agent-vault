@@ -2,6 +2,7 @@ package pgproxy
 
 import (
 	"net"
+	"sync/atomic"
 	"time"
 )
 
@@ -33,18 +34,33 @@ var (
 	noticeEncoding = closeNotice{"42501", "encoding_change", lexerChangeMessage}
 )
 
+// closeState carries an unpooled session's close notice from whoever ends it
+// to the relay that writes it, and whether it reached the client.
+type closeState struct {
+	notice  atomic.Pointer[closeNotice]
+	written atomic.Bool
+	sent    atomic.Pointer[closeNotice] // the notice actually written, after any restart_cut swap
+}
+
+// logSessionEnd records each session the broker ends itself, and whether the
+// client got the notice, so runs can count named and unnamed endings.
+func (b *Broker) logSessionEnd(service string, n closeNotice, notified bool) {
+	b.logger.Info("pgproxy: session ended by the broker", "reason", n.reason, "code", n.code, "notified", notified, "service", service)
+}
+
 // noticeWriteTimeout bounds writing a close notice to a client that is not
 // reading, so ending a session never waits on it.
 const noticeWriteTimeout = time.Second
 
 // writeNotice writes n to a client connection as one framed FATAL message.
-func writeNotice(conn net.Conn, n closeNotice) {
+func writeNotice(conn net.Conn, n closeNotice) bool {
 	frame, err := brokerError("FATAL", n.code, n.reason, n.message).Encode(nil)
 	if err != nil {
-		return
+		return false
 	}
 	_ = conn.SetWriteDeadline(time.Now().Add(noticeWriteTimeout))
-	_, _ = conn.Write(frame)
+	_, err = conn.Write(frame)
+	return err == nil
 }
 
 // registerCloser lets Shutdown, a failed audit trail or lost cleanup
@@ -75,5 +91,6 @@ func (b *Broker) endConnLocked(conn net.Conn, n closeNotice) {
 		go end(n)
 		return
 	}
+	b.logger.Info("pgproxy: connection closed during its handshake without a notice", "reason", n.reason)
 	_ = conn.Close()
 }

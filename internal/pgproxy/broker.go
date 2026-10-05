@@ -810,12 +810,12 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	// database side closes first so the relay stops at a message boundary and
 	// writes the notice before closing the client; the client is closed
 	// regardless once the notice has had its chance.
-	var notice atomic.Pointer[closeNotice]
+	var notice closeState
 	var endOnce sync.Once
 	endWith := func(n *closeNotice) {
 		endOnce.Do(func() {
 			if n != nil {
-				notice.Store(n)
+				notice.notice.Store(n)
 				time.AfterFunc(2*noticeWriteTimeout, func() { _ = conn.Close() })
 			} else {
 				_ = conn.Close()
@@ -850,6 +850,15 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	}()
 	defer func() { relayCancel(); <-renewDone }()
 
+	defer func() {
+		if n := notice.notice.Load(); n != nil {
+			sent := n
+			if s := notice.sent.Load(); s != nil {
+				sent = s
+			}
+			b.logSessionEnd(svc.Name, *sent, notice.written.Load())
+		}
+	}()
 	if !svc.ReadOnly {
 		relay(conn, upstream.conn, &notice)
 		return
@@ -944,7 +953,7 @@ func (b *Broker) renewLoop(ctx context.Context, lease *Lease, svc *DatabaseServi
 // relay splices two connections until either side closes, then tears both down
 // so the surviving copy unblocks. Bytes flow verbatim, so the full protocol
 // (simple and extended query, COPY, etc.) passes through untouched.
-func relay(client, upstream net.Conn, notice *atomic.Pointer[closeNotice]) {
+func relay(client, upstream net.Conn, notice *closeState) {
 	toClient := &frameTracker{w: client}
 	fromClient, fromServer := make(chan struct{}), make(chan struct{})
 	go func() {
@@ -969,14 +978,16 @@ func relay(client, upstream net.Conn, notice *atomic.Pointer[closeNotice]) {
 // sendNotice writes the session's close notice, if the broker ended it, once
 // the database stream has stopped between two messages. A restart that finds
 // a transaction open says so instead of claiming a clean restart.
-func sendNotice(client net.Conn, toClient *frameTracker, notice *atomic.Pointer[closeNotice]) {
-	n := notice.Load()
-	if n == nil || !toClient.atBoundary() {
+func sendNotice(client net.Conn, toClient *frameTracker, notice *closeState) {
+	n := notice.notice.Load()
+	if n == nil {
 		return
 	}
 	if *n == noticeRestarting && !toClient.idle() {
-		writeNotice(client, noticeRestartCut)
-		return
+		n = &noticeRestartCut
 	}
-	writeNotice(client, *n)
+	notice.sent.Store(n)
+	if toClient.atBoundary() {
+		notice.written.Store(writeNotice(client, *n))
+	}
 }

@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
-	"sync/atomic"
 )
 
 // maxReadOnlyStatementBytes bounds a Query or Parse message the read-only
@@ -21,7 +20,7 @@ const maxReadOnlyStatementBytes = 64 << 20
 // refused reports a refused statement. The session then ends: the database
 // stream is stopped first, and clean reports whether it stopped between
 // messages, so the caller can still send the client a refusal it can read.
-func relayReadOnly(client, upstream net.Conn, notice *atomic.Pointer[closeNotice]) (refused, clean bool) {
+func relayReadOnly(client, upstream net.Conn, notice *closeState) (refused, clean bool) {
 	toClient := &frameTracker{w: client}
 	fromClient := make(chan bool, 1)
 	fromServer := make(chan struct{})
