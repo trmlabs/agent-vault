@@ -46,6 +46,7 @@ harnesses:
     identity: {kind: pod-token, ownerKind: ReplicaSet, namespaces: [cursor-agents], imageDigests: [sha256:...]}
     path: {kind: sidecar}
     authorization: {mode: pool, poolName: cursor-agents}
+    client: {proxyEnv: GATEHOUSE_HTTPS_PROXY, caFileEnv: GATEHOUSE_CA_FILE, caSpkiEnv: GATEHOUSE_CA_SPKI}
 ```
 
 | Field | Values |
@@ -55,8 +56,9 @@ harnesses:
 | `identity` | `ownerKind` (the controller kind that must own the agent Pod), `namespaces`, `imageDigests`, optional `requester` (`session-jwt` or `signed-assertion`) |
 | `path` | `kind` (`sidecar` or `shared-proxy`), `crossCluster` |
 | `authorization` | `mode` (`pool` or `person`), `poolName` |
+| `client` | Environment variable names the worker render sets: `proxyEnv` (Gatehouse's proxy URL), `caFileEnv` (its CA file), optional `caSpkiEnv` (the CA's SPKI hash, for a browser launched with a trust flag). Cursor keeps `HTTPS_PROXY` for its own gateway, so it uses the `GATEHOUSE_` names; harnesses that leave the standard names free use `HTTPS_PROXY` and `SSL_CERT_FILE`. The broker does not read these |
 
-Every field is required except `requester` and `crossCluster`, and the catalog is refused when an entry is incomplete or contradictory: a `pod-token` harness runs a sidecar and decides for the pool; `session-jwt` decides for the person; `proxy-attested` runs a shared proxy; a cross-cluster path uses remote keys and is proxy-attested; `person` needs a requester. `signed-assertion` is refused until the broker verifies assertions. Once a catalog declares harnesses, each pool belongs to exactly one, its namespace is listed, and its `identity` agrees with the mode (`claude-session` exactly for `person`). A catalog without harnesses keeps today's behavior: each pool's profile is derived from its `identity`.
+Every field is required except `requester`, `crossCluster` and `caSpkiEnv`, and the catalog is refused when an entry is incomplete or contradictory: a `pod-token` harness runs a sidecar and decides for the pool; `session-jwt` decides for the person; `proxy-attested` runs a shared proxy; a cross-cluster path uses remote keys and is proxy-attested; `person` needs a requester. `signed-assertion` is refused until the broker verifies assertions. Once a catalog declares harnesses, each pool belongs to exactly one, its namespace is listed, and its `identity` agrees with the mode (`claude-session` exactly for `person`). A catalog without harnesses keeps today's behavior: each pool's profile is derived from its `identity`.
 
 ## Validation
 

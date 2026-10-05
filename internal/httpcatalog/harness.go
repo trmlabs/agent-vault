@@ -19,6 +19,21 @@ type Harness struct {
 	Identity      HarnessIdentity      `json:"identity"`
 	Path          HarnessPath          `json:"path"`
 	Authorization HarnessAuthorization `json:"authorization"`
+	Client        HarnessClient        `json:"client"`
+}
+
+// HarnessClient names the environment variables the worker render sets for
+// the agent's own programs, since some runtimes already use the standard
+// ones (Cursor's HTTPS_PROXY points at its own control gateway). The broker
+// does not read them; the HTTP and browser renders do.
+type HarnessClient struct {
+	// ProxyEnv holds Gatehouse's HTTP proxy URL (HTTPS_PROXY where free).
+	ProxyEnv string `json:"proxyEnv"`
+	// CAFileEnv holds the path of Gatehouse's interception CA file.
+	CAFileEnv string `json:"caFileEnv"`
+	// CASpkiEnv, optional, holds the CA's SPKI hash for browsers launched
+	// with a trust flag instead of a CA store (no certutil in the image).
+	CASpkiEnv string `json:"caSpkiEnv,omitempty"`
 }
 
 // HarnessTrustDomain is the cluster whose service-account tokens the broker
@@ -94,6 +109,7 @@ const (
 
 var (
 	kubernetesKind = regexp.MustCompile(`^[A-Z][A-Za-z0-9]{0,62}$`)
+	envName        = regexp.MustCompile(`^[A-Z_][A-Z0-9_]{0,127}$`)
 	audiencePat    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,252}$`)
 	digestPattern  = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 )
@@ -161,6 +177,13 @@ func (h Harness) validate() error {
 	}
 	if !idPattern.MatchString(h.Authorization.PoolName) {
 		return errors.New("authorization.poolName is required")
+	}
+	c := h.Client
+	if !envName.MatchString(c.ProxyEnv) || !envName.MatchString(c.CAFileEnv) || (c.CASpkiEnv != "" && !envName.MatchString(c.CASpkiEnv)) {
+		return errors.New("client needs proxyEnv and caFileEnv environment variable names")
+	}
+	if c.ProxyEnv == c.CAFileEnv || (c.CASpkiEnv != "" && (c.CASpkiEnv == c.ProxyEnv || c.CASpkiEnv == c.CAFileEnv)) {
+		return errors.New("client environment variable names must differ")
 	}
 	// The combinations that hold together. Each refusal names the reason.
 	switch id.Kind {

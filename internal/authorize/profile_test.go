@@ -21,9 +21,9 @@ func profiledPools(t *testing.T) (derived, explicit httpcatalog.Catalog) {
 		"entries":[{"name":"vendor","host":"api.vendor.example","pathPrefixes":["/v1/"],"methods":["GET"],"header":"Authorization","placeholder":"__vault_KEY__","key":{"mount":"gatehouse","path":"vendors/x","field":"key"},"pools":["cursor","ci","claude"]}]`
 	domain := `"trustDomain":{"issuer":"https://kubernetes.default.svc.cluster.local","keys":"in-cluster","audience":"gatehouse"}`
 	harnesses := `"harnesses":[
-		{"name":"cursor",` + domain + `,"identity":{"kind":"pod-token","ownerKind":"ReplicaSet","namespaces":["cursor"],"imageDigests":["` + digest + `"]},"path":{"kind":"sidecar"},"authorization":{"mode":"pool","poolName":"cursor"}},
-		{"name":"ci",` + domain + `,"identity":{"kind":"pod-token","ownerKind":"Job","namespaces":["ci"],"imageDigests":["` + digest + `"]},"path":{"kind":"sidecar"},"authorization":{"mode":"pool","poolName":"ci"}},
-		{"name":"claude",` + domain + `,"identity":{"kind":"session-jwt","ownerKind":"Job","namespaces":["claude"],"imageDigests":["` + digest + `"]},"path":{"kind":"sidecar"},"authorization":{"mode":"person","poolName":"claude"}}],`
+		{"name":"cursor",` + domain + `,"identity":{"kind":"pod-token","ownerKind":"ReplicaSet","namespaces":["cursor"],"imageDigests":["` + digest + `"]},"path":{"kind":"sidecar"},"authorization":{"mode":"pool","poolName":"cursor"},"client":{"proxyEnv":"GATEHOUSE_HTTPS_PROXY","caFileEnv":"GATEHOUSE_CA_FILE"}},
+		{"name":"ci",` + domain + `,"identity":{"kind":"pod-token","ownerKind":"Job","namespaces":["ci"],"imageDigests":["` + digest + `"]},"path":{"kind":"sidecar"},"authorization":{"mode":"pool","poolName":"ci"},"client":{"proxyEnv":"HTTPS_PROXY","caFileEnv":"SSL_CERT_FILE"}},
+		{"name":"claude",` + domain + `,"identity":{"kind":"session-jwt","ownerKind":"Job","namespaces":["claude"],"imageDigests":["` + digest + `"]},"path":{"kind":"sidecar"},"authorization":{"mode":"person","poolName":"claude"},"client":{"proxyEnv":"HTTPS_PROXY","caFileEnv":"SSL_CERT_FILE"}}],`
 	var err error
 	if derived, err = httpcatalog.Parse([]byte(`{` + pools + `}`)); err != nil {
 		t.Fatal(err)
