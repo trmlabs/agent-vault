@@ -53,6 +53,7 @@ func TestBrokerReasonsBecomeFixedWords(t *testing.T) {
 		"credential":      {"08006", "Gatehouse could not get a database credential; retry shortly"},
 		"restarting":      {"57P01", "Gatehouse is restarting; reconnect"},
 		"role_change":     {"42501", "Gatehouse refuses ALTER ROLE, ALTER USER and ALTER DATABASE"},
+		"read_only_temp":  {"25006", "this database login is read-only: Gatehouse refuses temporary tables"},
 		"statement_limit": {"54000", "too many prepared statements"},
 		"not_entitled":    {"42501", "not authorized for this database"},
 		"no_person":       {"42501", "not authorized for this database"},
