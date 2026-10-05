@@ -49,3 +49,46 @@ func TestListenerAdmitsOnlyItsIdentityKinds(t *testing.T) {
 		_ = b.Close()
 	}
 }
+
+// testListenerWrap, when set, wraps the test proxy's listener.
+var testListenerWrap func(net.Listener) net.Listener
+
+type crossClusterListener struct{ net.Listener }
+
+func (l crossClusterListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &brokercore.KindedConn{Conn: c, Kinds: []string{brokercore.KindProxyAttested}}, nil
+}
+
+// A proxy-attested CONNECT on the cross-cluster listener carries its
+// listener's kinds into the tunnel: the requests inside it are served, and
+// the same proxy on a pool listener is refused at the CONNECT.
+func TestCrossClusterTunnelServesItsRequests(t *testing.T) {
+	for name, cross := range map[string]bool{"cross-cluster listener": true, "pool listener": false} {
+		if cross {
+			testListenerWrap = func(l net.Listener) net.Listener { return crossClusterListener{l} }
+		}
+		f := newAdapterFixture(t, func(o *Options) {
+			o.Attestor = kindAttestorScope{&brokercore.ProxyScope{VaultID: "vault-1", AgentID: "agent-uuid-1", Pool: "pool-agent",
+				WorkloadID: "agent-pod-uid", VaultRole: "proxy", IdentityKind: brokercore.KindProxyAttested}}
+		})
+		testListenerWrap = nil
+		code, _, err := f.do(t, "POST", "/v1/chat/completions", "{}", nil)
+		if cross && (err != nil || code != 200) {
+			t.Errorf("%s: %d %v", name, code, err)
+		}
+		if !cross && err == nil && code == 200 {
+			t.Errorf("%s: a proxy-attested tunnel was served", name)
+		}
+	}
+}
+
+type kindAttestorScope struct{ scope *brokercore.ProxyScope }
+
+func (a kindAttestorScope) Attest(context.Context, string, netip.Addr) (*brokercore.ProxyScope, error) {
+	s := *a.scope
+	return &s, nil
+}
