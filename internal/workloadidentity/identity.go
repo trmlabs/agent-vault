@@ -423,7 +423,7 @@ func (r *Resolver) ResolveForProxy(ctx context.Context, token, vaultHint string)
 	if ctx.Err() != nil || c.Expires <= r.now().Unix() {
 		return nil, deny
 	}
-	scope.WorkloadID = c.Kubernetes.Pod.UID
+	scope.WorkloadID, scope.IdentityKind = c.Kubernetes.Pod.UID, brokercore.KindTokenReview
 	return scope, nil
 }
 

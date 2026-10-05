@@ -529,6 +529,10 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 
 	scope, token, err := authenticateAgent(startupCtx, backend, b.authenticator(peer), startup)
 	startupCancel()
+	if err == nil && scope != nil && !brokercore.KindAdmitted(brokercore.ConnKinds(conn), scope.IdentityKind) {
+		// Each listener admits only the identity kinds it was opened for.
+		err, scope = fmt.Errorf("identity kind not admitted on this listener"), nil
+	}
 	if err != nil || scope == nil || scope.VaultID == "" || scope.ActorID == "" {
 		if err == nil {
 			err = fmt.Errorf("incomplete agent scope")

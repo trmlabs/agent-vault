@@ -92,6 +92,10 @@ A binding with `proxy` trusts exactly one shared proxy: its `namespace`, `servic
 
 The broker admits the attested Pod only when the connection comes from `sourceCIDRs` (the private link's range), the Pod's namespace is listed, its controller is `ownerKind`, every image is listed, and its deadline has not passed. The session ends at that deadline or `maxSessionSeconds` after the proxy token was issued, whichever is first. The scope's workload is the attested Pod UID. Any other binding presenting an attestation is refused, and the token-only path never admits a proxy binding. When the catalog declares a harness for the pool, every admission, pool or proxy, must also match it: issuer, audience, key source, identity kind, namespace, controller kind and images.
 
+## Listeners admit identity kinds
+
+Every scope records how the workload proved itself: `pod-token`, `token-review` or `proxy-attested`. The HTTP proxy and PostgreSQL listeners (behind TLS 14443 and 15443) admit pool and legacy identities and refuse `proxy-attested`. Agents in another cluster arrive on the cross-cluster listener instead: set `AGENT_VAULT_CROSS_CLUSTER_PORT` (14325 on loopback, behind TLS front 16443), which needs the credential proxy, `AGENT_VAULT_MITM_PROXY_PROTOCOL` and, with PostgreSQL, `AGENT_VAULT_DB_PROXY_PROTOCOL`. It carries both protocols on one port: after the front's PROXY header, a stream opening with `GHATTS1 ` goes to the PostgreSQL broker and one opening with `CONNECT ` to the HTTP proxy, each admitting only `proxy-attested`. Anything else is closed within 5 seconds.
+
 ## Verification and remaining limits
 
 TokenReview runs for each authorization decision, followed by a live Pod read that rejects missing pods, deletion timestamps, changed UIDs or an unexpected account. The Pod read closes TokenReview's deletion grace period. Any API error, timeout, untrusted certificate or incomplete identity denies the request. Current broker agent status and vault permission are checked after proof verification. No positive authentication result is cached.

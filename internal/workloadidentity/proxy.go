@@ -171,6 +171,6 @@ func (r *Resolver) attestProxied(ctx context.Context, binding *Binding, c claims
 	if ctx.Err() != nil || (c.Expires <= r.now().Unix() && !renewal) || !r.now().Before(notAfter) {
 		return nil, deny
 	}
-	scope.WorkloadID, scope.NotAfter, scope.Pool = a.PodUID, notAfter, binding.Pool
+	scope.WorkloadID, scope.NotAfter, scope.Pool, scope.IdentityKind = a.PodUID, notAfter, binding.Pool, brokercore.KindProxyAttested
 	return scope, nil
 }

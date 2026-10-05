@@ -372,6 +372,6 @@ func (r *Resolver) attest(ctx context.Context, token string, peer netip.Addr, re
 	if ctx.Err() != nil || (c.Expires <= r.now().Unix() && !renewal) || !r.now().Before(notAfter) {
 		return nil, deny
 	}
-	scope.WorkloadID, scope.NotAfter, scope.Pool = k.Pod.UID, notAfter, binding.Pool
+	scope.WorkloadID, scope.NotAfter, scope.Pool, scope.IdentityKind = k.Pod.UID, notAfter, binding.Pool, brokercore.KindPodToken
 	return scope, nil
 }

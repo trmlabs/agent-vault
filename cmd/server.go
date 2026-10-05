@@ -324,6 +324,19 @@ func attachServerExtensions(srv *server.Server, host string, mitmPort, postgresP
 		}
 		srv.EnableCredentialProxy()
 	}
+	if port := os.Getenv("AGENT_VAULT_CROSS_CLUSTER_PORT"); port != "" {
+		// Agents in another cluster arrive through their shared proxy and a
+		// private link, behind a TLS front that names the source in a PROXY
+		// header. Both protocol listeners must trust that header.
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 || !srv.CredentialProxyEnabled() || !boolEnvValue("AGENT_VAULT_MITM_PROXY_PROTOCOL") ||
+			(postgresPort > 0 && !boolEnvValue("AGENT_VAULT_DB_PROXY_PROTOCOL")) {
+			return fmt.Errorf("AGENT_VAULT_CROSS_CLUSTER_PORT needs a port, the credential proxy and PROXY headers on both protocol listeners")
+		}
+		if err := srv.EnableCrossCluster(net.JoinHostPort(host, port)); err != nil {
+			return err
+		}
+	}
 	sessions := srv.SessionResolver()
 	var proxyIdentity workloadidentity.Config
 	var proxyResolver *workloadidentity.Resolver
