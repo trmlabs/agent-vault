@@ -162,6 +162,7 @@ type livePod struct {
 		Namespace         string  `json:"namespace"`
 		DeletionTimestamp *string `json:"deletionTimestamp"`
 		OwnerReferences   []struct {
+			Kind               string `json:"kind"`
 			UID                string `json:"uid"`
 			Controller         *bool  `json:"controller"`
 			BlockOwnerDeletion *bool  `json:"blockOwnerDeletion"`
@@ -207,6 +208,25 @@ func (p *livePod) imagesAllowed(digests []string) bool {
 		}
 	}
 	return true
+}
+
+// controllerKind is the kind of the Pod's controller owner, or "".
+func (p *livePod) controllerKind() string {
+	for _, owner := range p.Metadata.OwnerReferences {
+		if owner.Controller != nil && *owner.Controller {
+			return owner.Kind
+		}
+	}
+	return ""
+}
+
+// images lists the digest of every container and init container.
+func (p *livePod) images() []string {
+	var digests []string
+	for _, s := range append(append([]containerStatus(nil), p.Status.ContainerStatuses...), p.Status.InitContainerStatuses...) {
+		digests = append(digests, s.ImageID[strings.LastIndexByte(s.ImageID, '@')+1:])
+	}
+	return digests
 }
 
 // deadline returns when the Pod's admission ends, or the zero time if it is
@@ -319,6 +339,14 @@ func (r *Resolver) attest(ctx context.Context, token string, peer netip.Addr, re
 	if binding == nil {
 		return nil, deny
 	}
+	attestation := brokercore.AttestationFrom(ctx)
+	if binding.Proxy != nil {
+		return r.attestProxied(ctx, binding, c, d, peer, attestation, renewal)
+	}
+	// Only a proxy binding may vouch for another Pod.
+	if attestation != "" || d.remote {
+		return nil, deny
+	}
 	if len(binding.OwnerUIDs) == 0 {
 		return r.ResolveForProxy(ctx, token, "")
 	}
@@ -327,7 +355,7 @@ func (r *Resolver) attest(ctx context.Context, token string, peer netip.Addr, re
 		return nil, deny
 	}
 	notAfter := pod.deadline(binding, c, peer, r.now())
-	if notAfter.IsZero() {
+	if notAfter.IsZero() || !r.profileAdmits(binding.Pool, d, IdentityPodToken, k.Namespace, pod.controllerKind(), pod.images()) {
 		return nil, deny
 	}
 	scope, err := r.grant(ctx, binding, "")

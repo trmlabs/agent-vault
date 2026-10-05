@@ -15,46 +15,72 @@ import (
 // fixed header, so a stream without it is read unchanged.
 const sessionPreamble = "GHSESS1 "
 
-// maxSessionBytes bounds the token line before authentication. The caller's
-// startup deadline bounds how long it may take to arrive.
+// attestationPreamble opens the line a shared proxy sends first, carrying its
+// attestation of the agent Pod: "GHATTS1 <attestation>\n". It is also eight
+// bytes, and the Attestor accepts it from a proxy binding alone.
+const attestationPreamble = "GHATTS1 "
+
+// maxSessionBytes bounds each preamble line before authentication. The
+// caller's startup deadline bounds how long it may take to arrive.
 const maxSessionBytes = 8 * 1024
 
 var errSessionPreamble = errors.New("malformed session preamble")
 
-// readSessionPreamble returns the relayed session token (empty when none) and
-// a reader that yields the rest of the stream, including any bytes read while
-// looking for the preamble. It reads only what it consumes from conn.
-func readSessionPreamble(conn net.Conn) (string, io.Reader, error) {
+// readSessionPreamble returns the relayed session token and attestation
+// (each empty when none) and a reader that yields the rest of the stream,
+// including any bytes read while looking for a preamble. An attestation line,
+// when present, comes first. It reads only what it consumes from conn.
+func readSessionPreamble(conn net.Conn) (string, string, io.Reader, error) {
 	head := make([]byte, len(sessionPreamble))
 	if _, err := io.ReadFull(conn, head); err != nil {
-		return "", nil, err
+		return "", "", nil, err
+	}
+	attestation := ""
+	if string(head) == attestationPreamble {
+		line, err := readPreambleLine(conn)
+		if err != nil {
+			return "", "", nil, err
+		}
+		attestation = line
+		if _, err := io.ReadFull(conn, head); err != nil {
+			return "", "", nil, err
+		}
 	}
 	if string(head) != sessionPreamble {
-		return "", io.MultiReader(bytes.NewReader(head), conn), nil
+		return "", attestation, io.MultiReader(bytes.NewReader(head), conn), nil
 	}
+	session, err := readPreambleLine(conn)
+	if err != nil {
+		return "", "", nil, err
+	}
+	return session, attestation, conn, nil
+}
+
+// readPreambleLine reads one non-empty base64url line up to its newline.
+func readPreambleLine(conn net.Conn) (string, error) {
 	var token []byte
 	one := make([]byte, 1)
 	for {
 		if _, err := io.ReadFull(conn, one); err != nil {
-			return "", nil, err
+			return "", err
 		}
 		if one[0] == '\n' {
 			break
 		}
-		// A JWT is base64url and dots; anything else is not a token.
+		// A JWT or attestation is base64url and dots; anything else is not.
 		if len(token) >= maxSessionBytes || !tokenByte(one[0]) {
-			return "", nil, errSessionPreamble
+			return "", errSessionPreamble
 		}
 		token = append(token, one[0])
 	}
 	if len(token) == 0 {
-		return "", nil, errSessionPreamble
+		return "", errSessionPreamble
 	}
 	// The string copy lives for the session, because every recheck verifies it
 	// again; the read buffer does not.
-	session := string(token)
+	line := string(token)
 	clear(token)
-	return session, conn, nil
+	return line, nil
 }
 
 func tokenByte(c byte) bool {

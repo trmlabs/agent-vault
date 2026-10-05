@@ -492,7 +492,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 
 	// The sidecar's session line, if any, precedes the startup packet.
 	_ = conn.SetDeadline(time.Now().Add(b.opts.StartupTimeout))
-	session, stream, err := readSessionPreamble(conn)
+	session, attestation, stream, err := readSessionPreamble(conn)
 	if err != nil {
 		b.logger.Debug("pgproxy: session preamble refused")
 		return
@@ -503,7 +503,10 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 
 	// Pre-auth phase: a short deadline so a client that opens a socket and stalls
 	// is dropped quickly and cannot pin resources (half-open flood).
-	startupCtx, startupCancel := context.WithTimeout(b.ctx, b.opts.StartupTimeout)
+	// A shared proxy's attestation follows the connection to every identity
+	// check, admission and recheck alike.
+	baseCtx := brokercore.WithAttestation(b.ctx, attestation)
+	startupCtx, startupCancel := context.WithTimeout(baseCtx, b.opts.StartupTimeout)
 	_ = conn.SetDeadline(time.Now().Add(b.opts.StartupTimeout))
 
 	startup, err := readStartup(backend, conn)
@@ -541,7 +544,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	// Audit identity comes only from the verified scope. The binding is added
 	// once the database resolves.
 	event := auditchain.Event{Pool: scope.Pool, Agent: scope.ActorID, PodUID: scope.WorkloadID, Session: newSessionID()}
-	connCtx := WithSession(b.ctx, session)
+	connCtx := WithSession(baseCtx, session)
 	refuse := func(outcome, code, message string) {
 		b.auditDenied(event, outcome)
 		writeClientError(backend, code, outcome, message)

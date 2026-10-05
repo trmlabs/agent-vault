@@ -117,7 +117,10 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// The runner session token, set by the sidecar on CONNECT only; requests
 	// inside the tunnel cannot supply or replace it.
 	session := r.Header.Get(SessionHeader)
-	connectScope, err := p.resolveScope(r.Context(), token, hint, peer, peerErr, false)
+	// A shared proxy's attestation of the agent Pod, on CONNECT only; the
+	// Attestor accepts it from a proxy binding alone.
+	attested := brokercore.WithAttestation(r.Context(), r.Header.Get(brokercore.AttestationHeader))
+	connectScope, err := p.resolveScope(attested, token, hint, peer, peerErr, false)
 	if err != nil {
 		p.recordAuthFailure(r)
 		if p.strictCredentialProxy {
@@ -199,7 +202,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// A tunnel can outlive its token or grant. Recheck each request
 			// against the original proxy identity before injecting credentials.
-			scope, err := p.resolveScope(r.Context(), token, hint, peer, peerErr, true)
+			scope, err := p.resolveScope(brokercore.WithAttestation(r.Context(), brokercore.AttestationFrom(attested)), token, hint, peer, peerErr, true)
 			if err != nil {
 				w.Header().Set("Connection", "close")
 				if p.strictCredentialProxy {
@@ -210,6 +213,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			r.Header.Del(SessionHeader)
+			r.Header.Del(brokercore.AttestationHeader)
 			p.forwardHandler(target, host, port, scope).ServeHTTP(w, r.WithContext(withSessionToken(r.Context(), session)))
 		}),
 		// ReadHeaderTimeout and ReadTimeout bound the request side

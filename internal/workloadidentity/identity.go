@@ -18,6 +18,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Infisical/agent-vault/internal/brokercore"
@@ -49,6 +50,8 @@ type Binding struct {
 	// TrustDomain names the listed trust domain whose tokens this binding
 	// admits; empty is the broker's own cluster.
 	TrustDomain string `json:"trustDomain,omitempty"`
+	// Proxy makes this a shared proxy's binding; see ProxyBinding.
+	Proxy *ProxyBinding `json:"proxy,omitempty"`
 }
 
 // Config selects the broker's own Kubernetes trust domain, any remote ones,
@@ -83,6 +86,8 @@ type Resolver struct {
 	jwks   *signingKeys // the broker's own cluster's keys: domains[0].keys
 	// domains are the trust domains, the broker's own cluster first.
 	domains []*domain
+	// profiles, when set, holds each pool's declared harness profile.
+	profiles atomic.Pointer[profileSource]
 }
 
 var _ brokercore.SessionResolver = (*Resolver)(nil)
@@ -158,7 +163,7 @@ func newResolver(c Config, s Store, observer bool) (*Resolver, error) {
 		if observer && (b.AgentID != "" || b.VaultID != "") {
 			return nil, errors.New("observer policy must not contain proxy grants")
 		}
-		if len(b.OwnerUIDs) != 0 || b.ContainerName != "" || b.MaxPodSeconds != 0 || b.Pool != "" || len(b.ImageDigests) != 0 {
+		if b.Proxy == nil && (len(b.OwnerUIDs) != 0 || b.ContainerName != "" || b.MaxPodSeconds != 0 || b.Pool != "" || len(b.ImageDigests) != 0) {
 			if b.Pool != "" && !pathSegment(b.Pool) {
 				return nil, errors.New("pool binding name must be a lowercase DNS-style name")
 			}
@@ -185,7 +190,15 @@ func newResolver(c Config, s Store, observer bool) (*Resolver, error) {
 		if b.TrustDomain != "" && !listedDomain(c.TrustDomains, b.TrustDomain) {
 			return nil, errors.New("workload identity binding names an unlisted trust domain")
 		}
-		if b.TrustDomain != "" {
+		if b.Proxy != nil {
+			if observer || b.PodUID != "" || len(b.OwnerUIDs) != 0 || b.ContainerName != "" || b.MaxPodSeconds != 0 || len(b.ImageDigests) != 0 || !pathSegment(b.Pool) {
+				return nil, errors.New("a proxy binding names its pool and takes no Pod, owner or image settings of its own")
+			}
+			if err := b.Proxy.validate(); err != nil {
+				return nil, err
+			}
+		}
+		if b.TrustDomain != "" && b.Proxy == nil {
 			// The broker cannot read a remote cluster's Pods, so neither the
 			// TokenReview path nor the pool Pod check can admit its tokens.
 			return nil, errors.New("a remote trust domain admits only proxy bindings")
@@ -396,8 +409,9 @@ func (r *Resolver) ResolveForProxy(ctx context.Context, token, vaultHint string)
 		return nil, err
 	}
 	deny := brokercore.ErrInvalidSession
-	if len(binding.OwnerUIDs) != 0 {
-		// A pool binding is admitted only with the connection's peer address.
+	if len(binding.OwnerUIDs) != 0 || binding.Proxy != nil || binding.TrustDomain != "" || brokercore.AttestationFrom(ctx) != "" {
+		// Pool and proxy bindings are admitted only with the connection's peer
+		// address, and only a proxy binding may present an attestation.
 		return nil, deny
 	}
 	scope, err := r.grant(ctx, binding, vaultHint)

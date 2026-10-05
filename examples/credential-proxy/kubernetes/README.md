@@ -79,6 +79,19 @@ The top-level `issuer`, `audience` and `apiServer` are the broker's own cluster.
 
 A token's exact issuer picks its domain, and only that domain's keys can verify it. Keys are cached for an hour, refetched at most every 30 seconds for an unknown key ID, and a failed fetch keeps the last good set. `jwksURL` must be HTTPS; `caFile` optionally replaces the system roots for it. The broker cannot read another cluster's Pods, so a remote domain admits only a proxy binding (a shared proxy there checks the Pod), and its token lifetime (`maxTokenLifetimeSeconds`, 600 to 3600, default 3600) is the revocation window. A binding names its domain with `trustDomain`; empty is the broker's own cluster. The broker's egress must reach `jwksURL`.
 
+## Proxy-attested agents
+
+A binding with `proxy` trusts exactly one shared proxy: its `namespace`, `serviceAccount` and `serviceAccountUID`, in its `trustDomain`, with that domain's issuer and audience. The proxy runs the Pod check in its own cluster and sends an attestation of the agent Pod with each connection: the `Gatehouse-Attestation` header on CONNECT, or a `GHATTS1 <attestation>` line before any `GHSESS1` line on PostgreSQL.
+
+```json
+{"namespace": "gatehouse-edge", "serviceAccount": "gatehouse-edge", "serviceAccountUID": "UID", "agentID": "A", "vaultID": "V",
+ "pool": "agent-sandbox", "trustDomain": "agent-sandbox",
+ "proxy": {"namespaces": ["agent-sandboxes"], "ownerKind": "Sandbox", "imageDigests": ["sha256:..."],
+           "sourceCIDRs": ["10.200.0.0/28"], "maxSessionSeconds": 3600}}
+```
+
+The broker admits the attested Pod only when the connection comes from `sourceCIDRs` (the private link's range), the Pod's namespace is listed, its controller is `ownerKind`, every image is listed, and its deadline has not passed. The session ends at that deadline or `maxSessionSeconds` after the proxy token was issued, whichever is first. The scope's workload is the attested Pod UID. Any other binding presenting an attestation is refused, and the token-only path never admits a proxy binding. When the catalog declares a harness for the pool, every admission, pool or proxy, must also match it: issuer, audience, key source, identity kind, namespace, controller kind and images.
+
 ## Verification and remaining limits
 
 TokenReview runs for each authorization decision, followed by a live Pod read that rejects missing pods, deletion timestamps, changed UIDs or an unexpected account. The Pod read closes TokenReview's deletion grace period. Any API error, timeout, untrusted certificate or incomplete identity denies the request. Current broker agent status and vault permission are checked after proof verification. No positive authentication result is cached.
