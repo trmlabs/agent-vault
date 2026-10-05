@@ -156,6 +156,72 @@ func changesRole(sql string) bool {
 	return false
 }
 
+// createsTemporary reports whether SQL text on a read-only login could
+// create a temporary table, view, sequence or other object. PUBLIC holds the
+// TEMP privilege by default, so the broker refuses these itself rather than
+// rely on a database change. It fails closed: besides CREATE ... TEMP and
+// SELECT ... INTO TEMP, it refuses what could create one unseen (pg_temp in
+// any text, Unicode escapes that could spell it, DO blocks and set_config
+// with computed text, UPDATE pg_settings), and settings that would make the
+// server read later text differently from the broker's lexer. Unterminated
+// text is refused too.
+func createsTemporary(sql string) bool {
+	lower := strings.ToLower(sql)
+	if strings.Contains(lower, "pg_temp") || strings.Contains(lower, "u&'") || strings.Contains(lower, `u&"`) {
+		return true
+	}
+	statements, ok := splitStatements(sql)
+	if !ok {
+		return true
+	}
+	for _, statement := range statements {
+		words := strings.FieldsFunc(strings.ToLower(statement), func(r rune) bool { return r > 0x7f || !identChar(byte(r)) })
+		if len(words) == 0 {
+			continue
+		}
+		if words[0] == "do" {
+			return true
+		}
+		var update, settings, searchPath bool
+		for i, w := range words {
+			switch {
+			case w == "temp" || w == "temporary":
+				// CREATE [OR REPLACE] [GLOBAL | LOCAL] TEMP, and
+				// SELECT ... INTO [GLOBAL | LOCAL] TEMP.
+				for _, before := range words[max(0, i-3):i] {
+					if before == "create" || before == "into" {
+						return true
+					}
+				}
+			case strings.HasPrefix(w, "set_config"):
+				return true
+			case w == "update":
+				update = true
+			case w == "pg_settings":
+				settings = true
+			case w == "search_path" || words[0] == "set" && i <= 2 && w == "schema":
+				searchPath = true
+			}
+		}
+		// UPDATE pg_settings calls set_config.
+		if update && settings {
+			return true
+		}
+		// An escape string could spell pg_temp in a search path.
+		if searchPath && strings.ContainsRune(sql, '\\') {
+			return true
+		}
+		if words[0] == "set" {
+			for _, w := range words[1:min(len(words), 3)] {
+				if w == "standard_conforming_strings" || w == "client_encoding" || w == "names" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 func identChar(c byte) bool {
 	return c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c >= 0x80
 }

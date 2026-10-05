@@ -126,7 +126,8 @@ type fakeUpstream struct {
 	lastIdleTxn string
 	forbidParam string // a param key that must never be forwarded upstream
 	forbidSeen  bool
-	accepted    int // upstream connections accepted
+	accepted    int      // upstream connections accepted
+	queries     []string // simple-protocol query text received
 	// transactions makes BEGIN open a transaction (ReadyForQuery 'T') until
 	// COMMIT or ROLLBACK, and SLEEP take 300ms; off, every query is idle.
 	transactions bool
@@ -277,6 +278,7 @@ func (fu *fakeUpstream) handle(conn net.Conn) {
 		switch q := m.(type) {
 		case *pgproto3.Query:
 			fu.mu.Lock()
+			fu.queries = append(fu.queries, q.String)
 			transactions := fu.transactions
 			fu.mu.Unlock()
 			if transactions {

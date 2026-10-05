@@ -52,6 +52,7 @@ type DatabaseService struct {
 	Role     string // Vault role granting a scoped set of SQL privileges
 	SSLMode  string // upstream TLS mode: "disable" | "prefer" (default) | "require" | "verify-full"
 	MaxConns int    // per-database connection budget (0 = the broker's default); bounds this upstream so a burst to one database cannot starve the others
+	ReadOnly bool   // a read-only login: statements that could create temporary objects are refused
 }
 
 // DatabaseResolver selects the database service an authorized agent is asking

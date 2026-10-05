@@ -65,7 +65,7 @@ func (r catalogDatabaseResolver) ResolveDatabase(ctx context.Context, scope pgpr
 	}
 	p := entry.Postgres
 	svc := &pgproxy.DatabaseService{Name: entry.Name, Addr: net.JoinHostPort(entry.Host, strconv.Itoa(entry.Port)),
-		Database: p.Database, Mount: p.Mount, Role: p.Role, SSLMode: p.SSLMode, MaxConns: p.MaxConns}
+		Database: p.Database, Mount: p.Mount, Role: p.Role, SSLMode: p.SSLMode, MaxConns: p.MaxConns, ReadOnly: p.Access != "write"}
 	// Entries on one endpoint share its strictest explicit budget, as the
 	// store resolver does.
 	for _, other := range catalog.Entries() {

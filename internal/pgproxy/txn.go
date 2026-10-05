@@ -83,7 +83,13 @@ var clientWriteTimeout = 30 * time.Second
 var (
 	errRoleChange     = errors.New("role change on a pooled connection")
 	errStatementLimit = errors.New("prepared statement limit reached")
+	errReadOnlyTemp   = errors.New("temporary object on a read-only login")
 )
+
+// readOnlyTempMessage is the refusal a read-only login gets for a statement
+// that could create a temporary object, on either path.
+const readOnlyTempMessage = "Agent Vault: this database login is read-only; temporary tables, views and sequences are refused, " +
+	"as are DO blocks, set_config, pg_temp and encoding changes that could create them"
 
 type clientStatement struct {
 	query  string
@@ -204,6 +210,8 @@ func poolRefusal(err error) (code, message, outcome string) {
 		return "53300", "Agent Vault: no session-mode connection available for session state (SET, temp tables, LISTEN, advisory locks)", "pinned_share"
 	case errors.Is(err, errRoleChange):
 		return "42501", "Agent Vault: ALTER ROLE, ALTER USER and ALTER DATABASE are refused on a pooled connection", "role_change"
+	case errors.Is(err, errReadOnlyTemp):
+		return "25006", readOnlyTempMessage, "read_only_temp"
 	case errors.Is(err, errStatementLimit):
 		return "54000", "Agent Vault: this session holds too many prepared statements; deallocate some", "statement_limit"
 	default:
@@ -283,7 +291,8 @@ func (s *pooledSession) run(ctx context.Context) {
 		}
 		code, message, outcome := poolRefusal(refusal.err)
 		s.b.auditDenied(s.event, outcome)
-		if _, simple := msg.(*pgproto3.Query); simple {
+		switch msg.(type) {
+		case *pgproto3.Query, *pgproto3.FunctionCall: // each answered by its own ReadyForQuery
 			s.writeClient(brokerError("ERROR", code, outcome, message), &pgproto3.ReadyForQuery{TxStatus: s.status()})
 			continue
 		}
@@ -302,10 +311,18 @@ func (s *pooledSession) run(ctx context.Context) {
 }
 
 // refuse reports a statement the session must not send at all: a change to
-// the shared login, or a prepared statement beyond the session's cap.
+// the shared login, a temporary object on a read-only login, or a prepared
+// statement beyond the session's cap.
 func (s *pooledSession) refuse(msg pgproto3.FrontendMessage, sql string) error {
 	if sql != "" && changesRole(sql) {
 		return errRoleChange
+	}
+	if s.svc.ReadOnly {
+		// A fast-path FunctionCall names its function by OID, so it could
+		// call set_config unseen.
+		if _, call := msg.(*pgproto3.FunctionCall); call || sql != "" && createsTemporary(sql) {
+			return errReadOnlyTemp
+		}
 	}
 	if parse, ok := msg.(*pgproto3.Parse); ok && parse.Name != "" {
 		s.mu.Lock()
