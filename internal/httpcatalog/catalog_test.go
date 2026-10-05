@@ -44,10 +44,37 @@ func TestParseNormalizesAndRejects(t *testing.T) {
 		"trailing data":      `{"entries":[` + validEntry + `]} {}`,
 		"empty":              `{"entries":[]}`,
 		"key path traversal": strings.Replace(entryWith(""), `vendors/serpapi`, `vendors/../root`, 1),
+		"basic user header":  entryWith(`,"basicUser":true`),
+		"basic user scheme":  strings.Replace(entryWith(`,"basicUser":true,"scheme":"Basic"`), `"x-api-key"`, `"Authorization"`, 1),
 	} {
 		if _, err := Parse([]byte(doc)); err == nil {
 			t.Errorf("%s accepted", name)
 		}
+	}
+}
+
+// A Basic user entry sends the key as the user name with an empty password,
+// as axios auth.username and curl -u key: do; other entries keep their scheme.
+func TestCredentialEncodesBasicUser(t *testing.T) {
+	c, err := Parse([]byte(strings.Replace(entryWith(`,"basicUser":true`), `"x-api-key"`, `"authorization"`, 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := c.Entries()[0]
+	if got := e.Credential("__vault_SERPAPI_KEY__"); got != "Basic X192YXVsdF9TRVJQQVBJX0tFWV9fOg==" {
+		t.Fatalf("basic: %q", got)
+	}
+	bearer := Entry{Scheme: "Bearer"}
+	if bearer.Credential("k") != "Bearer k" || (&Entry{}).Credential("k") != "k" {
+		t.Fatal("scheme credential changed")
+	}
+	pg := `{"entries":[{"name":"db","kind":"postgres","host":"db.example.com","pools":["pool-a"],"basicUser":true,` +
+		`"postgres":{"database":"core","mount":"database","role":"readonly"}}]}`
+	if _, err := Parse([]byte(pg)); err == nil || !strings.Contains(err.Error(), "postgres entries take only") {
+		t.Fatalf("basicUser on a postgres entry: %v", err)
+	}
+	if _, err := Parse([]byte(strings.Replace(pg, `"basicUser":true,`, ``, 1))); err != nil {
+		t.Fatalf("control postgres entry: %v", err)
 	}
 }
 

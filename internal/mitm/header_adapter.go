@@ -203,10 +203,7 @@ func (p *Proxy) forwardCatalog(w http.ResponseWriter, r *http.Request, target, h
 		deny(http.StatusBadRequest, "placeholder_misplaced")
 		return
 	}
-	expectedCredential := entry.Placeholder
-	if entry.Scheme != "" {
-		expectedCredential = entry.Scheme + " " + entry.Placeholder
-	}
+	expectedCredential := entry.Credential(entry.Placeholder)
 	forwarded := http.Header{}
 	for name, values := range r.Header {
 		if name == entry.Header {
@@ -247,10 +244,7 @@ func (p *Proxy) forwardCatalog(w http.ResponseWriter, r *http.Request, target, h
 	}
 	out.Host = expected
 	out.Header = forwarded
-	credential := secret.Value()
-	if entry.Scheme != "" {
-		credential = entry.Scheme + " " + credential
-	}
+	credential := entry.Credential(secret.Value())
 	out.Header.Set(entry.Header, credential)
 	out.Header.Set("Accept-Encoding", "identity")
 
@@ -265,7 +259,12 @@ func (p *Proxy) forwardCatalog(w http.ResponseWriter, r *http.Request, target, h
 		done.Event, done.Outcome, done.Status = auditchain.EventHTTPResponse, outcome, status
 		_ = a.Audit.Record(done)
 	}
-	needles := secretRepresentations(map[string]string{"key": secret.Value(), "credential": credential})
+	values := map[string]string{"key": secret.Value(), "credential": credential}
+	if entry.BasicUser {
+		// The encoded user name alone, as a vendor might echo it.
+		values["basic"] = strings.TrimPrefix(credential, "Basic ")
+	}
+	needles := secretRepresentations(values)
 	p.relayScreened(w, out, needles, entry.MaxResponseBytes, finish, func(*http.Response) {
 		// The vendor may have rotated or revoked the key; read the newest next.
 		a.Keys.Invalidate(entry.Key)

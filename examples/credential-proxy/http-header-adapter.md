@@ -37,6 +37,7 @@ Set `AGENT_VAULT_HTTP_CATALOG_FILE` to a JSON file. One entry per binding:
 | `pathPrefixes` | Matched on whole path segments: `/v1/chat` allows `/v1/chat/completions`, not `/v1/chatx`. The longest matching prefix wins. A path with `;`, a segment starting with `..`, or `.` is refused before matching. |
 | `methods` | Any of GET, HEAD, POST, PUT, PATCH, DELETE. |
 | `header`, `scheme`, `placeholder` | Where the key goes. A worker may send exactly the placeholder there, or nothing. A worker's own value is refused. |
+| `basicUser` | The key is an HTTP Basic user name with an empty password, as axios `auth.username` and `curl -u key:` send it. The header is `Authorization` and `scheme` is unset. The worker sends its placeholder encoded the same way (set the client's key to the placeholder), or nothing. |
 | `key` | A KV version 2 secret on the `gatehouse` mount, at a path under `vendors/` (lower-case segments, at most 127 characters). Writing a new version rotates the key. |
 | `pools` | Broker agent IDs of the worker pools granted this entry. |
 | `forwardHeaders` | Extra caller headers the vendor needs. Only Accept, Accept-Language, Content-Type and User-Agent pass otherwise; routing headers such as `X-Forwarded-Host` or `X-HTTP-Method-Override` can never be listed. |

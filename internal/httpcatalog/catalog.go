@@ -5,6 +5,7 @@ package httpcatalog
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +29,10 @@ type Entry struct {
 	// Header carries the key. Scheme, when set, prefixes it ("Bearer").
 	Header string `json:"header"`
 	Scheme string `json:"scheme,omitempty"`
+	// BasicUser sends the key as an HTTP Basic user name with an empty
+	// password, the way clients such as axios and curl -u encode it. The
+	// header is Authorization and the scheme is Basic, so neither is set.
+	BasicUser bool `json:"basicUser,omitempty"`
 	// Placeholder is what a worker may send in Header instead of the key, so
 	// SDKs that insist on a key still work. The worker may also omit Header.
 	Placeholder string `json:"placeholder"`
@@ -373,6 +378,9 @@ func (e *Entry) normalize() error {
 	if e.Scheme != "" && !tokenPattern.MatchString(e.Scheme) {
 		return errors.New("scheme must be a single token such as Bearer")
 	}
+	if e.BasicUser && (e.Header != "Authorization" || e.Scheme != "") {
+		return errors.New("basicUser needs header Authorization and no scheme")
+	}
 	if !placeholder.MatchString(e.Placeholder) {
 		return errors.New("placeholder must look like __vault_NAME__")
 	}
@@ -407,7 +415,7 @@ func (e *Entry) normalize() error {
 }
 
 func (e *Entry) normalizePostgres() error {
-	if len(e.PathPrefixes) > 0 || len(e.Methods) > 0 || e.Header != "" || e.Scheme != "" || e.Placeholder != "" || e.Key != (KeyRef{}) ||
+	if len(e.PathPrefixes) > 0 || len(e.Methods) > 0 || e.Header != "" || e.Scheme != "" || e.BasicUser || e.Placeholder != "" || e.Key != (KeyRef{}) ||
 		len(e.ForwardHeaders) > 0 || e.Git != nil || e.BrowserSession != nil || e.GCP != nil || e.MaxRequestBytes != 0 || e.MaxResponseBytes != 0 {
 		return errors.New("postgres entries take only host, port, pools and postgres settings")
 	}
@@ -494,7 +502,7 @@ func (e *Entry) normalizeGit() error {
 	if e.Postgres != nil || e.BrowserSession != nil || e.GCP != nil {
 		return errors.New("postgres settings require kind postgres")
 	}
-	if len(e.PathPrefixes) > 0 || len(e.Methods) > 0 || e.Header != "" || e.Scheme != "" || e.Placeholder != "" || e.Key != (KeyRef{}) || len(e.ForwardHeaders) > 0 {
+	if len(e.PathPrefixes) > 0 || len(e.Methods) > 0 || e.Header != "" || e.Scheme != "" || e.BasicUser || e.Placeholder != "" || e.Key != (KeyRef{}) || len(e.ForwardHeaders) > 0 {
 		return errors.New("git entries derive paths, methods and credentials; leave them unset")
 	}
 	g := e.Git
@@ -878,4 +886,16 @@ func grantable(e Entry, p Pool, defined bool) error {
 		return nil
 	}
 	return fmt.Errorf("%s entries are never granted to a pool with no verified identity", e.Tier)
+}
+
+// Credential is the header value that carries v: v after Scheme, or for a
+// Basic user, "Basic " and the base64 of v and an empty password.
+func (e *Entry) Credential(v string) string {
+	switch {
+	case e.BasicUser:
+		return "Basic " + base64.StdEncoding.EncodeToString([]byte(v+":"))
+	case e.Scheme != "":
+		return e.Scheme + " " + v
+	}
+	return v
 }
