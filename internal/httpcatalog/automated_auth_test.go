@@ -695,3 +695,45 @@ func TestSignInSurvivesACancelledRequest(t *testing.T) {
 		t.Fatalf("cached: %v, %d sign-ins", err, fake.logins.Load())
 	}
 }
+
+// A catalog reload drops the token and sign-in state of entries it removed
+// or changed, and keeps the rest.
+func TestPruneDropsRemovedEntries(t *testing.T) {
+	fake, client := fakeAutomatedAuth(t)
+	tokens := &Auth0Tokens{Keys: &Keys{Vault: automatedVault{}}, Client: client, AutomatedAuth: client}
+	entry := automatedEntry(t)
+	if _, err := tokens.Token(context.Background(), entry); err != nil {
+		t.Fatal(err)
+	}
+	held := func() int {
+		tokens.mu.Lock()
+		defer tokens.mu.Unlock()
+		return len(tokens.states)
+	}
+	same, _ := Parse([]byte(`{"entries":[` + automatedEntryJSON(automatedSettings) + `]}`))
+	tokens.Prune(same)
+	if _, err := tokens.Token(context.Background(), entry); err != nil || held() != 1 || fake.logins.Load() != 1 {
+		t.Fatalf("unchanged entry dropped: %v, %d sign-ins", err, fake.logins.Load())
+	}
+	changed, _ := Parse([]byte(`{"entries":[` + strings.Replace(automatedEntryJSON(automatedSettings), "org_synthetic", "org_other", 1) + `]}`))
+	tokens.Prune(changed)
+	if held() != 0 {
+		t.Fatal("entry with changed sign-in settings kept")
+	}
+	if _, err := tokens.Token(context.Background(), entry); err != nil || fake.logins.Load() != 2 {
+		t.Fatalf("re-added entry: %v, %d sign-ins", err, fake.logins.Load())
+	}
+	other, _ := Parse([]byte(`{"entries":[{"name":"vendor","host":"vendor.example.com","pathPrefixes":["/v1"],"methods":["GET"],"header":"Authorization",
+		"placeholder":"__vault_V__","key":{"mount":"gatehouse","path":"v","field":"k"},"pools":["p"]}]}`))
+	tokens.Prune(other)
+	if held() != 0 {
+		t.Fatal("removed entry's token kept")
+	}
+	var strs []string
+	reachableStrings(reflect.ValueOf(tokens.states), map[uintptr]bool{}, &strs)
+	for _, s := range strs {
+		if strings.Contains(s, "synthetic-access-token") {
+			t.Fatal("removed entry's token still reachable")
+		}
+	}
+}
