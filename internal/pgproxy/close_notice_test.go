@@ -3,6 +3,8 @@ package pgproxy
 import (
 	"context"
 	"errors"
+	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -150,4 +152,56 @@ func TestPooledCloseNotices(t *testing.T) {
 		close(audit.failed)
 		wantNotice(t, s, "08004", "audit_unavailable")
 	})
+}
+
+// A pooled session ended by the broker cancels its running statement before
+// writing the notice, so a client slow to read it cannot keep the statement
+// running: while the cancel is held up, no notice reaches the client.
+func TestPooledCloseCancelsBeforeTheNotice(t *testing.T) {
+	up := noticeUpstreamWithTransactions(t)
+	var revoked atomic.Bool
+	cancelDialed, releaseCancel := make(chan struct{}), make(chan struct{})
+	var once atomic.Bool
+	var released sync.Once
+	release := func() { released.Do(func() { close(releaseCancel) }) }
+	scope := &AgentScope{VaultID: "v", ActorID: "a", WorkloadID: "pod-1", Pool: "cursor"}
+	_, addr := startBroker(t, Options{AuthorizationInterval: 10 * time.Millisecond, Leases: &fakeMinter{lease: newLease()}, Pool: &PoolOptions{QueueFactor: 20},
+		Databases: &fakeResolver{svc: &DatabaseService{Name: "db", Addr: up.addr(), Mount: "database", Role: "readonly", SSLMode: "disable", MaxConns: 4}},
+		Dialer: func(ctx context.Context, network, address string) (net.Conn, error) {
+			if revoked.Load() && once.CompareAndSwap(false, true) {
+				close(cancelDialed)
+				<-releaseCancel
+			}
+			var d net.Dialer
+			return d.DialContext(ctx, network, address)
+		},
+		Auth: authFunc(func(context.Context, string, string) (*AgentScope, error) {
+			if revoked.Load() {
+				return nil, errors.New("revoked")
+			}
+			return scope, nil
+		})})
+	// Registered after the broker's own cleanup, so it runs first: a failure
+	// must not leave the broker's cancel waiting through Shutdown.
+	t.Cleanup(release)
+	s := openAgentSession(t, addr, "token", "db")
+	defer s.close()
+	// An open transaction keeps the server connection, so there is a
+	// statement to cancel.
+	if _, err := s.query("BEGIN"); err != nil {
+		t.Fatal(err)
+	}
+	revoked.Store(true)
+	select {
+	case <-cancelDialed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("no cancel was sent")
+	}
+	_ = s.conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if msg, err := s.fe.Receive(); err == nil {
+		t.Fatalf("notice %T reached the client before the cancel finished", msg)
+	}
+	release()
+	s.fe = pgproto3.NewFrontend(s.conn, s.conn) // the timed-out read left the decoder mid-wait
+	wantNotice(t, s, "08006", "authorization_ended")
 }

@@ -1045,6 +1045,17 @@ func (s *pooledSession) killWith(n *closeNotice) {
 		s.unbindCancel()
 	}
 	s.mu.Unlock()
+	// Stop the running statement first, so a client that is slow to read the
+	// notice cannot keep it running.
+	if conn != nil {
+		if conn.sess.backendKey != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
+			s.b.cancelUpstream(ctx, conn.sess.conn.RemoteAddr().String(), &s.svc,
+				&pgproto3.CancelRequest{ProcessID: conn.sess.backendKey.ProcessID, SecretKey: conn.sess.backendKey.SecretKey})
+			cancel()
+		}
+		s.b.pools.release(conn, false)
+	}
 	if n != nil && s.writeMu.TryLock() {
 		_ = s.client.SetWriteDeadline(time.Now().Add(noticeWriteTimeout))
 		s.backend.Send(brokerError("FATAL", n.code, n.reason, n.message))
@@ -1052,16 +1063,6 @@ func (s *pooledSession) killWith(n *closeNotice) {
 		s.writeMu.Unlock()
 	}
 	_ = s.client.Close()
-	if conn == nil {
-		return
-	}
-	if conn.sess.backendKey != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
-		s.b.cancelUpstream(ctx, conn.sess.conn.RemoteAddr().String(), &s.svc,
-			&pgproto3.CancelRequest{ProcessID: conn.sess.backendKey.ProcessID, SecretKey: conn.sess.backendKey.SecretKey})
-		cancel()
-	}
-	s.b.pools.release(conn, false)
 }
 
 // registerPooledCancel gives the client a cancel key that reaches whichever
