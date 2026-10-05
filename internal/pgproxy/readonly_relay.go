@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"sync/atomic"
 )
 
 // maxReadOnlyStatementBytes bounds a Query or Parse message the read-only
@@ -20,7 +21,7 @@ const maxReadOnlyStatementBytes = 64 << 20
 // refused reports a refused statement. The session then ends: the database
 // stream is stopped first, and clean reports whether it stopped between
 // messages, so the caller can still send the client a refusal it can read.
-func relayReadOnly(client, upstream net.Conn) (refused, clean bool) {
+func relayReadOnly(client, upstream net.Conn, notice *atomic.Pointer[closeNotice]) (refused, clean bool) {
 	toClient := &frameTracker{w: client}
 	fromClient := make(chan bool, 1)
 	fromServer := make(chan struct{})
@@ -38,8 +39,9 @@ func relayReadOnly(client, upstream net.Conn) (refused, clean bool) {
 		}
 		return refused, refused && toClient.atBoundary()
 	case <-fromServer:
-		_ = client.Close()
 		_ = upstream.Close()
+		sendNotice(client, toClient, notice)
+		_ = client.Close()
 		<-fromClient
 		return false, false
 	}
@@ -130,6 +132,9 @@ type frameTracker struct {
 	have      int   // header bytes seen of the current message
 	remaining int64 // body bytes still to come
 	broken    bool
+	last      byte // type of the last message begun
+	status    byte // transaction status of the last ReadyForQuery
+	first     bool // the next body byte is the first of the current message
 }
 
 func (t *frameTracker) Write(p []byte) (int, error) {
@@ -141,6 +146,10 @@ func (t *frameTracker) Write(p []byte) (int, error) {
 func (t *frameTracker) advance(p []byte) {
 	for len(p) > 0 && !t.broken {
 		if t.remaining > 0 {
+			if t.first && t.last == 'Z' {
+				t.status = p[0]
+			}
+			t.first = false
 			k := int64(len(p))
 			if k > t.remaining {
 				k = t.remaining
@@ -160,8 +169,13 @@ func (t *frameTracker) advance(p []byte) {
 				return
 			}
 			t.remaining = length - 4
+			t.last, t.first = t.header[0], true
 		}
 	}
 }
 
 func (t *frameTracker) atBoundary() bool { return !t.broken && t.have == 0 && t.remaining == 0 }
+
+// idle reports that the last complete message was a ReadyForQuery outside a
+// transaction, so nothing the client sent is open on the database.
+func (t *frameTracker) idle() bool { return t.atBoundary() && t.last == 'Z' && t.status == 'I' }

@@ -3,6 +3,7 @@ package pgproxy
 import (
 	"context"
 	"fmt"
+	"github.com/jackc/pgx/v5/pgproto3"
 	"log/slog"
 	"net"
 	"strings"
@@ -116,10 +117,8 @@ func TestRecheckEndsTheSessionWhenTheDecisionChanges(t *testing.T) {
 	defer conn.Close()
 	r.want.Store("revoked")
 	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	if _, err := conn.Read(make([]byte, 1)); err == nil {
-		t.Fatal("session survived a refused recheck")
-	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
-		t.Fatal("session was not ended at the recheck")
+	if code, reason := readCloseNotice(t, pgproto3.NewFrontend(conn, conn)); code != "08006" || reason != "authorization_ended" {
+		t.Fatalf("refused recheck ended the session with %q %q, want the named authorization notice", code, reason)
 	}
 }
 

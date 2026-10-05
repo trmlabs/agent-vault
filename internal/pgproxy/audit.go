@@ -56,7 +56,7 @@ func (b *Broker) watchAudit() {
 		b.logger.Error("pgproxy: audit trail failed; ending open sessions")
 		b.mu.Lock()
 		for conn := range b.conns {
-			_ = conn.Close()
+			b.endConnLocked(conn, noticeAudit)
 		}
 		b.mu.Unlock()
 	}()

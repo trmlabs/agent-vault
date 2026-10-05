@@ -87,6 +87,7 @@ type Broker struct {
 	wg                   sync.WaitGroup
 	pools                *serverPools // nil unless Options.Pool is set
 	pooled               map[net.Conn]*pooledSession
+	closers              map[net.Conn]func(closeNotice) // unpooled sessions that can end with a notice
 	denied               deniedLimiter
 }
 
@@ -153,6 +154,7 @@ func New(addr string, opts Options) *Broker {
 		leaseCounts:    make(map[string]int),
 		leaseChanged:   make(chan struct{}),
 		pooled:         make(map[net.Conn]*pooledSession),
+		closers:        make(map[net.Conn]func(closeNotice)),
 	}
 	if opts.Pool != nil {
 		pool := *opts.Pool
@@ -293,7 +295,7 @@ func (b *Broker) Shutdown(ctx context.Context) error {
 				draining = append(draining, s)
 				continue
 			}
-			_ = conn.Close()
+			b.endConnLocked(conn, noticeRestarting)
 		}
 		if drain {
 			go func() {
@@ -308,7 +310,7 @@ func (b *Broker) Shutdown(ctx context.Context) error {
 					b.logger.Warn("pgproxy: drain deadline reached; closing busy sessions")
 					b.mu.Lock()
 					for conn := range b.conns {
-						_ = conn.Close()
+						b.endConnLocked(conn, noticeRestarting)
 					}
 					b.mu.Unlock()
 				case <-b.shutdownDone:
@@ -344,7 +346,7 @@ func (b *Broker) Shutdown(ctx context.Context) error {
 func (b *Broker) forceClose() {
 	b.mu.Lock()
 	for conn := range b.conns {
-		_ = conn.Close()
+		b.endConnLocked(conn, noticeRestarting)
 	}
 	b.mu.Unlock()
 }
@@ -797,37 +799,55 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 
 	relayCtx, relayCancel := context.WithCancel(connCtx)
 	defer relayCancel()
-	terminate := sync.OnceFunc(func() {
-		_ = conn.Close()
-		// Closing a PostgreSQL socket does not necessarily interrupt a running
-		// query. Send the session's private cancellation capability first.
-		if upstream.backendKey != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
-			b.cancelQuery(ctx, &pgproto3.CancelRequest{ProcessID: upstream.backendKey.ProcessID, SecretKey: upstream.backendKey.SecretKey})
-			cancel()
-		}
-		_ = upstream.conn.Close()
-	})
+	// endWith ends the session for the broker's own reason. With a notice, the
+	// database side closes first so the relay stops at a message boundary and
+	// writes the notice before closing the client; the client is closed
+	// regardless once the notice has had its chance.
+	var notice atomic.Pointer[closeNotice]
+	var endOnce sync.Once
+	endWith := func(n *closeNotice) {
+		endOnce.Do(func() {
+			if n != nil {
+				notice.Store(n)
+				time.AfterFunc(2*noticeWriteTimeout, func() { _ = conn.Close() })
+			} else {
+				_ = conn.Close()
+			}
+			// Closing a PostgreSQL socket does not necessarily interrupt a running
+			// query. Send the session's private cancellation capability first.
+			if upstream.backendKey != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
+				b.cancelQuery(ctx, &pgproto3.CancelRequest{ProcessID: upstream.backendKey.ProcessID, SecretKey: upstream.backendKey.SecretKey})
+				cancel()
+			}
+			_ = upstream.conn.Close()
+		})
+	}
+	terminate := func() { endWith(nil) }
+	defer b.registerCloser(conn, func(n closeNotice) { endWith(&n) })()
 	authorizationDone := make(chan struct{})
 	go func() {
 		defer close(authorizationDone)
-		b.authorizationLoop(relayCtx, token, startup.Parameters["agent_vault_vault"], requestedDB, *scope, *svc, terminate, peer)
+		b.authorizationLoop(relayCtx, token, startup.Parameters["agent_vault_vault"], requestedDB, *scope, *svc, func() { endWith(&noticeAuthorization) }, peer)
 	}()
 	defer func() { relayCancel(); <-authorizationDone }()
 	if !scope.NotAfter.IsZero() {
 		// A pool Pod's session ends at its deadline, independent of any recheck.
-		deadline := time.AfterFunc(time.Until(scope.NotAfter), terminate)
+		deadline := time.AfterFunc(time.Until(scope.NotAfter), func() { endWith(&noticeDeadline) })
 		defer deadline.Stop()
 	}
 	renewDone := make(chan struct{})
-	go func() { defer close(renewDone); b.renewLoop(relayCtx, lease, svc, terminate) }()
+	go func() {
+		defer close(renewDone)
+		b.renewLoop(relayCtx, lease, svc, func() { endWith(&noticeCredential) })
+	}()
 	defer func() { relayCancel(); <-renewDone }()
 
 	if !svc.ReadOnly {
-		relay(conn, upstream.conn)
+		relay(conn, upstream.conn, &notice)
 		return
 	}
-	if refused, clean := relayReadOnly(conn, upstream.conn); refused {
+	if refused, clean := relayReadOnly(conn, upstream.conn, &notice); refused {
 		b.logger.Warn("pgproxy: statement refused on a read-only login; ending session",
 			slog.String("service", svc.Name), slog.String("actor", scope.ActorID))
 		b.auditDenied(event, "read_only")
@@ -917,18 +937,39 @@ func (b *Broker) renewLoop(ctx context.Context, lease *Lease, svc *DatabaseServi
 // relay splices two connections until either side closes, then tears both down
 // so the surviving copy unblocks. Bytes flow verbatim, so the full protocol
 // (simple and extended query, COPY, etc.) passes through untouched.
-func relay(client, upstream net.Conn) {
-	done := make(chan struct{}, 2)
+func relay(client, upstream net.Conn, notice *atomic.Pointer[closeNotice]) {
+	toClient := &frameTracker{w: client}
+	fromClient, fromServer := make(chan struct{}), make(chan struct{})
 	go func() {
+		defer close(fromClient)
 		_, _ = io.Copy(upstream, client)
-		done <- struct{}{}
 	}()
 	go func() {
-		_, _ = io.Copy(client, upstream)
-		done <- struct{}{}
+		defer close(fromServer)
+		_, _ = io.Copy(toClient, upstream)
 	}()
-	<-done
-	_ = client.Close()
+	select {
+	case <-fromClient:
+	case <-fromServer:
+	}
 	_ = upstream.Close()
-	<-done
+	<-fromServer
+	sendNotice(client, toClient, notice)
+	_ = client.Close()
+	<-fromClient
+}
+
+// sendNotice writes the session's close notice, if the broker ended it, once
+// the database stream has stopped between two messages. A restart that finds
+// a transaction open says so instead of claiming a clean restart.
+func sendNotice(client net.Conn, toClient *frameTracker, notice *atomic.Pointer[closeNotice]) {
+	n := notice.Load()
+	if n == nil || !toClient.atBoundary() {
+		return
+	}
+	if *n == noticeRestarting && !toClient.idle() {
+		writeNotice(client, noticeRestartCut)
+		return
+	}
+	writeNotice(client, *n)
 }
