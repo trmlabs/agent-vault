@@ -53,7 +53,7 @@ type Entry struct {
 	GCP *GCPBinding `json:"gcp,omitempty"`
 	// Tier is T0 (data every worker allowed on the pool may read; the default),
 	// T1 (a verified person in every Requires group) or T2 (T1 with
-	// time-boxed groups granted through Lumos). Requires lists Entra group
+	// time-boxed groups granted through P0). Requires lists Entra group
 	// object IDs and is mandatory for T1 and T2.
 	Tier     string   `json:"tier,omitempty"`
 	Requires []string `json:"requires,omitempty"`

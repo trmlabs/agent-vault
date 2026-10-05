@@ -102,20 +102,21 @@ catalog, and checks again on every request.
 |---|---|
 | T0 (default) | Any worker in a granted pool, including Cursor's, which has no person behind its agents |
 | T1 | A verified person in every group the entry `requires`, from a Claude pool; or an automation pool whose fixed groups include them all. Never Cursor. |
-| T2 | As T1, from a Claude pool only, with the groups granted for a limited time in Lumos |
+| T2 | As T1, from a Claude pool only, with the groups granted for a limited time through P0 |
 
 `gcp` entries are always T1 or T2. When the Entra lookup is on, a person's
 groups are cached for at most 5 minutes, so adding or removing someone takes
 effect within 5 minutes.
 
-## Time-limited access goes through Lumos
+## Time-limited access goes through P0
 
-This works once the Entra group lookup is on.
+P0 is TRM's time-limited access request tool. This works once the Entra group
+lookup is on and P0 can grant the entry's groups.
 
 1. Find the entry's `requires` groups in the catalog.
-2. Request the group in Lumos, with the reason and how long you need it.
+2. Request the group in P0, with the reason and how long you need it.
 3. After approval, Gatehouse sees the group within 5 minutes. No restart is needed.
-4. When the grant expires, Lumos removes the group, and Gatehouse refuses within 5 minutes.
+4. When the grant expires, P0 removes the group, and Gatehouse refuses within 5 minutes.
 
 ## Agents connect to the sidecar on loopback
 
