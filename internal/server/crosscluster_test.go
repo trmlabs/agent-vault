@@ -48,6 +48,8 @@ func TestCrossClusterRoutesByFirstBytes(t *testing.T) {
 		"plain HTTP request":              {proxyLine + "GET / HTTP/1.1\r\n\r\n", false, false},
 		"session preamble only":           {proxyLine + "GHSESS1 a.b.c\n", false, false},
 		"no PROXY header":                 {"CONNECT h:443 HTTP/1.1\r\n\r\n", false, false},
+		"no PROXY header, PostgreSQL":     {"GHATTS1 abc\n", false, false},
+		"a second PROXY line":             {proxyLine + proxyLine + "CONNECT h:443 HTTP/1.1\r\n\r\n", false, false},
 	} {
 		routed, postgres, err := routeCrossCluster(loopbackPair(t, c.send))
 		if (err == nil) != c.ok || (c.ok && postgres != c.postgres) {
@@ -105,10 +107,31 @@ func TestMergedListenerServesBothAndCloses(t *testing.T) {
 
 func TestCrossClusterListenerMustBeLoopback(t *testing.T) {
 	s := &Server{}
-	if s.EnableCrossCluster("0.0.0.0:14325") == nil || s.EnableCrossCluster("10.0.0.1:14325") == nil {
-		t.Fatal("a non-loopback cross-cluster listener was accepted")
+	for _, addr := range []string{"0.0.0.0:14325", "10.0.0.1:14325", "[::]:14325", ":14325", "localhost:14325", "127.0.0.2:14325", "[::1]:14325"} {
+		if s.EnableCrossCluster(addr) == nil {
+			t.Errorf("cross-cluster listener on %s accepted", addr)
+		}
 	}
 	if err := s.EnableCrossCluster("127.0.0.1:14325"); err != nil || s.crossClusterAddr != "127.0.0.1:14325" {
 		t.Fatalf("loopback refused: %v", err)
+	}
+}
+
+// remoteConn reports another remote address, as if the TCP peer were not the
+// TLS front in the same Pod.
+type remoteConn struct {
+	net.Conn
+	remote net.Addr
+}
+
+func (c remoteConn) RemoteAddr() net.Addr { return c.remote }
+
+// The PROXY header is trusted only from a loopback TCP peer: a valid-looking
+// header from anywhere else is refused.
+func TestCrossClusterTrustsPROXYOnlyFromLoopback(t *testing.T) {
+	c := loopbackPair(t, proxyLine+"CONNECT h:443 HTTP/1.1\r\n\r\n")
+	peer := remoteConn{Conn: c, remote: &net.TCPAddr{IP: net.ParseIP("10.200.0.7"), Port: 51000}}
+	if _, _, err := routeCrossCluster(peer); err == nil {
+		t.Fatal("a PROXY header from a non-loopback peer was trusted")
 	}
 }

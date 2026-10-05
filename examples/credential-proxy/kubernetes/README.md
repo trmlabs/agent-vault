@@ -95,7 +95,7 @@ The attested namespace picks the profile and pool: the proxy names the profile i
 
 ## Listeners admit identity kinds
 
-Every scope records how the workload proved itself: `pod-token`, `token-review` or `proxy-attested`. The HTTP proxy and PostgreSQL listeners (behind TLS 14443 and 15443) admit pool and legacy identities and refuse `proxy-attested`. Agents in another cluster arrive on the cross-cluster listener instead: set `AGENT_VAULT_CROSS_CLUSTER_PORT` (14325 on loopback, behind TLS front 16443), which needs the credential proxy, `AGENT_VAULT_MITM_PROXY_PROTOCOL` and, with PostgreSQL, `AGENT_VAULT_DB_PROXY_PROTOCOL`. It carries both protocols on one port: after the front's PROXY header, a stream opening with `GHATTS1 ` goes to the PostgreSQL broker and one opening with `CONNECT ` to the HTTP proxy, each admitting only `proxy-attested`. Anything else is closed within 5 seconds.
+Every scope records how the workload proved itself: `pod-token`, `token-review` or `proxy-attested`. The HTTP proxy and PostgreSQL listeners (behind TLS 14443 and 15443) admit pool and legacy identities and refuse `proxy-attested`. Agents in another cluster arrive on the cross-cluster listener instead: set `AGENT_VAULT_CROSS_CLUSTER_PORT` (14325, always on 127.0.0.1, behind TLS front 16443 in the same Pod, which must send a PROXY header), which needs the credential proxy, `AGENT_VAULT_MITM_PROXY_PROTOCOL` and, with PostgreSQL, `AGENT_VAULT_DB_PROXY_PROTOCOL`. It carries both protocols on one port: after the front's PROXY header, a stream opening with `GHATTS1 ` goes to the PostgreSQL broker and one opening with `CONNECT ` to the HTTP proxy, each admitting only `proxy-attested`. Anything else is closed within 5 seconds.
 
 ## Verification and remaining limits
 

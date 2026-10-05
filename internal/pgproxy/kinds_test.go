@@ -54,12 +54,14 @@ func TestListenerAdmitsOnlyItsIdentityKinds(t *testing.T) {
 		kinds []string
 		ok    bool
 	}{
-		"pool Pod on a pool listener":                {brokercore.KindPodToken, nil, true},
-		"legacy session on a pool listener":          {"", nil, true},
-		"proxy on a pool listener":                   {brokercore.KindProxyAttested, nil, false},
-		"proxy on the cross-cluster listener":        {brokercore.KindProxyAttested, cross, true},
-		"pool Pod on the cross-cluster listener":     {brokercore.KindPodToken, cross, false},
-		"token review on the cross-cluster listener": {brokercore.KindTokenReview, cross, false},
+		"pool Pod on a pool listener":            {brokercore.KindPodToken, nil, true},
+		"legacy session on a pool listener":      {"", nil, true},
+		"proxy on a pool listener":               {brokercore.KindProxyAttested, nil, false},
+		"proxy on the cross-cluster listener":    {brokercore.KindProxyAttested, cross, true},
+		"pool Pod on the cross-cluster listener": {brokercore.KindPodToken, cross, false},
+		// A Claude session\'s Pod proves itself with its own token too.
+		"session-jwt caller on the cross-cluster listener": {brokercore.KindPodToken, cross, false},
+		"token review on the cross-cluster listener":       {brokercore.KindTokenReview, cross, false},
 	} {
 		addr := kindBroker(t, c.kind, c.kinds)
 		_, err := runAgentQuery(t, addr, "agent-vault-token-xyz", "appdb", "SELECT current_user")

@@ -19,12 +19,13 @@ import (
 // closed. Routed connections join the existing HTTP proxy and PostgreSQL
 // broker listeners, tagged so those admit them only as proxy-attested.
 
-// EnableCrossCluster opens the cross-cluster listener on a loopback address,
-// behind a TLS front that sends a PROXY header. It needs the credential proxy.
+// EnableCrossCluster opens the cross-cluster listener on 127.0.0.1, behind a
+// TLS front in the same Pod that sends a PROXY header. It needs the
+// credential proxy.
 func (s *Server) EnableCrossCluster(addr string) error {
 	host, _, err := net.SplitHostPort(addr)
-	if ip := net.ParseIP(host); err != nil || ip == nil || !ip.IsLoopback() {
-		return errors.New("the cross-cluster listener must be on a loopback address behind its TLS front")
+	if err != nil || host != "127.0.0.1" {
+		return errors.New("the cross-cluster listener binds 127.0.0.1 only, behind its TLS front")
 	}
 	s.crossClusterAddr = addr
 	return nil

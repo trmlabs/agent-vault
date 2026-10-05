@@ -28,14 +28,18 @@ func TestListenerAdmitsOnlyItsIdentityKinds(t *testing.T) {
 		"proxy on a pool listener":               {brokercore.KindProxyAttested, nil, false},
 		"proxy on the cross-cluster listener":    {brokercore.KindProxyAttested, cross, true},
 		"pool Pod on the cross-cluster listener": {brokercore.KindPodToken, cross, false},
-		"legacy session on the cross-cluster":    {"", cross, false},
+		// A Claude session's Pod proves itself with its own token too; the
+		// runner session only names the person.
+		"session-jwt caller on the cross-cluster listener": {brokercore.KindPodToken, cross, false},
+		"token review on the cross-cluster listener":       {brokercore.KindTokenReview, cross, false},
+		"legacy session on the cross-cluster":              {"", cross, false},
 	} {
 		a, b := net.Pipe()
 		conn := net.Conn(a)
 		if c.kinds != nil {
 			conn = &brokercore.KindedConn{Conn: a, Kinds: c.kinds}
 		}
-		ctx := withPeerConn(context.Background(), &peerConn{Conn: conn})
+		ctx := withSessionToken(withPeerConn(context.Background(), &peerConn{Conn: conn}), "runner.session.token")
 		p := &Proxy{attestor: kindAttestor{c.kind}}
 		_, err := p.resolveScope(ctx, "token", "", peer, nil, false)
 		if (err == nil) != c.ok {

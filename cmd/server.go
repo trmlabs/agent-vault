@@ -333,7 +333,7 @@ func attachServerExtensions(srv *server.Server, host string, mitmPort, postgresP
 			(postgresPort > 0 && !boolEnvValue("AGENT_VAULT_DB_PROXY_PROTOCOL")) {
 			return fmt.Errorf("AGENT_VAULT_CROSS_CLUSTER_PORT needs a port, the credential proxy and PROXY headers on both protocol listeners")
 		}
-		if err := srv.EnableCrossCluster(net.JoinHostPort(host, port)); err != nil {
+		if err := srv.EnableCrossCluster(net.JoinHostPort("127.0.0.1", port)); err != nil {
 			return err
 		}
 	}

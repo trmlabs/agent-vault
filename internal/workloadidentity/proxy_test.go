@@ -344,3 +344,42 @@ func TestNamespaceInTwoProxyBindingsIsRefused(t *testing.T) {
 		t.Fatalf("a second proxy for another namespace refused: %v", err)
 	}
 }
+
+// Item 8, exactly: a recheck holds until the proxy token's expiry plus the
+// domain's lifetime (at most 1200 s from issue at 600 s), a new session needs
+// an unexpired token, and no session outlives 1800 s from issue.
+func TestProxyRecheckLimits(t *testing.T) {
+	p := setupProxy(t)
+	p.r.domains[1].maxLifetime = 600
+	now := time.Now()
+	p.r.now = func() time.Time { return now }
+	at := func(issuedAgo int64) claims {
+		c := p.rc.claims()
+		c.Issued = now.Unix() - issuedAgo
+		c.Expires = c.Issued + 600
+		return c
+	}
+	// (a) expired 599 s ago: one second inside exp + 600.
+	if _, err := p.r.Reattest(p.ctx(t, p.a), p.rc.token(at(1199)), linkIP); err != nil {
+		t.Fatalf("(a) recheck at the limit minus 1 s refused: %v", err)
+	}
+	// (b) expired 601 s ago: one second past exp + 600.
+	if _, err := p.r.Reattest(p.ctx(t, p.a), p.rc.token(at(1201)), linkIP); err == nil {
+		t.Fatal("(b) recheck at the limit plus 1 s admitted")
+	}
+	// (c) a new session never takes an expired token.
+	if _, err := p.r.Attest(p.ctx(t, p.a), p.rc.token(at(601)), linkIP); err == nil {
+		t.Fatal("(c) new session on an expired token admitted")
+	}
+	// (d) the 1800 s cap ends a session, whatever the recheck bound allows.
+	p.r.domains[1].maxLifetime = 3600
+	a := p.a
+	a.NotAfter = now.Add(time.Hour).Unix()
+	scope, err := p.r.Reattest(p.ctx(t, a), p.rc.token(at(1799)), linkIP)
+	if err != nil || !scope.NotAfter.Equal(time.Unix(now.Unix()-1799+1800, 0)) {
+		t.Fatalf("(d) session 1 s before its cap: %v %+v", err, scope)
+	}
+	if _, err := p.r.Reattest(p.ctx(t, a), p.rc.token(at(1800)), linkIP); err == nil {
+		t.Fatal("(d) session at 1800 s not ended")
+	}
+}
