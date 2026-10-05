@@ -281,6 +281,9 @@ func (fu *fakeUpstream) handle(conn net.Conn) {
 			fu.queries = append(fu.queries, q.String)
 			transactions := fu.transactions
 			fu.mu.Unlock()
+			if q.String == "DROP BACKEND" {
+				return // the connection fails under the client
+			}
 			if transactions {
 				switch q.String {
 				case "BEGIN":

@@ -197,11 +197,8 @@ func TestPoolSessionEndsAtThePodDeadline(t *testing.T) {
 	}
 	defer conn.Close()
 	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	buf := make([]byte, 1)
-	if _, err := conn.Read(buf); err == nil {
-		t.Fatal("expected the broker to close the session at the deadline")
-	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
-		t.Fatal("session outlived the Pod deadline")
+	if code, reason := readCloseNotice(t, pgproto3.NewFrontend(conn, conn)); code != "08006" || reason != "deadline" {
+		t.Fatalf("session ended at the Pod deadline with %q %q, want the named deadline notice", code, reason)
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -88,6 +89,15 @@ type Resolver struct {
 	domains []*domain
 	// profiles, when set, holds each pool's declared harness profile.
 	profiles atomic.Pointer[profileSource]
+	logger   *slog.Logger
+}
+
+// SetLogger sets where refusal reasons are logged; the default is slog's.
+// Workers still see only a generic refusal.
+func (r *Resolver) SetLogger(l *slog.Logger) {
+	if l != nil {
+		r.logger = l
+	}
 }
 
 var _ brokercore.SessionResolver = (*Resolver)(nil)
@@ -229,7 +239,7 @@ func newResolver(c Config, s Store, observer bool) (*Resolver, error) {
 	c.APIServer = strings.TrimSuffix(c.APIServer, "/")
 	c.Bindings = append([]Binding(nil), c.Bindings...)
 	transport := &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool}}
-	r := &Resolver{config: c, store: s, now: time.Now, client: &http.Client{
+	r := &Resolver{config: c, store: s, now: time.Now, logger: slog.Default(), client: &http.Client{
 		Timeout: time.Duration(c.TimeoutSeconds) * time.Second, Transport: transport,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}}

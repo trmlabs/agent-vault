@@ -2,7 +2,11 @@ package cmd
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log/slog"
@@ -248,7 +252,7 @@ func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKe
 	if db.DialectName() == "postgres" {
 		caOpts.Store = &caStoreAdapter{db: db}
 	}
-	caProv, err := ca.New(masterKey, caOpts)
+	caProv, err := newInterceptionCA(masterKey, caOpts, srv.Logger(), srv.CredentialProxyEnabled())
 	if err != nil {
 		if srv.CredentialProxyEnabled() {
 			return fmt.Errorf("credential proxy CA initialization failed")
@@ -283,6 +287,34 @@ func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKe
 		},
 	))
 	return nil
+}
+
+// newInterceptionCA loads or creates the interception CA. In credential-proxy
+// mode it logs the public root once, so the certificate workers must trust can
+// be recorded from the broker's own logs. The root is stored with the broker,
+// so the line repeats the same certificate on every restart.
+func newInterceptionCA(masterKey []byte, opts ca.Options, logger *slog.Logger, credentialProxy bool) (*ca.SoftCA, error) {
+	caProv, err := ca.New(masterKey, opts)
+	if err != nil {
+		return nil, err
+	}
+	if credentialProxy {
+		logInterceptionCA(logger, caProv.RootPEM())
+	}
+	return caProv, nil
+}
+
+// logInterceptionCA logs the root certificate's SHA-256 (over its DER) and the
+// exact PEM the broker serves. It logs only a single CERTIFICATE block, never
+// anything else, so no key can reach the log.
+func logInterceptionCA(logger *slog.Logger, rootPEM []byte) {
+	block, rest := pem.Decode(rootPEM)
+	if block == nil || block.Type != "CERTIFICATE" || len(bytes.TrimSpace(rest)) != 0 {
+		logger.Warn("interception CA root is not a single certificate; not logged", "event", "mitm-ca")
+		return
+	}
+	sum := sha256.Sum256(block.Bytes)
+	logger.Info("interception CA", "event", "mitm-ca", "sha256", hex.EncodeToString(sum[:]), "pem", string(rootPEM))
 }
 
 // attachServerExtensions wires optional subsystems (MITM, Infisical) onto srv.
@@ -349,6 +381,7 @@ func attachServerExtensions(srv *server.Server, host string, mitmPort, postgresP
 		if err != nil {
 			return err
 		}
+		resolver.SetLogger(logger)
 		sessions = resolver
 		proxyIdentity = config
 		proxyResolver = resolver

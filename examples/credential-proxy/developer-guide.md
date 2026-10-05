@@ -39,7 +39,7 @@ agent-vault broker-catalog validate --require-pools gatehouse-catalog.yaml
 | A GitHub repository (clone, push) | `git` | The GitHub App, installed on the repository |
 | Opening and commenting on GitHub pull requests | `github-api` | The same App |
 | A Cloud Storage prefix or a BigQuery dataset | `gcp` | A second pull request in trm-global-infrastructure for the Google Cloud access grants. See `examples/credential-proxy/gcp-tokens.md`. |
-| A staging web app as a test user | `browser-session` | A test user and an Auth0 login client. See `examples/credential-proxy/browser-session.md`. |
+| A staging web app as a test user | `browser-session` | A test user, and an Auth0 login client or an automated-auth profile. See `examples/credential-proxy/browser-session.md`. |
 
 The module grants Vault access for `postgres`, HTTP, `git` and `github-api`
 entries only. A `browser-session` entry also needs Vault read access to its

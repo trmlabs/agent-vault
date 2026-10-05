@@ -3,7 +3,10 @@ package httpcatalog
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -19,6 +22,21 @@ type BrowserSessionBinding struct {
 	Auth0   Auth0Binding `json:"auth0"`
 	// User is a KV version 2 secret with fields email and password.
 	User KVRef `json:"user"`
+	// AutomatedAuth names TRM's automated-auth service when Auth0.Login is
+	// "automated-auth".
+	AutomatedAuth *AutomatedAuthBinding `json:"automatedAuth,omitempty"`
+}
+
+// AutomatedAuthBinding names TRM's automated-auth service, the login profile
+// it holds for the app, and the Auth0 organization the user signs in to.
+type AutomatedAuthBinding struct {
+	// URL is the service's https base URL: an exact DNS name, no path.
+	URL     string `json:"url"`
+	Profile string `json:"profile"`
+	OrgID   string `json:"orgID"`
+	// Key is a KV version 2 secret with field private_key, the service's
+	// caller key.
+	Key KVRef `json:"key"`
 }
 
 // Auth0Binding describes the app's Auth0 client and how the broker logs in.
@@ -30,10 +48,16 @@ type Auth0Binding struct {
 	// Default "openid profile email offline_access" (auth0-spa-js with refresh
 	// tokens). The broker's own login drops offline_access.
 	Scope string `json:"scope,omitempty"`
-	Realm string `json:"realm"` // database connection holding the test user
+	// Login is how the broker signs the user in: "password-realm" (the
+	// default), Auth0's password-realm grant through TokenClient, or
+	// "automated-auth", Universal Login through TRM's automated-auth service.
+	// Only the second can sign in to an Auth0 organization: Auth0 refuses the
+	// password-realm grant for organization-enabled applications.
+	Login string `json:"login,omitempty"`
+	Realm string `json:"realm,omitempty"` // database connection holding the test user
 	// TokenClient is a KV version 2 secret with fields client_id and
 	// client_secret: a confidential client allowed the password-realm grant.
-	TokenClient KVRef `json:"tokenClient"`
+	TokenClient KVRef `json:"tokenClient,omitempty"`
 }
 
 // KVRef is a KV version 2 secret whose fields the binding names.
@@ -81,8 +105,8 @@ func (e *Entry) normalizeBrowser() error {
 	a := &b.Auth0
 	a.Domain = strings.ToLower(a.Domain)
 	if !hostPattern.MatchString(a.Domain) || !idPattern.MatchString(a.ClientID) || a.Audience == "" || len(a.Audience) > 256 ||
-		strings.ContainsAny(a.Audience, " \t\r\n") || !idPattern.MatchString(a.Realm) {
-		return errors.New("browserSession.auth0 needs a domain, client ID, audience and realm")
+		strings.ContainsAny(a.Audience, " \t\r\n") {
+		return errors.New("browserSession.auth0 needs a domain, client ID and audience")
 	}
 	if a.Scope == "" {
 		a.Scope = "openid profile email offline_access"
@@ -90,24 +114,41 @@ func (e *Entry) normalizeBrowser() error {
 	if len(a.Scope) > 256 || !strings.Contains(" "+a.Scope+" ", " openid ") || !printableASCII(a.Scope) {
 		return errors.New("browserSession.auth0.scope must include openid")
 	}
-	for _, ref := range []KVRef{b.User, a.TokenClient} {
+	refs := []KVRef{b.User, a.TokenClient}
+	switch a.Login {
+	case "", "password-realm":
+		a.Login = "password-realm"
+		if b.AutomatedAuth != nil || !idPattern.MatchString(a.Realm) {
+			return errors.New("browserSession.auth0 login password-realm needs a realm and tokenClient, and no automatedAuth")
+		}
+	case "automated-auth":
+		// A realm is unused here and harmless; a token client would be a
+		// second sign-in secret with nothing to use it.
+		if b.AutomatedAuth == nil || a.TokenClient != (KVRef{}) {
+			return errors.New("browserSession.auth0 login automated-auth needs automatedAuth, and no tokenClient")
+		}
+		if err := b.AutomatedAuth.normalize(); err != nil {
+			return err
+		}
+		refs = []KVRef{b.User, b.AutomatedAuth.Key}
+	default:
+		return errors.New("browserSession.auth0.login must be password-realm or automated-auth")
+	}
+	for _, ref := range refs {
 		if !kvPattern.MatchString(ref.Mount) || !kvPattern.MatchString(ref.Path) || strings.Contains(ref.Path, "..") {
-			return errors.New("browserSession user and tokenClient need a KV mount and path")
+			return errors.New("browserSession user and login secrets need a KV mount and path")
 		}
 	}
 	if !placeholder.MatchString(e.Placeholder) {
 		return errors.New("placeholder must look like __vault_NAME__")
 	}
-	if len(e.PathPrefixes) == 0 {
-		e.PathPrefixes = []string{"/"}
+	if err := e.normalizeBrowserPaths(); err != nil {
+		return err
 	}
-	for _, p := range e.PathPrefixes {
-		if !strings.HasPrefix(p, "/") || strings.ContainsAny(p, "?#%*{} \\") || strings.Contains(p, "//") || strings.Contains(p, "/..") || strings.Contains(p, "__") {
-			return fmt.Errorf("invalid path prefix %q", p)
-		}
-	}
-	if len(e.Pools) == 0 {
-		return errors.New("at least one pool is required")
+	// The test user is one account: one pool's workers share it, and no
+	// other entry may sign in as it (see Parse).
+	if len(e.Pools) != 1 {
+		return errors.New("a browser-session entry grants exactly one pool")
 	}
 	for _, pool := range e.Pools {
 		if !idPattern.MatchString(pool) {
@@ -130,6 +171,50 @@ func (e *Entry) normalizeBrowser() error {
 		return errors.New("size limits out of range")
 	}
 	return nil
+}
+
+func (s *AutomatedAuthBinding) normalize() error {
+	u, err := url.Parse(s.URL)
+	if err != nil || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Opaque != "" {
+		return errors.New("browserSession.automatedAuth.url must be a bare base URL")
+	}
+	host := strings.ToLower(u.Hostname())
+	if net.ParseIP(host) != nil {
+		return errors.New("browserSession.automatedAuth.url must name its host, not an address")
+	}
+	switch {
+	case u.Scheme == "https" && hostPattern.MatchString(host):
+	// The login carries the user's password and the service key: plain http
+	// only to a Kubernetes Service, and only in an e2e build, as for databases.
+	case u.Scheme == "http" && hostPattern.MatchString(host) && clusterLocal(host) && plaintextDatabases.Load():
+	default:
+		return errors.New("browserSession.automatedAuth.url must be https")
+	}
+	if p := u.Port(); p != "" {
+		if n, err := strconv.Atoi(p); err != nil || n < 1 || n > 65535 || strconv.Itoa(n) != p {
+			return errors.New("browserSession.automatedAuth.url has an invalid port")
+		}
+		host = net.JoinHostPort(host, p)
+	}
+	s.URL = u.Scheme + "://" + host
+	// The org is required: a test user in several organizations would
+	// otherwise sign in to whichever one the login page offers first.
+	if !idPattern.MatchString(s.Profile) || !idPattern.MatchString(s.OrgID) {
+		return errors.New("browserSession.automatedAuth needs a profile and an orgID")
+	}
+	return nil
+}
+
+// Addr is the host:port the broker dials for the service.
+func (s *AutomatedAuthBinding) Addr() string {
+	u, _ := url.Parse(s.URL)
+	if u.Port() != "" {
+		return u.Host
+	}
+	if u.Scheme == "http" {
+		return net.JoinHostPort(u.Hostname(), "80")
+	}
+	return net.JoinHostPort(u.Hostname(), "443")
 }
 
 func printableASCII(s string) bool {
@@ -174,6 +259,10 @@ func (c Catalog) BrowserMatch(host string, port int, method, path, pool string) 
 				return matched, true, ErrMethod
 			case !contains(e.Pools, pool):
 				return matched, true, ErrPool
+			case !matched.Seed:
+				if err := e.guardBrowserPath(method, path); err != nil {
+					return matched, true, err
+				}
 			}
 			return matched, true, nil
 		}
