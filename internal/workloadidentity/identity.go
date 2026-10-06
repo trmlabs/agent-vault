@@ -197,8 +197,11 @@ func newResolver(c Config, s Store, observer bool) (*Resolver, error) {
 					return nil, errors.New("pool binding owner UID must be non-empty")
 				}
 			}
-			if len(b.ImageDigests) == 0 || len(b.ImageDigests) > 16 {
-				return nil, errors.New("pool binding requires 1 to 16 image digests")
+			// No upper bound: a fleet may run many approved images, each digest
+			// is a short fixed-size string, and the configuration file's size
+			// limit bounds the list.
+			if len(b.ImageDigests) == 0 {
+				return nil, errors.New("pool binding requires at least one image digest")
 			}
 			for _, digest := range b.ImageDigests {
 				if !imageDigest.MatchString(digest) {

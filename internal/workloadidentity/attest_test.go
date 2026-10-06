@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/big"
 	"net/http"
@@ -273,16 +274,20 @@ func TestPoolBindingValidation(t *testing.T) {
 	if _, err := New(c, &fakeStore{status: "active", role: "proxy"}); err != nil {
 		t.Fatalf("valid pool binding refused: %v", err)
 	}
+	// Thousands of approved images load: the list has no fixed upper bound.
+	many := base
+	many.ImageDigests = nil
+	for i := range 5000 {
+		many.ImageDigests = append(many.ImageDigests, fmt.Sprintf("sha256:%064x", i))
+	}
+	c.Bindings = []Binding{many}
+	if _, err := New(c, &fakeStore{status: "active", role: "proxy"}); err != nil {
+		t.Fatalf("5,000 image digests refused: %v", err)
+	}
 	for name, mutate := range map[string]func(*Binding){
-		"no image digests":        func(b *Binding) { b.ImageDigests = nil },
-		"malformed image digest":  func(b *Binding) { b.ImageDigests = []string{"sha256:ABC"} },
-		"tag instead of a digest": func(b *Binding) { b.ImageDigests = []string{"worker:latest"} },
-		"too many image digests": func(b *Binding) {
-			b.ImageDigests = nil
-			for range 17 {
-				b.ImageDigests = append(b.ImageDigests, workerDigest)
-			}
-		},
+		"no image digests":              func(b *Binding) { b.ImageDigests = nil },
+		"malformed image digest":        func(b *Binding) { b.ImageDigests = []string{"sha256:ABC"} },
+		"tag instead of a digest":       func(b *Binding) { b.ImageDigests = []string{"worker:latest"} },
 		"digests on a non-pool binding": func(b *Binding) { b.OwnerUIDs, b.MaxPodSeconds = nil, 0 },
 		"Pod UID pinned":                func(b *Binding) { b.PodUID = "p" },
 		"lifetime too long":             func(b *Binding) { b.MaxPodSeconds = 9 * 3600 },

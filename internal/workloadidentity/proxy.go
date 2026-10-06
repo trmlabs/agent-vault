@@ -156,9 +156,6 @@ func (p *ProxyBinding) validate() error {
 	if !kubernetesKind.MatchString(p.OwnerKind) {
 		return errors.New("proxy binding needs the agent Pods' controller kind")
 	}
-	if len(p.ImageDigests) > 16 {
-		return errors.New("proxy binding allows at most 16 image digests")
-	}
 	for _, digest := range p.ImageDigests {
 		if !imageDigest.MatchString(digest) {
 			return errors.New("proxy binding image digest must be sha256: and 64 lowercase hex characters")

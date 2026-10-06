@@ -163,8 +163,10 @@ func (h Harness) validate() error {
 	if id.ImagePrefix != "" && (id.Kind != IdentityProxyAttested || !imagerule.ValidPrefix(id.ImagePrefix)) {
 		return errors.New("identity.imagePrefix is for proxy-attested harnesses: an agent-sandbox repository or tenant path ending in /")
 	}
-	if (id.ImagePrefix == "" && len(id.ImageDigests) == 0) || len(id.ImageDigests) > 16 {
-		return errors.New("identity.imageDigests needs 1 to 16 digests, or 0 to 16 beside an image prefix")
+	// No upper bound on digests: each is short and fixed-size, and the
+	// catalog's own size limit bounds the list.
+	if id.ImagePrefix == "" && len(id.ImageDigests) == 0 {
+		return errors.New("identity.imageDigests needs at least one digest unless an image prefix is set")
 	}
 	for _, d := range id.ImageDigests {
 		if !digestPattern.MatchString(d) {
