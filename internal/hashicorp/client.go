@@ -37,8 +37,9 @@ type Client struct {
 	jwt     jwtConfig
 	logins  *loginSet
 	loginMu sync.Mutex // one new login at a time: scheduled or after a denied mint
-	// missingPolicies are child policies a fresh login also lacked; guarded
-	// by loginMu and cleared at each scheduled login.
+	// missingPolicies are child policies a fresh login also lacked, cleared
+	// at each scheduled login. Its own lock: loginMu is held across logins.
+	missingMu       sync.Mutex
 	missingPolicies map[string]bool
 	stopReauth      context.CancelFunc
 	reauthDone      chan struct{}
