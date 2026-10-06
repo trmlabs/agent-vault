@@ -321,6 +321,7 @@ func (j *janitor) activity(ctx context.Context, cutoff time.Time) (map[string]ti
 	// any failure is doubt and stops the rest.
 	sort.Slice(live, func(a, b int) bool { return live[a].Metadata.Name < live[b].Metadata.Name })
 	reports := make([]ActivityReport, len(live))
+	ips := make([]string, len(live))
 	readCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	limit := make(chan struct{}, j.replicaConcurrency())
@@ -331,6 +332,7 @@ func (j *janitor) activity(ctx context.Context, cutoff time.Time) (map[string]ti
 		if e != nil {
 			return nil, false, false, errJanitorDoubt
 		}
+		ips[i] = ip
 		path := ActivityLocalPath
 		if i == 0 {
 			path = ActivityPath
@@ -359,9 +361,26 @@ func (j *janitor) activity(ctx context.Context, cutoff time.Time) (map[string]ti
 	// A durable report vouches only for as long as the broker's history for
 	// its binding: a new, recreated or emptied history is young.
 	historyYoung := durable && (full.HistoryStarted.IsZero() || full.HistoryStarted.After(cutoff))
-	for _, report := range reports {
+	// The broker's history is whole only as far back as some live replica
+	// can vouch: one whose reports have been acknowledged since before the
+	// cutoff, and none of whose acknowledged writes the store has lost.
+	var vouched time.Time
+	lost := false
+	var unaware []string
+	for i, report := range reports {
 		if report.ReplicaStarted.After(cutoff) {
 			young = true
+		}
+		// Each replica's own stream: another replica's reports never
+		// advance it, so a loss stays visible until this replica reports.
+		if report.AckedSeq > 0 && report.AckedSeq > full.HistoryStreams[report.Replica] {
+			lost = true
+			if i > 0 {
+				unaware = append(unaware, ips[i])
+			}
+		}
+		if !report.FirstAcked.IsZero() && (vouched.IsZero() || report.FirstAcked.Before(vouched)) {
+			vouched = report.FirstAcked
 		}
 		for _, a := range report.Sandboxes {
 			if a.OwnerUID != "" && a.LastSeen.After(seen[a.OwnerUID]) {
@@ -369,8 +388,25 @@ func (j *janitor) activity(ctx context.Context, cutoff time.Time) (map[string]ti
 			}
 		}
 	}
-	if historyYoung {
+	switch {
+	case historyYoung:
 		return nil, false, false, janitorHold{"activity_history_young"}
+	case durable && lost:
+		// A replica saw writes acknowledged that the store no longer holds
+		// (a restore): its next report restarts the history. A replica
+		// asked only for its own activity has not read the broker's view,
+		// and an idle one may never report: asking it for the full report
+		// shows it the loss, and it reports once, holding rows or not.
+		j.tellLost(ctx, unaware)
+		return nil, false, false, janitorHold{"activity_history_lost"}
+	case durable && (vouched.IsZero() || vouched.After(cutoff)) && young:
+		// Every live replica started without an acknowledgment, or got its
+		// first one within the idle window (a rollout, perhaps over a
+		// restore), and some replica has not been up for the whole window:
+		// nothing vouches for the window yet. Once every live replica has
+		// been up a full window, their own memory covers it, so an idle
+		// fleet that never reports is not held for ever.
+		return nil, false, false, janitorHold{"activity_history_unverified"}
 	}
 	return seen, durable, young, nil
 }
@@ -381,6 +417,23 @@ func netipString(s string) (string, error) {
 		return "", errDenied
 	}
 	return ip.String(), nil
+}
+
+// tellLost asks each replica at ips for the full report, which reads the
+// broker's view and so shows the replica its loss. Best effort: a replica
+// not reached is asked again on the next pass, which holds meanwhile.
+func (j *janitor) tellLost(ctx context.Context, ips []string) {
+	limit := make(chan struct{}, j.replicaConcurrency())
+	var wg sync.WaitGroup
+	for _, ip := range ips {
+		wg.Add(1)
+		limit <- struct{}{}
+		go func() {
+			defer func() { <-limit; wg.Done() }()
+			_, _ = j.replica(ctx, ip, ActivityPath)
+		}()
+	}
+	wg.Wait()
 }
 
 func (j *janitor) replica(ctx context.Context, ip, path string) (ActivityReport, error) {

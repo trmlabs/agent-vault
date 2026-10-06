@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -33,6 +34,8 @@ type activityBroker struct {
 	failRecord  atomic.Bool
 	// history is when the binding's history began; zero until a report.
 	history time.Time
+	// streams is each replica's report sequence.
+	streams map[string]int64
 	// tunnels are the open CONNECT tunnels, for dropTunnels.
 	tunnels []net.Conn
 }
@@ -58,7 +61,7 @@ func (b *activityBroker) dropTunnels() {
 
 func newActivityBroker(t *testing.T) *activityBroker {
 	t.Helper()
-	b := &activityBroker{rows: map[string]SandboxActivity{}}
+	b := &activityBroker{rows: map[string]SandboxActivity{}, streams: map[string]int64{}}
 	b.srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodConnect && b.refuseHosts.Load():
@@ -76,8 +79,11 @@ func newActivityBroker(t *testing.T) *activityBroker {
 			buf.Flush()
 			io.Copy(c, buf)
 		case r.Method == http.MethodPost && r.URL.Path == activityRecordPath && !b.failRecord.Load() && strings.HasPrefix(r.Header.Get("Authorization"), "Bearer "):
-			var body struct{ Sandboxes []SandboxActivity }
-			if json.NewDecoder(r.Body).Decode(&body) != nil {
+			var body struct {
+				Sandboxes []SandboxActivity
+				Replica   string
+			}
+			if json.NewDecoder(r.Body).Decode(&body) != nil || body.Replica == "" {
 				w.WriteHeader(400)
 				return
 			}
@@ -90,9 +96,11 @@ func newActivityBroker(t *testing.T) *activityBroker {
 					b.rows[row.OwnerUID] = row
 				}
 			}
+			b.streams[body.Replica]++
+			n := b.streams[body.Replica]
 			b.mu.Unlock()
 			b.records.Add(1)
-			w.WriteHeader(http.StatusNoContent)
+			json.NewEncoder(w).Encode(map[string]any{"seq": n, "lost": false, "retentionSeconds": 7200})
 		case r.Method == http.MethodPost && r.URL.Path == activityReadPath && !b.failRead.Load():
 			var body struct{ After string }
 			json.NewDecoder(r.Body).Decode(&body)
@@ -104,7 +112,7 @@ func newActivityBroker(t *testing.T) *activityBroker {
 				}
 			}
 			sort.Strings(owners)
-			page := map[string]any{"retentionSeconds": 7200, "next": ""}
+			page := map[string]any{"retentionSeconds": 7200, "next": "", "streams": maps.Clone(b.streams)}
 			if !b.history.IsZero() {
 				page["historyStarted"] = b.history
 			}
@@ -204,24 +212,27 @@ func TestDurableActivityOutlivesTheReplica(t *testing.T) {
 	}
 }
 
-// Only newer times are reported, a failed report is retried, and the last
-// one goes out when the relay stops.
+// Nothing is sent while nothing is new; only newer times are reported, each
+// accepted report's sequence is remembered, a failed report is retried, and
+// the last one goes out when the relay stops.
 func TestDurableActivityReportsNewerTimesAndOnStop(t *testing.T) {
 	broker := newActivityBroker(t)
 	f := newRelayFixture(t)
 	a := newActivity(time.Now(), time.Hour)
-	d := &durable{activity: a, upstream: broker.upstream(f.upstream(t, "")), interval: time.Hour}
-	// With nothing to report, the first report still starts the history.
-	if e := d.push(context.Background()); e != nil || broker.records.Load() != 1 || broker.history.IsZero() {
-		t.Fatalf("empty first report: %v", e)
+	d := &durable{activity: a, upstream: broker.upstream(f.upstream(t, "")), interval: time.Hour, replica: "aaaa0001"}
+	if e := d.push(context.Background()); e != nil || broker.records.Load() != 0 {
+		t.Fatalf("an idle replica reported: %v", e)
 	}
-	if e := d.push(context.Background()); e != nil || broker.records.Load() != 1 {
-		t.Fatal("an empty report was repeated")
+	if acked, first := d.verification(); acked != 0 || !first.IsZero() {
+		t.Fatalf("acknowledged before any report: %d %v", acked, first)
 	}
 	now := time.Now().UTC()
 	a.record("ns", "sb-1", now.Add(-time.Minute))
-	if e := d.push(context.Background()); e != nil || broker.records.Load() != 2 {
+	if e := d.push(context.Background()); e != nil || broker.records.Load() != 1 {
 		t.Fatalf("first report: %v", e)
+	}
+	if acked, first := d.verification(); acked != 1 || time.Since(first) > time.Minute {
+		t.Fatalf("first acknowledgment: %d %v", acked, first)
 	}
 	if rows := a.pending(); len(rows) != 0 {
 		t.Fatalf("accepted rows still pending: %v", rows)
@@ -244,6 +255,47 @@ func TestDurableActivityReportsNewerTimesAndOnStop(t *testing.T) {
 	a.record("ns", "sb-3", now)
 	if d.push(context.Background()) == nil || len(a.pending()) != 1 {
 		t.Fatal("a refused report was marked accepted")
+	}
+}
+
+// A loss this replica read in the broker's view is reported once even with
+// nothing new, a refused attempt is retried, and nothing more is sent after.
+func TestDurableActivityReportsAnOwedLossOnce(t *testing.T) {
+	broker := newActivityBroker(t)
+	f := newRelayFixture(t)
+	d := &durable{activity: newActivity(time.Now(), time.Hour), upstream: broker.upstream(f.upstream(t, "")), interval: time.Hour, replica: "aaaa0001"}
+	d.oweLoss()
+	broker.failRecord.Store(true)
+	if d.push(context.Background()) == nil {
+		t.Fatal("a refused loss report succeeded")
+	}
+	broker.failRecord.Store(false)
+	for range 3 {
+		if e := d.push(context.Background()); e != nil {
+			t.Fatal(e)
+		}
+	}
+	if n := broker.records.Load(); n != 1 {
+		t.Fatalf("loss reports: %d, want 1", n)
+	}
+}
+
+// A replica that holds nothing still reports a loss it reads in the broker's
+// view: the full report shows it its stream behind its acknowledgment.
+func TestDurableActivityReportsALossReadInTheView(t *testing.T) {
+	broker := newActivityBroker(t)
+	f := newRelayFixture(t)
+	a := newActivity(time.Now(), time.Hour)
+	d := &durable{activity: a, upstream: broker.upstream(f.upstream(t, "")), interval: time.Hour, replica: "aaaa0001", acked: 5, lastAcked: time.Now(), keep: 2 * time.Hour}
+	a.durable = d
+	broker.mu.Lock()
+	broker.streams["aaaa0001"] = 2
+	broker.mu.Unlock()
+	if r := a.withDurable(context.Background(), a.report(time.Now())); !r.Durable {
+		t.Fatalf("view not read: %+v", r)
+	}
+	if e := d.push(context.Background()); e != nil || broker.records.Load() != 1 {
+		t.Fatalf("loss report: %v, %d sent", e, broker.records.Load())
 	}
 }
 
@@ -292,5 +344,31 @@ func TestDurableActivityRepushesWhatTheBrokerLost(t *testing.T) {
 	sort.Strings(owners)
 	if strings.Join(owners, ",") != "lost,older" {
 		t.Fatalf("pending again: %v", owners)
+	}
+}
+
+// An acknowledgment a retention old is forgotten, the broker's or the
+// replica's own, whichever is shorter: everything it covered is past
+// retention, and the broker may have pruned the stream, so an idle replica
+// never reads its pruned stream as a loss.
+func TestDurableActivityForgetsAnOldAcknowledgment(t *testing.T) {
+	for name, tc := range map[string]struct {
+		keep, retention, age time.Duration
+		acked                int64
+	}{
+		"within both":             {2 * time.Hour, time.Hour, 30 * time.Minute, 5},
+		"past the broker's":       {time.Hour, 3 * time.Hour, 2 * time.Hour, 0},
+		"past this replica's own": {3 * time.Hour, time.Hour, 2 * time.Hour, 0},
+		"never acknowledged":      {0, time.Hour, 0, 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			d := &durable{activity: newActivity(time.Now(), tc.retention), replica: "aaaa0001", firstAcked: time.Now().Add(-5 * time.Hour)}
+			if tc.keep > 0 {
+				d.acked, d.lastAcked, d.keep = 5, time.Now().Add(-tc.age), tc.keep
+			}
+			if acked, first := d.verification(); acked != tc.acked || first.IsZero() {
+				t.Fatalf("verification: %d %v, want %d", acked, first, tc.acked)
+			}
+		})
 	}
 }

@@ -413,6 +413,7 @@ func TestJanitorTrustsDurableReports(t *testing.T) {
 	durable := func(started time.Time) *httptest.Server {
 		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(ActivityReport{ReplicaStarted: started, RetentionSeconds: 86400, Durable: true, HistoryStarted: time.Now().Add(-5 * time.Hour),
+				Replica: "aaaa0001", AckedSeq: 3, HistoryStreams: map[string]int64{"aaaa0001": 3}, FirstAcked: time.Now().Add(-4 * time.Hour),
 				Sandboxes: []SandboxActivity{{Namespace: tenantNS, OwnerUID: "uid-sb-00002", LastSeen: time.Now().Add(-time.Minute)}}})
 		}))
 		t.Cleanup(s.Close)
@@ -441,7 +442,8 @@ func TestJanitorTrustsDurableReports(t *testing.T) {
 func TestJanitorHoldsOnAYoungDurableHistory(t *testing.T) {
 	durable := func(history time.Time) *httptest.Server {
 		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			json.NewEncoder(w).Encode(ActivityReport{ReplicaStarted: time.Now().Add(-time.Minute), RetentionSeconds: 86400, Durable: true, HistoryStarted: history})
+			json.NewEncoder(w).Encode(ActivityReport{ReplicaStarted: time.Now().Add(-time.Minute), RetentionSeconds: 86400, Durable: true, HistoryStarted: history,
+				Replica: "aaaa0001", AckedSeq: 3, HistoryStreams: map[string]int64{"aaaa0001": 3}, FirstAcked: time.Now().Add(-4 * time.Hour)})
 		}))
 		t.Cleanup(s.Close)
 		return s
@@ -490,7 +492,8 @@ func TestJanitorReadsTheDurableViewOnce(t *testing.T) {
 			inFlight--
 			mu.Unlock()
 			json.NewEncoder(w).Encode(ActivityReport{ReplicaStarted: time.Now().Add(-2 * time.Hour), RetentionSeconds: 86400,
-				Durable: r.URL.Path == ActivityPath, HistoryStarted: time.Now().Add(-5 * time.Hour)})
+				Durable: r.URL.Path == ActivityPath, HistoryStarted: time.Now().Add(-5 * time.Hour),
+				Replica: "aaaa0001", AckedSeq: 3, HistoryStreams: map[string]int64{"aaaa0001": 3}, FirstAcked: time.Now().Add(-4 * time.Hour)})
 		}))
 		t.Cleanup(s.Close)
 		return s
@@ -507,5 +510,72 @@ func TestJanitorReadsTheDurableViewOnce(t *testing.T) {
 	}
 	if full != 1 || local != 39 || maxFlight > 8 || maxFlight < 2 {
 		t.Fatalf("full reads %d, local reads %d, most at once %d", full, local, maxFlight)
+	}
+}
+
+// The durable history is trusted only as far as a live replica vouches for
+// it: a replica that saw an acknowledged write its own stream in the store
+// no longer reaches means a restore, and no replica acknowledged since before
+// the cutoff, with some replica up for less than the window, means nobody can
+// vouch (a rollout, perhaps over a restore). Each holds the pass; one replica
+// vouching is enough, and so is every replica having been up a whole window.
+func TestJanitorHoldsUntilAReplicaVouches(t *testing.T) {
+	type replica struct {
+		name    string
+		acked   int64
+		first   time.Time
+		started time.Time
+	}
+	old, recent := time.Now().Add(-3*time.Hour), time.Now().Add(-time.Minute)
+	for name, tc := range map[string]struct {
+		streams  map[string]int64
+		replicas []replica
+		held     string
+	}{
+		"a replica saw writes the store lost": {map[string]int64{"aaaa0001": 5, "bbbb0002": 5},
+			[]replica{{"aaaa0001", 5, old, old}, {"bbbb0002", 9, old, old}}, "activity_history_lost"},
+		// One shared sequence would read 12 here and miss the idle replica's
+		// loss: a busy replica's reports never advance another's stream.
+		"a busy replica reported past an idle one's loss": {map[string]int64{"aaaa0001": 12, "bbbb0002": 5},
+			[]replica{{"aaaa0001", 12, old, old}, {"bbbb0002", 9, old, old}}, "activity_history_lost"},
+		"a replica's stream is gone": {map[string]int64{"aaaa0001": 5},
+			[]replica{{"aaaa0001", 5, old, old}, {"bbbb0002", 2, old, old}}, "activity_history_lost"},
+		"no replica has an acknowledgment": {map[string]int64{"aaaa0001": 5},
+			[]replica{{"cccc0003", 0, time.Time{}, recent}, {"dddd0004", 0, time.Time{}, recent}}, "activity_history_unverified"},
+		"acknowledged only within the window": {map[string]int64{"cccc0003": 1},
+			[]replica{{"cccc0003", 1, recent, recent}, {"dddd0004", 0, time.Time{}, old}}, "activity_history_unverified"},
+		"every replica up a whole window": {map[string]int64{"aaaa0001": 5},
+			[]replica{{"cccc0003", 0, time.Time{}, old}, {"dddd0004", 0, time.Time{}, old}}, ""},
+		"one replica vouches": {map[string]int64{"bbbb0002": 5},
+			[]replica{{"cccc0003", 0, time.Time{}, recent}, {"bbbb0002", 4, old, old}}, ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			servers := map[string]*httptest.Server{}
+			for i, rep := range tc.replicas {
+				s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					json.NewEncoder(w).Encode(ActivityReport{ReplicaStarted: rep.started, RetentionSeconds: 86400,
+						Durable: r.URL.Path == ActivityPath, HistoryStarted: time.Now().Add(-5 * time.Hour), HistoryStreams: tc.streams,
+						Replica: rep.name, AckedSeq: rep.acked, FirstAcked: rep.first})
+				}))
+				t.Cleanup(s.Close)
+				servers[fmt.Sprintf("10.0.0.%d", i+1)] = s
+			}
+			jf := newJanitor(t, servers)
+			jf.api.scaleStatus = 403 // durable passes read no scale records
+			jf.api.sandboxes = []map[string]any{janitorSandbox(1, 3*time.Hour)}
+			if e := jf.j.pass(context.Background()); e != nil {
+				t.Fatal(e)
+			}
+			pass := jf.events(t, "janitor_pass")
+			if tc.held == "" {
+				if len(jf.api.deleted) != 1 || pass[0]["held"] != nil {
+					t.Fatalf("a vouched history held: %v %v", jf.api.deleted, pass)
+				}
+				return
+			}
+			if len(jf.api.deleted) != 0 || pass[0]["held"] != tc.held {
+				t.Fatalf("deleted %v, pass %v, want held %s", jf.api.deleted, pass, tc.held)
+			}
+		})
 	}
 }
