@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -68,9 +70,17 @@ type Event struct {
 	Decision      string
 	Groups        string
 	CacheAgeSec   int64
-	Method        string
-	Status        int
-	Duration      int64 // milliseconds
+	// Signing-key refusals: see Row.
+	Kid       string
+	KidSHA256 string
+	Peer      string
+	// Proxy certificate issuance: see Row.
+	Serial   string
+	NotAfter string
+	DNSNames string // comma-separated lower-case DNS names the certificate holds
+	Method   string
+	Status   int
+	Duration int64 // milliseconds
 }
 
 var (
@@ -150,11 +160,11 @@ func (c *Chain) Admit() error {
 	return nil
 }
 
-// Record appends a caller event. An error means the row may not exist, so the
-// caller must not start or continue the action it describes.
-func (c *Chain) Record(e Event) error {
+// Validate reports whether Record would accept the event: a known event and
+// method, and every text field a bounded identifier.
+func (e Event) Validate() error {
 	switch e.Event {
-	case EventSessionOpen, EventSessionClose, EventDenied, EventHTTPRequest, EventHTTPResponse, EventTransaction, EventStateLeak:
+	case EventSessionOpen, EventSessionClose, EventDenied, EventHTTPRequest, EventHTTPResponse, EventTransaction, EventStateLeak, EventCertificate:
 	default:
 		return ErrInvalidEvent
 	}
@@ -169,15 +179,77 @@ func (c *Chain) Record(e Event) error {
 	if e.CacheAgeSec < 0 {
 		return ErrInvalidEvent
 	}
-	for _, v := range []string{e.Pool, e.Agent, e.PodUID, e.Binding, e.Session, e.Outcome, e.Requester, e.RequesterKind, e.RequesterOID, e.TokenSHA256, e.Tier, e.Decision, e.Groups} {
+	for _, v := range []string{e.Pool, e.Agent, e.PodUID, e.Binding, e.Session, e.Outcome, e.Requester, e.RequesterKind, e.RequesterOID, e.TokenSHA256, e.Tier, e.Decision, e.Kid, e.KidSHA256, e.Peer} {
 		if !identifier(v, true) {
 			return ErrInvalidEvent
 		}
+	}
+	if !groupList(e.Groups) {
+		return ErrInvalidEvent
+	}
+	if !dnsNameList(e.DNSNames) {
+		return ErrInvalidEvent
+	}
+	if e.Serial != "" && !serialHex.MatchString(e.Serial) {
+		return ErrInvalidEvent
+	}
+	if e.NotAfter != "" {
+		if t, err := time.Parse(time.RFC3339, e.NotAfter); err != nil || t.UTC().Format(time.RFC3339) != e.NotAfter {
+			return ErrInvalidEvent
+		}
+	}
+	return nil
+}
+
+// serialHex is a certificate serial number: at most 20 octets (RFC 5280), in
+// lower-case hex with no leading zeros.
+var serialHex = regexp.MustCompile(`^(0|[1-9a-f][0-9a-f]{0,39})$`)
+
+var dnsName = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$`)
+
+// dnsNameList admits comma-separated lower-case DNS names, any number, so no
+// free text can enter the row.
+func dnsNameList(s string) bool {
+	if s == "" {
+		return true
+	}
+	for _, n := range strings.Split(s, ",") {
+		if len(n) > 253 || !dnsName.MatchString(n) {
+			return false
+		}
+	}
+	return true
+}
+
+var groupID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// groupList admits the comma-separated Entra object IDs of the groups a
+// decision checked. It has no length limit: an entry may require any number
+// of groups, the full list is recorded, and the row's MAC covers it. Every
+// element must still be an object ID, so no free text can enter the row.
+func groupList(s string) bool {
+	if s == "" {
+		return true
+	}
+	for _, g := range strings.Split(s, ",") {
+		if !groupID.MatchString(g) {
+			return false
+		}
+	}
+	return true
+}
+
+// Record appends a caller event. An error means the row may not exist, so the
+// caller must not start or continue the action it describes.
+func (c *Chain) Record(e Event) error {
+	if err := e.Validate(); err != nil {
+		return err
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	_, err := c.appendLocked(Row{Event: e.Event, Pool: e.Pool, Agent: e.Agent, PodUID: e.PodUID, Binding: e.Binding, Session: e.Session, Outcome: e.Outcome, Requester: e.Requester,
 		RequesterKind: e.RequesterKind, RequesterOID: e.RequesterOID, TokenSHA256: e.TokenSHA256, Tier: e.Tier, Decision: e.Decision, Groups: e.Groups, CacheAgeSec: e.CacheAgeSec,
+		Kid: e.Kid, KidSHA256: e.KidSHA256, Peer: e.Peer, Serial: e.Serial, NotAfter: e.NotAfter, DNSNames: e.DNSNames,
 		Method: e.Method, Status: e.Status, Duration: e.Duration})
 	return err
 }
@@ -262,13 +334,17 @@ func (c *Chain) Run(ctx context.Context, interval, refresh time.Duration) {
 	}
 }
 
+// writeMACVersion is the MAC version new rows use; tests lower it to write
+// the rows an older broker wrote.
+var writeMACVersion = MACVersionCurrent
+
 func (c *Chain) appendLocked(r Row) (Row, error) {
 	if c.failed {
 		return Row{}, ErrAuditFailed
 	}
 	r.Type, r.Replica, r.Boot, r.Seq = RowType, c.opts.Replica, c.boot, c.seq
 	r.Time = c.opts.Now().UTC().Format(time.RFC3339Nano)
-	r.KeyVersion, r.Prev, r.MACVersion = c.key.Version, c.prev, MACVersionCurrent
+	r.KeyVersion, r.Prev, r.MACVersion = c.key.Version, c.prev, writeMACVersion
 	r.MAC = r.computeMAC(c.key.secret)
 	line, err := json.Marshal(r)
 	if err != nil {

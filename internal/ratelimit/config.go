@@ -51,35 +51,48 @@ func DefaultsFor(profile Profile) Config {
 	}
 	mul := profileMultiplier(profile)
 	// Unauthenticated surface: login/register/forgot/reset/verify,
-	// invite/approval-token redemption, and proxy auth failures.
+	// invite/approval-token redemption, and proxy auth failures. Proxy
+	// failures are keyed per address, or per attested sandbox behind a
+	// shared proxy. AGENT_VAULT_RATELIMIT_AUTH_MAX and _WINDOW override.
 	c.Tiers[TierAuth] = TierConfig{
-		Algorithm: AlgSliding, Window: 5 * time.Minute, Max: scaleMax(50, mul), MaxKeys: 10000,
+		Algorithm: AlgSliding, Window: 5 * time.Minute, Max: scaleMax(50, mul), MaxKeys: defaultMaxKeys,
 	}
-	// MITM proxy: token bucket smooths traffic; Concurrency caps
-	// in-flight slow upstream calls per (actor, vault). Defaults are
-	// intentionally roomy because agent runtimes fan out across model,
-	// gateway, and tool API calls.
+	// MITM proxy: token bucket smooths traffic; Concurrency caps in-flight
+	// upstream calls per (actor and workload, vault), so it bounds one agent
+	// Pod, not a pool. Sized for an agent fanning out in parallel (many tool
+	// and model calls at once, each possibly streaming for minutes); vendors'
+	// own limits bound the real rate, and the global tier is the server's
+	// backstop. AGENT_VAULT_RATELIMIT_PROXY_RATE, _BURST and _CONCURRENCY
+	// override each.
 	c.Tiers[TierProxy] = TierConfig{
-		Algorithm: AlgTokenBucket, Rate: scaleRate(20.0, mul), Burst: scaleMax(200, mul),
-		Concurrency: scaleMax(64, mul), MaxKeys: 10000,
+		Algorithm: AlgTokenBucket, Rate: scaleRate(200.0, mul), Burst: scaleMax(2000, mul),
+		Concurrency: scaleMax(1024, mul), MaxKeys: defaultMaxKeys,
 	}
 	// Everything behind requireAuth — generous; the heaviest legitimate
 	// agent workload can be several discover+CRUD bursts per minute.
 	c.Tiers[TierAuthed] = TierConfig{
-		Algorithm: AlgTokenBucket, Rate: scaleRate(10.0, mul), Burst: scaleMax(240, mul), MaxKeys: 10000,
+		Algorithm: AlgTokenBucket, Rate: scaleRate(10.0, mul), Burst: scaleMax(240, mul), MaxKeys: defaultMaxKeys,
 	}
 	// Server-wide backstop. Rate/Burst drive the RPS bucket; Concurrency
-	// drives the in-flight semaphore.
+	// drives the in-flight semaphore. Sized so 10,000 workers on one replica
+	// each making about two requests a second fit; per-key tiers above are
+	// what stop one noisy workload.
 	c.Tiers[TierGlobal] = TierConfig{
-		Rate: float64(scaleMax(2000, mul)), Burst: scaleMax(4000, mul),
-		Concurrency: scaleMax(512, mul),
+		Rate: float64(scaleMax(20000, mul)), Burst: scaleMax(40000, mul),
+		Concurrency: scaleMax(10000, mul),
 	}
 	// Internal: failure counter for verification codes.
 	c.Tiers[TierVerifyFailure] = TierConfig{
-		Algorithm: AlgFailureCounter, Max: scaleMax(10, mul), MaxKeys: 10000,
+		Algorithm: AlgFailureCounter, Max: scaleMax(10, mul), MaxKeys: defaultMaxKeys,
 	}
 	return c
 }
+
+// defaultMaxKeys is how many distinct keys (an IP, or a workload and entry)
+// each keyed tier tracks before evicting the coldest. An evicted key starts
+// over with a full bucket, so this is sized for every workload of a large
+// fleet times its entries; a key costs a few hundred bytes.
+const defaultMaxKeys = 200000
 
 func profileMultiplier(p Profile) float64 {
 	switch p {

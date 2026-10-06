@@ -25,7 +25,28 @@ func mitmIPKey(r *http.Request) string {
 	if err != nil || host == "" {
 		host = r.RemoteAddr
 	}
-	return "mitm:" + host
+	key := "mitm:" + host
+	// Every sandbox behind one shared proxy arrives from the proxy's
+	// address, so on a listener that admits only proxy-attested identities
+	// the auth-failure budget is the attested sandbox's: refused sandboxes
+	// never lock out the rest. Elsewhere it stays per address.
+	if kinds := connKinds(r.Context()); len(kinds) == 1 && kinds[0] == brokercore.KindProxyAttested {
+		if sandbox := brokercore.AttestedSandbox(r.Header.Get(brokercore.AttestationHeader)); sandbox != "" {
+			key += "/sandbox:" + sandbox
+		}
+	}
+	return key
+}
+
+// proxyLimitActor is the per-actor rate-limit key: the actor, and for a
+// verified workload its Pod too. Many Pods can share one agent identity (a
+// pool, or every sandbox behind a shared proxy), and each gets its own
+// budget instead of splitting one.
+func proxyLimitActor(scope *brokercore.ProxyScope) string {
+	if scope.WorkloadID != "" {
+		return scope.ActorID() + "/" + scope.WorkloadID
+	}
+	return scope.ActorID()
 }
 
 // isLoopbackPeer reports whether the HTTP request came from a loopback
@@ -117,21 +138,33 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// The runner session token, set by the sidecar on CONNECT only; requests
 	// inside the tunnel cannot supply or replace it.
 	session := r.Header.Get(SessionHeader)
-	connectScope, err := p.resolveScope(r.Context(), token, hint, peer, peerErr, false)
+	// A shared proxy's attestation of the agent Pod, on CONNECT only; the
+	// Attestor accepts it from a proxy binding alone.
+	attested := brokercore.WithAttestation(r.Context(), r.Header.Get(brokercore.AttestationHeader))
+	connectScope, err := p.resolveScope(attested, token, hint, peer, peerErr, false)
 	if err != nil {
 		p.recordAuthFailure(r)
 		if p.strictCredentialProxy {
-			p.strictUnauthenticatedDeny(w, r, http.StatusForbidden)
+			p.strictIdentityDeny(w, r, err)
 			return
 		}
 		writeAuthError(w, err)
 		return
 	}
-	// With a catalog, refuse an unlisted host before minting a certificate
-	// for it or opening a tunnel.
-	if p.strictCredentialProxy && p.adapter.valid() && !p.adapter.Catalog.Current().HasHost(host, port) {
-		p.adapterDeny(w, auditchain.Event{Pool: connectScope.Pool, Agent: connectScope.AgentID, PodUID: connectScope.WorkloadID}, http.StatusForbidden, "unlisted")
-		return
+	// With a catalog, refuse a host the caller's pool is not granted before
+	// minting a certificate for it or opening a tunnel. The caller gets the
+	// same 403 whether another pool may reach the host or none may, so a
+	// tunnel attempt reveals nothing about other pools' catalog; only the
+	// audit row tells the two apart.
+	if p.strictCredentialProxy && p.adapter.valid() {
+		if catalog := p.adapter.Catalog.Current(); !catalog.HasHostForPool(host, port, connectScope.Pool) {
+			outcome := "unlisted"
+			if catalog.HasHost(host, port) {
+				outcome = "pool"
+			}
+			p.adapterDeny(w, auditchain.Event{Pool: connectScope.Pool, Agent: connectScope.AgentID, PodUID: connectScope.WorkloadID}, http.StatusForbidden, outcome)
+			return
+		}
 	}
 
 	// A replica shutting down takes no new tunnels; the client retries on
@@ -195,21 +228,25 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// ConnState tracks when the connection leaves the hijacked state and
 	// closes the listener so Serve returns.
 	listener := newOneShotListener(tlsConn)
+	// Requests inside the tunnel arrive on its own TLS connection, so they
+	// take the listener's identity kinds from the CONNECT.
+	kinds := connKinds(r.Context())
 	srv := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// A tunnel can outlive its token or grant. Recheck each request
 			// against the original proxy identity before injecting credentials.
-			scope, err := p.resolveScope(r.Context(), token, hint, peer, peerErr, true)
+			scope, err := p.resolveScope(withKinds(brokercore.WithAttestation(r.Context(), brokercore.AttestationFrom(attested)), kinds), token, hint, peer, peerErr, true)
 			if err != nil {
 				w.Header().Set("Connection", "close")
 				if p.strictCredentialProxy {
-					p.strictUnauthenticatedDeny(w, r, http.StatusForbidden)
+					p.strictIdentityDeny(w, r, err)
 					return
 				}
 				writeAuthError(w, err)
 				return
 			}
 			r.Header.Del(SessionHeader)
+			r.Header.Del(brokercore.AttestationHeader)
 			p.forwardHandler(target, host, port, scope).ServeHTTP(w, r.WithContext(withSessionToken(r.Context(), session)))
 		}),
 		// ReadHeaderTimeout and ReadTimeout bound the request side

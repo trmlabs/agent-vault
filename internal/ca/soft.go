@@ -29,7 +29,7 @@ const (
 	rootKeyFile      = "ca.key.enc"
 	defaultDirName   = "ca"
 	defaultLeafTTL   = 24 * time.Hour
-	defaultCacheSize = 1024
+	defaultCacheSize = 10000 // minted leaves kept, one per destination host; a few KiB each
 	rootValidity     = 10 * 365 * 24 * time.Hour
 	clockSkew        = 5 * time.Minute
 	rootCommonName   = "Agent Vault Root CA"
@@ -454,8 +454,11 @@ func (c *SoftCA) MintLeaf(sni string) (*tls.Certificate, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parsing leaf cert: %w", err)
 	}
+	// The chain carries the root after the leaf. A browser that trusts this CA by
+	// its key hash (Chromium's --ignore-certificate-errors-spki-list) compares
+	// the hashes of the presented chain, so a leaf alone never matches.
 	tlsCert := &tls.Certificate{
-		Certificate: [][]byte{der},
+		Certificate: [][]byte{der, c.rootCert.Raw},
 		PrivateKey:  leafKey,
 		Leaf:        leaf,
 	}

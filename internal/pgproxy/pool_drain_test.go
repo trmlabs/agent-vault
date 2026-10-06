@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
+
+	"github.com/Infisical/agent-vault/internal/brokercore"
 )
 
 // drainBroker is a pooled broker over a fake upstream with transactions.
@@ -62,6 +64,34 @@ func (c *drainClient) query(sql string) byte {
 			c.t.Fatalf("%s: %s %s", sql, m.Code, m.Message)
 		}
 	}
+}
+
+// endingReason is ending plus the notice's reason code.
+func (c *drainClient) endingReason() (string, string) {
+	c.t.Helper()
+	return readCloseNotice(c.t, c.fe)
+}
+
+// readCloseNotice reads what a session ends with: a FATAL notice's code and
+// reason, or empty strings when the connection closes without one.
+func readCloseNotice(t *testing.T, fe *pgproto3.Frontend) (string, string) {
+	t.Helper()
+	msg, err := fe.Receive()
+	if err != nil {
+		var timeout net.Error
+		if errors.As(err, &timeout) && timeout.Timeout() {
+			t.Fatal("session still open")
+		}
+		return "", ""
+	}
+	m, ok := msg.(*pgproto3.ErrorResponse)
+	if !ok || m.Severity != "FATAL" {
+		t.Fatalf("session ended with %T %+v", msg, msg)
+	}
+	if _, err := fe.Receive(); err == nil {
+		t.Fatal("session open after its FATAL")
+	}
+	return m.Code, m.UnknownFields[brokercore.RefusalReasonField]
 }
 
 // ending reads what the session ends with: the restart notice's code, or ""
@@ -150,8 +180,8 @@ func TestPooledDrainCutsATransactionStillOpenAtTheDeadline(t *testing.T) {
 	c.query("BEGIN")
 	started := time.Now()
 	done := shutdownBroker(b, drainReserve+300*time.Millisecond)
-	if code := c.ending(); code != "" {
-		t.Fatalf("a cut transaction got %q; it must not look like a clean restart", code)
+	if code, reason := c.endingReason(); code != "08006" || reason != "restart_cut" {
+		t.Fatalf("a cut transaction got %q %q; it must be named, and not look like a clean restart", code, reason)
 	}
 	if elapsed := time.Since(started); elapsed < 250*time.Millisecond || elapsed > 2*time.Second {
 		t.Fatalf("transaction cut after %v, want at the drain deadline", elapsed)
@@ -167,8 +197,8 @@ func TestPooledShutdownWithoutDrainClosesAtOnce(t *testing.T) {
 	c.query("BEGIN")
 	started := time.Now()
 	done := shutdownBroker(b, 10*time.Second)
-	if code := c.ending(); code != "" {
-		t.Fatalf("undrained session ended with %q, want a plain close", code)
+	if code, reason := c.endingReason(); code != "08006" || reason != "restart_cut" {
+		t.Fatalf("undrained session in a transaction ended with %q %q, want the named restart_cut", code, reason)
 	}
 	if elapsed := time.Since(started); elapsed > time.Second {
 		t.Fatalf("undrained session closed after %v", elapsed)
@@ -208,8 +238,8 @@ func TestPooledDrainStopsWhenCleanupAuthorityIsLost(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	started := time.Now()
 	close(minter.done)
-	if code := c.ending(); code != "" {
-		t.Fatalf("session ended with %q; a lost-authority stop is not a clean restart", code)
+	if code, reason := c.endingReason(); code != "08006" || reason != "restart_cut" {
+		t.Fatalf("session ended with %q %q; a lost-authority stop is named and is not a clean restart", code, reason)
 	}
 	if elapsed := time.Since(started); elapsed > 2*time.Second {
 		t.Fatalf("busy session outlived lost authority by %v", elapsed)

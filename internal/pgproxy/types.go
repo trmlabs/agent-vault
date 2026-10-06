@@ -25,6 +25,8 @@ type AgentScope struct {
 	WorkloadID string
 	Pool       string    // catalog pool name; empty matches no catalog grant
 	NotAfter   time.Time // zero, or when the session must end (a pool Pod's deadline)
+	// IdentityKind is how the workload proved itself; see brokercore.KindPodToken.
+	IdentityKind string
 }
 
 // AgentAuthenticator validates the agent's Agent Vault token (presented in the
@@ -120,12 +122,18 @@ const (
 	// defaultMinRenewInterval floors the renew cadence so a very short TTL does
 	// not spin the renew loop. Overridable via Options.MinRenewInterval.
 	defaultMinRenewInterval = 5 * time.Second
-	// defaultMaxConns caps concurrent SERVING connections — those holding an
-	// upstream database connection. Each brokered connection is one real DB
-	// connection, so this must be tuned below the database's max_connections
-	// (minus reserved + the Vault admin pool). The conservative default assumes
-	// a small shared database.
-	defaultMaxConns = 50
+	// defaultMaxConns caps concurrent SERVING connections across every
+	// database. Each database's own ceiling is its catalog entry's maxConns,
+	// sized there against its max_connections, so this only bounds broker
+	// memory and defaults to fleet scale (AGENT_VAULT_DB_MAX_CONNS).
+	defaultMaxConns = 10000
+	// defaultDatabaseConns is the ceiling for a database whose catalog entry
+	// states no maxConns, in both modes. A database's size is unknown then,
+	// and a small Postgres allows about 100 connections in all, so the
+	// fallback stays below that rather than risk exhausting a database other
+	// services share. Set maxConns in the catalog, or override with
+	// AGENT_VAULT_DB_DEFAULT_DATABASE_CONNS.
+	defaultDatabaseConns = 50
 	// defaultMaxPendingConns caps accepted-but-not-yet-serving connections
 	// (handshake in progress). Generous and independent of MaxConns so a flood of
 	// stalled handshakes cannot starve the serving capacity real agents use.
@@ -135,6 +143,14 @@ const (
 	// amplification and, kept below MaxConns, prevents one noisy or compromised
 	// agent from monopolizing the serving cap and starving other agents.
 	defaultMaxLeasesPerActor = 16
+	// With pooling, a client session holds no database connection or
+	// credential of its own: the per-database budget protects the database.
+	// The session caps then only bound broker memory (a goroutine and small
+	// buffers per session), so they default to fleet scale. All are
+	// overridable (AGENT_VAULT_DB_MAX_CONNS, _MAX_PENDING_CONNS,
+	// _MAX_LEASES_PER_ACTOR).
+	defaultPooledMaxConns          = defaultMaxConns
+	defaultPooledMaxLeasesPerActor = 1024
 )
 
 // ErrSessionLimit is returned by a SessionLedger when a Pod is at its cap.

@@ -93,6 +93,17 @@ func (p *Proxy) strictUnauthenticatedDeny(w http.ResponseWriter, r *http.Request
 	p.strictDeny(w, r, strictAttempt(nil, nil, r.Method, "", "", "deny"), status)
 }
 
+// strictIdentityDeny refuses a caller whose identity was not admitted (403).
+// With the catalog's signed audit, the row names the refusing check.
+func (p *Proxy) strictIdentityDeny(w http.ResponseWriter, r *http.Request, err error) {
+	reason := brokercore.DenialReason(err)
+	if p.adapter != nil && p.adapter.valid() && reason != "" {
+		p.adapterIdentityDeny(w, r, strictAttempt(nil, nil, r.Method, "", "", "deny"), http.StatusForbidden, "identity_"+reason, brokercore.DenialKey(err))
+		return
+	}
+	p.strictUnauthenticatedDeny(w, r, http.StatusForbidden)
+}
+
 func (p *Proxy) forwardStrict(w http.ResponseWriter, r *http.Request, target, host string, port int, useTLS bool, scope *brokercore.ProxyScope) {
 	if p.adapter != nil {
 		if !p.adapter.valid() {
@@ -133,7 +144,7 @@ func (p *Proxy) forwardStrict(w http.ResponseWriter, r *http.Request, target, ho
 			return
 		}
 	}
-	enf := p.rateLimit.EnforceProxy(r.Context(), scope.ActorID(), scope.VaultID)
+	enf := p.rateLimit.EnforceProxy(r.Context(), proxyLimitActor(scope), scope.VaultID)
 	if !enf.Allowed {
 		deny(http.StatusTooManyRequests)
 		return

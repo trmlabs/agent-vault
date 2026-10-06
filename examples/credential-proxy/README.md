@@ -106,8 +106,9 @@ prevents forwarding. An interrupted or unrecordable outcome remains unknown;
 the proxy does not replay it. Responses are limited to 1 MiB before any body is returned and checked for
 direct and common encoded secret echoes. Approved upstreams must still be trusted with
 their credential: arbitrary malicious transformations cannot be recognized
-universally. Strict mode admits at most 128 pending or open CONNECT tunnels;
-saturation returns 429, or 503 if its denial cannot be durably recorded.
+universally. Strict mode admits at most 10,000 pending or open CONNECT tunnels per
+replica (`AGENT_VAULT_MITM_MAX_TUNNELS`); saturation returns 429, or 503 if its
+denial cannot be durably recorded.
 
 PostgreSQL uses a separate temporary database credential per connection,
 continues checking authorization, and journals cleanup before issuing a

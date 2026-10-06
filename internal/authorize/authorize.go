@@ -33,10 +33,11 @@ type Requester struct {
 }
 
 // Resolve derives the requester for a pool from the session token the sidecar
-// relayed (empty when none). It returns a refusal code when a presented token
-// is invalid, was issued for another runner pool, or arrives on a pool that
-// takes no session: a bad token is refused even for T0, never silently
-// ignored. A Claude-session pool with no session has no person: T0 only.
+// relayed (empty when none), as the pool's harness profile says. It returns a
+// refusal code when a presented token is invalid, was issued for another
+// runner pool, or arrives on a profile whose requester is not a session: a
+// bad token is refused even for T0, never silently ignored. A session-jwt
+// profile with no session has no person: T0 only.
 //
 // A session token is a bearer credential, so it is pinned to the first Pod
 // that presents it: the same token from another Pod is refused
@@ -44,15 +45,19 @@ type Requester struct {
 // refused (session_unbindable).
 func Resolve(ctx context.Context, pool httpcatalog.Pool, session, pod string, v Verifier, b Binder) (Requester, string) {
 	who := Requester{Kind: "none"}
-	// Only a Claude-session pool's sidecar relays a session. One arriving on
-	// any other pool is a misconfigured or forged channel, never ignored.
-	if session != "" && pool.Identity != "claude-session" {
+	requester := pool.Profile().RequesterKind()
+	// Only a session-jwt sidecar relays a session. One arriving on any other
+	// profile is a misconfigured or forged channel, never ignored.
+	if session != "" && requester != httpcatalog.RequesterSessionJWT {
 		return who, "session_unexpected"
 	}
-	switch pool.Identity {
-	case "workload":
-		who.Kind = "workload"
-	case "claude-session":
+	switch requester {
+	case "":
+		// Pool authorization: a workload pool's fixed entitlements, or none.
+		if pool.Identity == "workload" {
+			who.Kind = "workload"
+		}
+	case httpcatalog.RequesterSessionJWT:
 		if session == "" {
 			return who, ""
 		}
@@ -78,6 +83,10 @@ func Resolve(ctx context.Context, pool httpcatalog.Pool, session, pod string, v 
 			return who, "session_pod_mismatch"
 		}
 		who.Kind, who.Subject = string(s.Kind), s.Subject
+	default:
+		// A requester kind this broker cannot verify. The catalog refuses
+		// such a profile at load; this keeps the decision closed regardless.
+		return who, "requester_unverifiable"
 	}
 	return who, ""
 }

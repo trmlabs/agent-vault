@@ -13,6 +13,11 @@ import (
 	"time"
 )
 
+// maxTrackedPeople bounds the answer cache and lookup budgets, which start
+// over when exceeded. It is sized for every person in a large organization
+// times a few group sets; an entry is a few hundred bytes.
+const maxTrackedPeople = 200000
+
 // MaxCacheTTL bounds how long a person's groups are trusted. Offboarding takes
 // effect within it, because the runner's session tokens cannot be revoked.
 const MaxCacheTTL = 5 * time.Minute
@@ -122,7 +127,7 @@ func (c *Cache) spend(subject string, now time.Time) bool {
 	if limit <= 0 {
 		limit = DefaultLookupsPerMinute
 	}
-	if c.spent == nil || len(c.spent) > 10000 {
+	if c.spent == nil || len(c.spent) > maxTrackedPeople {
 		c.spent = map[string][]time.Time{}
 	}
 	recent := c.spent[subject][:0]
@@ -193,7 +198,7 @@ func (c *Cache) lookup(ctx context.Context, subject string, groups []string, fre
 		delete(c.flights, key)
 	}
 	if f.err == nil && c.purges == generation {
-		if c.entries == nil || len(c.entries) > 10000 {
+		if c.entries == nil || len(c.entries) > maxTrackedPeople {
 			c.entries = map[string]cached{}
 		}
 		c.entries[key] = cached{person: f.person, fetched: now}
@@ -268,6 +273,11 @@ func Decide(ctx context.Context, cache *Cache, pool Pool, entry Entry, who Reque
 		tier = "T0"
 	}
 	d := Decision{Tier: tier, Groups: append([]string(nil), entry.Requires...)}
+	// A pool below T0 reaches nothing; the catalog grants it no entry either.
+	if pool.Ceiling == "external" {
+		d.Outcome = "pool_external"
+		return d
+	}
 	want, err1 := Tier(entry.Tier)
 	ceiling, err2 := Tier(pool.Ceiling)
 	if err1 != nil || err2 != nil {

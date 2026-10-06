@@ -350,26 +350,94 @@ func (c *Client) reauthTick(ctx context.Context) {
 	if !c.logins.rotationDue(now) {
 		return
 	}
+	c.loginMu.Lock()
+	defer c.loginMu.Unlock()
+	if !c.logins.rotationDue(now) { // a denied mint logged in again meanwhile
+		return
+	}
 	if c.logins.atCeiling() {
 		c.logger.Warn("vault login refresh deferred: older-login ceiling reached; new database sessions stop when the current login ages out")
 		return
 	}
-	callCtx, cancel := context.WithTimeout(ctx, reauthCallTimeout)
-	next, err := jwtLogin(callCtx, c.api, c.jwt, c.clock)
-	cancel()
-	if err != nil {
+	if err := c.loginAgainLocked(ctx); err != nil {
 		c.logger.Warn("vault login refresh failed; existing sessions continue, new sessions stop when the current login ages out",
 			slog.String("err", err.Error()))
 		return
 	}
-	if err := c.logins.rotate(next); err != nil {
-		revokeToken(c.api, next.token)
-		c.logger.Warn("vault login refresh discarded", slog.String("err", err.Error()))
-		return
-	}
-	c.api.SetToken(next.token)
+	c.missingMu.Lock()
+	c.missingPolicies = nil // the scheduled login may hold policies added since
+	c.missingMu.Unlock()
 	retired, sessions := c.logins.counts()
 	c.logger.Info("vault login refreshed", slog.Int("older_logins", retired), slog.Int("live_sessions", sessions))
+}
+
+// loginAgainLocked logs in and makes the new login current. c.loginMu is held.
+func (c *Client) loginAgainLocked(ctx context.Context) error {
+	callCtx, cancel := context.WithTimeout(ctx, reauthCallTimeout)
+	next, err := jwtLogin(callCtx, c.api, c.jwt, c.clock)
+	cancel()
+	if err != nil {
+		return err
+	}
+	if err := c.logins.rotate(next); err != nil {
+		revokeToken(c.api, next.token)
+		return err
+	}
+	c.api.SetToken(next.token)
+	return nil
+}
+
+// policyMissing reports whether a new login already lacked policy since the
+// last scheduled login.
+func (c *Client) policyMissing(policy string) bool {
+	c.missingMu.Lock()
+	defer c.missingMu.Unlock()
+	return c.missingPolicies[policy]
+}
+
+func (c *Client) markPolicyMissing(policy string) {
+	c.missingMu.Lock()
+	defer c.missingMu.Unlock()
+	if c.missingPolicies == nil {
+		c.missingPolicies = map[string]bool{}
+	}
+	c.missingPolicies[policy] = true
+}
+
+// deniedReloginAfter is how old the current login must be before a denied
+// session mint logs in again. A denial on a younger login means the policy
+// itself is missing, not that the login predates it, so this bounds the
+// logins a misconfigured database can cause to one a minute per replica,
+// whatever the number of agents asking.
+const deniedReloginAfter = time.Minute
+
+var errLoginLacksPolicy = errors.New("vault refused this database's session policy to the broker's current login")
+
+// reloginAfterDenial replaces the login that Vault refused a database
+// session, because a login only holds the policies that existed when it was
+// issued: a database the catalog added since needs a new login. Concurrent
+// denials share one new login.
+func (c *Client) reloginAfterDenial(ctx context.Context, denied string) error {
+	c.loginMu.Lock()
+	defer c.loginMu.Unlock()
+	c.logins.mu.Lock()
+	current := c.logins.current
+	same := current != nil && current.token == denied
+	young := same && c.clock().Before(current.issued.Add(deniedReloginAfter))
+	c.logins.mu.Unlock()
+	switch {
+	case !same:
+		return nil // another mint or the schedule already logged in again
+	case young:
+		return errLoginLacksPolicy
+	case c.logins.atCeiling():
+		return fmt.Errorf("vault login ceiling reached; cannot log in again for a database added since the current login")
+	}
+	if err := c.loginAgainLocked(ctx); err != nil {
+		return err
+	}
+	c.logger.Info("vault login refreshed after a denied database session")
+	return nil
 }
 
 func (c *Client) renewLogin(ctx context.Context, l *heldLogin, now time.Time) {
@@ -455,13 +523,14 @@ func (c *Client) clock() time.Time {
 }
 
 // Ready reports whether a new database session could be minted now. Token and
-// AppRole modes have no refresh window and report ready.
+// AppRole modes keep one login, which they never renew: they are ready until
+// it expires, and always for a login that does not expire.
 func (c *Client) Ready() bool {
 	if c == nil {
 		return false
 	}
 	if c.logins == nil {
-		return true
+		return c.loginExpiry.IsZero() || c.clock().Before(c.loginExpiry)
 	}
 	c.logins.mu.Lock()
 	defer c.logins.mu.Unlock()

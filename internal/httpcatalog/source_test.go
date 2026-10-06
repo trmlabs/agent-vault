@@ -3,6 +3,7 @@ package httpcatalog
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -228,6 +229,28 @@ func TestGitGranted(t *testing.T) {
 	}
 }
 
+// GitScope lists every repository an installation's entries name, for the
+// broker's installation scope check.
+func TestGitScope(t *testing.T) {
+	doc := `{"entries":[
+		{"name":"git","kind":"git","host":"github.com","pools":["pool-a"],"git":{"appID":7,"installationID":42,"repos":[{"repo":"trmlabs/a","access":"write"},{"repo":"trmlabs/b","access":"read"}]}},
+		{"name":"other","kind":"git","host":"github.com","pools":["pool-b"],"git":{"appID":7,"installationID":43,"repos":[{"repo":"trmlabs/c","access":"read"}]}},
+		{"name":"api","kind":"github-api","host":"api.github.com","pools":["pool-a"],"git":{"appID":7,"installationID":42,"repos":[{"repo":"trmlabs/a","access":"write"}]}}]}`
+	c, err := Parse([]byte(doc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repos, pullRequests := c.GitScope(42); fmt.Sprint(repos) != "[trmlabs/a trmlabs/b trmlabs/a]" || !pullRequests {
+		t.Errorf("GitScope(42) = %v, %v", repos, pullRequests)
+	}
+	if repos, pullRequests := c.GitScope(43); fmt.Sprint(repos) != "[trmlabs/c]" || pullRequests {
+		t.Errorf("GitScope(43) = %v, %v", repos, pullRequests)
+	}
+	if repos, _ := c.GitScope(44); repos != nil {
+		t.Errorf("GitScope(44) = %v", repos)
+	}
+}
+
 // The catalog refuses the strings the Terraform module refuses, since they
 // end up in the broker's Vault policy.
 func TestCatalogRefusesPolicyUnsafeStrings(t *testing.T) {
@@ -278,6 +301,13 @@ func TestCatalogDatabaseRolesAndAccess(t *testing.T) {
 		"readonly as write":     {"database", "staging.us.crunchy.core-readonly", "write", false},
 		"bad access":            {"database", "staging.us.crunchy.core-readonly", "admin", false},
 		"other environment":     {"database", "prod.us.crunchy.core-readonly", "", false},
+		"gatehouse readonly":    {"database", "gatehouse-staging.us.crunchy.core-readonly", "", true},
+		"gatehouse readwrite":   {"database", "gatehouse-staging.us.crunchy.core-readwrite", "write", true},
+		"gatehouse as write":    {"database", "gatehouse-staging.us.crunchy.core-readonly", "write", false},
+		"gatehouse other env":   {"database", "gatehouse-prod.us.crunchy.core-readonly", "", false},
+		"gatehouse env suffix":  {"database", "gatehouse-stagingx.us.crunchy.core-readonly", "", false},
+		"other prefix":          {"database", "agent-staging.us.crunchy.core-readonly", "", false},
+		"doubled prefix":        {"database", "gatehouse-gatehouse-staging.us.crunchy.core-readonly", "", false},
 		"no suffix":             {"database", "staging.us.crunchy.core", "", false},
 		"bare role":             {"database", "readonly", "", false},
 		"plus mount":            {"data+base", "staging.us.crunchy.core-readonly", "", false},

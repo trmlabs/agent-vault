@@ -137,6 +137,26 @@ func TestMintLeaf_VerifiesAgainstRoot(t *testing.T) {
 	}
 }
 
+// A browser that trusts the interception CA by its key hash only sees the hashes of
+// the presented chain, so the chain must carry the root after the leaf.
+func TestMintLeaf_ChainCarriesTheRootAfterTheLeaf(t *testing.T) {
+	ca := newTestCA(t, Options{LeafTTL: time.Hour})
+	cert, err := ca.MintLeaf("example.com")
+	if err != nil {
+		t.Fatalf("MintLeaf: %v", err)
+	}
+	if len(cert.Certificate) != 2 {
+		t.Fatalf("chain length = %d, want leaf and root", len(cert.Certificate))
+	}
+	if !bytes.Equal(cert.Certificate[0], cert.Leaf.Raw) {
+		t.Error("first certificate is not the leaf")
+	}
+	block, _ := pem.Decode(ca.RootPEM())
+	if block == nil || !bytes.Equal(cert.Certificate[1], block.Bytes) {
+		t.Error("second certificate is not the root")
+	}
+}
+
 func TestMintLeaf_CacheHit_ReturnsSamePointer(t *testing.T) {
 	ca := newTestCA(t, Options{})
 	a, err := ca.MintLeaf("example.com")
@@ -321,5 +341,16 @@ func TestRootPEM_IsValidCACert(t *testing.T) {
 	}
 	if cert.Subject.CommonName != rootCommonName {
 		t.Errorf("CN = %q, want %q", cert.Subject.CommonName, rootCommonName)
+	}
+}
+
+// The leaf cache holds one certificate per destination host, so its default
+// covers a fleet that reaches thousands of hosts; an explicit size still wins.
+func TestNew_LeafCacheDefaultsToFleetScale(t *testing.T) {
+	if got := newTestCA(t, Options{}).cache.cap; got != 10000 {
+		t.Fatalf("default leaf cache = %d, want 10000", got)
+	}
+	if got := newTestCA(t, Options{CacheSize: 64}).cache.cap; got != 64 {
+		t.Fatalf("explicit leaf cache = %d, want 64", got)
 	}
 }

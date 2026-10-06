@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -34,6 +35,8 @@ type fakeVault struct {
 	parentOf    map[string]string // child accessor -> parent token
 	revoked     []string          // parent tokens revoked by the broker
 	failRevokes int               // revoke-self calls to fail before succeeding
+	policyFrom  int               // logins numbered below this lack the child policy: 403
+	missing     map[string]bool   // child policies no login holds: 403
 	creates     int
 	lastJWT     string
 }
@@ -91,11 +94,15 @@ func (f *fakeVault) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		w.WriteHeader(http.StatusNoContent)
 	case "/v1/auth/token/create":
-		if !f.alive[token] {
+		var n int
+		_, _ = fmt.Sscanf(token, "parent-%d", &n)
+		body := decodeBody(f.t, r)
+		policies, _ := body["policies"].([]any)
+		if !f.alive[token] || n < f.policyFrom || (len(policies) == 1 && f.missing[fmt.Sprint(policies[0])]) {
 			w.WriteHeader(http.StatusForbidden)
 			return
 		}
-		ttl, err := time.ParseDuration(decodeBody(f.t, r)["ttl"].(string))
+		ttl, err := time.ParseDuration(body["ttl"].(string))
 		if err != nil {
 			f.t.Error("child TTL not a duration")
 		}
@@ -444,5 +451,120 @@ func TestDetectAuthMethodJWT(t *testing.T) {
 		return map[string]string{"VAULT_JWT_ROLE": "../x", "VAULT_JWT_TOKEN_FILE": "/t"}[k]
 	}); err == nil {
 		t.Fatal("unsafe role accepted")
+	}
+}
+
+func (f *fakeVault) setPolicyFrom(n int) {
+	f.mu.Lock()
+	f.policyFrom = n
+	f.mu.Unlock()
+}
+
+// A database the catalog added after the current login was issued: Vault
+// refuses its child policy to that login. The broker logs in again once and
+// the retry succeeds, with no wait for the scheduled refresh.
+func TestJWTDeniedMintLogsInAgainAndRetries(t *testing.T) {
+	h := newJWTHarness(t, 3600, defaultReauthOptions())
+	h.vault.setPolicyFrom(2) // the apply landed after parent-1
+	h.advance(2 * time.Minute)
+	s, err := h.session()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.vault.parent(s.Accessor) != "parent-2" {
+		t.Fatal("retry not under the new login")
+	}
+	if logins, _, _ := h.vault.snapshot(); logins != 2 {
+		t.Fatalf("logins=%d", logins)
+	}
+	// The scheduled refresh counts from the new login.
+	h.advance(15 * time.Minute)
+	if logins, _, _ := h.vault.snapshot(); logins != 2 {
+		t.Fatalf("logins=%d; the schedule must not log in again early", logins)
+	}
+}
+
+// A policy that no login holds costs at most one new login a minute, however
+// many sessions ask, and each refusal says why.
+func TestJWTDeniedMintLoginsAreBounded(t *testing.T) {
+	h := newJWTHarness(t, 3600, defaultReauthOptions())
+	h.vault.setPolicyFrom(1 << 30) // no login ever holds it
+	h.advance(2 * time.Minute)
+	var wg sync.WaitGroup
+	errs := make(chan error, 200)
+	for range 200 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := h.session()
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err == nil || !strings.Contains(err.Error(), "lacks this database's policy") {
+			t.Fatalf("err=%v", err)
+		}
+	}
+	if logins, _, _ := h.vault.snapshot(); logins != 2 {
+		t.Fatalf("logins=%d; 200 denied mints must share one new login", logins)
+	}
+	// The new login is young: another denial does not log in again.
+	if _, err := h.session(); err == nil {
+		t.Fatal("minted without the policy")
+	}
+	if logins, _, _ := h.vault.snapshot(); logins != 2 {
+		t.Fatalf("logins=%d", logins)
+	}
+	// A new login also lacked the policy, so it is missing, not new: no more
+	// logins for it until the next scheduled one.
+	h.advance(2 * time.Minute)
+	_, _ = h.session()
+	if logins, _, _ := h.vault.snapshot(); logins != 2 {
+		t.Fatalf("logins=%d; a policy a new login lacked must wait for the schedule", logins)
+	}
+}
+
+// A policy missing for an hour of minute-by-minute attempts costs at most one
+// extra login per scheduled login, not one a minute.
+func TestJWTMissingPolicyForAnHourStaysBounded(t *testing.T) {
+	h := newJWTHarness(t, 3600, defaultReauthOptions())
+	h.vault.setPolicyFrom(1 << 30)
+	for range 60 {
+		h.advance(time.Minute)
+		if _, err := h.session(); err == nil {
+			t.Fatal("minted without the policy")
+		}
+	}
+	// Scheduled logins every 20 minutes from the newest login, each followed
+	// by at most one login after a denial: well under the 60 a per-minute
+	// re-login would make.
+	if logins, _, _ := h.vault.snapshot(); logins > 7 {
+		t.Fatalf("logins=%d in an hour with a missing policy", logins)
+	}
+}
+
+// Each distinct missing policy can add one login per scheduled login, never
+// one a minute: three missing for an hour stays within 1 + 3 + 3 x 3.
+func TestJWTSeveralMissingPoliciesStayBounded(t *testing.T) {
+	h := newJWTHarness(t, 3600, defaultReauthOptions())
+	roles := []string{"orders", "ledger", "audit"}
+	h.vault.mu.Lock()
+	h.vault.missing = map[string]bool{}
+	for _, role := range roles {
+		h.vault.missing[DatabaseCredentialPolicyName("database", role)] = true
+	}
+	h.vault.mu.Unlock()
+	for range 60 {
+		h.advance(time.Minute)
+		for _, role := range roles {
+			if _, err := h.c.NewDatabaseSession(context.Background(), "database", role, 30*time.Minute); err == nil {
+				t.Fatal("minted without the policy")
+			}
+		}
+	}
+	if logins, _, _ := h.vault.snapshot(); logins > 1+3+3*3 {
+		t.Fatalf("logins=%d in an hour with three missing policies", logins)
 	}
 }

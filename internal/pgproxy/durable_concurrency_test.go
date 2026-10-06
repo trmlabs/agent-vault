@@ -24,9 +24,10 @@ func TestDurableLeaseUnrelatedCleanupDoesNotDelayRenewal(t *testing.T) {
 	entered := make(chan struct{}, 1)
 	release := make(chan struct{})
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/auth/token/revoke-accessor" {
+		// A dead session's cleanup revokes its credential by path.
+		if strings.HasPrefix(r.URL.Path, "/v1/sys/leases/revoke/") {
 			body, _ := io.ReadAll(r.Body)
-			if strings.Contains(string(body), "unrelated-orphan") {
+			if strings.Contains(r.URL.Path, "unrelated-orphan") {
 				select {
 				case entered <- struct{}{}:
 				default:
@@ -58,6 +59,9 @@ func TestDurableLeaseUnrelatedCleanupDoesNotDelayRenewal(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := st.AddDatabaseCleanup(context.Background(), m.owner, store.DatabaseCleanup{Accessor: "unrelated-orphan", Binding: "vault/broken"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetDatabaseCleanupLease(context.Background(), m.owner, "unrelated-orphan", "database/creds/reader/unrelated-orphan"); err != nil {
 		t.Fatal(err)
 	}
 	select {

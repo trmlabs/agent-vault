@@ -37,7 +37,13 @@ type adapterAudit struct {
 }
 
 func (a *adapterAudit) Admit() error { a.mu.Lock(); defer a.mu.Unlock(); return a.admitErr }
+
+// Record refuses what the real chain refuses, so a row the chain would reject
+// fails here too.
 func (a *adapterAudit) Record(e auditchain.Event) error {
+	if err := e.Validate(); err != nil {
+		return err
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.events = append(a.events, e)
@@ -96,6 +102,8 @@ type adapterFixture struct {
 	seen     atomic.Value // http.Header of the last vendor request
 	release  chan struct{}
 	sessions *scopeResolver
+	proxyURL *url.URL
+	roots    *x509.CertPool
 }
 
 // scopeResolver lets a test change the admitted scope without touching the
@@ -195,7 +203,7 @@ func newAdapterFixtureWith(t *testing.T, basic bool, options ...func(*Options)) 
 			option(o)
 		}
 	})
-	f.proxy = p
+	f.proxy, f.proxyURL, f.roots = p, proxyURL, roots
 	vendorRoots := x509.NewCertPool()
 	vendorRoots.AddCert(f.vendor.Certificate())
 	p.upstream.TLSClientConfig.RootCAs = vendorRoots
@@ -285,7 +293,9 @@ func TestAdapterRefusesOutsideTheCatalog(t *testing.T) {
 	if err == nil || f.audit.last().Outcome != "unlisted" || f.calls.Load() != 0 {
 		t.Fatalf("unlisted host tunnelled: %v %+v", err, f.audit.last())
 	}
-	// A pool without the grant matches the route but is refused.
+	// A pool without the grant is still refused per request inside a tunnel
+	// that is already open (this client reuses its earlier tunnel); a new
+	// tunnel for it is refused at CONNECT (TestAdapterRefusesAScopeWithoutAPool).
 	other := &brokercore.ProxyScope{VaultID: "vault-1", AgentID: "agent-uuid-9", Pool: "other-pool", WorkloadID: "pod-9"}
 	f.sessions.set(other)
 	if code, _, _ := f.do(t, "POST", "/v1/chat/completions", "{}", nil); code != 403 || f.audit.last().Outcome != "pool" || f.calls.Load() != 0 {
@@ -446,11 +456,12 @@ func TestAdapterFailsClosed(t *testing.T) {
 	}
 }
 
-// A verified agent whose scope carries no catalog pool reaches nothing.
+// A verified agent whose scope carries no catalog pool reaches nothing: its
+// CONNECT is refused before a tunnel opens.
 func TestAdapterRefusesAScopeWithoutAPool(t *testing.T) {
 	f := newAdapterFixture(t)
 	f.sessions.set(&brokercore.ProxyScope{VaultID: "vault-1", AgentID: "agent-uuid-1", WorkloadID: "pod-uid-1"})
-	if code, _, _ := f.do(t, "POST", "/v1/chat/completions", "{}", nil); code != 403 || f.audit.last().Outcome != "pool" || f.calls.Load() != 0 {
+	if code, _, _ := f.do(t, "POST", "/v1/chat/completions", "{}", nil); code != 0 || f.audit.last().Outcome != "pool" || f.calls.Load() != 0 {
 		t.Fatalf("pool-less scope admitted: %d %+v", code, f.audit.last())
 	}
 }

@@ -192,17 +192,18 @@ func (b *Broker) servePooled(ctx context.Context, conn net.Conn, backend *pgprot
 	b.logger.Info("pgproxy: pooled session established", slog.String("vault", scope.VaultID), slog.String("actor", scope.ActorID),
 		slog.String("workload", scope.WorkloadID), slog.String("service", svc.Name))
 
-	relayCtx, relayCancel := context.WithCancel(WithSession(b.ctx, Session(ctx)))
+	// The recheck needs the connection's session and attestation, not its deadline.
+	relayCtx, relayCancel := context.WithCancel(WithSession(brokercore.WithAttestation(b.ctx, brokercore.AttestationFrom(ctx)), Session(ctx)))
 	defer relayCancel()
 	authorizationDone := make(chan struct{})
 	go func() {
 		defer close(authorizationDone)
-		b.authorizationLoop(relayCtx, token, hint, requested, scope, *svc, s.kill, peer)
+		b.authorizationLoop(relayCtx, token, hint, requested, scope, *svc, func() { s.killWith(&noticeAuthorization) }, peer)
 	}()
 	defer func() { relayCancel(); <-authorizationDone }()
 	if !scope.NotAfter.IsZero() {
 		// A pool Pod's session ends at its deadline, as on the unpooled path.
-		deadline := time.AfterFunc(time.Until(scope.NotAfter), s.kill)
+		deadline := time.AfterFunc(time.Until(scope.NotAfter), func() { s.killWith(&noticeDeadline) })
 		defer deadline.Stop()
 	}
 	defer s.end()
@@ -302,7 +303,11 @@ func (s *pooledSession) run(ctx context.Context) {
 		}
 		var refusal *refusalError
 		if !errors.As(err, &refusal) {
-			return // server connection lost or client gone
+			// Binding or forwarding failed on the database side: say so to the
+			// client and in the log, instead of ending in silence.
+			s.b.logger.Warn("pgproxy: pooled session lost its server connection", "service", s.svc.Name, "error", errorClass(err))
+			s.killWith(&noticeUpstream)
+			return
 		}
 		code, message, outcome := poolRefusal(refusal.err)
 		s.b.auditDenied(s.event, outcome)
@@ -664,7 +669,13 @@ func (s *pooledSession) readServer(conn *serverConn, done chan struct{}) {
 			stale := s.conn != conn
 			s.mu.Unlock()
 			if !stale {
-				s.kill() // the server connection failed under an active client
+				// The server connection failed under an active client: the pool
+				// closes it at its credential's expiry, otherwise it was lost.
+				notice := &noticeUpstream
+				if conn.cred != nil && conn.cred.lease != nil && !time.Now().Before(conn.cred.lease.ExpiresAt.Add(-conn.cred.margin)) {
+					notice = &noticeCredential
+				}
+				s.killWith(notice)
 			}
 			return
 		}
@@ -706,8 +717,7 @@ func (s *pooledSession) readServer(conn *serverConn, done chan struct{}) {
 				// read safely, so the session ends before the next statement.
 				s.mu.Unlock()
 				s.b.auditDenied(s.event, "encoding_change")
-				s.writeClient(brokerError("FATAL", "42501", "encoding_change", lexerChangeMessage))
-				s.kill()
+				s.killWith(&noticeEncoding)
 				return
 			}
 		case *pgproto3.DataRow:
@@ -1018,30 +1028,52 @@ func discardAll(conn *serverConn, timeout time.Duration) error {
 // statement on its server connection is cancelled and the connection closed.
 // The connection is detached first, under the session lock, so it cannot
 // have gone back to the pool and to another client when the cancel lands.
-func (s *pooledSession) kill() {
+func (s *pooledSession) kill() { s.killWith(nil) }
+
+// killWith is kill with a close notice for the client, written once the
+// server connection is detached, so no later server message follows it. A
+// restart that finds a transaction open says so instead. A client whose
+// writes are blocked gets no notice rather than holding up the kill.
+func (s *pooledSession) killWith(n *closeNotice) {
 	s.mu.Lock()
 	if s.killed {
 		s.mu.Unlock()
 		return
 	}
 	s.killed = true
+	if n != nil && *n == noticeRestarting && !s.idleLocked() {
+		n = &noticeRestartCut
+	}
 	conn := s.conn
 	s.conn = nil
 	if conn != nil {
 		s.unbindCancel()
 	}
 	s.mu.Unlock()
+	// Stop the running statement first, so a client that is slow to read the
+	// notice cannot keep it running.
+	if conn != nil {
+		if conn.sess.backendKey != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
+			s.b.cancelUpstream(ctx, conn.sess.conn.RemoteAddr().String(), &s.svc,
+				&pgproto3.CancelRequest{ProcessID: conn.sess.backendKey.ProcessID, SecretKey: conn.sess.backendKey.SecretKey})
+			cancel()
+		}
+		s.b.pools.release(conn, false)
+	}
+	if n != nil {
+		notified := false
+		// Another write may be finishing a message; the notice waits for that
+		// boundary, but never longer than a notice write may take.
+		if lockWithin(&s.writeMu, noticeWriteTimeout) {
+			_ = s.client.SetWriteDeadline(time.Now().Add(noticeWriteTimeout))
+			s.backend.Send(brokerError("FATAL", n.code, n.reason, n.message))
+			notified = s.backend.Flush() == nil
+			s.writeMu.Unlock()
+		}
+		s.b.logSessionEnd(s.svc.Name, *n, notified)
+	}
 	_ = s.client.Close()
-	if conn == nil {
-		return
-	}
-	if conn.sess.backendKey != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
-		s.b.cancelUpstream(ctx, conn.sess.conn.RemoteAddr().String(), &s.svc,
-			&pgproto3.CancelRequest{ProcessID: conn.sess.backendKey.ProcessID, SecretKey: conn.sess.backendKey.SecretKey})
-		cancel()
-	}
-	s.b.pools.release(conn, false)
 }
 
 // registerPooledCancel gives the client a cancel key that reaches whichever

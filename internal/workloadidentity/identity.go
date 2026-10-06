@@ -13,11 +13,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Infisical/agent-vault/internal/brokercore"
@@ -46,10 +48,16 @@ type Binding struct {
 	// ListAgents is valid only in observer policy. It lets the admission
 	// controller read every agent's outstanding cleanup by agent and Pod UID.
 	ListAgents bool `json:"listAgents,omitempty"`
+	// TrustDomain names the listed trust domain whose tokens this binding
+	// admits; empty is the broker's own cluster.
+	TrustDomain string `json:"trustDomain,omitempty"`
+	// Proxy makes this a shared proxy's binding; see ProxyBinding.
+	Proxy *ProxyBinding `json:"proxy,omitempty"`
 }
 
-// Config selects one Kubernetes trust domain and explicit workload grants.
-// Empty API/CA/reviewer paths select the standard in-cluster endpoints.
+// Config selects the broker's own Kubernetes trust domain, any remote ones,
+// and explicit workload grants. Empty API/CA/reviewer paths select the
+// standard in-cluster endpoints.
 type Config struct {
 	APIServer               string    `json:"apiServer"`
 	CAFile                  string    `json:"caFile"`
@@ -59,6 +67,24 @@ type Config struct {
 	TimeoutSeconds          int       `json:"timeoutSeconds"`
 	MaxTokenLifetimeSeconds int64     `json:"maxTokenLifetimeSeconds"`
 	Bindings                []Binding `json:"bindings"`
+	// TrustDomains are other clusters, each verified by its published keys.
+	TrustDomains []TrustDomain `json:"trustDomains,omitempty"`
+	// MaxSessionSeconds is the ceiling on every pool binding's Pod lifetime
+	// and every proxy binding's session (default a day, at most 30 days).
+	// Lifetimes follow the platform's own ceilings, so it is set here once.
+	MaxSessionSeconds int64 `json:"maxSessionSeconds,omitempty"`
+}
+
+// DefaultSessionCeiling is MaxSessionSeconds when unset.
+const DefaultSessionCeiling = 24 * time.Hour
+
+const maxSessionCeiling = 30 * 24 * time.Hour
+
+func (c *Config) sessionCeiling() int64 {
+	if c.MaxSessionSeconds == 0 {
+		return int64(DefaultSessionCeiling / time.Second)
+	}
+	return c.MaxSessionSeconds
 }
 
 // Store supplies current broker identity and grant state for every decision.
@@ -74,12 +100,36 @@ type Resolver struct {
 	client *http.Client
 	store  Store
 	now    func() time.Time
-	jwks   *signingKeys
+	jwks   *signingKeys // the broker's own cluster's keys: domains[0].keys
+	// domains are the trust domains, the broker's own cluster first.
+	domains []*domain
+	// profiles, when set, holds each pool's declared harness profile.
+	profiles atomic.Pointer[profileSource]
+	logger   *slog.Logger
+}
+
+// SetLogger sets where refusal reasons are logged; the default is slog's.
+// Workers still see only a generic refusal.
+func (r *Resolver) SetLogger(l *slog.Logger) {
+	if l != nil {
+		r.logger = l
+	}
 }
 
 var _ brokercore.SessionResolver = (*Resolver)(nil)
 
 var imageDigest = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+
+const (
+	// maxConfigBytes bounds the configuration file read at startup: room
+	// for a proxy serving 10,000 tenant namespaces.
+	maxConfigBytes = 16 << 20
+	// maxListItems bounds short lists an operator writes (owner UIDs,
+	// source ranges): only a guard against a malformed file.
+	maxListItems = 1024
+	// maxProxyProfiles is how many namespaces one shared proxy may serve.
+	maxProxyProfiles = 10000
+)
 
 // LoadConfig reads a bounded JSON policy and rejects unknown fields.
 func LoadConfig(path string) (Config, error) {
@@ -89,8 +139,8 @@ func LoadConfig(path string) (Config, error) {
 		return c, errors.New("cannot open workload identity configuration")
 	}
 	defer func() { _ = f.Close() }()
-	data, err := io.ReadAll(io.LimitReader(f, (1<<20)+1))
-	if err != nil || len(data) > 1<<20 {
+	data, err := io.ReadAll(io.LimitReader(f, maxConfigBytes+1))
+	if err != nil || len(data) > maxConfigBytes {
 		return c, errors.New("workload identity configuration exceeds size limit or cannot be read")
 	}
 	d := json.NewDecoder(bytes.NewReader(data))
@@ -124,6 +174,9 @@ func newResolver(c Config, s Store, observer bool) (*Resolver, error) {
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
 		return nil, errors.New("workload identity apiServer must be an HTTPS origin")
 	}
+	if observer && len(c.TrustDomains) != 0 {
+		return nil, errors.New("observer policy must not list trust domains")
+	}
 	if (!observer && s == nil) || c.CAFile == "" || c.ReviewerTokenFile == "" || c.Issuer == "" || c.Audience == "" || len(c.Bindings) == 0 {
 		return nil, errors.New("workload identity requires trust, reviewer token, issuer, audience, store and bindings")
 	}
@@ -136,10 +189,15 @@ func newResolver(c Config, s Store, observer bool) (*Resolver, error) {
 	if c.MaxTokenLifetimeSeconds == 0 {
 		c.MaxTokenLifetimeSeconds = 3600
 	}
+	if c.MaxSessionSeconds != 0 && (c.MaxSessionSeconds < 60 || c.MaxSessionSeconds > int64(maxSessionCeiling/time.Second)) {
+		return nil, errors.New("workload identity maxSessionSeconds must be between 60 s and 30 days")
+	}
+	ceiling := c.sessionCeiling()
 	if c.MaxTokenLifetimeSeconds < 600 || c.MaxTokenLifetimeSeconds > 3600 {
 		return nil, errors.New("workload identity maxTokenLifetimeSeconds must be between 600 and 3600")
 	}
 	seen := map[string]bool{}
+	proxyNamespaces := map[string]bool{}
 	for _, b := range c.Bindings {
 		if !pathSegment(b.Namespace) || !pathSegment(b.ServiceAccount) || b.ServiceAccountUID == "" || (!observer && (b.AgentID == "" || b.VaultID == "")) {
 			return nil, errors.New("workload identity binding requires namespace, account, account UID, agent and vault")
@@ -147,20 +205,23 @@ func newResolver(c Config, s Store, observer bool) (*Resolver, error) {
 		if observer && (b.AgentID != "" || b.VaultID != "") {
 			return nil, errors.New("observer policy must not contain proxy grants")
 		}
-		if len(b.OwnerUIDs) != 0 || b.ContainerName != "" || b.MaxPodSeconds != 0 || b.Pool != "" || len(b.ImageDigests) != 0 {
+		if b.Proxy == nil && (len(b.OwnerUIDs) != 0 || b.ContainerName != "" || b.MaxPodSeconds != 0 || b.Pool != "" || len(b.ImageDigests) != 0) {
 			if b.Pool != "" && !pathSegment(b.Pool) {
 				return nil, errors.New("pool binding name must be a lowercase DNS-style name")
 			}
-			if observer || len(b.OwnerUIDs) == 0 || len(b.OwnerUIDs) > 16 || b.PodUID != "" || b.MaxPodSeconds < 60 || b.MaxPodSeconds > 8*3600 || (b.ContainerName != "" && !pathSegment(b.ContainerName)) {
-				return nil, errors.New("pool binding requires 1 to 16 owner UIDs, no Pod UID and a 60 s to 8 h Pod lifetime")
+			if observer || len(b.OwnerUIDs) == 0 || len(b.OwnerUIDs) > maxListItems || b.PodUID != "" || b.MaxPodSeconds < 60 || b.MaxPodSeconds > ceiling || (b.ContainerName != "" && !pathSegment(b.ContainerName)) {
+				return nil, errors.New("pool binding requires owner UIDs (at most 1,024), no Pod UID and a Pod lifetime from 60 s to maxSessionSeconds")
 			}
 			for _, owner := range b.OwnerUIDs {
 				if owner == "" {
 					return nil, errors.New("pool binding owner UID must be non-empty")
 				}
 			}
-			if len(b.ImageDigests) == 0 || len(b.ImageDigests) > 16 {
-				return nil, errors.New("pool binding requires 1 to 16 image digests")
+			// No upper bound: a fleet may run many approved images, each digest
+			// is a short fixed-size string, and the configuration file's size
+			// limit bounds the list.
+			if len(b.ImageDigests) == 0 {
+				return nil, errors.New("pool binding requires at least one image digest")
 			}
 			for _, digest := range b.ImageDigests {
 				if !imageDigest.MatchString(digest) {
@@ -171,7 +232,31 @@ func newResolver(c Config, s Store, observer bool) (*Resolver, error) {
 		if !observer && b.ListAgents {
 			return nil, errors.New("proxy policy must not contain observer access")
 		}
-		key := b.Namespace + ":" + b.ServiceAccount
+		if b.TrustDomain != "" && !listedDomain(c.TrustDomains, b.TrustDomain) {
+			return nil, errors.New("workload identity binding names an unlisted trust domain")
+		}
+		if b.Proxy != nil {
+			if observer || b.PodUID != "" || len(b.OwnerUIDs) != 0 || b.ContainerName != "" || b.MaxPodSeconds != 0 || len(b.ImageDigests) != 0 || b.Pool != "" {
+				return nil, errors.New("a proxy binding takes its pools from its profiles and no Pod, owner or image settings of its own")
+			}
+			if err := b.Proxy.validate(ceiling); err != nil {
+				return nil, err
+			}
+			// Within one trust domain, a namespace names one profile.
+			for _, pp := range b.Proxy.Profiles {
+				key := b.TrustDomain + "/" + pp.Namespace
+				if proxyNamespaces[key] {
+					return nil, errors.New("a namespace is served by two proxy bindings of one trust domain")
+				}
+				proxyNamespaces[key] = true
+			}
+		}
+		if b.TrustDomain != "" && b.Proxy == nil {
+			// The broker cannot read a remote cluster's Pods, so neither the
+			// TokenReview path nor the pool Pod check can admit its tokens.
+			return nil, errors.New("a remote trust domain admits only proxy bindings")
+		}
+		key := b.TrustDomain + "/" + b.Namespace + ":" + b.ServiceAccount
 		if seen[key] {
 			return nil, errors.New("ambiguous workload identity binding")
 		}
@@ -188,10 +273,24 @@ func newResolver(c Config, s Store, observer bool) (*Resolver, error) {
 	c.APIServer = strings.TrimSuffix(c.APIServer, "/")
 	c.Bindings = append([]Binding(nil), c.Bindings...)
 	transport := &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool}}
-	return &Resolver{config: c, store: s, now: time.Now, jwks: &signingKeys{}, client: &http.Client{
+	r := &Resolver{config: c, store: s, now: time.Now, logger: slog.Default(), client: &http.Client{
 		Timeout: time.Duration(c.TimeoutSeconds) * time.Second, Transport: transport,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-	}}, nil
+	}}
+	if err := r.buildDomains(c); err != nil {
+		return nil, err
+	}
+	r.jwks = r.domains[0].keys
+	return r, nil
+}
+
+func listedDomain(domains []TrustDomain, name string) bool {
+	for _, d := range domains {
+		if d.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func pathSegment(s string) bool {
@@ -363,8 +462,9 @@ func (r *Resolver) ResolveForProxy(ctx context.Context, token, vaultHint string)
 		return nil, err
 	}
 	deny := brokercore.ErrInvalidSession
-	if len(binding.OwnerUIDs) != 0 {
-		// A pool binding is admitted only with the connection's peer address.
+	if len(binding.OwnerUIDs) != 0 || binding.Proxy != nil || binding.TrustDomain != "" || brokercore.AttestationFrom(ctx) != "" {
+		// Pool and proxy bindings are admitted only with the connection's peer
+		// address, and only a proxy binding may present an attestation.
 		return nil, deny
 	}
 	scope, err := r.grant(ctx, binding, vaultHint)
@@ -376,7 +476,7 @@ func (r *Resolver) ResolveForProxy(ctx context.Context, token, vaultHint string)
 	if ctx.Err() != nil || c.Expires <= r.now().Unix() {
 		return nil, deny
 	}
-	scope.WorkloadID = c.Kubernetes.Pod.UID
+	scope.WorkloadID, scope.IdentityKind = c.Kubernetes.Pod.UID, brokercore.KindTokenReview
 	return scope, nil
 }
 

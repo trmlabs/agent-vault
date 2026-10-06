@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/Infisical/agent-vault/internal/workloadidentity"
 )
 
 var errDenied = errors.New("task relay denied")
@@ -21,17 +23,25 @@ const pairInterval = time.Second
 type pairVerifier struct {
 	config FixedConfig
 	client *http.Client
+	cache  *podCache // shared mode: the agent Pods, by address
 }
 
 func newPairVerifier(c FixedConfig) (*pairVerifier, error) {
 	if c.Self {
 		return &pairVerifier{config: c}, nil
 	}
+	if c.Shared != nil {
+		cache, e := newPodCache(c)
+		if e != nil {
+			return nil, e
+		}
+		return &pairVerifier{config: c, cache: cache}, nil
+	}
 	t, e := clientTLS(c.Kubernetes.CAFile, "")
 	if e != nil {
 		return nil, e
 	}
-	return &pairVerifier{c, &http.Client{Timeout: apiTimeout, Transport: &http.Transport{TLSClientConfig: t, Proxy: nil, MaxResponseHeaderBytes: 8192}, CheckRedirect: func(*http.Request, []*http.Request) error { return errDenied }}}, nil
+	return &pairVerifier{config: c, client: &http.Client{Timeout: apiTimeout, Transport: &http.Transport{TLSClientConfig: t, Proxy: nil, MaxResponseHeaderBytes: 8192}, CheckRedirect: func(*http.Request, []*http.Request) error { return errDenied }}}, nil
 }
 
 // peerMatches reports whether a socket address belongs to the immutable
@@ -39,12 +49,26 @@ func newPairVerifier(c FixedConfig) (*pairVerifier, error) {
 // foreign peer before spending a TLS handshake, a Kubernetes request or an
 // audit write on it. It is not admission: check still performs the live test.
 func (v *pairVerifier) peerMatches(peer string) bool {
+	if v.cache != nil {
+		_, ok := v.attestation(peer)
+		return ok
+	}
 	host, _, e := net.SplitHostPort(peer)
 	if v.config.Self {
 		// Same Pod: only the shared loopback interface reaches the sidecar.
 		return e == nil && net.ParseIP(host) != nil && net.ParseIP(host).IsLoopback()
 	}
 	return e == nil && net.ParseIP(host).Equal(net.ParseIP(v.config.Sandbox.PodIP))
+}
+
+// attestation returns the attestation of the one admissible agent Pod at a
+// connection's source address, in shared mode.
+func (v *pairVerifier) attestation(peer string) (workloadidentity.Attestation, bool) {
+	addr, ok := sharedPeer(peer)
+	if !ok || v.cache == nil {
+		return workloadidentity.Attestation{}, false
+	}
+	return v.cache.lookup(addr)
 }
 
 // check never consults caller headers. With a nonempty peer it requires the
@@ -57,7 +81,9 @@ func (v *pairVerifier) check(ctx context.Context, peer string) error {
 	if peer != "" && !v.peerMatches(peer) {
 		return errDenied
 	}
-	if c.Self {
+	if c.Self || v.cache != nil {
+		// A shared proxy has no single pair: each connection's own Pod is
+		// checked through peerMatches and rechecked by watchPeer.
 		return nil
 	}
 	token, e := readBoundedFile(c.Kubernetes.ReviewerTokenFile, 32<<10)

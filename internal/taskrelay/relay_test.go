@@ -122,7 +122,9 @@ func (f *relayFixture) start(t *testing.T) {
 	default:
 		address = f.c.Browser.Listen
 	}
-	for end := time.Now().Add(3 * time.Second); time.Now().Before(end); {
+	// Polls until the listener answers; the bound only stops a broken start,
+	// so it is wide enough for a full -race suite on a loaded runner.
+	for end := time.Now().Add(30 * time.Second); time.Now().Before(end); {
 		conn, e := net.DialTimeout("tcp", address, 20*time.Millisecond)
 		if e == nil {
 			conn.Close()
@@ -262,7 +264,7 @@ func TestConfigAndProofFailClosed(t *testing.T) {
 			t.Fatal("accepted invalid proof")
 		}
 	}
-	f.c.Deadline = time.Now().Add(9 * time.Hour)
+	f.c.Deadline = time.Now().Add(25 * time.Hour)
 	if f.c.Validate(time.Now()) == nil {
 		t.Fatal("accepted excessive deadline")
 	}

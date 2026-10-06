@@ -16,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Infisical/agent-vault/internal/workloadidentity"
 )
 
 // FixedConfig is operator-owned. None of these fields may come from requests.
@@ -30,11 +32,38 @@ type FixedConfig struct {
 	Connect          *ConnectConfig   `json:"connect,omitempty"`
 	Postgres         *PostgresConfig  `json:"postgres,omitempty"`
 	PostgresBindings []PostgresConfig `json:"postgresBindings,omitempty"`
-	Browser          *BrowserConfig   `json:"browser,omitempty"`
+	// PostgresListener, in shared mode only, is one port for every catalog
+	// database; see PostgresListenerConfig.
+	PostgresListener *PostgresListenerConfig `json:"postgresListener,omitempty"`
+	Browser          *BrowserConfig          `json:"browser,omitempty"`
 	// Self runs the relay as a sidecar in the worker's own Pod: loopback,
 	// plaintext listeners only, and no Kubernetes pairing, because the broker
 	// verifies this Pod's token and address on every connection.
 	Self bool `json:"self,omitempty"`
+	// MaxConnections bounds a sidecar's open connections (paired or self
+	// mode; default 32). The pool render sets it from sessionsPerWorker. A
+	// shared proxy uses shared.maxConnections instead.
+	MaxConnections int `json:"maxConnections,omitempty"`
+	// HandshakeSeconds bounds each connection's setup: the client's startup
+	// or CONNECT, the dial and TLS handshake to the broker, and the broker's
+	// answer (default 10, 1 to 300). See handshakeTimeout.
+	HandshakeSeconds int `json:"handshakeSeconds,omitempty"`
+	// Shared runs the relay as one proxy for many agent Pods; see SharedConfig.
+	Shared *SharedConfig `json:"shared,omitempty"`
+	// TLS, in shared mode only, serves every listener but AdminListen in TLS
+	// with a broker-issued certificate; see ServingTLSConfig.
+	TLS *ServingTLSConfig `json:"tls,omitempty"`
+	// AdminListen, in shared mode only, serves GET /v1/activity in plaintext:
+	// when each agent Pod last used this replica, for the idle janitor. A
+	// network policy must admit only the janitor to it.
+	AdminListen string `json:"adminListen,omitempty"`
+	// ActivityRetentionSeconds is how long the activity report keeps a
+	// Sandbox after its last use (default a day). The janitor refuses a
+	// retention shorter than its idle time.
+	ActivityRetentionSeconds int64 `json:"activityRetentionSeconds,omitempty"`
+	// DurableActivity keeps activity in the broker's shared store; see
+	// DurableActivityConfig.
+	DurableActivity *DurableActivityConfig `json:"durableActivity,omitempty"`
 }
 type SandboxConfig struct {
 	Namespace     string `json:"namespace"`
@@ -65,7 +94,16 @@ type ConnectConfig struct {
 	Listen         string         `json:"listen"`
 	Upstream       UpstreamConfig `json:"upstream"`
 	AllowedTargets []string       `json:"allowedTargets"`
+	// Routes "broker", in shared mode only and in place of AllowedTargets,
+	// forwards any well-formed host:443 to the broker, whose catalog refuses
+	// a host it does not list. See brokerRouteTarget.
+	Routes string `json:"routes,omitempty"`
 }
+
+// routesBroker leaves routing to the broker's catalog. It must be set
+// explicitly: a config that merely drops its list fails validation.
+const routesBroker = "broker"
+
 type PostgresConfig struct {
 	Listen      string         `json:"listen"`
 	Upstream    UpstreamConfig `json:"upstream"`
@@ -73,6 +111,29 @@ type PostgresConfig struct {
 	User        string         `json:"user"`
 	Placeholder string         `json:"placeholder"`
 }
+
+// PostgresListenerConfig is one PostgreSQL port routed by the startup
+// packet's database parameter. Databases is the route table, rendered from
+// the catalog: a name outside it is refused before the broker is dialed, and a
+// name in it goes to the one upstream, which authorizes it per pool. There is
+// no fixed route count.
+type PostgresListenerConfig struct {
+	Listen      string         `json:"listen"`
+	Upstream    UpstreamConfig `json:"upstream"`
+	Databases   []string       `json:"databases,omitempty"`
+	User        string         `json:"user"`
+	Placeholder string         `json:"placeholder"`
+	// Routes "broker", in place of Databases, forwards any well-formed
+	// database name to the broker, whose catalog refuses a name not granted
+	// to the agent's pool with the same 3D000 words. See brokerRouteDatabase.
+	Routes string `json:"routes,omitempty"`
+}
+
+// route is the binding for one catalog database on this listener.
+func (l *PostgresListenerConfig) route(database string) PostgresConfig {
+	return PostgresConfig{Listen: l.Listen, Upstream: l.Upstream, Database: database, User: l.User, Placeholder: l.Placeholder}
+}
+
 type BrowserConfig struct {
 	Listen   string         `json:"listen"`
 	Upstream UpstreamConfig `json:"upstream"`
@@ -82,10 +143,14 @@ var safeName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,252}$`)
 var containerName = regexp.MustCompile(`^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$`)
 var errConfig = errors.New("invalid fixed task relay configuration")
 
+const maxConfigBytes = 16 << 20
+
 // LoadConfig rejects unknown fields, trailing data and oversized configuration.
 func LoadConfig(path string) (FixedConfig, error) {
 	var c FixedConfig
-	b, err := readBoundedFile(path, 64<<10)
+	// A shared proxy's route table lists every catalog database, so the bound
+	// is sized for tens of thousands of names, not for one binding.
+	b, err := readBoundedFile(path, maxConfigBytes)
 	if err != nil {
 		return c, errConfig
 	}
@@ -97,12 +162,37 @@ func LoadConfig(path string) (FixedConfig, error) {
 	// A sidecar's config is static in the Pod template, so its relay lifetime
 	// starts with the container; the broker enforces the Pod's real deadline.
 	if c.Self && c.Deadline.IsZero() {
-		c.Deadline = time.Now().Add(8 * time.Hour).Add(-time.Minute)
+		c.Deadline = time.Now().Add(workloadidentity.DefaultSessionCeiling).Add(-time.Minute)
+	}
+	// A shared proxy serves many agents for as long as it runs; each agent's
+	// own deadline comes from its Pod.
+	if c.Shared != nil && c.Deadline.IsZero() {
+		c.Deadline = time.Now().Add(10 * 365 * 24 * time.Hour)
 	}
 	return c, c.Validate(time.Now())
 }
 
 func (c FixedConfig) Validate(now time.Time) error {
+	if (c.AdminListen != "" || c.PostgresListener != nil || c.TLS != nil) && c.Shared == nil {
+		return errConfig
+	}
+	// Activity reaches the broker over the CONNECT upstream.
+	if d := c.DurableActivity; d != nil && (c.AdminListen == "" || c.Connect == nil || d.PushSeconds < 0 || d.PushSeconds > 3600) {
+		return errConfig
+	}
+	// A sidecar's cap has no ceiling but the relay's sanity bound; the shared
+	// proxy has its own.
+	if c.MaxConnections < 0 || c.MaxConnections > 65536 || (c.MaxConnections != 0 && c.Shared != nil) ||
+		c.HandshakeSeconds < 0 || c.HandshakeSeconds > 300 {
+		return errConfig
+	}
+	// Up to a year: retention costs one small entry per Sandbox used.
+	if c.ActivityRetentionSeconds != 0 && (c.AdminListen == "" || c.ActivityRetentionSeconds < 60 || c.ActivityRetentionSeconds > 366*24*3600) {
+		return errConfig
+	}
+	if c.Shared != nil {
+		return c.validateShared(now)
+	}
 	if c.Self {
 		return c.validateSelf(now)
 	}
@@ -117,7 +207,7 @@ func (c FixedConfig) Validate(now time.Time) error {
 	if !containerName.MatchString(c.Sandbox.ContainerName) {
 		return errConfig
 	}
-	if !safeName.MatchString(c.TaskID) || !c.Deadline.After(now) || c.Deadline.After(now.Add(8*time.Hour)) {
+	if !safeName.MatchString(c.TaskID) || !c.Deadline.After(now) || c.Deadline.After(now.Add(workloadidentity.DefaultSessionCeiling)) {
 		return errConfig
 	}
 	for _, v := range []string{c.Sandbox.Namespace, c.Sandbox.Name, c.Sandbox.UID} {
@@ -141,7 +231,7 @@ func (c FixedConfig) Validate(now time.Time) error {
 		return nil
 	}
 	if c.Connect != nil {
-		if check(c.Connect.Listen, c.Connect.Upstream) != nil || len(c.Connect.AllowedTargets) == 0 || len(c.Connect.AllowedTargets) > 32 {
+		if check(c.Connect.Listen, c.Connect.Upstream) != nil || c.Connect.Routes != "" || len(c.Connect.AllowedTargets) == 0 {
 			return errConfig
 		}
 		for _, target := range c.Connect.AllowedTargets {
@@ -177,7 +267,7 @@ func (c FixedConfig) validateSelf(now time.Time) error {
 			return errConfig
 		}
 	}
-	if !safeName.MatchString(c.TaskID) || !c.Deadline.After(now) || c.Deadline.After(now.Add(8*time.Hour)) || c.AuditFile == "" || c.Browser != nil ||
+	if !safeName.MatchString(c.TaskID) || !c.Deadline.After(now) || c.Deadline.After(now.Add(workloadidentity.DefaultSessionCeiling)) || c.AuditFile == "" || c.Browser != nil ||
 		c.Sandbox != (SandboxConfig{}) || c.Kubernetes != (KubernetesConfig{}) || c.TLSCertFile != "" || c.TLSKeyFile != "" {
 		return errConfig
 	}
@@ -192,7 +282,7 @@ func (c FixedConfig) validateSelf(now time.Time) error {
 		return nil
 	}
 	if c.Connect != nil {
-		if check(c.Connect.Listen, c.Connect.Upstream) != nil || len(c.Connect.AllowedTargets) == 0 || len(c.Connect.AllowedTargets) > 32 {
+		if check(c.Connect.Listen, c.Connect.Upstream) != nil || c.Connect.Routes != "" || len(c.Connect.AllowedTargets) == 0 {
 			return errConfig
 		}
 		for _, target := range c.Connect.AllowedTargets {
@@ -216,6 +306,13 @@ func (c FixedConfig) validateSelf(now time.Time) error {
 }
 
 // postgresBindings preserves the legacy single binding without mixing authority.
+func (c FixedConfig) activityRetention() time.Duration {
+	if c.ActivityRetentionSeconds == 0 {
+		return defaultActivityRetention
+	}
+	return time.Duration(c.ActivityRetentionSeconds) * time.Second
+}
+
 func (c FixedConfig) postgresBindings() []PostgresConfig {
 	if c.Postgres != nil {
 		return []PostgresConfig{*c.Postgres}

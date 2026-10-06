@@ -37,9 +37,12 @@ type Options struct {
 	HandshakeTimeout      time.Duration
 	StartupTimeout        time.Duration // bound on the pre-auth phase (default 5s)
 	MinRenewInterval      time.Duration // floor on the renew cadence (default 5s)
-	MaxConns              int           // cap on concurrent SERVING connections = upstream DB connections (default 50)
-	MaxPendingConns       int           // cap on accepted-but-not-yet-serving connections (default 512)
-	MaxLeasesPerActor     int           // cap on live credentials/connections per workload (Pod), or per agent when no workload is known (default 16; clamped to <= MaxConns)
+	MaxConns              int           // cap on concurrent SERVING connections = upstream DB connections, all databases (default 10,000)
+	// DefaultDatabaseConns is a database's ceiling when its catalog entry
+	// sets no maxConns (default 50).
+	DefaultDatabaseConns int
+	MaxPendingConns      int // cap on accepted-but-not-yet-serving connections (default 512)
+	MaxLeasesPerActor    int // cap on live credentials/connections per workload (Pod), or per agent when no workload is known (default 16; clamped to <= MaxConns)
 	// MaxLeasesPerAgent caps one agent's sessions across all its workloads on
 	// this replica, so a pool agent with many Pods cannot take the whole
 	// serving cap (default MaxConns minus MaxLeasesPerActor, at least
@@ -87,6 +90,7 @@ type Broker struct {
 	wg                   sync.WaitGroup
 	pools                *serverPools // nil unless Options.Pool is set
 	pooled               map[net.Conn]*pooledSession
+	closers              map[net.Conn]func(closeNotice) // unpooled sessions that can end with a notice
 	denied               deniedLimiter
 }
 
@@ -118,14 +122,28 @@ func New(addr string, opts Options) *Broker {
 	if opts.MinRenewInterval <= 0 {
 		opts.MinRenewInterval = defaultMinRenewInterval
 	}
+	maxConns, perActor := defaultMaxConns, defaultMaxLeasesPerActor
+	if opts.Pool != nil {
+		maxConns, perActor = defaultPooledMaxConns, defaultPooledMaxLeasesPerActor
+	}
+	explicitMaxConns := opts.MaxConns > 0
 	if opts.MaxConns <= 0 {
-		opts.MaxConns = defaultMaxConns
+		opts.MaxConns = maxConns
+	}
+	if opts.DefaultDatabaseConns <= 0 {
+		opts.DefaultDatabaseConns = defaultDatabaseConns
+		if explicitMaxConns && opts.Pool == nil {
+			// An operator who sized the broker for its databases keeps that
+			// size for an entry without maxConns, as before.
+			opts.DefaultDatabaseConns = opts.MaxConns
+		}
 	}
 	if opts.MaxPendingConns <= 0 {
-		opts.MaxPendingConns = defaultMaxPendingConns
+		// Handshakes in progress scale with the serving cap they feed.
+		opts.MaxPendingConns = max(defaultMaxPendingConns, opts.MaxConns)
 	}
 	if opts.MaxLeasesPerActor <= 0 {
-		opts.MaxLeasesPerActor = defaultMaxLeasesPerActor
+		opts.MaxLeasesPerActor = perActor
 	}
 	if opts.MaxLeasesPerActor > opts.MaxConns {
 		// A per-actor limit above the global ceiling has no effect.
@@ -153,6 +171,7 @@ func New(addr string, opts Options) *Broker {
 		leaseCounts:    make(map[string]int),
 		leaseChanged:   make(chan struct{}),
 		pooled:         make(map[net.Conn]*pooledSession),
+		closers:        make(map[net.Conn]func(closeNotice)),
 	}
 	if opts.Pool != nil {
 		pool := *opts.Pool
@@ -282,9 +301,6 @@ func (b *Broker) Shutdown(ctx context.Context) error {
 	if !b.closed {
 		b.closed = true
 		drain := b.opts.Pool != nil && b.opts.Pool.DrainSessions && !b.authorityLost.Load()
-		if !drain {
-			b.cancel()
-		}
 		if b.listener != nil {
 			_ = b.listener.Close()
 		}
@@ -293,7 +309,12 @@ func (b *Broker) Shutdown(ctx context.Context) error {
 				draining = append(draining, s)
 				continue
 			}
-			_ = conn.Close()
+			b.endConnLocked(conn, noticeRestarting)
+		}
+		// Only after every session has its notice: a relay that sees the
+		// broker's context end first would otherwise close without one.
+		if !drain {
+			b.cancel()
 		}
 		if drain {
 			go func() {
@@ -308,7 +329,7 @@ func (b *Broker) Shutdown(ctx context.Context) error {
 					b.logger.Warn("pgproxy: drain deadline reached; closing busy sessions")
 					b.mu.Lock()
 					for conn := range b.conns {
-						_ = conn.Close()
+						b.endConnLocked(conn, noticeRestarting)
 					}
 					b.mu.Unlock()
 				case <-b.shutdownDone:
@@ -344,7 +365,7 @@ func (b *Broker) Shutdown(ctx context.Context) error {
 func (b *Broker) forceClose() {
 	b.mu.Lock()
 	for conn := range b.conns {
-		_ = conn.Close()
+		b.endConnLocked(conn, noticeRestarting)
 	}
 	b.mu.Unlock()
 }
@@ -443,9 +464,10 @@ func (b *Broker) acquireUpstreamSlot(svc *DatabaseService) bool {
 	b.serveMu.Lock()
 	defer b.serveMu.Unlock()
 	limit := svc.MaxConns
-	if limit <= 0 || limit > b.opts.MaxConns {
-		limit = b.opts.MaxConns
+	if limit <= 0 {
+		limit = b.opts.DefaultDatabaseConns
 	}
+	limit = min(limit, b.opts.MaxConns)
 	if b.upstreamCounts[svc.Addr] >= limit {
 		return false
 	}
@@ -492,7 +514,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 
 	// The sidecar's session line, if any, precedes the startup packet.
 	_ = conn.SetDeadline(time.Now().Add(b.opts.StartupTimeout))
-	session, stream, err := readSessionPreamble(conn)
+	session, attestation, stream, err := readSessionPreamble(conn)
 	if err != nil {
 		b.logger.Debug("pgproxy: session preamble refused")
 		return
@@ -503,7 +525,10 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 
 	// Pre-auth phase: a short deadline so a client that opens a socket and stalls
 	// is dropped quickly and cannot pin resources (half-open flood).
-	startupCtx, startupCancel := context.WithTimeout(b.ctx, b.opts.StartupTimeout)
+	// A shared proxy's attestation follows the connection to every identity
+	// check, admission and recheck alike.
+	baseCtx := brokercore.WithAttestation(b.ctx, attestation)
+	startupCtx, startupCancel := context.WithTimeout(baseCtx, b.opts.StartupTimeout)
 	_ = conn.SetDeadline(time.Now().Add(b.opts.StartupTimeout))
 
 	startup, err := readStartup(backend, conn)
@@ -526,6 +551,10 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 
 	scope, token, err := authenticateAgent(startupCtx, backend, b.authenticator(peer), startup)
 	startupCancel()
+	if err == nil && scope != nil && !brokercore.KindAdmitted(brokercore.ConnKinds(conn), scope.IdentityKind) {
+		// Each listener admits only the identity kinds it was opened for.
+		err, scope = fmt.Errorf("identity kind not admitted on this listener"), nil
+	}
 	if err != nil || scope == nil || scope.VaultID == "" || scope.ActorID == "" {
 		if err == nil {
 			err = fmt.Errorf("incomplete agent scope")
@@ -533,7 +562,16 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		b.logger.Warn("pgproxy: agent authentication failed", slog.String("error", err.Error()))
 		// Anyone can reach this point, so these rows are rate-limited.
 		if b.denied.allow(time.Now(), b.logger) {
-			b.auditDenied(auditchain.Event{}, "authentication")
+			// The refusing check, and for a signing-key refusal the token's
+			// kid and the peer; never the token.
+			event := auditchain.Event{}
+			if reason := brokercore.DenialReason(err); reason != "" {
+				event.Decision = "identity_" + reason
+			}
+			if key := brokercore.DenialKey(err); key != nil {
+				event.Kid, event.KidSHA256, event.Peer = key.Kid, key.KidSHA256, key.Peer
+			}
+			b.auditDenied(event, "authentication")
 		}
 		writeClientError(backend, "28000", "authentication", "Agent Vault: authentication failed")
 		return
@@ -541,7 +579,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	// Audit identity comes only from the verified scope. The binding is added
 	// once the database resolves.
 	event := auditchain.Event{Pool: scope.Pool, Agent: scope.ActorID, PodUID: scope.WorkloadID, Session: newSessionID()}
-	connCtx := WithSession(b.ctx, session)
+	connCtx := WithSession(baseCtx, session)
 	refuse := func(outcome, code, message string) {
 		b.auditDenied(event, outcome)
 		writeClientError(backend, code, outcome, message)
@@ -797,37 +835,74 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 
 	relayCtx, relayCancel := context.WithCancel(connCtx)
 	defer relayCancel()
-	terminate := sync.OnceFunc(func() {
-		_ = conn.Close()
-		// Closing a PostgreSQL socket does not necessarily interrupt a running
-		// query. Send the session's private cancellation capability first.
-		if upstream.backendKey != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
-			b.cancelQuery(ctx, &pgproto3.CancelRequest{ProcessID: upstream.backendKey.ProcessID, SecretKey: upstream.backendKey.SecretKey})
-			cancel()
+	// endWith ends the session for the broker's own reason. With a notice, the
+	// database side closes first so the relay stops at a message boundary and
+	// writes the notice before closing the client; the client is closed
+	// regardless once the notice has had its chance.
+	var notice closeState
+	var endOnce sync.Once
+	endWith := func(n *closeNotice) {
+		if n != nil {
+			notice.notice.CompareAndSwap(nil, n) // the first reason stands
 		}
-		_ = upstream.conn.Close()
-	})
+		endOnce.Do(func() {
+			if n != nil {
+				// Stop relaying the database first, so the cancel below cannot
+				// reach the client as the server's own error ahead of the notice.
+				_ = upstream.conn.Close()
+				time.AfterFunc(2*noticeWriteTimeout, func() { _ = conn.Close() })
+			} else {
+				_ = conn.Close()
+			}
+			// Closing a PostgreSQL socket does not necessarily interrupt a running
+			// query. Send the session's private cancellation capability as well.
+			if upstream.backendKey != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
+				b.cancelQuery(ctx, &pgproto3.CancelRequest{ProcessID: upstream.backendKey.ProcessID, SecretKey: upstream.backendKey.SecretKey})
+				cancel()
+			}
+			_ = upstream.conn.Close()
+		})
+	}
+	terminate := func() { endWith(nil) }
+	// The broker's closer records the notice at once, before it cancels any
+	// context the relay watches, and ends the session off its lock.
+	defer b.registerCloser(conn, func(n closeNotice) {
+		notice.notice.CompareAndSwap(nil, &n)
+		go endWith(&n)
+	})()
 	authorizationDone := make(chan struct{})
 	go func() {
 		defer close(authorizationDone)
-		b.authorizationLoop(relayCtx, token, startup.Parameters["agent_vault_vault"], requestedDB, *scope, *svc, terminate, peer)
+		b.authorizationLoop(relayCtx, token, startup.Parameters["agent_vault_vault"], requestedDB, *scope, *svc, func() { endWith(&noticeAuthorization) }, peer)
 	}()
 	defer func() { relayCancel(); <-authorizationDone }()
 	if !scope.NotAfter.IsZero() {
 		// A pool Pod's session ends at its deadline, independent of any recheck.
-		deadline := time.AfterFunc(time.Until(scope.NotAfter), terminate)
+		deadline := time.AfterFunc(time.Until(scope.NotAfter), func() { endWith(&noticeDeadline) })
 		defer deadline.Stop()
 	}
 	renewDone := make(chan struct{})
-	go func() { defer close(renewDone); b.renewLoop(relayCtx, lease, svc, terminate) }()
+	go func() {
+		defer close(renewDone)
+		b.renewLoop(relayCtx, lease, svc, func() { endWith(&noticeCredential) })
+	}()
 	defer func() { relayCancel(); <-renewDone }()
 
+	defer func() {
+		if n := notice.notice.Load(); n != nil {
+			sent := n
+			if s := notice.sent.Load(); s != nil {
+				sent = s
+			}
+			b.logSessionEnd(svc.Name, *sent, notice.written.Load())
+		}
+	}()
 	if !svc.ReadOnly {
-		relay(conn, upstream.conn)
+		relay(conn, upstream.conn, &notice)
 		return
 	}
-	if refused, clean := relayReadOnly(conn, upstream.conn); refused {
+	if refused, clean := relayReadOnly(conn, upstream.conn, &notice); refused {
 		b.logger.Warn("pgproxy: statement refused on a read-only login; ending session",
 			slog.String("service", svc.Name), slog.String("actor", scope.ActorID))
 		b.auditDenied(event, "read_only")
@@ -917,18 +992,41 @@ func (b *Broker) renewLoop(ctx context.Context, lease *Lease, svc *DatabaseServi
 // relay splices two connections until either side closes, then tears both down
 // so the surviving copy unblocks. Bytes flow verbatim, so the full protocol
 // (simple and extended query, COPY, etc.) passes through untouched.
-func relay(client, upstream net.Conn) {
-	done := make(chan struct{}, 2)
+func relay(client, upstream net.Conn, notice *closeState) {
+	toClient := &frameTracker{w: client}
+	fromClient, fromServer := make(chan struct{}), make(chan struct{})
 	go func() {
+		defer close(fromClient)
 		_, _ = io.Copy(upstream, client)
-		done <- struct{}{}
 	}()
 	go func() {
-		_, _ = io.Copy(client, upstream)
-		done <- struct{}{}
+		defer close(fromServer)
+		_, _ = io.Copy(toClient, upstream)
 	}()
-	<-done
-	_ = client.Close()
+	select {
+	case <-fromClient:
+	case <-fromServer:
+	}
 	_ = upstream.Close()
-	<-done
+	<-fromServer
+	sendNotice(client, toClient, notice)
+	_ = client.Close()
+	<-fromClient
+}
+
+// sendNotice writes the session's close notice, if the broker ended it, once
+// the database stream has stopped between two messages. A restart that finds
+// a transaction open says so instead of claiming a clean restart.
+func sendNotice(client net.Conn, toClient *frameTracker, notice *closeState) {
+	n := notice.notice.Load()
+	if n == nil {
+		return
+	}
+	if *n == noticeRestarting && !toClient.idle() {
+		n = &noticeRestartCut
+	}
+	notice.sent.Store(n)
+	if toClient.atBoundary() {
+		notice.written.Store(writeNotice(client, *n))
+	}
 }

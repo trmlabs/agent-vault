@@ -86,7 +86,18 @@ func (p *Proxy) adapterDeny(w http.ResponseWriter, event auditchain.Event, statu
 // adapterUnauthenticatedDeny replaces the SQL audit for refusals that happen
 // before identity is known, so every refusal lands in the signed trail.
 func (p *Proxy) adapterUnauthenticatedDeny(w http.ResponseWriter, r *http.Request, a requestlog.Attempt, status int) {
-	p.adapterDeny(w, auditchain.Event{Agent: a.ActorID, PodUID: a.WorkloadID, Method: auditMethod(r.Method)}, status, "refused")
+	p.adapterIdentityDeny(w, r, a, status, "", nil)
+}
+
+// adapterIdentityDeny records a refusal with the identity check that refused
+// it, as a fixed code in the row's decision field ("" when none applies), and
+// for a signing-key refusal the token's kid and the connection's peer.
+func (p *Proxy) adapterIdentityDeny(w http.ResponseWriter, r *http.Request, a requestlog.Attempt, status int, reason string, key *brokercore.KeyDenial) {
+	event := auditchain.Event{Agent: a.ActorID, PodUID: a.WorkloadID, Method: auditMethod(r.Method), Decision: reason}
+	if key != nil {
+		event.Kid, event.KidSHA256, event.Peer = key.Kid, key.KidSHA256, key.Peer
+	}
+	p.adapterDeny(w, event, status, "refused")
 }
 
 func auditMethod(m string) string {
@@ -225,7 +236,7 @@ func (p *Proxy) forwardCatalog(w http.ResponseWriter, r *http.Request, target, h
 	}
 	// One rate bucket per Pod, not per pool agent: a pool of many workers
 	// shares one agent identity.
-	enf := p.rateLimit.EnforceProxy(r.Context(), scope.AgentID+"/"+scope.WorkloadID, entry.Name)
+	enf := p.rateLimit.EnforceProxy(r.Context(), proxyLimitActor(scope), entry.Name)
 	if !enf.Allowed {
 		deny(http.StatusTooManyRequests, "rate_limited")
 		return

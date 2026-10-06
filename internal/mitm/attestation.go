@@ -133,6 +133,39 @@ func peerFromContext(ctx context.Context) (netip.Addr, error) {
 // Reattest when the Attestor has it, because the tunnel outlives its token.
 // A scope past its NotAfter is refused.
 func (p *Proxy) resolveScope(ctx context.Context, token, hint string, peer netip.Addr, peerErr error, recheck bool) (*brokercore.ProxyScope, error) {
+	scope, err := p.resolveAnyScope(ctx, token, hint, peer, peerErr, recheck)
+	if err != nil {
+		return nil, err
+	}
+	// Each listener admits only the identity kinds it was opened for.
+	if !brokercore.KindAdmitted(connKinds(ctx), scope.IdentityKind) {
+		p.logRefusal("listener_kind", nil)
+		return nil, brokercore.Denied("listener_kind")
+	}
+	return scope, nil
+}
+
+type kindsKey struct{}
+
+// withKinds carries the CONNECT listener's identity kinds into the requests
+// of its tunnel, which are served on their own connection.
+func withKinds(ctx context.Context, kinds []string) context.Context {
+	return context.WithValue(ctx, kindsKey{}, kinds)
+}
+
+// connKinds returns the identity kinds the request's listener admits: the
+// tunnel's, for a request inside a CONNECT tunnel.
+func connKinds(ctx context.Context) []string {
+	if kinds, ok := ctx.Value(kindsKey{}).([]string); ok {
+		return kinds
+	}
+	if pc, ok := ctx.Value(peerContextKey{}).(*peerConn); ok {
+		return brokercore.ConnKinds(pc.Conn)
+	}
+	return brokercore.ConnKinds(nil)
+}
+
+func (p *Proxy) resolveAnyScope(ctx context.Context, token, hint string, peer netip.Addr, peerErr error, recheck bool) (*brokercore.ProxyScope, error) {
 	if p.attestor == nil {
 		return p.sessions.ResolveForProxy(ctx, token, hint)
 	}
@@ -147,10 +180,64 @@ func (p *Proxy) resolveScope(ctx context.Context, token, hint string, peer netip
 		scope, err = p.attestor.Attest(ctx, token, peer)
 	}
 	if err != nil || scope == nil {
-		return nil, brokercore.ErrInvalidSession
+		reason := brokercore.DenialReason(err)
+		p.logRefusal(reason, brokercore.DenialKey(err))
+		if reason == "" {
+			return nil, brokercore.ErrInvalidSession
+		}
+		// The refusal itself, so its kid and peer reach the audit row.
+		return nil, err
 	}
 	if !scope.NotAfter.IsZero() && !time.Now().Before(scope.NotAfter) {
-		return nil, brokercore.ErrInvalidSession
+		p.logRefusal("deadline", nil)
+		return nil, brokercore.Denied("deadline")
 	}
 	return scope, nil
+}
+
+// refusalLogEvery bounds the refusal log: one line per reason per interval,
+// with the count since the last, so a flood of bad callers stays one line.
+// A signing-key refusal's line names the kid and peer of the refusal that
+// opens the interval; every refusal's own are in its audit row.
+const refusalLogEvery = 10 * time.Second
+
+type refusalLog struct {
+	mu     sync.Mutex
+	last   map[string]time.Time
+	counts map[string]int
+}
+
+// logRefusal records why an identity was refused: a fixed code, never a
+// token or name. A signing-key refusal adds the token's kid, in its safe
+// form, and the connection's peer address.
+func (p *Proxy) logRefusal(reason string, key *brokercore.KeyDenial) {
+	if reason == "" {
+		reason = "unspecified"
+	}
+	l := &p.refusals
+	l.mu.Lock()
+	if l.last == nil {
+		l.last, l.counts = map[string]time.Time{}, map[string]int{}
+	}
+	l.counts[reason]++
+	now := time.Now()
+	if now.Sub(l.last[reason]) < refusalLogEvery {
+		l.mu.Unlock()
+		return
+	}
+	count := l.counts[reason]
+	l.last[reason], l.counts[reason] = now, 0
+	l.mu.Unlock()
+	if p.logger == nil {
+		return
+	}
+	args := []any{"reason", reason, "count", count}
+	if key != nil {
+		args = append(args, "kid", key.Kid)
+		if key.KidSHA256 != "" {
+			args = append(args, "kid_sha256", key.KidSHA256)
+		}
+		args = append(args, "peer", key.Peer)
+	}
+	p.logger.Warn("workload identity refused", args...)
 }

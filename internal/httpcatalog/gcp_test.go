@@ -182,3 +182,19 @@ func TestGCPUserProjectHeaderIsOptIn(t *testing.T) {
 		t.Fatal("opted-in billing header refused")
 	}
 }
+
+// An entry may require any number of groups; the audit row records them all.
+func TestEntryMayRequireManyGroups(t *testing.T) {
+	var groups []string
+	for i := range 1000 {
+		groups = append(groups, fmt.Sprintf(`"%08x-0000-0000-0000-%012x"`, i, i))
+	}
+	entry := strings.Replace(gcsEntry, `"requires":["`+gcpGroup+`"]`, `"requires":[`+strings.Join(groups, ",")+`]`, 1)
+	c, err := Parse([]byte(`{` + gcpPools + `,"entries":[` + entry + `]}`))
+	if err != nil {
+		t.Fatalf("1,000 required groups refused: %v", err)
+	}
+	if got := len(c.Entries()[0].Requires); got != 1000 {
+		t.Fatalf("kept %d groups", got)
+	}
+}

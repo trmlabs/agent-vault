@@ -153,7 +153,7 @@ func (p *Proxy) handleForward(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		p.recordAuthFailure(r)
 		if p.strictCredentialProxy {
-			p.strictUnauthenticatedDeny(w, r, http.StatusForbidden)
+			p.strictIdentityDeny(w, r, err)
 			return
 		}
 		writeAuthError(w, err)
@@ -233,7 +233,7 @@ func (p *Proxy) forwardRequest(
 		p.logSink.Record(r.Context(), requestlog.FromEvent(event, scope.VaultID, actorType, actorID))
 	}
 
-	enf := p.rateLimit.EnforceProxy(r.Context(), scope.ActorID(), scope.VaultID)
+	enf := p.rateLimit.EnforceProxy(r.Context(), proxyLimitActor(scope), scope.VaultID)
 	if !enf.Allowed {
 		ratelimit.WriteDenial(w, enf.Decision, enf.Message)
 		emit(http.StatusTooManyRequests, enf.ErrCode)

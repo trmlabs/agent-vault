@@ -90,9 +90,8 @@ func stubDatabaseVault(t *testing.T, mount string, validRoles []string, noPasswo
 				"lease_duration": 7200,
 				"renewable":      true,
 			})
-		case logical == "sys/leases/revoke":
-			body := decodeBody(t, r)
-			leaseID, _ := body["lease_id"].(string)
+		case strings.HasPrefix(logical, "sys/leases/revoke/"):
+			leaseID := strings.TrimPrefix(logical, "sys/leases/revoke/")
 			state.mu.Lock()
 			state.revoked = append(state.revoked, leaseID)
 			state.mu.Unlock()
@@ -209,6 +208,15 @@ func TestRevokeLease(t *testing.T) {
 	if _, _, revokes := state.snapshot(); len(revokes) != 1 || revokes[0] != "database/creds/readonly/lease-7" {
 		t.Errorf("revoke calls = %v, want one for lease-7", revokes)
 	}
+	// A lease ID that could leave the credential path never reaches Vault.
+	for _, bad := range []string{"database/creds/../../sys/x", "database//creds", "database/creds/readonly/lease?x=1"} {
+		if err := c.RevokeLease(context.Background(), bad); err == nil {
+			t.Errorf("RevokeLease(%q) accepted", bad)
+		}
+	}
+	if _, _, revokes := state.snapshot(); len(revokes) != 1 {
+		t.Errorf("an invalid lease ID reached Vault: %v", revokes)
+	}
 }
 
 func TestDatabaseReferenceRejectsTraversal(t *testing.T) {
@@ -266,13 +274,13 @@ func TestDatabaseMintDoesNotRetryAmbiguousFailure(t *testing.T) {
 func TestDatabaseMintNilDataStillRevokesKnownLease(t *testing.T) {
 	var revoked atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "creds/") {
-			_, _ = io.WriteString(w, `{"lease_id":"database/creds/readonly/id","lease_duration":60}`)
-			return
-		}
-		if r.URL.Path == "/v1/sys/leases/revoke" {
+		if r.URL.Path == "/v1/sys/leases/revoke/database/creds/readonly/id" {
 			revoked.Store(true)
 			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if strings.Contains(r.URL.Path, "creds/") {
+			_, _ = io.WriteString(w, `{"lease_id":"database/creds/readonly/id","lease_duration":60}`)
 			return
 		}
 		t.Errorf("unexpected path %s", r.URL.Path)

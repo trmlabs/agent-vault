@@ -110,6 +110,11 @@ func TestMatchUsesSegmentsAndLongestPrefix(t *testing.T) {
 	if !c.HasHost("serpapi.com", 443) || c.HasHost("serpapi.com", 8443) || c.HasHost("example.com", 443) {
 		t.Fatal("HasHost wrong")
 	}
+	// Per pool: only a pool an entry grants sees its host.
+	if !c.HasHostForPool("SerpAPI.com", 443, "pool-a") || c.HasHostForPool("serpapi.com", 443, "pool-b") ||
+		c.HasHostForPool("serpapi.com", 443, "") || c.HasHostForPool("example.com", 443, "pool-a") {
+		t.Fatal("HasHostForPool wrong")
+	}
 }
 
 type fakeVault struct {
@@ -239,5 +244,21 @@ func TestTTLIsCappedAtOneMinute(t *testing.T) {
 	_, _ = keys.Get(context.Background(), ref)
 	if vault.reads.Load() != 2 {
 		t.Fatal("a TTL above one minute was honored")
+	}
+}
+
+// basicUser applies only to HTTP header entries; a browser or Google entry
+// that sets it is refused at load instead of silently ignoring it.
+func TestBasicUserRefusedOnBrowserAndGoogleEntries(t *testing.T) {
+	browser := `{"entries":[` + browserEntryJSON(`,"basicUser":true`) + `]}`
+	if _, err := Parse([]byte(browser)); err == nil {
+		t.Fatal("basicUser on a browser-session entry was accepted")
+	}
+	gcp := `{` + gcpPools + `,"entries":[` + strings.Replace(gcsEntry, `"kind":"gcp",`, `"kind":"gcp","basicUser":true,`, 1) + `]}`
+	if _, err := Parse([]byte(gcp)); err == nil {
+		t.Fatal("basicUser on a gcp entry was accepted")
+	}
+	if _, err := Parse([]byte(`{` + gcpPools + `,"entries":[` + gcsEntry + `]}`)); err != nil {
+		t.Fatalf("control gcp entry: %v", err)
 	}
 }

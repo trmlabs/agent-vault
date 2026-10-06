@@ -36,9 +36,10 @@ type PoolOptions struct {
 	// at once.
 	DrainSessions bool
 	// QueueFactor bounds waiting checkouts at this multiple of the budget;
-	// QueueWait bounds how long one waits. Defaults 20 and 5 seconds, so 50
-	// clients on a 5-connection budget queue rather than fail. Overflow
-	// and timeouts are refused with SQLSTATE 53300.
+	// QueueWait bounds how long one waits. Defaults 200 and 5 seconds, so
+	// 10,000 clients on a 50-connection budget queue rather than fail. A
+	// waiter costs only a goroutine. Overflow and timeouts are refused with
+	// SQLSTATE 53300.
 	QueueFactor int
 	QueueWait   time.Duration
 	// RotateFraction of a credential's lifetime passes before its successor
@@ -52,7 +53,7 @@ type PoolOptions struct {
 	// a server connection. Default 5m.
 	IdleInTransaction time.Duration
 	// DefaultBudget is the server-connection budget for a database without a
-	// catalog maxConns. Default 50.
+	// catalog maxConns. Default 50 (see defaultDatabaseConns).
 	DefaultBudget int
 }
 
@@ -65,7 +66,7 @@ func (o *PoolOptions) withDefaults() PoolOptions {
 		p.SessionShare = 0.1
 	}
 	if p.QueueFactor < 1 {
-		p.QueueFactor = 20
+		p.QueueFactor = 200
 	}
 	if p.QueueWait <= 0 {
 		p.QueueWait = 5 * time.Second
@@ -80,7 +81,7 @@ func (o *PoolOptions) withDefaults() PoolOptions {
 		p.IdleInTransaction = 5 * time.Minute
 	}
 	if p.DefaultBudget <= 0 {
-		p.DefaultBudget = defaultMaxConns
+		p.DefaultBudget = defaultDatabaseConns
 	}
 	return p
 }

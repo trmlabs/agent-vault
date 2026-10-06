@@ -25,7 +25,12 @@ type Entry struct {
 	Host         string   `json:"host"`
 	Port         int      `json:"port,omitempty"` // default 443
 	PathPrefixes []string `json:"pathPrefixes"`
-	Methods      []string `json:"methods"`
+	// DeniedPaths and ReadOnlyPaths are browser-session path templates (see
+	// browser_paths.go): every method is refused at or below a denied one,
+	// and all but GET, HEAD and OPTIONS below a read-only one.
+	DeniedPaths   []string `json:"deniedPaths,omitempty"`
+	ReadOnlyPaths []string `json:"readOnlyPaths,omitempty"`
+	Methods       []string `json:"methods"`
 	// Header carries the key. Scheme, when set, prefixes it ("Bearer").
 	Header string `json:"header"`
 	Scheme string `json:"scheme,omitempty"`
@@ -88,8 +93,9 @@ type KeyRef struct {
 }
 
 type Catalog struct {
-	entries []Entry
-	pools   []Pool
+	entries   []Entry
+	pools     []Pool
+	harnesses []Harness
 }
 
 // Pool names a set of workers by their Kubernetes identity. When a catalog
@@ -102,7 +108,9 @@ type Pool struct {
 	// default), "claude-session" (a runner session token naming the person)
 	// or "workload" (CI and automation: Entitlements, never a person).
 	Identity string `json:"identity,omitempty"`
-	// Ceiling is the highest tier the pool may reach (default T0).
+	// Ceiling is the highest tier the pool may reach (default T0). "external"
+	// is below T0: the pool's workers may reach nothing, and no entry may
+	// grant it, until entries can be scoped to a tenant.
 	Ceiling string `json:"ceiling,omitempty"`
 	// CCPoolID is the runner pool a claude-session token must be issued for.
 	CCPoolID string `json:"ccpoolID,omitempty"`
@@ -110,6 +118,8 @@ type Pool struct {
 	BaseGroup string `json:"baseGroup,omitempty"`
 	// Entitlements are a workload pool's fixed groups.
 	Entitlements []string `json:"entitlements,omitempty"`
+
+	harness *Harness // the declared profile naming this pool, if any
 }
 
 // Pool returns the defined pool with this name.
@@ -168,7 +178,9 @@ func ValidMount(mount string) bool { return len(mount) <= 127 && vaultMount.Matc
 
 // Environment, when set (AGENT_VAULT_CATALOG_ENVIRONMENT, such as staging),
 // requires every database role to be that environment's named role:
-// <env>.<region>.<cluster>.<name>-readonly or -readwrite.
+// <env>.<region>.<cluster>.<name>-readonly or -readwrite, or the
+// Gatehouse-only role for the same connection, the same name prefixed with
+// "gatehouse-".
 var Environment atomic.Value // string
 
 func environment() string {
@@ -187,7 +199,7 @@ func validRole(role string) bool {
 	if env == "" {
 		return rolesWithoutEnvironment && vaultSegment.MatchString(role)
 	}
-	pattern := `^` + regexp.QuoteMeta(env) + `\.[a-z]+\.[a-z0-9]+\.[a-z0-9-]+-(readonly|readwrite)$`
+	pattern := `^(gatehouse-)?` + regexp.QuoteMeta(env) + `\.[a-z]+\.[a-z0-9]+\.[a-z0-9-]+-(readonly|readwrite)$`
 	return regexp.MustCompile(pattern).MatchString(role)
 }
 
@@ -219,8 +231,9 @@ func Load(path string) (Catalog, error) {
 
 func Parse(data []byte) (Catalog, error) {
 	var file struct {
-		Pools   []Pool  `json:"pools,omitempty"`
-		Entries []Entry `json:"entries"`
+		Harnesses []Harness `json:"harnesses,omitempty"`
+		Pools     []Pool    `json:"pools,omitempty"`
+		Entries   []Entry   `json:"entries"`
 	}
 	d := json.NewDecoder(bytes.NewReader(data))
 	d.DisallowUnknownFields()
@@ -245,7 +258,17 @@ func Parse(data []byte) (Catalog, error) {
 		poolNames[pool.Name] = true
 		pools[pool.Name] = pool
 	}
+	profiles, err := validateHarnesses(file.Harnesses, pools)
+	if err != nil {
+		return Catalog{}, err
+	}
+	for i := range file.Pools {
+		if h, ok := profiles[file.Pools[i].Name]; ok {
+			file.Pools[i].harness = &h
+		}
+	}
 	names := map[string]bool{}
+	users := map[KVRef]string{}
 	routes := map[string]string{}
 	kinds := map[string]string{}
 	for i := range file.Entries {
@@ -274,6 +297,12 @@ func Parse(data []byte) (Catalog, error) {
 		}
 		kinds[hostKey] = e.Kind
 		if e.BrowserSession != nil {
+			// A test user signs in for one entry only, so its session and
+			// audit trail belong to that entry's pool.
+			if other, ok := users[e.BrowserSession.User]; ok {
+				return Catalog{}, fmt.Errorf("browser-session entries %q and %q share a test user", other, e.Name)
+			}
+			users[e.BrowserSession.User] = e.Name
 			// The app host belongs to its entry alone.
 			appKey := fmt.Sprintf("%s:%d", e.BrowserSession.AppHost, e.Port)
 			if _, ok := kinds[appKey]; ok {
@@ -298,7 +327,7 @@ func Parse(data []byte) (Catalog, error) {
 			routes[route] = e.Name
 		}
 	}
-	return Catalog{entries: file.Entries, pools: file.Pools}, nil
+	return Catalog{entries: file.Entries, pools: file.Pools, harnesses: file.Harnesses}, nil
 }
 
 func (e *Entry) normalize() error {
@@ -318,6 +347,9 @@ func (e *Entry) normalize() error {
 	}
 	if e.Port < 1 || e.Port > 65535 {
 		return errors.New("invalid port")
+	}
+	if e.Kind != "browser-session" && (len(e.DeniedPaths) > 0 || len(e.ReadOnlyPaths) > 0) {
+		return errors.New("deniedPaths and readOnlyPaths apply to browser-session entries only")
 	}
 	switch e.Kind {
 	case "postgres":
@@ -553,7 +585,12 @@ func (e *Entry) normalizeGit() error {
 type GitRequest struct {
 	Entry *Entry
 	Repo  GitRepo
-	Write bool // receive-pack: the push service
+	Write bool // receive-pack: the push service; for github-api, a POST
+	// OpensPullRequest marks a github-api request that opens a pull request;
+	// its head must start with one of HeadPrefixes, the pool's own push
+	// prefixes (none: no pull request may be opened).
+	OpensPullRequest bool
+	HeadPrefixes     []string
 }
 
 // GitMatch routes a request to a git entry. ok is false when the host has no
@@ -611,11 +648,13 @@ func (c Catalog) GitMatch(host string, port int, method, path, rawQuery, pool st
 }
 
 // GitHubAPIMatch routes a request to a github-api entry. ok is false when the
-// host has none. Only POST to these paths exists, for a listed repository:
-// /repos/{owner}/{repo}/pulls (open a pull request),
-// /repos/{owner}/{repo}/issues/{n}/comments (comment on one),
-// /repos/{owner}/{repo}/pulls/{n}/comments and .../comments/{id}/replies
-// (review comments). Reviews, merges and everything else are unlisted.
+// host has none. For a listed repository only these exist:
+// POST /repos/{owner}/{repo}/pulls (open a pull request, from a branch under
+// the pool's own push prefixes: HeadPrefixes),
+// GET /repos/{owner}/{repo}/pulls/{n} (read one, for its state and checks
+// summary), POST .../issues/{n}/comments (comment on one) and POST
+// .../pulls/{n}/comments and .../comments/{id}/replies (review comments).
+// Reviews, merges, updates and everything else are unlisted.
 func (c Catalog) GitHubAPIMatch(host string, port int, method, path, rawQuery, pool string) (GitRequest, bool, error) {
 	host = strings.ToLower(host)
 	var hostEntries []*Entry
@@ -628,7 +667,11 @@ func (c Catalog) GitHubAPIMatch(host string, port int, method, path, rawQuery, p
 		return GitRequest{}, false, nil
 	}
 	parts := strings.Split(path, "/")
-	if rawQuery != "" || len(parts) < 5 || parts[0] != "" || parts[1] != "repos" || !githubAPIEndpoint(parts[4:]) {
+	if rawQuery != "" || len(parts) < 5 || parts[0] != "" || parts[1] != "repos" {
+		return GitRequest{}, true, ErrUnlisted
+	}
+	want, create := githubAPIEndpoint(parts[4:])
+	if want == "" {
 		return GitRequest{}, true, ErrUnlisted
 	}
 	repo := strings.ToLower(parts[2] + "/" + parts[3])
@@ -637,12 +680,15 @@ func (c Catalog) GitHubAPIMatch(host string, port int, method, path, rawQuery, p
 			if r.Repo != repo {
 				continue
 			}
-			matched := GitRequest{Entry: e, Repo: r, Write: true}
+			matched := GitRequest{Entry: e, Repo: r, Write: want == "POST"}
 			switch {
-			case method != "POST":
+			case method != want:
 				return matched, true, ErrMethod
 			case !contains(e.Pools, pool):
 				return matched, true, ErrPool
+			}
+			if create {
+				matched.OpensPullRequest, matched.HeadPrefixes = true, c.pushBranchPrefixes(repo, pool)
 			}
 			return matched, true, nil
 		}
@@ -650,7 +696,32 @@ func (c Catalog) GitHubAPIMatch(host string, port int, method, path, rawQuery, p
 	return GitRequest{}, true, ErrUnlisted
 }
 
-func githubAPIEndpoint(rest []string) bool {
+// pushBranchPrefixes are the branch names (refs/heads/ removed) a pool may
+// push to in a repository, from its git entries' refPrefixes. A pull request
+// may come only from one of them; none means none may be opened.
+func (c Catalog) pushBranchPrefixes(repo, pool string) []string {
+	var out []string
+	for _, e := range c.entries {
+		if e.Kind != "git" || e.Git == nil || !contains(e.Pools, pool) {
+			continue
+		}
+		for _, r := range e.Git.Repos {
+			if r.Repo != repo || r.Access != "write" {
+				continue
+			}
+			for _, prefix := range r.RefPrefixes {
+				if branch, ok := strings.CutPrefix(prefix, "refs/heads/"); ok && branch != "" {
+					out = append(out, branch)
+				}
+			}
+		}
+	}
+	return out
+}
+
+// githubAPIEndpoint returns the one method a GitHub REST path allows, or ""
+// when it is unlisted, and whether it opens a pull request.
+func githubAPIEndpoint(rest []string) (method string, create bool) {
 	number := func(s string) bool {
 		if s == "" || len(s) > 12 {
 			return false
@@ -662,15 +733,17 @@ func githubAPIEndpoint(rest []string) bool {
 		}
 		return true
 	}
-	switch len(rest) {
-	case 1:
-		return rest[0] == "pulls"
-	case 3:
-		return (rest[0] == "issues" || rest[0] == "pulls") && number(rest[1]) && rest[2] == "comments"
-	case 5:
-		return rest[0] == "pulls" && number(rest[1]) && rest[2] == "comments" && number(rest[3]) && rest[4] == "replies"
+	switch {
+	case len(rest) == 1 && rest[0] == "pulls":
+		return "POST", true
+	case len(rest) == 2 && rest[0] == "pulls" && number(rest[1]):
+		return "GET", false
+	case len(rest) == 3 && (rest[0] == "issues" || rest[0] == "pulls") && number(rest[1]) && rest[2] == "comments":
+		return "POST", false
+	case len(rest) == 5 && rest[0] == "pulls" && number(rest[1]) && rest[2] == "comments" && number(rest[3]) && rest[4] == "replies":
+		return "POST", false
 	}
-	return false
+	return "", false
 }
 
 // Match returns the entry for a request, choosing the longest path prefix
@@ -719,12 +792,44 @@ func (c Catalog) HasHost(host string, port int) bool {
 	return false
 }
 
+// HasHostForPool reports whether an entry granted to pool names host and
+// port. A tunnel is refused before it opens unless this holds, so a caller
+// learns nothing about hosts other pools may reach.
+func (c Catalog) HasHostForPool(host string, port int, pool string) bool {
+	host = strings.ToLower(host)
+	for _, e := range c.entries {
+		if !contains(e.Pools, pool) {
+			continue
+		}
+		if e.Kind != "postgres" && e.Host == host && e.Port == port {
+			return true
+		}
+		if e.BrowserSession != nil && e.BrowserSession.AppHost == host && e.Port == port {
+			return true
+		}
+	}
+	return false
+}
+
 // HasAuth0Domain reports whether host is the Auth0 domain of a
 // browser-session entry: the only hosts the broker's own logins may reach.
 func (c Catalog) HasAuth0Domain(host string) bool {
 	host = strings.ToLower(host)
 	for _, e := range c.entries {
 		if e.BrowserSession != nil && e.BrowserSession.Auth0.Domain == host {
+			return true
+		}
+	}
+	return false
+}
+
+// HasAutomatedAuth reports whether addr (host:port) is the automated-auth
+// service of a browser-session entry: the only other place the broker's own
+// logins may reach.
+func (c Catalog) HasAutomatedAuth(addr string) bool {
+	addr = strings.ToLower(addr)
+	for _, e := range c.entries {
+		if e.BrowserSession != nil && e.BrowserSession.AutomatedAuth != nil && e.BrowserSession.AutomatedAuth.Addr() == addr {
 			return true
 		}
 	}
@@ -757,6 +862,21 @@ func (c Catalog) GitGranted(installation int64, repo, scope string) bool {
 	return false
 }
 
+// GitScope returns every repository the catalog lists for an installation,
+// and whether any github-api entry on it opens pull requests.
+func (c Catalog) GitScope(installation int64) (repos []string, pullRequests bool) {
+	for _, e := range c.entries {
+		if e.Git == nil || e.Git.InstallationID != installation {
+			continue
+		}
+		pullRequests = pullRequests || e.Kind == "github-api"
+		for _, r := range e.Git.Repos {
+			repos = append(repos, r.Repo)
+		}
+	}
+	return repos, pullRequests
+}
+
 // clusterLocal reports whether host is a Kubernetes Service name, the only
 // kind of host a plaintext database entry may name.
 func clusterLocal(host string) bool {
@@ -764,7 +884,7 @@ func clusterLocal(host string) bool {
 }
 
 // plaintextDatabases lets a database entry for a Kubernetes Service host use
-// sslmode disable. Only a binary built with the e2e tag can set it (see
+// sslmode disable, and an automated-auth service on one use plain http. Only a binary built with the e2e tag can set it (see
 // plaintext_e2e.go), for the Kind fixture database, which serves no TLS.
 var plaintextDatabases atomic.Bool
 
@@ -800,8 +920,16 @@ var (
 	tierRank = map[string]int{"": 0, "T0": 0, "T1": 1, "T2": 2}
 )
 
+// CeilingExternal is the ceiling below T0, for workers serving people
+// outside the company.
+const CeilingExternal = "external"
+
 func (p Pool) validate() error {
-	if _, ok := tierRank[p.Ceiling]; !ok {
+	if p.Ceiling == CeilingExternal {
+		if p.Identity != "" && p.Identity != "none" {
+			return fmt.Errorf("an external pool has no verified identity")
+		}
+	} else if _, ok := tierRank[p.Ceiling]; !ok {
 		return fmt.Errorf("unknown ceiling %q", p.Ceiling)
 	}
 	for _, g := range append(append([]string(nil), p.Entitlements...), p.BaseGroup) {
@@ -839,11 +967,7 @@ func (e *Entry) validateTier() error {
 	if rank > 0 && len(e.Requires) == 0 {
 		return fmt.Errorf("a %s entry must name its required groups", e.Tier)
 	}
-	// The audit row records the groups checked within its 512-byte identifier
-	// limit; more groups would make every request on the entry fail closed.
-	if len(e.Requires) > maxRequiredGroups {
-		return fmt.Errorf("an entry requires at most %d groups", maxRequiredGroups)
-	}
+	// Any number of groups: the audit row records the full list, under its MAC.
 	for _, g := range e.Requires {
 		if !groupID.MatchString(g) {
 			return fmt.Errorf("required groups must be Entra object IDs")
@@ -852,11 +976,12 @@ func (e *Entry) validateTier() error {
 	return nil
 }
 
-const maxRequiredGroups = 8
-
 // grantable is the CI rule: an entry above T0 is never granted to a pool that
 // cannot carry it. Without defined pools only T0 entries may be granted.
 func grantable(e Entry, p Pool, defined bool) error {
+	if p.Ceiling == CeilingExternal {
+		return fmt.Errorf("a pool at the external ceiling holds no entries")
+	}
 	rank := tierRank[e.Tier]
 	if rank == 0 {
 		return nil

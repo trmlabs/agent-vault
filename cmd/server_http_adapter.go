@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Infisical/agent-vault/internal/auditchain"
 	"github.com/Infisical/agent-vault/internal/githubapp"
 	"github.com/Infisical/agent-vault/internal/hashicorp"
 	"github.com/Infisical/agent-vault/internal/httpcatalog"
@@ -32,7 +33,9 @@ var sharedCatalog struct {
 // (mount/path of a KV version 2 secret whose "catalog" field Terraform
 // writes) is reloaded every 30 seconds without a restart; a version that
 // fails validation is logged and the last good catalog stays in force.
-// AGENT_VAULT_HTTP_CATALOG_FILE is a fixed catalog read at start.
+// AGENT_VAULT_CATALOG_VAULT_PREFIX reads the same catalog stored one secret
+// per entry, with the same reload. AGENT_VAULT_HTTP_CATALOG_FILE is a fixed
+// catalog read at start.
 func brokerCatalog(ctx context.Context, client *hashicorp.Client, getenv func(string) string, logger *slog.Logger) (*httpcatalog.Source, error) {
 	sharedCatalog.Lock()
 	defer sharedCatalog.Unlock()
@@ -44,12 +47,22 @@ func brokerCatalog(ctx context.Context, client *hashicorp.Client, getenv func(st
 	}
 	testPlaintextDatabases(getenv, logger)
 	var source *httpcatalog.Source
-	if location := getenv("AGENT_VAULT_CATALOG_VAULT_PATH"); location != "" {
+	single, perEntry := getenv("AGENT_VAULT_CATALOG_VAULT_PATH"), getenv("AGENT_VAULT_CATALOG_VAULT_PREFIX")
+	if single != "" && perEntry != "" {
+		return nil, fmt.Errorf("set AGENT_VAULT_CATALOG_VAULT_PATH or AGENT_VAULT_CATALOG_VAULT_PREFIX, not both")
+	}
+	if location := single + perEntry; location != "" {
 		mount, path, ok := strings.Cut(location, "/")
 		if !ok || client == nil {
-			return nil, fmt.Errorf("AGENT_VAULT_CATALOG_VAULT_PATH needs mount/path and a Vault client")
+			return nil, fmt.Errorf("the catalog's Vault location needs mount/path and a Vault client")
 		}
+		// One secret per entry (AGENT_VAULT_CATALOG_VAULT_PREFIX) has no size
+		// limit; the single document (AGENT_VAULT_CATALOG_VAULT_PATH) is
+		// bounded by Vault's size limit for one secret and stays for migration.
 		load := httpcatalog.VaultLoader(client.Logical(), mount, path, "catalog")
+		if perEntry != "" {
+			load = httpcatalog.VaultPrefixLoader(client.Logical(), mount, path)
+		}
 		var err error
 		if source, err = httpcatalog.Open(ctx, load); err != nil {
 			return nil, fmt.Errorf("broker catalog: %w", err)
@@ -75,7 +88,7 @@ func brokerCatalog(ctx context.Context, client *hashicorp.Client, getenv func(st
 // client and the signed audit chain, and refuses to start without any of
 // them rather than serve unaudited or unlisted traffic.
 func httpHeaderAdapter(ctx context.Context, srv *server.Server, getenv func(string) string) (*mitm.HeaderAdapter, error) {
-	if getenv("AGENT_VAULT_CATALOG_VAULT_PATH") == "" && getenv("AGENT_VAULT_HTTP_CATALOG_FILE") == "" {
+	if getenv("AGENT_VAULT_CATALOG_VAULT_PATH") == "" && getenv("AGENT_VAULT_CATALOG_VAULT_PREFIX") == "" && getenv("AGENT_VAULT_HTTP_CATALOG_FILE") == "" {
 		return nil, nil
 	}
 	if !srv.CredentialProxyEnabled() {
@@ -107,7 +120,13 @@ func httpHeaderAdapter(ctx context.Context, srv *server.Server, getenv func(stri
 		return nil, err
 	}
 	adapter.Sessions = sessionBinder(srv.CleanupStore())
-	adapter.BrowserTokens = &httpcatalog.Auth0Tokens{Keys: keys, Client: auth0Client(source, netguard.SafeDialContext(netguard.AllowPrivateFromEnv()))}
+	dial := netguard.SafeDialContext(netguard.AllowPrivateFromEnv())
+	browserTokens := &httpcatalog.Auth0Tokens{Keys: keys, Client: auth0Client(source, dial), AutomatedAuth: automatedAuthClient(source, dial),
+		Revoked: func(binding, outcome string, status int) {
+			_ = chain.Record(auditchain.Event{Event: auditchain.EventHTTPResponse, Binding: binding + "/revoke", Outcome: outcome, Method: http.MethodPost, Status: status})
+		}}
+	adapter.BrowserTokens = browserTokens
+	source.OnChange(browserTokens.Prune)
 	githubEntries, gcpEntries := false, false
 	for _, e := range source.Current().Entries() {
 		githubEntries = githubEntries || e.Kind == "git" || e.Kind == "github-api"
@@ -130,11 +149,20 @@ func httpHeaderAdapter(ctx context.Context, srv *server.Server, getenv func(stri
 		if api != "" && !strings.HasPrefix(api, "https://") {
 			return nil, fmt.Errorf("AGENT_VAULT_GITHUB_API_URL must be https")
 		}
-		minter := &githubapp.Minter{Signer: signer, API: api}
+		scopeMode, err := githubapp.ParseScopeMode(getenv("AGENT_VAULT_GITHUB_APP_SCOPE"))
+		if err != nil {
+			return nil, err
+		}
+		minter := &githubapp.Minter{Signer: signer, API: api, Log: srv.Logger(), ScopeMode: scopeMode, Scope: func(installation int64) githubapp.Scope {
+			repos, pullRequests := source.Current().GitScope(installation)
+			return githubapp.Scope{Repos: repos, PullRequests: pullRequests}
+		}}
 		adapter.GitTokens = minter
 		// A catalog change that removes or narrows a repository revokes the
-		// tokens it no longer grants instead of letting them run out.
+		// tokens it no longer grants instead of letting them run out, and
+		// checks each installation against the new catalog before its next token.
 		source.OnChange(func(c httpcatalog.Catalog) {
+			minter.ForgetScope()
 			minter.Prune(func(installation int64, repo string, p githubapp.Permissions) bool {
 				return c.GitGranted(installation, repo, gitScope(p))
 			})
@@ -159,6 +187,22 @@ func auth0Client(catalog interface{ Current() httpcatalog.Catalog }, dial func(c
 		return dial(ctx, network, addr)
 	}
 	return &http.Client{Timeout: 10 * time.Second,
+		Transport:     &http.Transport{DialContext: pinned, TLSHandshakeTimeout: 5 * time.Second},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+}
+
+// automatedAuthClient is how browser-session test users sign in through TRM's
+// automated-auth service: over the guarded dialer, to a service address the
+// current catalog names and nowhere else, never following a redirect. The
+// service drives a real login page, so a sign-in takes tens of seconds.
+func automatedAuthClient(catalog interface{ Current() httpcatalog.Catalog }, dial func(context.Context, string, string) (net.Conn, error)) *http.Client {
+	pinned := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if !catalog.Current().HasAutomatedAuth(addr) {
+			return nil, errors.New("automated-auth login: service not in the catalog")
+		}
+		return dial(ctx, network, addr)
+	}
+	return &http.Client{Timeout: 60 * time.Second,
 		Transport:     &http.Transport{DialContext: pinned, TLSHandshakeTimeout: 5 * time.Second},
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 }

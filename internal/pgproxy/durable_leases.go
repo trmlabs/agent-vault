@@ -57,6 +57,7 @@ type DurableLeaseOptions struct {
 type durableLease struct {
 	accessor string
 	expires  time.Time
+	session  *hashicorp.DatabaseSession // revokes itself while this process holds it
 }
 
 // DurableLeaseMinter journals a child-token accessor before credential issuance.
@@ -290,9 +291,9 @@ func (m *DurableLeaseMinter) ConfirmDatabaseCleanup(ctx context.Context, accesso
 	if !unknown {
 		return fmt.Errorf("unknown-issuance record not found")
 	}
-	if err := m.client.RevokeDatabaseSession(ctx, accessor); err != nil {
-		return err
-	}
+	// The record's child token is not revoked here: its value died with the
+	// process that held it, and it expires within its TTL, revoking any lease
+	// it issued. The operator's database evidence is what reopens the binding.
 	return m.journal.ConfirmDatabaseCleanup(ctx, m.owner, accessor, evidence)
 }
 
@@ -386,15 +387,16 @@ func (m *DurableLeaseMinter) reconcile(ctx context.Context, binding string) erro
 		}
 		cleanupCtx, cancel := context.WithTimeout(ctx, leaseRevokeTimeout)
 		var err error
+		// A record no live session holds belongs to a dead or retired session:
+		// its credential is revoked by path. Its child token is not revoked by
+		// accessor, a right no policy could limit to the broker's own tokens;
+		// only that session's process ever held the token, and it expires
+		// within its TTL.
 		if record.LeaseID == "" {
-			_ = m.client.RevokeDatabaseSession(cleanupCtx, record.Accessor)
 			_ = m.journal.QuarantineDatabaseCleanup(cleanupCtx, m.owner, record.Accessor)
 			err = fmt.Errorf("unknown database issuance requires operator reconciliation")
 		} else {
 			err = m.client.RevokeDatabaseLeaseConfirmed(cleanupCtx, record.LeaseID)
-			if err == nil {
-				err = m.client.RevokeDatabaseSession(cleanupCtx, record.Accessor)
-			}
 		}
 		cancel()
 		if err == nil {
@@ -440,17 +442,20 @@ func (m *DurableLeaseMinter) Mint(ctx context.Context, scope AgentScope, svc *Da
 	if err := m.journal.AddDatabaseCleanup(ctx, m.owner, record); err != nil {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
 		defer cleanupCancel()
-		_ = m.client.RevokeDatabaseSession(cleanupCtx, session.Accessor)
+		_ = session.Revoke(cleanupCtx)
 		return nil, fmt.Errorf("persist database cleanup before issuance: %w", err)
 	}
 	issued := time.Now()
 	credential, err := session.ReadCredential(ctx)
 	if err != nil {
-		// Keep the durable accessor even if immediate cleanup fails. A missing
-		// credential response leaves the binding quarantined until database-backed
+		// Vault may have issued a credential whose response was lost. This
+		// process still holds the child token, and revoking it with its own
+		// token revokes every lease it issued, that one included. The durable
+		// record stays, so the binding is quarantined until database-backed
 		// reconciliation confirms that no issued role or session remains.
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
 		defer cleanupCancel()
+		_ = session.Revoke(cleanupCtx)
 		_ = m.reconcile(cleanupCtx, binding)
 		return nil, err
 	}
@@ -458,7 +463,7 @@ func (m *DurableLeaseMinter) Mint(ctx context.Context, scope AgentScope, svc *Da
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
 		defer cleanupCancel()
 		_ = m.client.RevokeDatabaseLeaseConfirmed(cleanupCtx, credential.LeaseID)
-		_ = m.client.RevokeDatabaseSession(cleanupCtx, session.Accessor)
+		_ = session.Revoke(cleanupCtx)
 		return nil, fmt.Errorf("persist issued database lease: %w", err)
 	}
 	expiry := credential.ExpiresAt(issued)
@@ -466,7 +471,7 @@ func (m *DurableLeaseMinter) Mint(ctx context.Context, scope AgentScope, svc *Da
 		expiry = session.ExpiresAt
 	}
 	m.activeMu.Lock()
-	m.active[credential.LeaseID] = durableLease{accessor: session.Accessor, expires: session.ExpiresAt}
+	m.active[credential.LeaseID] = durableLease{accessor: session.Accessor, expires: session.ExpiresAt, session: session}
 	m.activeMu.Unlock()
 	return &Lease{ID: credential.LeaseID, Username: credential.Username, Password: credential.Password, ExpiresAt: expiry, Renewable: credential.Renewable}, nil
 }
@@ -512,8 +517,10 @@ func (m *DurableLeaseMinter) Revoke(ctx context.Context, id string) error {
 	if err := m.client.RevokeDatabaseLeaseConfirmed(ctx, id); err != nil {
 		return err
 	}
-	if err := m.client.RevokeDatabaseSession(ctx, lease.accessor); err != nil {
-		return err
+	// The credential is gone; ending the child token is tidiness, not a
+	// condition for clearing the record (see DatabaseSession.Revoke).
+	if lease.session != nil {
+		_ = lease.session.Revoke(ctx)
 	}
 	return m.journal.DeleteDatabaseCleanup(ctx, lease.accessor)
 }

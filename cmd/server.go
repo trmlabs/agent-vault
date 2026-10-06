@@ -2,7 +2,11 @@ package cmd
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log/slog"
@@ -23,12 +27,15 @@ import (
 	"github.com/Infisical/agent-vault/internal/ca"
 	"github.com/Infisical/agent-vault/internal/crypto"
 	"github.com/Infisical/agent-vault/internal/hashicorp"
+	"github.com/Infisical/agent-vault/internal/httpcatalog"
 	"github.com/Infisical/agent-vault/internal/infisical"
 	"github.com/Infisical/agent-vault/internal/mitm"
 	"github.com/Infisical/agent-vault/internal/netguard"
 	"github.com/Infisical/agent-vault/internal/notify"
 	"github.com/Infisical/agent-vault/internal/pgproxy"
 	"github.com/Infisical/agent-vault/internal/pidfile"
+	"github.com/Infisical/agent-vault/internal/proxyactivity"
+	"github.com/Infisical/agent-vault/internal/proxycert"
 	"github.com/Infisical/agent-vault/internal/requestlog"
 	"github.com/Infisical/agent-vault/internal/runtimestatus"
 	"github.com/Infisical/agent-vault/internal/server"
@@ -247,7 +254,7 @@ func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKe
 	if db.DialectName() == "postgres" {
 		caOpts.Store = &caStoreAdapter{db: db}
 	}
-	caProv, err := ca.New(masterKey, caOpts)
+	caProv, err := newInterceptionCA(masterKey, caOpts, srv.Logger(), srv.CredentialProxyEnabled())
 	if err != nil {
 		if srv.CredentialProxyEnabled() {
 			return fmt.Errorf("credential proxy CA initialization failed")
@@ -279,9 +286,131 @@ func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKe
 			MaxResponseBytes:      maxRespBytes,
 			MaxRequestBytes:       maxReqBytes,
 			DrainTunnels:          drainSeconds > 0,
+			// Pending or active credential-proxy tunnels per replica.
+			MaxCredentialProxyTunnels: intEnvValue("AGENT_VAULT_MITM_MAX_TUNNELS"),
 		},
 	))
 	return nil
+}
+
+// newInterceptionCA loads or creates the interception CA. In credential-proxy
+// mode it logs the public root once, so the certificate workers must trust can
+// be recorded from the broker's own logs. The root is stored with the broker,
+// so the line repeats the same certificate on every restart.
+func newInterceptionCA(masterKey []byte, opts ca.Options, logger *slog.Logger, credentialProxy bool) (*ca.SoftCA, error) {
+	caProv, err := ca.New(masterKey, opts)
+	if err != nil {
+		return nil, err
+	}
+	if credentialProxy {
+		logInterceptionCA(logger, caProv.RootPEM())
+	}
+	return caProv, nil
+}
+
+// logInterceptionCA logs the root certificate's SHA-256 (over its DER) and the
+// exact PEM the broker serves. It logs only a single CERTIFICATE block, never
+// anything else, so no key can reach the log.
+func logInterceptionCA(logger *slog.Logger, rootPEM []byte) {
+	block, rest := pem.Decode(rootPEM)
+	if block == nil || block.Type != "CERTIFICATE" || len(bytes.TrimSpace(rest)) != 0 {
+		logger.Warn("interception CA root is not a single certificate; not logged", "event", "mitm-ca")
+		return
+	}
+	sum := sha256.Sum256(block.Bytes)
+	logger.Info("interception CA", "event", "mitm-ca", "sha256", hex.EncodeToString(sum[:]), "pem", string(rootPEM))
+}
+
+// attachProxyCertificates lets shared proxies in another cluster ask for
+// their serving certificate on the cross-cluster listener, signed by a Vault
+// PKI role limited to their names. Set all of AGENT_VAULT_PROXY_PKI_MOUNT,
+// AGENT_VAULT_PROXY_PKI_ROLE and AGENT_VAULT_PROXY_CERT_NAMES, or none;
+// AGENT_VAULT_PROXY_CERT_TTL defaults to 24h.
+func attachProxyCertificates(srv *server.Server, resolver *workloadidentity.Resolver, logger *slog.Logger, getenv func(string) string) error {
+	mount, role, names := getenv("AGENT_VAULT_PROXY_PKI_MOUNT"), getenv("AGENT_VAULT_PROXY_PKI_ROLE"), getenv("AGENT_VAULT_PROXY_CERT_NAMES")
+	if mount == "" && role == "" && names == "" && getenv("AGENT_VAULT_PROXY_CERT_TTL") == "" {
+		return nil
+	}
+	if mount == "" || role == "" || names == "" {
+		return fmt.Errorf("proxy certificates need AGENT_VAULT_PROXY_PKI_MOUNT, AGENT_VAULT_PROXY_PKI_ROLE and AGENT_VAULT_PROXY_CERT_NAMES")
+	}
+	if getenv("AGENT_VAULT_CROSS_CLUSTER_PORT") == "" || resolver == nil || srv.HashicorpClient() == nil {
+		return fmt.Errorf("proxy certificates need the cross-cluster listener, workload identity and Vault")
+	}
+	ttl := proxycert.MaxTTL
+	if raw := getenv("AGENT_VAULT_PROXY_CERT_TTL"); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil {
+			return fmt.Errorf("AGENT_VAULT_PROXY_CERT_TTL must be a duration such as 24h")
+		}
+		ttl = parsed
+	}
+	var list []string
+	for _, name := range strings.Split(names, ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			list = append(list, name)
+		}
+	}
+	// Every certificate issued is a row in the signed audit trail, so there is
+	// no issuing without it.
+	chain, err := sharedAuditChain(context.Background(), srv.HashicorpClient(), srv.CleanupStore(), getenv, logger)
+	if err != nil {
+		return err
+	}
+	if chain == nil {
+		return fmt.Errorf("proxy certificates need the signed audit trail (AGENT_VAULT_AUDIT_CHAIN)")
+	}
+	// Issuance per proxy binding: AGENT_VAULT_PROXY_CERT_PER_HOUR and
+	// AGENT_VAULT_PROXY_CERT_BURST (default 1,000 each).
+	return srv.EnableProxyCertificates(&proxycert.Issuer{Mount: mount, Role: role, Names: list, TTL: ttl,
+		Signer: srv.HashicorpClient(), Verifier: resolver, Audit: chain, Logger: logger,
+		PerHour: intEnvValue("AGENT_VAULT_PROXY_CERT_PER_HOUR"), Burst: intEnvValue("AGENT_VAULT_PROXY_CERT_BURST")})
+}
+
+// attachProxyActivity keeps shared proxies' Sandbox activity in the shared
+// store whenever the cross-cluster listener and workload identity are on, so
+// the idle janitor's view outlives any proxy replica.
+// AGENT_VAULT_PROXY_ACTIVITY_RETENTION (default 24h) is how long a row is kept;
+// AGENT_VAULT_PROXY_ACTIVITY_MAX_ROWS (default proxyactivity.DefaultMaxRows) is
+// the most rows one proxy binding may hold.
+func attachProxyActivity(srv *server.Server, resolver *workloadidentity.Resolver, db store.Store, logger *slog.Logger, getenv func(string) string) error {
+	raw := getenv("AGENT_VAULT_PROXY_ACTIVITY_RETENTION")
+	if getenv("AGENT_VAULT_CROSS_CLUSTER_PORT") == "" || resolver == nil {
+		if raw != "" {
+			return fmt.Errorf("AGENT_VAULT_PROXY_ACTIVITY_RETENTION needs the cross-cluster listener and workload identity")
+		}
+		return nil
+	}
+	activityStore, ok := db.(proxyactivity.Store)
+	if !ok {
+		return fmt.Errorf("proxy activity needs the SQL store")
+	}
+	retention := 24 * time.Hour
+	if raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil {
+			return fmt.Errorf("AGENT_VAULT_PROXY_ACTIVITY_RETENTION must be a duration such as 24h")
+		}
+		retention = parsed
+	}
+	maxRows := 0
+	if raw := getenv("AGENT_VAULT_PROXY_ACTIVITY_MAX_ROWS"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 {
+			return fmt.Errorf("AGENT_VAULT_PROXY_ACTIVITY_MAX_ROWS must be a positive whole number")
+		}
+		maxRows = parsed
+	}
+	return srv.EnableProxyActivity(&proxyactivity.Service{Store: activityStore, Identifier: proxyIdentifier{resolver}, Retention: retention,
+		MaxRows: maxRows, Logger: logger})
+}
+
+// proxyIdentifier adapts workload identity to proxy activity.
+type proxyIdentifier struct{ r *workloadidentity.Resolver }
+
+func (p proxyIdentifier) IdentifyProxy(ctx context.Context, token string, peer netip.Addr) (proxyactivity.Identity, error) {
+	id, err := p.r.IdentifyProxy(ctx, token, peer)
+	return proxyactivity.Identity{Scope: id.Scope, Namespaces: id.Namespaces}, err
 }
 
 // attachServerExtensions wires optional subsystems (MITM, Infisical) onto srv.
@@ -323,6 +452,19 @@ func attachServerExtensions(srv *server.Server, host string, mitmPort, postgresP
 		}
 		srv.EnableCredentialProxy()
 	}
+	if port := os.Getenv("AGENT_VAULT_CROSS_CLUSTER_PORT"); port != "" {
+		// Agents in another cluster arrive through their shared proxy and a
+		// private link, behind a TLS front that names the source in a PROXY
+		// header. Both protocol listeners must trust that header.
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 || !srv.CredentialProxyEnabled() || !boolEnvValue("AGENT_VAULT_MITM_PROXY_PROTOCOL") ||
+			(postgresPort > 0 && !boolEnvValue("AGENT_VAULT_DB_PROXY_PROTOCOL")) {
+			return fmt.Errorf("AGENT_VAULT_CROSS_CLUSTER_PORT needs a port, the credential proxy and PROXY headers on both protocol listeners")
+		}
+		if err := srv.EnableCrossCluster(net.JoinHostPort("127.0.0.1", port)); err != nil {
+			return err
+		}
+	}
 	sessions := srv.SessionResolver()
 	var proxyIdentity workloadidentity.Config
 	var proxyResolver *workloadidentity.Resolver
@@ -335,6 +477,7 @@ func attachServerExtensions(srv *server.Server, host string, mitmPort, postgresP
 		if err != nil {
 			return err
 		}
+		resolver.SetLogger(logger)
 		sessions = resolver
 		proxyIdentity = config
 		proxyResolver = resolver
@@ -349,6 +492,15 @@ func attachServerExtensions(srv *server.Server, host string, mitmPort, postgresP
 	adapter, err := httpHeaderAdapter(context.Background(), srv, os.Getenv)
 	if err != nil {
 		return fmt.Errorf("http header adapter: %w", err)
+	}
+	if proxyResolver != nil && adapter != nil {
+		proxyResolver.SetProfiles(catalogProfiles(adapter.Catalog))
+	}
+	if err := attachProxyCertificates(srv, proxyResolver, logger, os.Getenv); err != nil {
+		return err
+	}
+	if err := attachProxyActivity(srv, proxyResolver, db, logger, os.Getenv); err != nil {
+		return err
 	}
 	if err := attachMITMIfEnabled(srv, host, mitmPort, masterKey, db, maxRespBytes, maxReqBytes, adapter, sessions); err != nil {
 		return err
@@ -473,11 +625,14 @@ func attachPostgresBrokerIfEnabled(srv *server.Server, host string, postgresPort
 		// Per-Pod caps hold across every replica sharing this store.
 		opts.Sessions = server.NewSessionLedger(srv.CleanupStore(), minter)
 	}
-	// Each brokered connection is one real upstream DB connection, so MaxConns
-	// must be tuned below the database's max_connections. Operators set it (and
-	// the per-actor cap) via env; unset keeps the conservative defaults.
+	// Each database's ceiling is its catalog entry's maxConns; MaxConns only
+	// bounds the broker across all of them. A database whose entry sets none
+	// gets AGENT_VAULT_DB_DEFAULT_DATABASE_CONNS (default 50).
 	if v := intEnvValue("AGENT_VAULT_DB_MAX_CONNS"); v > 0 {
 		opts.MaxConns = v
+	}
+	if v := intEnvValue("AGENT_VAULT_DB_DEFAULT_DATABASE_CONNS"); v > 0 {
+		opts.DefaultDatabaseConns = v
 	}
 	if v := intEnvValue("AGENT_VAULT_DB_MAX_LEASES_PER_ACTOR"); v > 0 {
 		opts.MaxLeasesPerActor = v
@@ -505,13 +660,23 @@ func attachPostgresBrokerIfEnabled(srv *server.Server, host string, postgresPort
 	// and one rotating credential per pool and database. MaxConns then caps
 	// client sessions; each database's server budget comes from the catalog.
 	if boolEnvValue("AGENT_VAULT_DB_POOLING") {
-		opts.Pool = &pgproxy.PoolOptions{Replicas: intEnvValue("AGENT_VAULT_DB_POOL_REPLICAS"), DefaultBudget: intEnvValue("AGENT_VAULT_DB_POOL_BUDGET"),
+		opts.Pool = &pgproxy.PoolOptions{Replicas: intEnvValue("AGENT_VAULT_DB_POOL_REPLICAS"), DefaultBudget: firstPositive(intEnvValue("AGENT_VAULT_DB_POOL_BUDGET"), intEnvValue("AGENT_VAULT_DB_DEFAULT_DATABASE_CONNS")),
 			QueueFactor: intEnvValue("AGENT_VAULT_DB_POOL_QUEUE_FACTOR"), QueueWait: time.Duration(intEnvValue("AGENT_VAULT_DB_POOL_QUEUE_WAIT_MS")) * time.Millisecond,
 			// A graceful stop ends each session between transactions.
 			DrainSessions: intEnvValue("AGENT_VAULT_SHUTDOWN_SECONDS") > 0}
 	}
 	srv.AttachPostgresBroker(pgproxy.New(net.JoinHostPort(host, strconv.Itoa(postgresPort)), opts))
 	return nil
+}
+
+// firstPositive returns the first value above zero, or 0.
+func firstPositive(values ...int) int {
+	for _, v := range values {
+		if v > 0 {
+			return v
+		}
+	}
+	return 0
 }
 
 // tokenReviewOnly exposes only ResolveForProxy, hiding a resolver's Attest.
@@ -1171,4 +1336,22 @@ func cleanupObserverPort(path, value string) (int, error) {
 		return 0, fmt.Errorf("cleanup observer requires both policy file and a numeric port from 1 through 65535")
 	}
 	return port, nil
+}
+
+// catalogProfiles reads each pool's declared harness profile from the live
+// catalog, so every admission also matches it.
+func catalogProfiles(catalog interface{ Current() httpcatalog.Catalog }) workloadidentity.ProfileSource {
+	return func(name string) (workloadidentity.Profile, bool) {
+		pool, ok := catalog.Current().Pool(name)
+		if !ok {
+			return workloadidentity.Profile{}, false
+		}
+		p := pool.Profile()
+		if !p.Explicit {
+			return workloadidentity.Profile{}, false
+		}
+		return workloadidentity.Profile{Name: p.Name, Issuer: p.TrustDomain.Issuer, Audience: p.TrustDomain.Audience, Remote: p.TrustDomain.Keys != httpcatalog.KeysInCluster,
+			Kind: p.Identity.Kind, OwnerKind: p.Identity.OwnerKind, Namespaces: p.Identity.Namespaces, ImageDigests: p.Identity.ImageDigests,
+			ImagePrefix: p.Identity.ImagePrefix}, true
+	}
 }

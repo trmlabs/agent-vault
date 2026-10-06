@@ -55,6 +55,7 @@ type Proxy struct {
 	isListening           atomic.Bool
 	baseURL               string // externally-reachable control-plane URL for help links
 	logger                *slog.Logger
+	refusals              refusalLog
 	rateLimit             *ratelimit.Registry // shared with the HTTP server; nil = no-op
 	logSink               requestlog.Sink     // never nil (Nop default); shared with the HTTP server
 	maxResponseBytes      int64               // 0 = unlimited
@@ -75,6 +76,11 @@ type Proxy struct {
 	draining     bool
 }
 
+// DefaultMaxTunnels bounds pending or active credential-proxy CONNECT tunnels
+// per replica. A tunnel costs goroutines and one TLS session, so the bound is
+// fleet scale; AGENT_VAULT_MITM_MAX_TUNNELS overrides it.
+const DefaultMaxTunnels = 10000
+
 // Options carries the dependencies a Proxy needs. BaseURL is the
 // externally-reachable control-plane URL used in help-link error
 // responses. Logger must be non-nil; tests can pass
@@ -82,7 +88,7 @@ type Proxy struct {
 // server so proxy limits and control-plane limits live in one registry;
 // nil disables rate limiting on the MITM path.
 type Options struct {
-	MaxCredentialProxyTunnels int                // <=0 defaults to 128 pending or active CONNECT tunnels
+	MaxCredentialProxyTunnels int                // <=0 defaults to DefaultMaxTunnels pending or active CONNECT tunnels
 	StrictCredentialProxy     bool               // bounded header-placeholder release path
 	DurableAudit              requestlog.Durable // mandatory when strict mode is enabled, unless HeaderAdapter is set
 	HeaderAdapter             *HeaderAdapter     // strict mode only: catalog destinations with signed audit
@@ -132,7 +138,7 @@ func New(addr string, opts Options) *Proxy {
 
 	tunnelLimit := opts.MaxCredentialProxyTunnels
 	if tunnelLimit <= 0 {
-		tunnelLimit = 128
+		tunnelLimit = DefaultMaxTunnels
 	}
 	p := &Proxy{
 		ca:                    opts.CA,

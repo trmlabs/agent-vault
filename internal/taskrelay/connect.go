@@ -5,10 +5,14 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/textproto"
+	"regexp"
 	"strings"
 	"time"
+
+	"github.com/Infisical/agent-vault/internal/brokercore"
 )
 
 func (r *relay) connect(w http.ResponseWriter, req *http.Request) {
@@ -22,7 +26,7 @@ func (r *relay) connect(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "denied", http.StatusForbidden)
 		return
 	}
-	allowed := false
+	allowed := c.Routes == routesBroker && brokerRouteTarget(req.Host)
 	for _, target := range c.AllowedTargets {
 		if req.Host == target {
 			allowed = true
@@ -50,7 +54,10 @@ func (r *relay) connect(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	up, e := dialUpstream(req.Context(), c.Upstream)
+	dialCtx, cancelDial := context.WithTimeout(req.Context(), r.handshake())
+	up, e := dialUpstream(dialCtx, c.Upstream)
+	cancelDial()
+	r.upstreams.dialed(r.log, c.Upstream.Address, e)
 	if e != nil {
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 		return
@@ -58,7 +65,7 @@ func (r *relay) connect(w http.ResponseWriter, req *http.Request) {
 	defer func() { _ = up.Close() }()
 	stop := context.AfterFunc(r.ctx, func() { _ = up.Close() })
 	defer stop()
-	_ = up.SetDeadline(minTime(expiry, time.Now().Add(handshakeTimeout)))
+	_ = up.SetDeadline(minTime(expiry, time.Now().Add(r.handshake())))
 	if !time.Now().Before(expiry) || r.pair.check(req.Context(), req.RemoteAddr) != nil {
 		http.Error(w, "denied", http.StatusForbidden)
 		return
@@ -66,6 +73,15 @@ func (r *relay) connect(w http.ResponseWriter, req *http.Request) {
 	session := readSession(c.Upstream)
 	if session != "" {
 		session = "Gatehouse-Session: " + session + "\r\n"
+	}
+	// A shared proxy states which agent Pod is behind this connection.
+	attestation, agent, e := r.attest(req.RemoteAddr)
+	if e != nil {
+		http.Error(w, "denied", http.StatusForbidden)
+		return
+	}
+	if attestation != "" {
+		session += brokercore.AttestationHeader + ": " + attestation + "\r\n"
 	}
 	if _, e = fmt.Fprintf(up, "CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Authorization: Bearer %s\r\n%s\r\n", req.Host, req.Host, proof, session); e != nil {
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
@@ -76,6 +92,18 @@ func (r *relay) connect(w http.ResponseWriter, req *http.Request) {
 	limited := &io.LimitedReader{R: up, N: 8193}
 	reader := bufio.NewReader(limited)
 	status, e := reader.ReadString('\n')
+	if e == nil && !strings.HasPrefix(status, "HTTP/1.1 200 ") {
+		// The broker's status (not its text) names the refusal in the relay log.
+		if code := strings.TrimPrefix(status, "HTTP/1.1 "); len(code) >= 3 && strings.Trim(code[:3], "0123456789") == "" {
+			_ = r.record("connect", "refused:"+code[:3])
+		}
+	}
+	if e == nil && strings.HasPrefix(status, "HTTP/1.1 403 ") {
+		// The broker refused the target (not in the catalog, or not this
+		// pool's): a refusal, not an outage. Only the status passes.
+		http.Error(w, "denied", http.StatusForbidden)
+		return
+	}
 	if e != nil || !strings.HasPrefix(status, "HTTP/1.1 200 ") || !strings.HasSuffix(status, "\r\n") {
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 		return
@@ -102,7 +130,11 @@ func (r *relay) connect(w http.ResponseWriter, req *http.Request) {
 	}
 	// Restore the bounded reader after parsing; buffered tunnel bytes are kept.
 	limited.N = 1<<63 - 1
-	copyTunnel(r.ctx, conn, buffer, up, reader, expiry)
+	end, started := &ending{}, time.Now()
+	defer func() { r.logClose("connect", req.RemoteAddr, agent, c.Upstream.Address, req.Host, started, end) }()
+	stopWatch := r.watchPeer(req.RemoteAddr, agent, func() { end.set(endWithdrawn); _ = conn.Close(); _ = up.Close() })
+	defer stopWatch()
+	copyTunnel(r.ctx, conn, buffer, up, reader, expiry, end)
 }
 
 func minTime(a, b time.Time) time.Time {
@@ -127,4 +159,29 @@ func readSession(c UpstreamConfig) string {
 		return ""
 	}
 	return token
+}
+
+var dnsHostLabel = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+
+// brokerRouteTarget is the shape a CONNECT target must have to be forwarded
+// under broker routing: a lower-case DNS name of two or more labels, its last
+// label not all digits (so no IPv4 literal; an IPv6 literal fails the
+// labels), and port 443 only. Whether the host is reachable is the broker's
+// catalog's decision. Port 443 only is a deliberate limit: a catalog entry on
+// any other port is not reachable through broker routing.
+func brokerRouteTarget(target string) bool {
+	host, port, e := net.SplitHostPort(target)
+	if e != nil || port != "443" || len(host) > 253 {
+		return false
+	}
+	labels := strings.Split(host, ".")
+	if len(labels) < 2 {
+		return false
+	}
+	for _, label := range labels {
+		if !dnsHostLabel.MatchString(label) {
+			return false
+		}
+	}
+	return strings.Trim(labels[len(labels)-1], "0123456789") != ""
 }
