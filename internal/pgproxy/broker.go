@@ -684,6 +684,14 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		b.auditDenied(event, outcome)
 		writeClientError(backend, code, outcome, message)
 	}
+	// refuseBusy is busy for a session past authentication: it is audited like
+	// every other refusal from here on.
+	refuseBusy := func(stage string) {
+		if b.ctx.Err() == nil {
+			b.auditDenied(event, "admission_timeout")
+		}
+		busy(stage)
+	}
 	if err := b.auditAdmit(); err != nil {
 		b.logger.Error("pgproxy: audit trail unavailable; refusing session", slog.String("error", err.Error()))
 		refuse("audit_unavailable", "08004", "Agent Vault: audit unavailable")
@@ -752,7 +760,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		if id != "" {
 			release, ok := b.acquireAdmission(hsCtx)
 			if !ok {
-				busy("ledger_queue")
+				refuseBusy("ledger_queue")
 				return
 			}
 			// Its own deadline: a slow ledger must not spend the wait for
@@ -814,7 +822,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	// recheck and resolution are store calls, so they take an admission slot.
 	releaseStore, ok := b.acquireAdmission(hsCtx)
 	if !ok {
-		busy("resolve_queue")
+		refuseBusy("resolve_queue")
 		return
 	}
 	defer releaseStore()
