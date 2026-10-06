@@ -110,6 +110,11 @@ func TestMatchUsesSegmentsAndLongestPrefix(t *testing.T) {
 	if !c.HasHost("serpapi.com", 443) || c.HasHost("serpapi.com", 8443) || c.HasHost("example.com", 443) {
 		t.Fatal("HasHost wrong")
 	}
+	// Per pool: only a pool an entry grants sees its host.
+	if !c.HasHostForPool("SerpAPI.com", 443, "pool-a") || c.HasHostForPool("serpapi.com", 443, "pool-b") ||
+		c.HasHostForPool("serpapi.com", 443, "") || c.HasHostForPool("example.com", 443, "pool-a") {
+		t.Fatal("HasHostForPool wrong")
+	}
 }
 
 type fakeVault struct {
