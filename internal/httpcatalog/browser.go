@@ -226,6 +226,19 @@ func printableASCII(s string) bool {
 	return true
 }
 
+// BrowserHost reports whether host:port is a browser-session entry's API host
+// or app host: a host whose TLS leaf the browser CA signs.
+func (c Catalog) BrowserHost(host string, port int) bool {
+	host = strings.ToLower(host)
+	for i := range c.entries {
+		e := &c.entries[i]
+		if e.Kind == "browser-session" && port == e.Port && (host == e.Host || host == e.BrowserSession.AppHost) {
+			return true
+		}
+	}
+	return false
+}
+
 // BrowserMatch routes a request to a browser-session entry. ok is false when
 // neither the API host nor the app host of any such entry matches. The app
 // host serves GET and HEAD only.
