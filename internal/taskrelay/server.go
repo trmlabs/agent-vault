@@ -15,7 +15,15 @@ import (
 	"github.com/Infisical/agent-vault/internal/workloadidentity"
 )
 
+// handshakeTimeout is the default bound on a connection's setup. Ten seconds
+// covers a TLS handshake and the broker's admission (a Kubernetes token
+// review and a catalog decision, each normally under a second) several times
+// over, yet frees a slot held by a client that stalls before its startup.
+// Set handshakeSeconds where the broker sits far away or under heavy load.
 const handshakeTimeout = 10 * time.Second
+
+// maxConnections is a sidecar's default connection cap when the render sets
+// none (maxConnections).
 const maxConnections = 32
 
 type relay struct {
@@ -65,6 +73,9 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 	ctx, cancel := context.WithDeadline(parent, c.Deadline)
 	defer cancel()
 	limit := maxConnections
+	if c.MaxConnections != 0 {
+		limit = c.MaxConnections
+	}
 	if c.Shared != nil {
 		limit = c.Shared.connections()
 	}
@@ -165,7 +176,7 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 			defer r.wg.Done()
 			h.ServeHTTP(w, req)
 		})
-		s := &http.Server{Handler: tracked, ErrorLog: log.New(io.Discard, "", 0), ReadHeaderTimeout: handshakeTimeout, ReadTimeout: handshakeTimeout, WriteTimeout: handshakeTimeout, IdleTimeout: handshakeTimeout, MaxHeaderBytes: 8192, BaseContext: func(net.Listener) context.Context { return ctx }}
+		s := &http.Server{Handler: tracked, ErrorLog: log.New(io.Discard, "", 0), ReadHeaderTimeout: r.handshake(), ReadTimeout: r.handshake(), WriteTimeout: r.handshake(), IdleTimeout: r.handshake(), MaxHeaderBytes: 8192, BaseContext: func(net.Listener) context.Context { return ctx }}
 		r.wg.Add(1)
 		go func() {
 			defer r.wg.Done()
@@ -416,6 +427,14 @@ func (r *relay) attest(peer string) (encoded string, agent agentIdentity, err er
 	return encoded, agentIdentity{pod: a.PodUID, owner: a.OwnerUID, requester: a.Requester}, nil
 }
 
+// handshake is this relay's bound on a connection's setup.
+func (r *relay) handshake() time.Duration {
+	if r.config.HandshakeSeconds != 0 {
+		return time.Duration(r.config.HandshakeSeconds) * time.Second
+	}
+	return handshakeTimeout
+}
+
 // agentIdentity is the Pod and controller UIDs, and the requester, a
 // connection was admitted for.
 type agentIdentity struct{ pod, owner, requester string }
@@ -453,12 +472,20 @@ func (r *relay) watchPeer(peer string, admitted agentIdentity, end func()) func(
 	var once sync.Once
 	return func() { once.Do(func() { close(done) }) }
 }
+
+// dialUpstream dials and handshakes within ctx's deadline, or within
+// handshakeTimeout when ctx has none.
 func dialUpstream(ctx context.Context, c UpstreamConfig) (net.Conn, error) {
 	t, e := clientTLS(c.CAFile, c.ServerName)
 	if e != nil {
 		return nil, e
 	}
-	d := tls.Dialer{NetDialer: &net.Dialer{Timeout: handshakeTimeout}, Config: t}
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, handshakeTimeout)
+		defer cancel()
+	}
+	d := tls.Dialer{NetDialer: &net.Dialer{}, Config: t}
 	return d.DialContext(ctx, "tcp", c.Address)
 }
 

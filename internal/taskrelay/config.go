@@ -40,6 +40,14 @@ type FixedConfig struct {
 	// plaintext listeners only, and no Kubernetes pairing, because the broker
 	// verifies this Pod's token and address on every connection.
 	Self bool `json:"self,omitempty"`
+	// MaxConnections bounds a sidecar's open connections (paired or self
+	// mode; default 32). The pool render sets it from sessionsPerWorker. A
+	// shared proxy uses shared.maxConnections instead.
+	MaxConnections int `json:"maxConnections,omitempty"`
+	// HandshakeSeconds bounds each connection's setup: the client's startup
+	// or CONNECT, the dial and TLS handshake to the broker, and the broker's
+	// answer (default 10, 1 to 300). See handshakeTimeout.
+	HandshakeSeconds int `json:"handshakeSeconds,omitempty"`
 	// Shared runs the relay as one proxy for many agent Pods; see SharedConfig.
 	Shared *SharedConfig `json:"shared,omitempty"`
 	// TLS, in shared mode only, serves every listener but AdminListen in TLS
@@ -170,6 +178,12 @@ func (c FixedConfig) Validate(now time.Time) error {
 	}
 	// Activity reaches the broker over the CONNECT upstream.
 	if d := c.DurableActivity; d != nil && (c.AdminListen == "" || c.Connect == nil || d.PushSeconds < 0 || d.PushSeconds > 3600) {
+		return errConfig
+	}
+	// A sidecar's cap has no ceiling but the relay's sanity bound; the shared
+	// proxy has its own.
+	if c.MaxConnections < 0 || c.MaxConnections > 65536 || (c.MaxConnections != 0 && c.Shared != nil) ||
+		c.HandshakeSeconds < 0 || c.HandshakeSeconds > 300 {
 		return errConfig
 	}
 	// Up to a year: retention costs one small entry per Sandbox used.
