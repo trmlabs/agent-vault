@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 
 	vaultapi "github.com/hashicorp/vault/api"
@@ -42,6 +43,7 @@ func VaultPrefixLoader(vault ListLogical, mount, prefix string) Loader {
 	var mu sync.Mutex
 	var lastVersion int
 	var last []byte
+	var lastEntries map[string]string // name to the entry JSON in the last good catalog
 	return func(ctx context.Context) ([]byte, int, error) {
 		if vault == nil || !kvPattern.MatchString(mount) || !kvPattern.MatchString(prefix) {
 			return nil, 0, errors.New("catalog location is not configured")
@@ -90,13 +92,17 @@ func VaultPrefixLoader(vault ListLogical, mount, prefix string) Loader {
 			digest.Write([]byte(name + "\n" + entries[i] + "\n"))
 		}
 		if hex.EncodeToString(digest.Sum(nil)) != want {
-			return nil, version, errors.New("catalog entries do not match the head; retrying at the next poll")
+			return nil, version, fmt.Errorf("catalog entries do not match the head; retrying at the next poll (%s)", entryChanges(lastEntries, names, entries))
 		}
 		out, err := assemble(document, names, entries)
 		if err != nil {
 			return nil, version, err
 		}
 		last, lastVersion = out, version
+		lastEntries = make(map[string]string, len(names))
+		for i, name := range names {
+			lastEntries[name] = entries[i]
+		}
 		return out, version, nil
 	}
 }
@@ -104,6 +110,38 @@ func VaultPrefixLoader(vault ListLogical, mount, prefix string) Loader {
 // errDeleted is a KV secret whose current version is deleted or destroyed.
 // Vault still lists its key until its metadata is removed.
 var errDeleted = errors.New("catalog secret deleted")
+
+// entryChanges names what differs from the last good catalog, so an operator
+// can find a stray or half-written document from the log: every count in
+// full and up to shownNames names of each kind. Names are catalog
+// identifiers, so they are safe to log; entry contents never are.
+func entryChanges(last map[string]string, names, entries []string) string {
+	const shownNames = 20
+	var added, changed, removed []string
+	seen := make(map[string]bool, len(names))
+	for i, name := range names {
+		seen[name] = true
+		switch old, ok := last[name]; {
+		case !ok:
+			added = append(added, name)
+		case old != entries[i]:
+			changed = append(changed, name)
+		}
+	}
+	for name := range last {
+		if !seen[name] {
+			removed = append(removed, name)
+		}
+	}
+	sort.Strings(removed)
+	show := func(kind string, list []string) string {
+		if len(list) > shownNames {
+			return fmt.Sprintf("%s %d: %s, ...", kind, len(list), strings.Join(list[:shownNames], ","))
+		}
+		return fmt.Sprintf("%s %d: %s", kind, len(list), strings.Join(list, ","))
+	}
+	return fmt.Sprintf("listed %d; since the last good catalog %s; %s; %s", len(names), show("added", added), show("changed", changed), show("removed", removed))
+}
 
 func readKV(ctx context.Context, vault Logical, path string) (map[string]interface{}, int, error) {
 	resp, err := vault.ReadWithDataWithContext(ctx, path, nil)
