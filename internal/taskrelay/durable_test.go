@@ -2,9 +2,11 @@ package taskrelay
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"encoding/pem"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -31,6 +33,27 @@ type activityBroker struct {
 	failRecord  atomic.Bool
 	// history is when the binding's history began; zero until a report.
 	history time.Time
+	// tunnels are the open CONNECT tunnels, for dropTunnels.
+	tunnels []net.Conn
+}
+
+// dropTunnels kills every open tunnel as a dead process would: no TLS
+// close_notify and a TCP reset.
+func (b *activityBroker) dropTunnels() {
+	b.mu.Lock()
+	tunnels := b.tunnels
+	b.tunnels = nil
+	b.mu.Unlock()
+	for _, c := range tunnels {
+		raw := c
+		if tc, ok := c.(*tls.Conn); ok {
+			raw = tc.NetConn()
+		}
+		if tcp, ok := raw.(*net.TCPConn); ok {
+			_ = tcp.SetLinger(0)
+		}
+		_ = raw.Close()
+	}
 }
 
 func newActivityBroker(t *testing.T) *activityBroker {
@@ -45,6 +68,9 @@ func newActivityBroker(t *testing.T) *activityBroker {
 			if e != nil {
 				return
 			}
+			b.mu.Lock()
+			b.tunnels = append(b.tunnels, c)
+			b.mu.Unlock()
 			defer c.Close()
 			buf.WriteString("HTTP/1.1 200 OK\r\n\r\n")
 			buf.Flush()

@@ -194,6 +194,7 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig, route func(datab
 	dialCtx, cancelDial := context.WithTimeout(r.ctx, r.handshake())
 	up, e := dialUpstream(dialCtx, c.Upstream)
 	cancelDial()
+	r.upstreams.dialed(r.log, c.Upstream.Address, e)
 	if e != nil {
 		tell(errorFrame("08001", unreachableMessage))
 		return
@@ -214,7 +215,8 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig, route func(datab
 			return
 		}
 	}
-	stopWatch := r.watchPeer(peer, agent, func() { _ = conn.Close(); _ = up.Close() })
+	end := &ending{}
+	stopWatch := r.watchPeer(peer, agent, func() { end.set(endWithdrawn); _ = conn.Close(); _ = up.Close() })
 	defer stopWatch()
 	// The runner session rides the broker-side stream ahead of the startup
 	// packet this sidecar authors; the worker's own bytes never carry it.
@@ -324,7 +326,9 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig, route func(datab
 	if _, e = conn.Write(response); e != nil {
 		return
 	}
-	copyPostgres(r.ctx, conn, up, expiry)
+	started := time.Now()
+	defer func() { r.logClose("postgres", peer, agent, c.Upstream.Address, c.Database, started, end) }()
+	copyPostgres(r.ctx, conn, up, expiry, end)
 }
 
 // validStartup fixes database and user to the binding and allows only the
@@ -593,12 +597,13 @@ func refusalFrame(body []byte) []byte { return brokerRefusal("FATAL", body) }
 // whole, so when the broker ends the session (deadline, revocation, a failed
 // recheck) at a frame boundary while the worker is still connected, the
 // worker gets one relay-authored FATAL frame instead of a silent close.
-func copyPostgres(ctx context.Context, client, up net.Conn, deadline time.Time) {
+func copyPostgres(ctx context.Context, client, up net.Conn, deadline time.Time, end *ending) {
 	_ = client.SetDeadline(deadline)
 	_ = up.SetDeadline(deadline)
 	// At the task deadline the worker is told; a withdrawn task (cancelled)
 	// closes both sides at once.
 	stop := context.AfterFunc(ctx, func() {
+		end.set(stopCause(ctx))
 		if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			_ = client.Close()
 		}
@@ -611,13 +616,13 @@ func copyPostgres(ctx context.Context, client, up net.Conn, deadline time.Time) 
 		// The worker closing its side, or the relay closing it (a withdrawn
 		// task), ends the session quietly; a deadline or a broker close ends
 		// it with the relay's frame.
-		if _, e := io.Copy(up, client); e == nil || errors.Is(e, net.ErrClosed) {
+		if _, e := io.Copy(up, watch(client, false, end)); e == nil || errors.Is(e, net.ErrClosed) {
 			quiet.Store(true)
 		}
 		_ = up.Close()
 		done <- struct{}{}
 	}()
-	boundary := relayFrames(client, bufio.NewReaderSize(up, 32<<10))
+	boundary := relayFrames(client, bufio.NewReaderSize(watch(up, true, end), 32<<10))
 	// A relay that is itself stopping (task withdrawn) closes without a frame.
 	withdrawn := ctx.Err() != nil && !errors.Is(ctx.Err(), context.DeadlineExceeded)
 	if boundary && !quiet.Load() && !withdrawn {

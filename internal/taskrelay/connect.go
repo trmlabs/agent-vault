@@ -57,6 +57,7 @@ func (r *relay) connect(w http.ResponseWriter, req *http.Request) {
 	dialCtx, cancelDial := context.WithTimeout(req.Context(), r.handshake())
 	up, e := dialUpstream(dialCtx, c.Upstream)
 	cancelDial()
+	r.upstreams.dialed(r.log, c.Upstream.Address, e)
 	if e != nil {
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 		return
@@ -129,9 +130,11 @@ func (r *relay) connect(w http.ResponseWriter, req *http.Request) {
 	}
 	// Restore the bounded reader after parsing; buffered tunnel bytes are kept.
 	limited.N = 1<<63 - 1
-	stopWatch := r.watchPeer(req.RemoteAddr, agent, func() { _ = conn.Close(); _ = up.Close() })
+	end, started := &ending{}, time.Now()
+	defer func() { r.logClose("connect", req.RemoteAddr, agent, c.Upstream.Address, req.Host, started, end) }()
+	stopWatch := r.watchPeer(req.RemoteAddr, agent, func() { end.set(endWithdrawn); _ = conn.Close(); _ = up.Close() })
 	defer stopWatch()
-	copyTunnel(r.ctx, conn, buffer, up, reader, expiry)
+	copyTunnel(r.ctx, conn, buffer, up, reader, expiry, end)
 }
 
 func minTime(a, b time.Time) time.Time {

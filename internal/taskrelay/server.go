@@ -6,8 +6,10 @@ import (
 	"errors"
 	"io"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,6 +44,11 @@ type relay struct {
 	// pgTLS, with a broker-issued certificate, answers a PostgreSQL client's
 	// SSLRequest; its listeners are then plain TCP and refuse plaintext.
 	pgTLS *tls.Config
+	// log is the relay's structured log (closelog.go); upstreams names an
+	// upstream's failures once.
+	log       *slog.Logger
+	upstreams upstreamWatch
+	atLimit   refusalWatch
 }
 
 // Run serves native TLS only. Failure of any listener, pairing, deadline or
@@ -79,7 +86,7 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 	if c.Shared != nil {
 		limit = c.Shared.connections()
 	}
-	r := &relay{config: c, pair: pair, audit: audit, ctx: ctx, cancel: cancel, slots: make(chan struct{}, limit)}
+	r := &relay{config: c, pair: pair, audit: audit, ctx: ctx, cancel: cancel, slots: make(chan struct{}, limit), log: newRelayLog()}
 	if pair.cache != nil {
 		// Admit nothing until every agent namespace has been listed.
 		cacheDone := make(chan struct{})
@@ -149,7 +156,8 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 		if e != nil {
 			return nil, e
 		}
-		var l net.Listener = &boundedListener{Listener: plain, slots: listenerSlots}
+		var l net.Listener = &boundedListener{Listener: plain, slots: listenerSlots,
+			refused: func() { r.atLimit.refused(r.log, strconv.Itoa(limit), "listener_limit") }}
 		if outer != nil {
 			l = tls.NewListener(l, outer)
 		}
@@ -348,6 +356,8 @@ func (r *relay) beginWork() bool {
 type boundedListener struct {
 	net.Listener
 	slots chan struct{}
+	// refused, if set, is told of each connection closed at the limit.
+	refused func()
 }
 type countedConn struct {
 	net.Conn
@@ -367,6 +377,9 @@ func (l *boundedListener) Accept() (net.Conn, error) {
 			return &countedConn{Conn: c, release: func() { <-l.slots }}, nil
 		default:
 			_ = c.Close()
+			if l.refused != nil {
+				l.refused()
+			}
 		}
 	}
 }
@@ -381,6 +394,7 @@ func (r *relay) acquire() bool {
 	case r.slots <- struct{}{}:
 		return true
 	default:
+		r.atLimit.refused(r.log, strconv.Itoa(cap(r.slots)), "connection_limit")
 		return false
 	}
 }
@@ -489,11 +503,14 @@ func dialUpstream(ctx context.Context, c UpstreamConfig) (net.Conn, error) {
 	return d.DialContext(ctx, "tcp", c.Address)
 }
 
-func copyTunnel(ctx context.Context, a net.Conn, ar io.Reader, b net.Conn, br io.Reader, deadline time.Time) {
+// copyTunnel relays a (the agent) and b (the broker) until either ends,
+// recording in end why it ended.
+func copyTunnel(ctx context.Context, a net.Conn, ar io.Reader, b net.Conn, br io.Reader, deadline time.Time, end *ending) {
 	_ = a.SetDeadline(deadline)
 	_ = b.SetDeadline(deadline)
-	stop := context.AfterFunc(ctx, func() { _ = a.Close(); _ = b.Close() })
+	stop := context.AfterFunc(ctx, func() { end.set(stopCause(ctx)); _ = a.Close(); _ = b.Close() })
 	defer stop()
+	ar, br = watch(ar, false, end), watch(br, true, end)
 	done := make(chan struct{}, 1)
 	go func() { _, _ = io.Copy(b, ar); _ = b.Close(); _ = a.Close(); done <- struct{}{} }()
 	_, _ = io.Copy(a, br)
