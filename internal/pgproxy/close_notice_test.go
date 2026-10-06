@@ -249,3 +249,55 @@ func TestBrokerEndedSessionsAreLogged(t *testing.T) {
 		mu.Unlock()
 	}
 }
+
+// An unpooled session the broker ends mid-statement shows the client the
+// broker's notice, not the server's own error from the cancel that stops the
+// statement: the database stream is closed before the cancel is sent.
+func TestUnpooledEndShowsTheNoticeBeforeTheCancelError(t *testing.T) {
+	for _, pooled := range []bool{false, true} {
+		t.Run(map[bool]string{false: "unpooled", true: "pooled"}[pooled], func(t *testing.T) { endShowsTheNotice(t, pooled) })
+	}
+}
+
+func endShowsTheNotice(t *testing.T, pooled bool) {
+	up := startFakeUpstream(t, authTrust, "")
+	up.mu.Lock()
+	up.cancelled = make(chan struct{})
+	cancelled := up.cancelled
+	up.mu.Unlock()
+	var revoked atomic.Bool
+	opts := Options{AuthorizationInterval: 10 * time.Millisecond, Leases: &fakeMinter{lease: newLease()},
+		Databases: &fakeResolver{svc: &DatabaseService{Name: "db", Addr: up.addr(), Mount: "database", Role: "readonly", SSLMode: "disable", MaxConns: 4}},
+		Auth: authFunc(func(context.Context, string, string) (*AgentScope, error) {
+			if revoked.Load() {
+				return nil, errors.New("revoked")
+			}
+			return &AgentScope{VaultID: "v", ActorID: "a", WorkloadID: "pod-1", Pool: "cursor"}, nil
+		})}
+	if pooled {
+		opts.Pool = &PoolOptions{QueueFactor: 20}
+	}
+	_, addr := startBroker(t, opts)
+	s := openAgentSession(t, addr, "token", "db")
+	defer s.close()
+	s.fe.Send(&pgproto3.Query{String: "SLEEP UNTIL CANCELLED"})
+	if err := s.fe.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond) // the statement is running
+	revoked.Store(true)
+	_ = s.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	msg, err := s.fe.Receive()
+	if err != nil {
+		t.Fatalf("session ended with no notice: %v", err)
+	}
+	e, ok := msg.(*pgproto3.ErrorResponse)
+	if !ok || e.Code != "08006" || e.Severity != "FATAL" {
+		t.Fatalf("the client saw %#v first, want the broker's 08006 notice", msg)
+	}
+	select {
+	case <-cancelled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the running statement was not cancelled")
+	}
+}
