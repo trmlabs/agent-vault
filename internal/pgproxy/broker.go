@@ -604,11 +604,13 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		requestedDB = startup.Parameters["user"]
 	}
 
-	// Admission's store calls (authentication here, the session ledger
-	// below) run a bounded number at a time. Once its token has arrived, a
-	// connection waits for a slot for up to the handshake budget, so a burst
-	// queues instead of reaching the store all at once and timing out
-	// together. Authentication then has its own startup budget.
+	// Admission's store calls (authentication here; the session ledger, the
+	// recheck and database resolution below) run a bounded number at a time.
+	// A slot is held only around those calls, never across a wait for
+	// capacity. Once its token has arrived, a connection waits for a slot for
+	// up to the handshake budget, so a burst queues instead of reaching the
+	// store all at once and timing out together. Authentication then has its
+	// own startup budget.
 	releaseAdmission := func() {}
 	defer func() { releaseAdmission() }()
 	admit := func() (context.Context, context.CancelFunc, error) {
@@ -623,10 +625,18 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	}
 	scope, token, err := authenticateAgent(startupCtx, backend, b.authenticator(peer), startup, admit)
 	startupCancel()
-	if errors.Is(err, errAdmissionQueue) {
+	releaseAdmission()
+	// busy refuses a session whose wait for an admission slot ran out. The
+	// wait can outlast the connection's startup deadline, so the refusal
+	// gets a fresh write deadline of its own.
+	busy := func(stage string) {
 		b.logger.Warn("pgproxy: admission queue wait exceeded; refusing session",
-			slog.String("stage", "admission_queue"), slog.Int("concurrency", b.opts.AdmissionConcurrency))
+			slog.String("stage", stage), slog.Int("concurrency", b.opts.AdmissionConcurrency))
+		_ = conn.SetWriteDeadline(time.Now().Add(noticeWriteTimeout))
 		writeClientError(backend, "53300", "admission_timeout", "Agent Vault: broker busy; retry")
+	}
+	if errors.Is(err, errAdmissionQueue) {
+		busy("admission_queue")
 		return
 	}
 	if err == nil && scope != nil && !brokercore.KindAdmitted(brokercore.ConnKinds(conn), scope.IdentityKind) {
@@ -728,11 +738,17 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		sessionID := "ledger-" + id
 		err := errors.New("session ID unavailable")
 		if id != "" {
+			release, ok := b.acquireAdmission(hsCtx)
+			if !ok {
+				busy("ledger_queue")
+				return
+			}
 			// Its own deadline: a slow ledger must not spend the wait for
 			// serving capacity below.
 			ledgerCtx, ledgerCancel := context.WithTimeout(hsCtx, b.opts.LedgerTimeout)
 			err = b.opts.Sessions.Add(ledgerCtx, sessionID, scope.WorkloadID, b.opts.MaxLeasesPerActor)
 			ledgerCancel()
+			release()
 		}
 		if errors.Is(err, ErrSessionLimit) {
 			b.logger.Warn("pgproxy: per-workload live-credential limit reached across the fleet",
@@ -763,7 +779,6 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	admitted := !expired && b.acquireServeSlot(serveCtx)
 	serveCancel()
 	admissionCancel()
-	releaseAdmission() // the store calls of admission are done
 	if expired {
 		// The budget ran out on the per-actor waits above, not on serving
 		// capacity: say so instead of naming the cap.
@@ -783,7 +798,14 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	releasePending()
 
 	// Admission can wait for cleanup. Recheck the original proof before using
-	// its scope to resolve a destination or issue another credential.
+	// its scope to resolve a destination or issue another credential. The
+	// recheck and resolution are store calls, so they take an admission slot.
+	releaseStore, ok := b.acquireAdmission(hsCtx)
+	if !ok {
+		busy("resolve_queue")
+		return
+	}
+	defer releaseStore()
 	checkCtx, checkCancel := context.WithTimeout(hsCtx, b.opts.AuthorizationTimeout)
 	current, checkErr := b.authenticator(peer).Authenticate(checkCtx, token, startup.Parameters["agent_vault_vault"])
 	valid := checkErr == nil && checkCtx.Err() == nil && current != nil &&
@@ -796,6 +818,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 
 	var who Requester
 	svc, err := b.opts.Databases.ResolveDatabase(withRequesterRecord(hsCtx, &who), *scope, requestedDB)
+	releaseStore()
 	event.RequesterKind, event.TokenSHA256, event.RequesterOID = who.Kind, who.TokenSHA256, who.ObjectID
 	event.Tier, event.Decision, event.Groups, event.CacheAgeSec = who.Tier, who.Decision, who.Groups, who.CacheAgeSec
 	if who.Kind == "person" || who.Kind == "agent" {

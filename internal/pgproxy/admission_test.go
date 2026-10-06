@@ -351,3 +351,57 @@ func TestSlowLedgerHasItsOwnDeadline(t *testing.T) {
 		t.Fatalf("ledger past its own deadline: %q", code)
 	}
 }
+
+// Admission's store calls never run more than AdmissionConcurrency at once,
+// whatever the pending bound lets in.
+func TestAdmissionConcurrencyBoundsStoreCalls(t *testing.T) {
+	up := startFakeUpstream(t, authTrust, "")
+	var inFlight, peak atomic.Int32
+	_, addr := startBroker(t, Options{MaxPendingConns: 1000, AdmissionConcurrency: 2,
+		Auth: authFunc(func(_ context.Context, token, _ string) (*AgentScope, error) {
+			n := inFlight.Add(1)
+			defer inFlight.Add(-1)
+			for p := peak.Load(); n > p && !peak.CompareAndSwap(p, n); p = peak.Load() {
+			}
+			time.Sleep(5 * time.Millisecond)
+			return &AgentScope{VaultID: "v", ActorID: token}, nil
+		}),
+		Databases: &fakeResolver{svc: &DatabaseService{Name: "db", Addr: up.addr()}}, Leases: &fakeMinter{lease: newLease()}})
+	var wg sync.WaitGroup
+	var served atomic.Int32
+	for i := range 60 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if connectExpectCode(t, addr, fmt.Sprintf("agent-%d", i), "db") == "OK" {
+				served.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if served.Load() != 60 || peak.Load() > 2 {
+		t.Fatalf("served %d of 60, peak store calls %d", served.Load(), peak.Load())
+	}
+}
+
+// A connection that waited in the admission queue past its startup deadline
+// still receives its refusal, not a dropped connection.
+func TestQueuedRefusalReachesTheClient(t *testing.T) {
+	up := startFakeUpstream(t, authTrust, "")
+	held, release := make(chan struct{}), make(chan struct{})
+	defer close(release)
+	_, addr := startBroker(t, Options{AdmissionConcurrency: 1, StartupTimeout: 100 * time.Millisecond, HandshakeTimeout: 400 * time.Millisecond,
+		Auth: authFunc(func(_ context.Context, token, _ string) (*AgentScope, error) {
+			if token == "holder" {
+				close(held)
+				<-release
+			}
+			return &AgentScope{VaultID: "v", ActorID: token}, nil
+		}),
+		Databases: &fakeResolver{svc: &DatabaseService{Name: "db", Addr: up.addr()}}, Leases: &fakeMinter{lease: newLease()}})
+	go connectExpectCode(t, addr, "holder", "db")
+	<-held
+	if code := connectExpectCode(t, addr, "queued", "db"); code != "53300" {
+		t.Fatalf("queued refusal: %q", code)
+	}
+}
