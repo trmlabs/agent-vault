@@ -448,11 +448,14 @@ func (m *DurableLeaseMinter) Mint(ctx context.Context, scope AgentScope, svc *Da
 	issued := time.Now()
 	credential, err := session.ReadCredential(ctx)
 	if err != nil {
-		// Keep the durable accessor even if immediate cleanup fails. A missing
-		// credential response leaves the binding quarantined until database-backed
+		// Vault may have issued a credential whose response was lost. This
+		// process still holds the child token, and revoking it with its own
+		// token revokes every lease it issued, that one included. The durable
+		// record stays, so the binding is quarantined until database-backed
 		// reconciliation confirms that no issued role or session remains.
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
 		defer cleanupCancel()
+		_ = session.Revoke(cleanupCtx)
 		_ = m.reconcile(cleanupCtx, binding)
 		return nil, err
 	}

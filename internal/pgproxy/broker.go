@@ -126,11 +126,17 @@ func New(addr string, opts Options) *Broker {
 	if opts.Pool != nil {
 		maxConns, perActor = defaultPooledMaxConns, defaultPooledMaxLeasesPerActor
 	}
+	explicitMaxConns := opts.MaxConns > 0
 	if opts.MaxConns <= 0 {
 		opts.MaxConns = maxConns
 	}
 	if opts.DefaultDatabaseConns <= 0 {
 		opts.DefaultDatabaseConns = defaultDatabaseConns
+		if explicitMaxConns && opts.Pool == nil {
+			// An operator who sized the broker for its databases keeps that
+			// size for an entry without maxConns, as before.
+			opts.DefaultDatabaseConns = opts.MaxConns
+		}
 	}
 	if opts.MaxPendingConns <= 0 {
 		// Handshakes in progress scale with the serving cap they feed.
