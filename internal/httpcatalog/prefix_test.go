@@ -182,3 +182,31 @@ func TestPrefixLoaderSkipsDeletedEntries(t *testing.T) {
 		t.Fatalf("deleted entry kept: %v", err)
 	}
 }
+
+// A stray document fails the digest; the error names it, and what changed,
+// against the last good catalog, so it can be found from the log.
+func TestPrefixLoaderNamesWhatChangedOnAMismatch(t *testing.T) {
+	v := newPrefixVault(3)
+	load := VaultPrefixLoader(v, "gatehouse", "catalog")
+	if _, _, err := load(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	v.mu.Lock()
+	v.headVersion = 2
+	v.entries["stray"] = prefixEntry("stray")
+	v.entries["e00001"] = strings.Replace(v.entries["e00001"], `"/search"`, `"/other"`, 1)
+	delete(v.entries, "e00002")
+	v.mu.Unlock()
+	_, _, err := load(context.Background())
+	if err == nil {
+		t.Fatal("mismatch accepted")
+	}
+	for _, want := range []string{"listed 3", "added 1: stray", "changed 1: e00001", "removed 1: e00002"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error lacks %q: %v", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), "serpapi") || strings.Contains(err.Error(), "/other") {
+		t.Errorf("error carries entry contents: %v", err)
+	}
+}

@@ -125,12 +125,18 @@ const (
 	// defaultMinRenewInterval floors the renew cadence so a very short TTL does
 	// not spin the renew loop. Overridable via Options.MinRenewInterval.
 	defaultMinRenewInterval = 5 * time.Second
-	// defaultMaxConns caps concurrent SERVING connections — those holding an
-	// upstream database connection. Each brokered connection is one real DB
-	// connection, so this must be tuned below the database's max_connections
-	// (minus reserved + the Vault admin pool). The conservative default assumes
-	// a small shared database.
-	defaultMaxConns = 50
+	// defaultMaxConns caps concurrent SERVING connections across every
+	// database. Each database's own ceiling is its catalog entry's maxConns,
+	// sized there against its max_connections, so this only bounds broker
+	// memory and defaults to fleet scale (AGENT_VAULT_DB_MAX_CONNS).
+	defaultMaxConns = 10000
+	// defaultDatabaseConns is the ceiling for a database whose catalog entry
+	// states no maxConns, in both modes. A database's size is unknown then,
+	// and a small Postgres allows about 100 connections in all, so the
+	// fallback stays below that rather than risk exhausting a database other
+	// services share. Set maxConns in the catalog, or override with
+	// AGENT_VAULT_DB_DEFAULT_DATABASE_CONNS.
+	defaultDatabaseConns = 50
 	// defaultMaxPendingConns caps accepted-but-not-yet-serving connections
 	// (handshake in progress). Generous and independent of MaxConns so a flood of
 	// stalled handshakes cannot starve the serving capacity real agents use.
@@ -146,7 +152,7 @@ const (
 	// buffers per session), so they default to fleet scale. All are
 	// overridable (AGENT_VAULT_DB_MAX_CONNS, _MAX_PENDING_CONNS,
 	// _MAX_LEASES_PER_ACTOR).
-	defaultPooledMaxConns          = 10000
+	defaultPooledMaxConns          = defaultMaxConns
 	defaultPooledMaxLeasesPerActor = 1024
 )
 

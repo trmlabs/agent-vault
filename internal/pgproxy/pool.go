@@ -53,7 +53,7 @@ type PoolOptions struct {
 	// a server connection. Default 5m.
 	IdleInTransaction time.Duration
 	// DefaultBudget is the server-connection budget for a database without a
-	// catalog maxConns. Default 50.
+	// catalog maxConns. Default 50 (see defaultDatabaseConns).
 	DefaultBudget int
 }
 
@@ -81,7 +81,7 @@ func (o *PoolOptions) withDefaults() PoolOptions {
 		p.IdleInTransaction = 5 * time.Minute
 	}
 	if p.DefaultBudget <= 0 {
-		p.DefaultBudget = defaultMaxConns
+		p.DefaultBudget = defaultDatabaseConns
 	}
 	return p
 }
