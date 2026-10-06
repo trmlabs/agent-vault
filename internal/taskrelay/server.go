@@ -149,6 +149,16 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 		}
 		serveHTTP(l, http.HandlerFunc(r.connect))
 	}
+	if c.AdminListen != "" && pair.cache != nil {
+		// Plaintext and outside the connection slots: it serves one read-only
+		// report, and its network policy admits only the janitor.
+		l, e := net.Listen("tcp", c.AdminListen)
+		if e != nil {
+			return errConfig
+		}
+		listeners = append(listeners, l)
+		serveHTTP(l, pair.cache.activity.handler())
+	}
 	for _, binding := range c.postgresBindings() {
 		l, e := bind(binding.Listen)
 		if e != nil {
@@ -328,6 +338,7 @@ func (r *relay) admit(ctx context.Context, peer, protocol string) error {
 			r.cancel()
 			return e
 		}
+		r.pair.cache.activity.seen(a, time.Now())
 		return nil
 	}
 	return r.record(protocol, "admitted")
@@ -372,10 +383,13 @@ func (r *relay) watchPeer(peer string, admitted agentIdentity, end func()) func(
 				end()
 				return
 			case <-ticker.C:
-				if a, ok := r.pair.attestation(peer); !ok || a.PodUID != admitted.pod || a.OwnerUID != admitted.owner {
+				a, ok := r.pair.attestation(peer)
+				if !ok || a.PodUID != admitted.pod || a.OwnerUID != admitted.owner {
 					end()
 					return
 				}
+				// An open connection is use: the janitor never retires a Sandbox mid-session.
+				r.pair.cache.activity.seen(a, time.Now())
 			}
 		}
 	}()
