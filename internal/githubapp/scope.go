@@ -130,22 +130,32 @@ func (m *Minter) checkScope(ctx context.Context, app App) error {
 	m.scopeChecking[app.InstallationID] = done
 	gen := m.scopeGen
 	m.scopeMu.Unlock()
-	found := m.verifyScope(ctx, app, m.Scope(app.InstallationID))
+	// The check is shared, so it runs on its own deadline: a caller that
+	// goes away must not cancel it and cache a refusal for everyone. Its
+	// waiters are released even if it panics, with a refusal recorded.
 	var err error
+	finished := false
+	defer func() {
+		if !finished {
+			err = fmt.Errorf("%w: check failed", errScope)
+		}
+		m.scopeMu.Lock()
+		if gen == m.scopeGen {
+			if m.scopes == nil {
+				m.scopes = map[int64]scopeVerdict{}
+			}
+			m.scopes[app.InstallationID] = scopeVerdict{err: err, checked: m.now()}
+		}
+		delete(m.scopeChecking, app.InstallationID)
+		close(done)
+		m.scopeMu.Unlock()
+	}()
+	found := m.verifyScope(context.WithoutCancel(ctx), app, m.Scope(app.InstallationID))
 	outcome := "serve"
 	if len(found.reach) > 0 && m.ScopeMode != ScopeWarn {
 		err, outcome = fmt.Errorf("%w: %s", errScope, strings.Join(found.reach, "; ")), "refuse"
 	}
-	m.scopeMu.Lock()
-	if gen == m.scopeGen {
-		if m.scopes == nil {
-			m.scopes = map[int64]scopeVerdict{}
-		}
-		m.scopes[app.InstallationID] = scopeVerdict{err: err, checked: m.now()}
-	}
-	delete(m.scopeChecking, app.InstallationID)
-	close(done)
-	m.scopeMu.Unlock()
+	finished = true
 	if m.Log != nil && (len(found.reach) > 0 || len(found.settings) > 0) {
 		mode := m.ScopeMode
 		if mode == "" {

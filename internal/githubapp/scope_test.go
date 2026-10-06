@@ -392,3 +392,63 @@ func TestScopeAllRepositoriesSkipsTheListing(t *testing.T) {
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// A caller that goes away mid-check does not cancel the shared check: the
+// verdict is the installation's, not that caller's.
+func TestScopeCheckOutlivesItsCaller(t *testing.T) {
+	g, m := newScopeGitHub(t)
+	release, reached := make(chan struct{}), make(chan struct{}, 1)
+	slow := m.Client.Transport
+	m.Client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/app/installations/42" {
+			select {
+			case reached <- struct{}{}:
+			default:
+			}
+			<-release
+		}
+		return slow.RoundTrip(r)
+	})}
+	app := App{AppID: 7, InstallationID: 42}
+	ctx, cancel := context.WithCancel(context.Background())
+	first := make(chan error, 1)
+	go func() { first <- m.checkScope(ctx, app) }()
+	<-reached
+	cancel()
+	close(release)
+	<-first
+	if err := m.checkScope(context.Background(), app); err != nil {
+		t.Fatalf("a cancelled caller cached a refusal: %v", err)
+	}
+	if settings, _, _, _ := g.counts(); settings != 1 {
+		t.Fatalf("%d checks", settings)
+	}
+}
+
+// A check that panics still releases its waiters, with a refusal recorded.
+func TestScopeCheckPanicReleasesWaiters(t *testing.T) {
+	_, m := newScopeGitHub(t)
+	calls := 0
+	m.Scope = func(int64) Scope {
+		calls++
+		if calls == 1 {
+			panic("scope source")
+		}
+		return Scope{Repos: []string{"trmlabs/trm-b2b"}}
+	}
+	app := App{AppID: 7, InstallationID: 42}
+	func() {
+		defer func() { _ = recover() }()
+		_ = m.checkScope(context.Background(), app)
+	}()
+	done := make(chan error, 1)
+	go func() { done <- m.checkScope(context.Background(), app) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("no refusal recorded after a panic")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a panicked check left its installation waiting")
+	}
+}
