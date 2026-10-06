@@ -313,18 +313,18 @@ func TestProxyBindingValidation(t *testing.T) {
 		"repeated namespace": func(b *Binding) {
 			b.Proxy.Profiles = append(b.Proxy.Profiles, ProxyProfile{Namespace: "agent-sandboxes", Profile: "x", Pool: "y"})
 		},
-		"profile with no pool":        func(b *Binding) { b.Proxy.Profiles = []ProxyProfile{{Namespace: "n", Profile: "p"}} },
-		"own pool":                    func(b *Binding) { b.Pool = "sandboxes" },
-		"session cap over 30 minutes": func(b *Binding) { b.Proxy.MaxSessionSeconds = 1801 },
-		"no owner kind":               func(b *Binding) { b.Proxy.OwnerKind = "" },
-		"no image digests":            func(b *Binding) { b.Proxy.ImageDigests = nil },
-		"no source range":             func(b *Binding) { b.Proxy.SourceCIDRs = nil },
-		"any source":                  func(b *Binding) { b.Proxy.SourceCIDRs = []string{"0.0.0.0/0"} },
-		"unmasked source":             func(b *Binding) { b.Proxy.SourceCIDRs = []string{"10.200.0.7/24"} },
-		"no session cap":              func(b *Binding) { b.Proxy.MaxSessionSeconds = 0 },
-		"with owner UIDs":             func(b *Binding) { b.OwnerUIDs = []string{"x"} },
-		"with a Pod UID":              func(b *Binding) { b.PodUID = "x" },
-		"with own image digest":       func(b *Binding) { b.ImageDigests = []string{workerDigest} },
+		"profile with no pool":     func(b *Binding) { b.Proxy.Profiles = []ProxyProfile{{Namespace: "n", Profile: "p"}} },
+		"own pool":                 func(b *Binding) { b.Pool = "sandboxes" },
+		"session over the ceiling": func(b *Binding) { b.Proxy.MaxSessionSeconds = 24*3600 + 1 },
+		"no owner kind":            func(b *Binding) { b.Proxy.OwnerKind = "" },
+		"no image digests":         func(b *Binding) { b.Proxy.ImageDigests = nil },
+		"no source range":          func(b *Binding) { b.Proxy.SourceCIDRs = nil },
+		"any source":               func(b *Binding) { b.Proxy.SourceCIDRs = []string{"0.0.0.0/0"} },
+		"unmasked source":          func(b *Binding) { b.Proxy.SourceCIDRs = []string{"10.200.0.7/24"} },
+		"session under a minute":   func(b *Binding) { b.Proxy.MaxSessionSeconds = 59 },
+		"with owner UIDs":          func(b *Binding) { b.OwnerUIDs = []string{"x"} },
+		"with a Pod UID":           func(b *Binding) { b.PodUID = "x" },
+		"with own image digest":    func(b *Binding) { b.ImageDigests = []string{workerDigest} },
 	} {
 		p := setupProxy(t)
 		c := p.r.config
@@ -619,6 +619,54 @@ func TestAttestationRequester(t *testing.T) {
 		encoded, _ := EncodeAttestation(a)
 		if _, err := decodeAttestation(encoded); err == nil {
 			t.Errorf("%q accepted", requester)
+		}
+	}
+}
+
+// The session ceiling is one policy setting, a day by default: a proxy
+// binding without its own cap takes it, and a pool binding's Pod lifetime and
+// a proxy binding's cap may reach it but not pass it.
+func TestSessionCeiling(t *testing.T) {
+	p := setupProxy(t)
+	if got := p.r.config.Bindings[1].Proxy.MaxSessionSeconds; got == 0 {
+		t.Fatal("fixture has no proxy cap")
+	}
+	for name, tc := range map[string]struct {
+		ceiling, pod, proxy int64
+		ok                  bool
+	}{
+		"defaults":                {0, 24 * 3600, 0, true},
+		"proxy takes the ceiling": {7200, 3600, 0, true},
+		"pod past the ceiling":    {7200, 7201, 0, false},
+		"proxy past the ceiling":  {7200, 3600, 7201, false},
+		"week ceiling":            {7 * 24 * 3600, 7 * 24 * 3600, 7 * 24 * 3600, true},
+		"ceiling past 30 days":    {30*24*3600 + 1, 3600, 3600, false},
+		"ceiling under a minute":  {59, 3600, 3600, false},
+	} {
+		c := p.r.config
+		c.MaxSessionSeconds = tc.ceiling
+		c.Bindings = append([]Binding(nil), c.Bindings...)
+		proxy := *c.Bindings[1].Proxy
+		proxy.MaxSessionSeconds = tc.proxy
+		c.Bindings[1].Proxy = &proxy
+		for i := range c.Bindings {
+			if c.Bindings[i].Proxy == nil && len(c.Bindings[i].OwnerUIDs) != 0 {
+				c.Bindings[i].MaxPodSeconds = tc.pod
+			}
+		}
+		r, err := New(c, &fakeStore{status: "active", role: "proxy"})
+		if (err == nil) != tc.ok {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		if err == nil && tc.proxy == 0 {
+			want := tc.ceiling
+			if want == 0 {
+				want = 24 * 3600
+			}
+			if got := r.config.Bindings[1].Proxy.MaxSessionSeconds; got != want {
+				t.Errorf("%s: proxy cap %d, want %d", name, got, want)
+			}
 		}
 	}
 }

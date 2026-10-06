@@ -147,6 +147,7 @@ type fakeSigner struct {
 	caKey  *ecdsa.PrivateKey
 	caCert *x509.Certificate
 	issued string
+	serial *big.Int // default 0x7f00aa01
 }
 
 func newSigner(t *testing.T) *fakeSigner {
@@ -176,7 +177,11 @@ func (f *fakeSigner) SignCertificate(_ context.Context, mount, role, csrText str
 		return "", "", err
 	}
 	public := csr.PublicKey
-	leaf := &x509.Certificate{SerialNumber: new(big.Int).SetBytes([]byte{0x7f, 0x00, 0xaa, 0x01}), DNSNames: names,
+	serial := f.serial
+	if serial == nil {
+		serial = new(big.Int).SetBytes([]byte{0x7f, 0x00, 0xaa, 0x01})
+	}
+	leaf := &x509.Certificate{SerialNumber: serial, DNSNames: names,
 		NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(ttl).Truncate(time.Second),
 		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
 	switch f.wrong {
@@ -220,12 +225,12 @@ type fakeVerifier struct {
 	err  error
 }
 
-func (f *fakeVerifier) VerifyProxy(_ context.Context, token string, peer netip.Addr) error {
+func (f *fakeVerifier) ProxyBinding(_ context.Context, token string, peer netip.Addr) (string, error) {
 	f.peer = peer
 	if token != "proxy-token" {
-		return errors.New("not a proxy")
+		return "", errors.New("not a proxy")
 	}
-	return f.err
+	return "sandbox-cluster/gatehouse-proxy/0f0e-uid", f.err
 }
 
 func TestHandlerIssuesOnlyToTheProxy(t *testing.T) {
@@ -286,6 +291,9 @@ func TestHandlerIssuesOnlyToTheProxy(t *testing.T) {
 			if len(audit.events) != 1 || audit.events[0].Serial != want.Serial || audit.events[0].Peer != want.Peer || audit.events[0].Event != want.Event {
 				t.Errorf("%s: audit %+v", name, audit.events)
 			}
+			if audit.events[0].Binding != "sandbox-cluster/gatehouse-proxy/0f0e-uid" || audit.events[0].DNSNames != strings.Join(proxyNames, ",") {
+				t.Errorf("%s: row names %q %q", name, audit.events[0].Binding, audit.events[0].DNSNames)
+			}
 			if _, err := time.Parse(time.RFC3339, audit.events[0].NotAfter); err != nil {
 				t.Errorf("%s: notAfter %q", name, audit.events[0].NotAfter)
 			}
@@ -307,8 +315,10 @@ func TestHandlerIssuesOnlyToTheProxy(t *testing.T) {
 }
 
 func TestIssuerValidate(t *testing.T) {
-	base := Issuer{Mount: "pki-gatehouse-proxy", Role: "proxy", Names: proxyNames, TTL: 24 * time.Hour, Signer: &fakeSigner{}, Verifier: &fakeVerifier{}, Audit: &fakeAudit{}}
-	if err := base.Validate(); err != nil {
+	base := func() *Issuer {
+		return &Issuer{Mount: "pki-gatehouse-proxy", Role: "proxy", Names: proxyNames, TTL: 24 * time.Hour, Signer: &fakeSigner{}, Verifier: &fakeVerifier{}, Audit: &fakeAudit{}}
+	}
+	if err := base().Validate(); err != nil {
 		t.Fatal(err)
 	}
 	for name, mutate := range map[string]func(*Issuer){
@@ -321,10 +331,62 @@ func TestIssuerValidate(t *testing.T) {
 		"no verifier":   func(i *Issuer) { i.Verifier = nil },
 		"no audit":      func(i *Issuer) { i.Audit = nil },
 	} {
-		i := base
-		mutate(&i)
+		i := base()
+		mutate(i)
 		if i.Validate() == nil {
 			t.Errorf("%s: accepted", name)
 		}
+	}
+}
+
+// Vault serials start with a zero nibble about one time in sixteen. The row
+// records lower-case hex with no leading zeros, which the audit trail
+// accepts, so those certificates issue like any other.
+func TestIssuedSerialsRecordWithoutLeadingZeros(t *testing.T) {
+	csr := csrPEM(t, p256(t), x509.CertificateRequest{DNSNames: proxyNames})
+	for want, serial := range map[string]*big.Int{"abc": big.NewInt(0x0abc), "0": big.NewInt(0), "7f00aa01": big.NewInt(0x7f00aa01)} {
+		signer, audit := newSigner(t), &fakeAudit{}
+		signer.serial = serial
+		issuer := &Issuer{Mount: "pki-gatehouse-proxy", Role: "proxy", Names: proxyNames, TTL: 24 * time.Hour, Signer: signer, Verifier: &fakeVerifier{}, Audit: audit}
+		b, _ := json.Marshal(map[string]string{"csr": csr})
+		req := httptest.NewRequest(http.MethodPost, "/v1/proxy/certificate", bytes.NewReader(b))
+		req.RemoteAddr = "10.200.0.7:51000"
+		req.Header.Set("Authorization", "Bearer proxy-token")
+		rec := httptest.NewRecorder()
+		issuer.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK || len(audit.events) != 1 || audit.events[0].Serial != want {
+			t.Errorf("serial %s: status %d, rows %+v", want, rec.Code, audit.events)
+		}
+	}
+}
+
+// Issuance is limited per proxy binding: past its burst a proxy gets 429 and
+// nothing reaches Vault, and the bucket refills over the hour.
+func TestIssuanceIsRateLimitedPerBinding(t *testing.T) {
+	signer, audit := newSigner(t), &fakeAudit{}
+	issuer := &Issuer{Mount: "pki-gatehouse-proxy", Role: "proxy", Names: proxyNames, TTL: 24 * time.Hour, Signer: signer, Verifier: &fakeVerifier{}, Audit: audit, PerHour: 60, Burst: 3}
+	csr := csrPEM(t, p256(t), x509.CertificateRequest{DNSNames: proxyNames})
+	post := func() int {
+		b, _ := json.Marshal(map[string]string{"csr": csr})
+		req := httptest.NewRequest(http.MethodPost, "/v1/proxy/certificate", bytes.NewReader(b))
+		req.RemoteAddr = "10.200.0.7:51000"
+		req.Header.Set("Authorization", "Bearer proxy-token")
+		rec := httptest.NewRecorder()
+		issuer.Handler().ServeHTTP(rec, req)
+		return rec.Code
+	}
+	for i := range 3 {
+		if code := post(); code != http.StatusOK {
+			t.Fatalf("issue %d: %d", i, code)
+		}
+	}
+	if code := post(); code != http.StatusTooManyRequests || len(audit.events) != 3 {
+		t.Fatalf("past the burst: %d, %d rows", code, len(audit.events))
+	}
+	if !issuer.allow("another/binding/uid", time.Now()) {
+		t.Fatal("one proxy's limit held another")
+	}
+	if !issuer.allow("sandbox-cluster/gatehouse-proxy/0f0e-uid", time.Now().Add(time.Minute+time.Second)) {
+		t.Fatal("the bucket did not refill")
 	}
 }

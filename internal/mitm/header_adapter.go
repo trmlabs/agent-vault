@@ -237,7 +237,7 @@ func (p *Proxy) forwardCatalog(w http.ResponseWriter, r *http.Request, target, h
 	}
 	// One rate bucket per Pod, not per pool agent: a pool of many workers
 	// shares one agent identity.
-	enf := p.rateLimit.EnforceProxy(r.Context(), scope.AgentID+"/"+scope.WorkloadID, entry.Name)
+	enf := p.rateLimit.EnforceProxy(r.Context(), proxyLimitActor(scope), entry.Name)
 	if !enf.Allowed {
 		deny(http.StatusTooManyRequests, "rate_limited")
 		return

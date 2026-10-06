@@ -6,8 +6,10 @@ import (
 	"errors"
 	"io"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,7 +17,15 @@ import (
 	"github.com/Infisical/agent-vault/internal/workloadidentity"
 )
 
+// handshakeTimeout is the default bound on a connection's setup. Ten seconds
+// covers a TLS handshake and the broker's admission (a Kubernetes token
+// review and a catalog decision, each normally under a second) several times
+// over, yet frees a slot held by a client that stalls before its startup.
+// Set handshakeSeconds where the broker sits far away or under heavy load.
 const handshakeTimeout = 10 * time.Second
+
+// maxConnections is a sidecar's default connection cap when the render sets
+// none (maxConnections).
 const maxConnections = 32
 
 type relay struct {
@@ -34,6 +44,11 @@ type relay struct {
 	// pgTLS, with a broker-issued certificate, answers a PostgreSQL client's
 	// SSLRequest; its listeners are then plain TCP and refuse plaintext.
 	pgTLS *tls.Config
+	// log is the relay's structured log (closelog.go); upstreams names an
+	// upstream's failures once.
+	log       *slog.Logger
+	upstreams upstreamWatch
+	atLimit   refusalWatch
 }
 
 // Run serves native TLS only. Failure of any listener, pairing, deadline or
@@ -65,10 +80,13 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 	ctx, cancel := context.WithDeadline(parent, c.Deadline)
 	defer cancel()
 	limit := maxConnections
+	if c.MaxConnections != 0 {
+		limit = c.MaxConnections
+	}
 	if c.Shared != nil {
 		limit = c.Shared.connections()
 	}
-	r := &relay{config: c, pair: pair, audit: audit, ctx: ctx, cancel: cancel, slots: make(chan struct{}, limit)}
+	r := &relay{config: c, pair: pair, audit: audit, ctx: ctx, cancel: cancel, slots: make(chan struct{}, limit), log: newRelayLog()}
 	if pair.cache != nil {
 		// Admit nothing until every agent namespace has been listed.
 		cacheDone := make(chan struct{})
@@ -107,6 +125,17 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 		go func() { defer close(certDone); serving.run(ctx) }()
 	}
 	defer func() { cancel(); <-certDone }()
+	// Durable activity reports until the relay stops, then once more after
+	// every listener has closed.
+	durableDone := make(chan struct{})
+	close(durableDone)
+	if d := c.DurableActivity; d != nil && pair.cache != nil {
+		reporter := &durable{activity: pair.cache.activity, upstream: c.Connect.Upstream, interval: d.interval()}
+		pair.cache.activity.durable = reporter
+		durableDone = make(chan struct{})
+		go func() { defer close(durableDone); reporter.run(ctx) }()
+	}
+	defer func() { cancel(); <-durableDone }()
 	var listeners []net.Listener
 	defer func() {
 		r.workMu.Lock()
@@ -127,7 +156,8 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 		if e != nil {
 			return nil, e
 		}
-		var l net.Listener = &boundedListener{Listener: plain, slots: listenerSlots}
+		var l net.Listener = &boundedListener{Listener: plain, slots: listenerSlots,
+			refused: func() { r.atLimit.refused(r.log, strconv.Itoa(limit), "listener_limit") }}
 		if outer != nil {
 			l = tls.NewListener(l, outer)
 		}
@@ -154,7 +184,7 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 			defer r.wg.Done()
 			h.ServeHTTP(w, req)
 		})
-		s := &http.Server{Handler: tracked, ErrorLog: log.New(io.Discard, "", 0), ReadHeaderTimeout: handshakeTimeout, ReadTimeout: handshakeTimeout, WriteTimeout: handshakeTimeout, IdleTimeout: handshakeTimeout, MaxHeaderBytes: 8192, BaseContext: func(net.Listener) context.Context { return ctx }}
+		s := &http.Server{Handler: tracked, ErrorLog: log.New(io.Discard, "", 0), ReadHeaderTimeout: r.handshake(), ReadTimeout: r.handshake(), WriteTimeout: r.handshake(), IdleTimeout: r.handshake(), MaxHeaderBytes: 8192, BaseContext: func(net.Listener) context.Context { return ctx }}
 		r.wg.Add(1)
 		go func() {
 			defer r.wg.Done()
@@ -233,12 +263,16 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 		if e != nil {
 			return errConfig
 		}
-		catalog := make(map[string]bool, len(pl.Databases))
-		for _, name := range pl.Databases {
-			catalog[name] = true
+		route := brokerRouteDatabase
+		if pl.Routes != routesBroker {
+			catalog := make(map[string]bool, len(pl.Databases))
+			for _, name := range pl.Databases {
+				catalog[name] = true
+			}
+			route = func(name string) bool { return catalog[name] }
 		}
 		binding := pl.route("")
-		servePostgres(l, func(conn net.Conn) { r.postgres(conn, binding, catalog) })
+		servePostgres(l, func(conn net.Conn) { r.postgres(conn, binding, route) })
 	}
 	if c.Browser != nil {
 		bc := c.Browser
@@ -322,6 +356,8 @@ func (r *relay) beginWork() bool {
 type boundedListener struct {
 	net.Listener
 	slots chan struct{}
+	// refused, if set, is told of each connection closed at the limit.
+	refused func()
 }
 type countedConn struct {
 	net.Conn
@@ -341,6 +377,9 @@ func (l *boundedListener) Accept() (net.Conn, error) {
 			return &countedConn{Conn: c, release: func() { <-l.slots }}, nil
 		default:
 			_ = c.Close()
+			if l.refused != nil {
+				l.refused()
+			}
 		}
 	}
 }
@@ -355,6 +394,7 @@ func (r *relay) acquire() bool {
 	case r.slots <- struct{}{}:
 		return true
 	default:
+		r.atLimit.refused(r.log, strconv.Itoa(cap(r.slots)), "connection_limit")
 		return false
 	}
 }
@@ -401,6 +441,14 @@ func (r *relay) attest(peer string) (encoded string, agent agentIdentity, err er
 	return encoded, agentIdentity{pod: a.PodUID, owner: a.OwnerUID, requester: a.Requester}, nil
 }
 
+// handshake is this relay's bound on a connection's setup.
+func (r *relay) handshake() time.Duration {
+	if r.config.HandshakeSeconds != 0 {
+		return time.Duration(r.config.HandshakeSeconds) * time.Second
+	}
+	return handshakeTimeout
+}
+
 // agentIdentity is the Pod and controller UIDs, and the requester, a
 // connection was admitted for.
 type agentIdentity struct{ pod, owner, requester string }
@@ -438,20 +486,31 @@ func (r *relay) watchPeer(peer string, admitted agentIdentity, end func()) func(
 	var once sync.Once
 	return func() { once.Do(func() { close(done) }) }
 }
+
+// dialUpstream dials and handshakes within ctx's deadline, or within
+// handshakeTimeout when ctx has none.
 func dialUpstream(ctx context.Context, c UpstreamConfig) (net.Conn, error) {
 	t, e := clientTLS(c.CAFile, c.ServerName)
 	if e != nil {
 		return nil, e
 	}
-	d := tls.Dialer{NetDialer: &net.Dialer{Timeout: handshakeTimeout}, Config: t}
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, handshakeTimeout)
+		defer cancel()
+	}
+	d := tls.Dialer{NetDialer: &net.Dialer{}, Config: t}
 	return d.DialContext(ctx, "tcp", c.Address)
 }
 
-func copyTunnel(ctx context.Context, a net.Conn, ar io.Reader, b net.Conn, br io.Reader, deadline time.Time) {
+// copyTunnel relays a (the agent) and b (the broker) until either ends,
+// recording in end why it ended.
+func copyTunnel(ctx context.Context, a net.Conn, ar io.Reader, b net.Conn, br io.Reader, deadline time.Time, end *ending) {
 	_ = a.SetDeadline(deadline)
 	_ = b.SetDeadline(deadline)
-	stop := context.AfterFunc(ctx, func() { _ = a.Close(); _ = b.Close() })
+	stop := context.AfterFunc(ctx, func() { end.set(stopCause(ctx)); _ = a.Close(); _ = b.Close() })
 	defer stop()
+	ar, br = watch(ar, false, end), watch(br, true, end)
 	done := make(chan struct{}, 1)
 	go func() { _, _ = io.Copy(b, ar); _ = b.Close(); _ = a.Close(); done <- struct{}{} }()
 	_, _ = io.Copy(a, br)

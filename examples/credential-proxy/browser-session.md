@@ -11,7 +11,7 @@ email, password and automated-auth private key that agents hold today.
 
 | Step | What happens |
 |---|---|
-| Seed | The agent fetches `https://<api host>/.gatehouse/browser-seed` through Gatehouse. The answer is a Playwright storage state: the app's Auth0 localStorage entries with the placeholder as the access token, an unsigned ID token carrying the user's non-secret claims (`sub`, `org_id`, email), and the `auth0.<client>.is.authenticated` cookie. It expires at the worker Pod's deadline, at most 8 hours. |
+| Seed | The agent fetches `https://<api host>/.gatehouse/browser-seed` through Gatehouse. The answer is a Playwright storage state: the app's Auth0 localStorage entries with the placeholder as the access token, an unsigned ID token carrying the user's non-secret claims (`sub`, `org_id`, email), and the `auth0.<client>.is.authenticated` cookie. It expires at the worker Pod's deadline, at most 24 hours. |
 | App | The app's own host (`appHost`) serves GET and HEAD with no credential. |
 | API | Requests to the API host carry `Authorization: Bearer <placeholder>`, or none. Gatehouse replaces the placeholder with the real token. Any other credential is refused. |
 | Sign-in | Gatehouse signs the user in by the entry's `auth0.login` method (below). It reads the sign-in secrets from Vault for each sign-in and caches the token until a quarter of its life is left. Requests that need a sign-in share one attempt, which runs on its own (up to 90 seconds) even if the request that started it gives up. After any attempt, successful or not, the entry makes no other for a minute: a failure answers 503 for that minute, and a failed renewal keeps the last token serving until it expires. It keeps no refresh token. |

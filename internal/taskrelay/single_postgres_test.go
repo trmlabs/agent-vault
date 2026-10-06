@@ -27,6 +27,9 @@ type catalogBackend struct {
 	arrivals      atomic.Int32
 	databases     chan string
 	cancellations chan []byte
+	// refuse, if set, names databases the broker refuses as not in the
+	// pool's catalog, as the real broker does.
+	refuse func(database string) bool
 }
 
 func newCatalogBackend(t *testing.T) *catalogBackend {
@@ -71,6 +74,10 @@ func (b *catalogBackend) serve(cert tls.Certificate) {
 					return
 				}
 				b.databases <- startup.Parameters["database"]
+				if b.refuse != nil && b.refuse(startup.Parameters["database"]) {
+					_, _ = c.Write(encodePGFrame('E', reasonBody("FATAL", "3D000", "no_database")))
+					return
+				}
 				_, _ = c.Write(encodePGFrame('R', []byte{0, 0, 0, 3}))
 				if typ, _, e := readPGFrame(in, 32768); e != nil || typ != 'p' {
 					return

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -46,11 +47,11 @@ type cancelTarget struct {
 // row by sending a rejected startup or placeholder; a peer that closes without
 // sending a startup packet leaves nothing.
 //
-// On a routed listener (catalog non-nil) the startup's database parameter
-// picks the binding: a name in the catalog fixes Database to it, and any other
+// On a routed listener (route non-nil) the startup's database parameter
+// picks the binding: a name route accepts fixes Database to it, and any other
 // name is refused with the no_database words before admission.
-func (r *relay) postgres(conn net.Conn, binding PostgresConfig, catalog map[string]bool) {
-	_ = conn.SetDeadline(minTime(r.config.Deadline, time.Now().Add(handshakeTimeout)))
+func (r *relay) postgres(conn net.Conn, binding PostgresConfig, route func(database string) bool) {
+	_ = conn.SetDeadline(minTime(r.config.Deadline, time.Now().Add(r.handshake())))
 	peer := conn.RemoteAddr().String()
 	// The listener hands over the connection before the TLS handshake, so a
 	// foreign address is refused before the relay reads a byte from it. Only
@@ -123,8 +124,8 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig, catalog map[stri
 	var startup pgproto3.StartupMessage
 	c := &binding
 	decoded := startup.Decode(packet[4:]) == nil && startup.ProtocolVersion == pgproto3.ProtocolVersionNumber
-	if decoded && catalog != nil {
-		if !catalog[startup.Parameters["database"]] {
+	if decoded && route != nil {
+		if !route(startup.Parameters["database"]) {
 			_ = r.record("postgres", "denied:no-database")
 			refusal := refusalsByReason["no_database"]
 			_, _ = conn.Write(errorFrame(refusal.code, refusal.message))
@@ -190,7 +191,10 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig, catalog map[stri
 	if r.pair.check(r.ctx, peer) != nil {
 		return
 	}
-	up, e := dialUpstream(r.ctx, c.Upstream)
+	dialCtx, cancelDial := context.WithTimeout(r.ctx, r.handshake())
+	up, e := dialUpstream(dialCtx, c.Upstream)
+	cancelDial()
+	r.upstreams.dialed(r.log, c.Upstream.Address, e)
 	if e != nil {
 		tell(errorFrame("08001", unreachableMessage))
 		return
@@ -198,7 +202,7 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig, catalog map[stri
 	defer func() { _ = up.Close() }()
 	stop := context.AfterFunc(r.ctx, func() { _ = up.Close() })
 	defer stop()
-	_ = up.SetDeadline(minTime(expiry, time.Now().Add(handshakeTimeout)))
+	_ = up.SetDeadline(minTime(expiry, time.Now().Add(r.handshake())))
 	// A shared proxy states which agent Pod is behind this connection, first
 	// on the broker-side stream, and drops it when that Pod stops qualifying.
 	attestation, agent, e := r.attest(peer)
@@ -211,7 +215,8 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig, catalog map[stri
 			return
 		}
 	}
-	stopWatch := r.watchPeer(peer, agent, func() { _ = conn.Close(); _ = up.Close() })
+	end := &ending{}
+	stopWatch := r.watchPeer(peer, agent, func() { end.set(endWithdrawn); _ = conn.Close(); _ = up.Close() })
 	defer stopWatch()
 	// The runner session rides the broker-side stream ahead of the startup
 	// packet this sidecar authors; the worker's own bytes never carry it.
@@ -227,6 +232,7 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig, catalog map[stri
 	}
 	typ, body, e := readPGFrame(up, 8192)
 	if e == nil && typ == 'E' {
+		_ = r.record("postgres", "refused:"+refusalReason(body))
 		tell(refusalFrame(body))
 		return
 	}
@@ -296,6 +302,7 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig, catalog map[stri
 				return
 			}
 		case 'E':
+			_ = r.record("postgres", "refused:"+refusalReason(body))
 			tell(refusalFrame(body))
 			return
 		default:
@@ -319,7 +326,9 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig, catalog map[stri
 	if _, e = conn.Write(response); e != nil {
 		return
 	}
-	copyPostgres(r.ctx, conn, up, expiry)
+	started := time.Now()
+	defer func() { r.logClose("postgres", peer, agent, c.Upstream.Address, c.Database, started, end) }()
+	copyPostgres(r.ctx, conn, up, expiry, end)
 }
 
 // validStartup fixes database and user to the binding and allows only the
@@ -434,7 +443,7 @@ func (r *relay) cancelPostgres(peer string, packet []byte, binding PostgresConfi
 	// Pin to the established broker socket, not a newly selected service replica.
 	c := binding.Upstream
 	c.Address = target.address
-	ctx, cancel := context.WithDeadline(r.ctx, minTime(target.expiry, time.Now().Add(handshakeTimeout)))
+	ctx, cancel := context.WithDeadline(r.ctx, minTime(target.expiry, time.Now().Add(r.handshake())))
 	defer cancel()
 	up, e := dialUpstream(ctx, c)
 	if e != nil {
@@ -507,7 +516,46 @@ var refusalsByReason = map[string]refusal{
 	"encoding_change":     {"42501", "Gatehouse refuses changing standard_conforming_strings or client_encoding mid-session; only on and UTF8 at connect"},
 	"pipelined_escape":    {"0A000", "Gatehouse refuses a statement with a backslash after an Execute in the same batch; send Sync first"},
 	"statement_limit":     {"54000", "this session holds too many prepared statements; deallocate some"},
+	"audit_unavailable":   {"08004", "Gatehouse could not write its audit record, so it refused the connection; retry shortly"},
+	"ledger_unavailable":  {"08004", "Gatehouse could not record the session in its accounting, so it refused the connection; retry shortly"},
+	// Authorization decisions (42501): which check refused.
+	"pool_external":            {"42501", "Gatehouse: this pool may reach only external destinations, not this database"},
+	"pool_ceiling":             {"42501", "Gatehouse: this database is above your pool's tier ceiling"},
+	"entitlement_config":       {"42501", "Gatehouse: this database's entitlement settings are incomplete; tell the Gatehouse owners"},
+	"workload_not_entitled":    {"42501", "Gatehouse: this workload is not entitled to this database"},
+	"no_identity":              {"42501", "Gatehouse: this pool has no identity that can be authorized for this database"},
+	"no_person":                {"42501", "Gatehouse: no person could be named for this session"},
+	"entitlement_rate_limited": {"42501", "Gatehouse could not check entitlements just now (rate limited); retry shortly"},
+	"entitlement_unavailable":  {"42501", "Gatehouse could not check entitlements just now; retry shortly"},
+	"account_disabled":         {"42501", "Gatehouse: this person's account is disabled"},
+	"not_entitled":             {"42501", "Gatehouse: this person is not entitled to this database"},
+	"session_unexpected":       {"42501", "Gatehouse: this pool takes no runner session, but one was sent"},
+	"session_unverifiable":     {"42501", "Gatehouse could not verify this runner session"},
+	"session_token":            {"42501", "Gatehouse: this runner session's token was refused"},
+	"session_pool":             {"42501", "Gatehouse: this runner session belongs to another pool"},
+	"session_unbindable":       {"42501", "Gatehouse could not bind this runner session to its Pod; retry shortly"},
+	"session_pod_mismatch":     {"42501", "Gatehouse: this runner session is already bound to another Pod"},
+	"requester_unverifiable":   {"42501", "Gatehouse could not verify the person behind this session"},
 }
+
+// brokerReason is the broker's reason code on a refusal, if it has the shape
+// of one: a fixed identifier, safe to log and to name to the client.
+var brokerReason = regexp.MustCompile(`^[a-z][a-z_]{0,47}$`)
+
+// refusalReason is a refusal's reason for the relay log: the broker's code,
+// or its SQLSTATE when it gave none.
+func refusalReason(body []byte) string {
+	if reason := errorField(body, brokercore.RefusalReasonField); brokerReason.MatchString(reason) {
+		return reason
+	}
+	if code := sqlState(body); sqlStateShape.MatchString(code) {
+		return "sqlstate_" + code
+	}
+	return "unknown"
+}
+
+// sqlStateShape is a SQLSTATE: five digits or capital letters.
+var sqlStateShape = regexp.MustCompile(`^[0-9A-Z]{5}$`)
 
 // refusalsByCode covers a broker refusal whose reason has no entry of its own:
 // every authorization decision is a 42501, whatever its reason.
@@ -529,11 +577,17 @@ func brokerRefusal(severity string, body []byte) []byte {
 	if r, ok := refusalsByReason[errorField(body, brokercore.RefusalReasonField)]; ok {
 		return severityFrame(severity, r.code, r.message)
 	}
+	// A reason this relay has no words for still reaches the client by name,
+	// so one failure under load can be told from another.
+	named := ""
+	if reason := errorField(body, brokercore.RefusalReasonField); brokerReason.MatchString(reason) {
+		named = " (" + reason + ")"
+	}
 	code := sqlState(body)
 	if message, ok := refusalsByCode[code]; ok {
-		return severityFrame(severity, code, message)
+		return severityFrame(severity, code, message+named)
 	}
-	return severityFrame(severity, "08004", genericRefusalMessage)
+	return severityFrame(severity, "08004", genericRefusalMessage+named)
 }
 
 // refusalFrame is the relay-authored FATAL error for a broker startup refusal.
@@ -543,12 +597,13 @@ func refusalFrame(body []byte) []byte { return brokerRefusal("FATAL", body) }
 // whole, so when the broker ends the session (deadline, revocation, a failed
 // recheck) at a frame boundary while the worker is still connected, the
 // worker gets one relay-authored FATAL frame instead of a silent close.
-func copyPostgres(ctx context.Context, client, up net.Conn, deadline time.Time) {
+func copyPostgres(ctx context.Context, client, up net.Conn, deadline time.Time, end *ending) {
 	_ = client.SetDeadline(deadline)
 	_ = up.SetDeadline(deadline)
 	// At the task deadline the worker is told; a withdrawn task (cancelled)
 	// closes both sides at once.
 	stop := context.AfterFunc(ctx, func() {
+		end.set(stopCause(ctx))
 		if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			_ = client.Close()
 		}
@@ -561,13 +616,13 @@ func copyPostgres(ctx context.Context, client, up net.Conn, deadline time.Time) 
 		// The worker closing its side, or the relay closing it (a withdrawn
 		// task), ends the session quietly; a deadline or a broker close ends
 		// it with the relay's frame.
-		if _, e := io.Copy(up, client); e == nil || errors.Is(e, net.ErrClosed) {
+		if _, e := io.Copy(up, watch(client, false, end)); e == nil || errors.Is(e, net.ErrClosed) {
 			quiet.Store(true)
 		}
 		_ = up.Close()
 		done <- struct{}{}
 	}()
-	boundary := relayFrames(client, bufio.NewReaderSize(up, 32<<10))
+	boundary := relayFrames(client, bufio.NewReaderSize(watch(up, true, end), 32<<10))
 	// A relay that is itself stopping (task withdrawn) closes without a frame.
 	withdrawn := ctx.Err() != nil && !errors.Is(ctx.Err(), context.DeadlineExceeded)
 	if boundary && !quiet.Load() && !withdrawn {
@@ -642,4 +697,19 @@ func severityFrame(severity, code, message string) []byte {
 		body = append(append(append(body, f.t), f.v...), 0)
 	}
 	return encodePGFrame('E', append(body, 0))
+}
+
+// brokerRouteDatabase is the shape a database name must have to be forwarded
+// under broker routing: 1 to 63 printable ASCII bytes with no space, within
+// PostgreSQL's identifier length. The broker's catalog decides the rest.
+func brokerRouteDatabase(name string) bool {
+	if len(name) == 0 || len(name) > 63 {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		if name[i] < 0x21 || name[i] > 0x7e {
+			return false
+		}
+	}
+	return true
 }

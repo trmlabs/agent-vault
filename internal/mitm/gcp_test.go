@@ -237,7 +237,8 @@ func TestGCPRefusesCursorPoolAndUnentitledPeople(t *testing.T) {
 		t.Fatalf("no session: %d %q", code, f.audit.last().Outcome)
 	}
 	f.sessions.set(&brokercore.ProxyScope{VaultID: "vault-1", AgentID: "pool-agent", Pool: "cursor", WorkloadID: "pod-uid-9", VaultRole: "proxy"})
-	if code, _ := f.get(t, "alice", gcs); code != 403 || f.audit.last().Outcome != "pool" {
+	// A pool without the grant is refused at CONNECT, before any tunnel opens.
+	if code, _ := f.get(t, "alice", gcs); code != 0 || f.audit.last().Outcome != "pool" {
 		t.Fatalf("cursor pool: %d %q", code, f.audit.last().Outcome)
 	}
 	if f.fake.mints.Load() != 0 {

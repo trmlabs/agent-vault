@@ -34,11 +34,14 @@ type Client struct {
 	loginExpiry time.Time
 
 	// JWT mode only: held logins and their refresh loop.
-	jwt        jwtConfig
-	logins     *loginSet
-	loginMu    sync.Mutex // one new login at a time: scheduled or after a denied mint
-	stopReauth context.CancelFunc
-	reauthDone chan struct{}
+	jwt     jwtConfig
+	logins  *loginSet
+	loginMu sync.Mutex // one new login at a time: scheduled or after a denied mint
+	// missingPolicies are child policies a fresh login also lacked; guarded
+	// by loginMu and cleared at each scheduled login.
+	missingPolicies map[string]bool
+	stopReauth      context.CancelFunc
+	reauthDone      chan struct{}
 }
 
 // NewClient returns ErrNotConfigured when VAULT_ADDR is unset (callers keep

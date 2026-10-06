@@ -76,17 +76,17 @@ type Proxy struct {
 	draining     bool
 }
 
+// DefaultMaxTunnels bounds pending or active credential-proxy CONNECT tunnels
+// per replica. A tunnel costs goroutines and one TLS session, so the bound is
+// fleet scale; AGENT_VAULT_MITM_MAX_TUNNELS overrides it.
+const DefaultMaxTunnels = 10000
+
 // Options carries the dependencies a Proxy needs. BaseURL is the
 // externally-reachable control-plane URL used in help-link error
 // responses. Logger must be non-nil; tests can pass
 // slog.New(slog.DiscardHandler). RateLimit is shared with the HTTP
 // server so proxy limits and control-plane limits live in one registry;
 // nil disables rate limiting on the MITM path.
-// DefaultMaxTunnels bounds pending or active credential-proxy CONNECT tunnels
-// per replica. A tunnel costs goroutines and one TLS session, so the bound is
-// fleet scale; AGENT_VAULT_MITM_MAX_TUNNELS overrides it.
-const DefaultMaxTunnels = 10000
-
 type Options struct {
 	MaxCredentialProxyTunnels int                // <=0 defaults to DefaultMaxTunnels pending or active CONNECT tunnels
 	StrictCredentialProxy     bool               // bounded header-placeholder release path

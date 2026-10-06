@@ -138,7 +138,7 @@ func RunJanitor(ctx context.Context, c JanitorConfig, out io.Writer) error {
 	j := &janitor{config: c, out: out, now: time.Now,
 		client: &http.Client{Timeout: 60 * time.Second, Transport: &http.Transport{TLSClientConfig: t, Proxy: nil, MaxResponseHeaderBytes: 8192,
 			MaxIdleConnsPerHost: c.DeleteConcurrency}, CheckRedirect: func(*http.Request, []*http.Request) error { return errDenied }},
-		admin: &http.Client{Timeout: 15 * time.Second, Transport: &http.Transport{Proxy: nil, MaxResponseHeaderBytes: 8192},
+		admin: &http.Client{Timeout: 2 * brokerRequestTimeout, Transport: &http.Transport{Proxy: nil, MaxResponseHeaderBytes: 8192},
 			CheckRedirect: func(*http.Request, []*http.Request) error { return errDenied }},
 		backoff: defaultBackoff}
 	j.replicaURL = func(ip string) string {
@@ -169,10 +169,13 @@ func (j *janitor) log(event string, fields map[string]any) {
 func (j *janitor) pass(ctx context.Context) error {
 	now := j.now()
 	cutoff := now.Add(-time.Duration(j.config.IdleSeconds) * time.Second)
-	e := j.scaledSince(ctx, cutoff)
-	var lastSeen map[string]time.Time
-	if e == nil {
-		lastSeen, e = j.activity(ctx, cutoff)
+	// With every replica's report durable, a replica's coming or going loses
+	// nothing, so the scale holds apply only to replica-local reports.
+	lastSeen, durable, young, e := j.activity(ctx, cutoff)
+	if e == nil && !durable {
+		if e = j.scaledSince(ctx, cutoff); e == nil && young {
+			e = janitorHold{"proxy_replica_young"}
+		}
 	}
 	if hold, ok := e.(janitorHold); ok {
 		j.log("janitor_pass", map[string]any{"deleted": 0, "dryRun": j.config.DryRun, "held": hold.reason})
@@ -200,7 +203,7 @@ func (j *janitor) pass(ctx context.Context) error {
 		}
 	}
 	deleted, e := j.delete(ctx, idle, lastSeen)
-	fields := map[string]any{"sandboxes": total, "idle": len(idle), "deleted": deleted, "dryRun": j.config.DryRun}
+	fields := map[string]any{"sandboxes": total, "idle": len(idle), "deleted": deleted, "dryRun": j.config.DryRun, "durable": durable}
 	if e != nil {
 		fields["error"] = e.Error()
 	}
@@ -259,11 +262,12 @@ func (j *janitor) get(ctx context.Context, path string, into any) error {
 }
 
 // activity reads every proxy replica's report and returns, per Sandbox UID,
-// the latest use any replica saw. It is all or nothing: a replica that does
-// not answer, or reports a retention shorter than the idle time, is a fault;
-// one started after the cutoff cannot vouch for the whole idle window, so the
-// pass holds. Either way nothing is deleted.
-func (j *janitor) activity(ctx context.Context, cutoff time.Time) (map[string]time.Time, error) {
+// the latest use any replica saw; whether every report was durable; and
+// whether any replica started after the cutoff (on its own it cannot vouch
+// for the whole idle window). It is all or nothing: a replica that does not
+// answer, or reports a retention shorter than the idle time, is a fault, and
+// nothing is deleted.
+func (j *janitor) activity(ctx context.Context, cutoff time.Time) (map[string]time.Time, bool, bool, error) {
 	selector := make([]string, 0, len(j.config.ProxyLabels))
 	for k, v := range j.config.ProxyLabels {
 		selector = append(selector, k+"="+v)
@@ -287,24 +291,30 @@ func (j *janitor) activity(ctx context.Context, cutoff time.Time) (map[string]ti
 		replicas = append(replicas, page...)
 		return nil
 	}); e != nil {
-		return nil, fmt.Errorf("list proxy replicas: %w", e)
+		return nil, false, false, fmt.Errorf("list proxy replicas: %w", e)
 	}
 	seen := map[string]time.Time{}
-	answered, young := 0, false
+	answered, young, durable, historyYoung := 0, false, true, false
 	for _, r := range replicas {
 		if r.Status.Phase == "Succeeded" || r.Status.Phase == "Failed" {
 			continue
 		}
 		ip, e := netipString(r.Status.PodIP)
 		if e != nil {
-			return nil, errJanitorDoubt
+			return nil, false, false, errJanitorDoubt
 		}
 		report, e := j.replica(ctx, ip)
 		if e != nil || report.ReplicaStarted.IsZero() || report.RetentionSeconds < j.config.IdleSeconds {
-			return nil, errJanitorDoubt
+			return nil, false, false, errJanitorDoubt
 		}
 		if report.ReplicaStarted.After(cutoff) {
 			young = true
+		}
+		durable = durable && report.Durable
+		// A durable report vouches only for as long as the broker's history
+		// for its binding: a new, recreated or emptied history is young.
+		if report.Durable && (report.HistoryStarted.IsZero() || report.HistoryStarted.After(cutoff)) {
+			historyYoung = true
 		}
 		answered++
 		for _, a := range report.Sandboxes {
@@ -314,12 +324,12 @@ func (j *janitor) activity(ctx context.Context, cutoff time.Time) (map[string]ti
 		}
 	}
 	if answered == 0 {
-		return nil, errJanitorDoubt
+		return nil, false, false, errJanitorDoubt
 	}
-	if young {
-		return nil, janitorHold{"proxy_replica_young"}
+	if historyYoung {
+		return nil, false, false, janitorHold{"activity_history_young"}
 	}
-	return seen, nil
+	return seen, durable, young, nil
 }
 
 func netipString(s string) (string, error) {

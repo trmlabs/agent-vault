@@ -42,7 +42,8 @@ type SharedConfig struct {
 	// the image the node pulled, never the Pod spec.
 	ImagePrefixes map[string]string `json:"imagePrefixes,omitempty"`
 	ImageDigests  []string          `json:"imageDigests,omitempty"`
-	// MaxPodSeconds bounds an agent Pod's admission from its start (60 s to 8 h).
+	// MaxPodSeconds bounds an agent Pod's admission from its start (60 s up to
+	// the broker's default session ceiling, a day).
 	MaxPodSeconds int64 `json:"maxPodSeconds"`
 	// RequesterNamespaces are the namespaces whose attestations carry the
 	// requester: the Pod's gatehouse.trmlabs.com/requester annotation, which
@@ -82,9 +83,15 @@ func (s *SharedConfig) namespaces() []string {
 	return out
 }
 
+// maxSharedProfiles matches the broker's proxy binding bound.
+const maxSharedProfiles = 10000
+
 func (s *SharedConfig) validate() error {
-	if len(s.Profiles) == 0 || len(s.Profiles) > 64 || !kindPattern.MatchString(s.OwnerKind) || !apiVersionPattern.MatchString(s.OwnerAPIVersion) ||
-		len(s.ImageDigests) > 16 || s.MaxPodSeconds < 60 || s.MaxPodSeconds > 8*3600 || s.MaxConnections < 0 || s.MaxConnections > 65536 {
+	// No small caps: a shared proxy serves up to as many namespaces as the
+	// broker's proxy binding allows, and the config file's size bounds the
+	// lists.
+	if len(s.Profiles) == 0 || len(s.Profiles) > maxSharedProfiles || !kindPattern.MatchString(s.OwnerKind) || !apiVersionPattern.MatchString(s.OwnerAPIVersion) ||
+		s.MaxPodSeconds < 60 || s.MaxPodSeconds > int64(workloadidentity.DefaultSessionCeiling/time.Second) || s.MaxConnections < 0 || s.MaxConnections > 65536 {
 		return errConfig
 	}
 	for ns, profile := range s.Profiles {
@@ -152,7 +159,11 @@ func (c FixedConfig) validateShared(now time.Time) error {
 		return nil
 	}
 	if c.Connect != nil {
-		if check(c.Connect.Listen, c.Connect.Upstream) != nil || len(c.Connect.AllowedTargets) == 0 || len(c.Connect.AllowedTargets) > 32 {
+		// Exactly one of a target list and broker routing; with neither the
+		// config is refused, so a dropped list never opens the listener.
+		targets := len(c.Connect.AllowedTargets)
+		if check(c.Connect.Listen, c.Connect.Upstream) != nil || (c.Connect.Routes != "" && c.Connect.Routes != routesBroker) ||
+			(c.Connect.Routes == routesBroker) == (targets != 0) {
 			return errConfig
 		}
 		for _, target := range c.Connect.AllowedTargets {
@@ -175,7 +186,8 @@ func (c FixedConfig) validateShared(now time.Time) error {
 		return errConfig
 	}
 	if l := c.PostgresListener; l != nil {
-		if check(l.Listen, l.Upstream) != nil || len(l.Databases) == 0 || !safeName.MatchString(l.User) || !safeName.MatchString(l.Placeholder) {
+		if check(l.Listen, l.Upstream) != nil || (l.Routes != "" && l.Routes != routesBroker) || (l.Routes == routesBroker) == (len(l.Databases) != 0) ||
+			!safeName.MatchString(l.User) || !safeName.MatchString(l.Placeholder) {
 			return errConfig
 		}
 		seen := make(map[string]bool, len(l.Databases))

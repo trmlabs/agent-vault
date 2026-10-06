@@ -303,7 +303,11 @@ func (s *pooledSession) run(ctx context.Context) {
 		}
 		var refusal *refusalError
 		if !errors.As(err, &refusal) {
-			return // server connection lost or client gone
+			// Binding or forwarding failed on the database side: say so to the
+			// client and in the log, instead of ending in silence.
+			s.b.logger.Warn("pgproxy: pooled session lost its server connection", "service", s.svc.Name, "error", errorClass(err))
+			s.killWith(&noticeUpstream)
+			return
 		}
 		code, message, outcome := poolRefusal(refusal.err)
 		s.b.auditDenied(s.event, outcome)

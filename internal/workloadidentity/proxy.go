@@ -36,9 +36,11 @@ type ProxyBinding struct {
 	// address range. A connection from anywhere else is refused.
 	SourceCIDRs []string `json:"sourceCIDRs"`
 	// MaxSessionSeconds caps a session from the proxy token's issue time (60
-	// to 1800 s). A remote proxy token cannot be revoked by a live Pod read,
-	// so this bounds how long an open session outlives it.
-	MaxSessionSeconds int64 `json:"maxSessionSeconds"`
+	// s up to the policy's maxSessionSeconds, which is also the default). A
+	// remote proxy token cannot be revoked by a live Pod read, so this bounds
+	// how long an open session outlives it; the proxy itself ends a session
+	// within a second of its Pod no longer qualifying.
+	MaxSessionSeconds int64 `json:"maxSessionSeconds,omitempty"`
 }
 
 // ProxyProfile is one namespace a proxy serves: the harness profile its
@@ -142,7 +144,7 @@ func decodeAttestation(s string) (Attestation, error) {
 }
 
 // validate checks a proxy binding at load.
-func (p *ProxyBinding) validate() error {
+func (p *ProxyBinding) validate(ceiling int64) error {
 	if len(p.Profiles) == 0 || len(p.Profiles) > maxProxyProfiles {
 		return errors.New("proxy binding needs 1 to 10,000 namespace profiles")
 	}
@@ -184,8 +186,11 @@ func (p *ProxyBinding) validate() error {
 			return errors.New("proxy binding source range must be a non-default CIDR")
 		}
 	}
-	if p.MaxSessionSeconds < 60 || p.MaxSessionSeconds > 1800 {
-		return errors.New("proxy binding maxSessionSeconds must be between 60 and 1800")
+	if p.MaxSessionSeconds == 0 {
+		p.MaxSessionSeconds = ceiling
+	}
+	if p.MaxSessionSeconds < 60 || p.MaxSessionSeconds > ceiling {
+		return errors.New("proxy binding maxSessionSeconds must be from 60 s to the policy's maxSessionSeconds")
 	}
 	return nil
 }
@@ -258,28 +263,54 @@ func (r *Resolver) attestProxied(ctx context.Context, binding *Binding, c claims
 // token from a proxy binding's own account, from the binding's source ranges.
 // It is how a proxy asks the broker for its serving certificate.
 func (r *Resolver) VerifyProxy(ctx context.Context, token string, peer netip.Addr) error {
+	_, err := r.IdentifyProxy(ctx, token, peer)
+	return err
+}
+
+// ProxyBinding names the proxy binding a shared proxy's token and source
+// address belong to, for the certificate endpoint's audit row and limit.
+func (r *Resolver) ProxyBinding(ctx context.Context, token string, peer netip.Addr) (string, error) {
+	id, err := r.IdentifyProxy(ctx, token, peer)
+	return id.Scope, err
+}
+
+// ProxyIdentity is the shared proxy VerifyProxy admitted: Scope names its
+// binding (trust domain, namespace and service account UID), and Namespaces
+// are the agent namespaces it serves.
+type ProxyIdentity struct {
+	Scope      string
+	Namespaces []string
+}
+
+// IdentifyProxy is VerifyProxy, returning which proxy binding was admitted.
+func (r *Resolver) IdentifyProxy(ctx context.Context, token string, peer netip.Addr) (ProxyIdentity, error) {
+	var id ProxyIdentity
 	if !peer.IsValid() || peer.IsLoopback() || peer.IsUnspecified() {
-		return brokercore.Denied("peer")
+		return id, brokercore.Denied("peer")
 	}
 	peer = peer.Unmap()
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(r.config.TimeoutSeconds)*time.Second)
 	defer cancel()
 	c, d, err := r.verifyLocally(ctx, token, false)
 	if err != nil {
-		return err
+		return id, err
 	}
 	k := c.Kubernetes
 	for i := range r.config.Bindings {
 		b := &r.config.Bindings[i]
 		if b.TrustDomain == d.name && b.Namespace == k.Namespace && b.ServiceAccount == k.ServiceAccount.Name && b.ServiceAccountUID == k.ServiceAccount.UID {
 			if b.Proxy == nil {
-				return brokercore.Denied("not_proxy")
+				return id, brokercore.Denied("not_proxy")
 			}
 			if !b.Proxy.fromSource(peer) {
-				return brokercore.Denied("proxy_source")
+				return id, brokercore.Denied("proxy_source")
 			}
-			return nil
+			id.Scope = b.TrustDomain + "/" + b.Namespace + "/" + b.ServiceAccountUID
+			for _, pp := range b.Proxy.Profiles {
+				id.Namespaces = append(id.Namespaces, pp.Namespace)
+			}
+			return id, nil
 		}
 	}
-	return brokercore.Denied("no_binding")
+	return id, brokercore.Denied("no_binding")
 }
