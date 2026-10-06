@@ -100,52 +100,124 @@ func (m *mergedListener) inject(c net.Conn) {
 
 var errUnrouted = errors.New("cross-cluster connection is neither attested HTTP nor PostgreSQL")
 
+// The places a cross-cluster connection can go.
+const (
+	routeHTTP        = "http"
+	routePostgres    = "postgres"
+	routeCertificate = "certificate"
+)
+
 // routeCrossCluster reads the TLS front's PROXY header and the first eight
 // bytes after it, without consuming them for the server that gets the
-// connection, and says where it goes.
-func routeCrossCluster(c net.Conn) (*brokercore.KindedConn, bool, error) {
+// connection, and says where it goes. A shared proxy's request for its
+// serving certificate is an HTTP POST; that server gets the bytes after the
+// PROXY header, with the proxy's address as the connection's remote address.
+func routeCrossCluster(c net.Conn) (net.Conn, string, error) {
 	_ = c.SetReadDeadline(time.Now().Add(crossClusterRouteTimeout))
 	defer func() { _ = c.SetReadDeadline(time.Time{}) }()
 	var seen bytes.Buffer
-	if _, err := brokercore.ReadProxyV1(io.TeeReader(c, &seen), c.RemoteAddr()); err != nil {
-		return nil, false, err
+	peer, err := brokercore.ReadProxyV1(io.TeeReader(c, &seen), c.RemoteAddr())
+	if err != nil {
+		return nil, "", err
 	}
 	head := make([]byte, 8)
 	if _, err := io.ReadFull(c, head); err != nil {
-		return nil, false, err
+		return nil, "", err
 	}
 	seen.Write(head)
 	routed := &brokercore.KindedConn{Conn: c, Kinds: crossClusterKinds, Prefix: bytes.NewReader(seen.Bytes())}
 	switch string(head) {
 	case "GHATTS1 ":
-		return routed, true, nil
+		return routed, routePostgres, nil
 	case "CONNECT ":
-		return routed, false, nil
+		return routed, routeHTTP, nil
+	case "POST /v1":
+		return &peerConn{Conn: c, prefix: bytes.NewReader(head), peer: &net.TCPAddr{IP: peer.AsSlice()}}, routeCertificate, nil
 	}
-	return nil, false, errUnrouted
+	return nil, "", errUnrouted
 }
 
-// serveCrossCluster routes each connection of l to the PostgreSQL broker's
-// or the HTTP proxy's listener; either may be nil, and its traffic is then
-// closed.
-func serveCrossCluster(l net.Listener, httpLn, pgLn *mergedListener) error {
+// peerConn replays the bytes routing read and reports the address the TLS
+// front named as its remote address.
+type peerConn struct {
+	net.Conn
+	prefix io.Reader
+	peer   net.Addr
+}
+
+func (c *peerConn) Read(b []byte) (int, error) {
+	if c.prefix != nil {
+		n, err := c.prefix.Read(b)
+		if n > 0 || err != io.EOF {
+			return n, err
+		}
+		c.prefix = nil
+	}
+	return c.Conn.Read(b)
+}
+
+func (c *peerConn) RemoteAddr() net.Addr { return c.peer }
+
+// serveCrossCluster routes each connection of l to the PostgreSQL broker's,
+// the HTTP proxy's or the proxy-certificate listener; any may be nil, and its
+// traffic is then closed.
+func serveCrossCluster(l net.Listener, httpLn, pgLn *mergedListener, certLn *injectedListener) error {
 	for {
 		c, err := l.Accept()
 		if err != nil {
 			return err
 		}
 		go func() {
-			routed, postgres, err := routeCrossCluster(c)
+			routed, route, err := routeCrossCluster(c)
 			switch {
 			case err != nil:
 				_ = c.Close()
-			case postgres && pgLn != nil:
+			case route == routePostgres && pgLn != nil:
 				pgLn.inject(routed)
-			case !postgres && httpLn != nil:
+			case route == routeHTTP && httpLn != nil:
 				httpLn.inject(routed)
+			case route == routeCertificate && certLn != nil:
+				certLn.inject(routed)
 			default:
 				_ = c.Close()
 			}
 		}()
+	}
+}
+
+// injectedListener yields only the connections a dispatcher injects: the
+// proxy-certificate server has no listener of its own.
+type injectedListener struct {
+	addr     net.Addr
+	injected chan net.Conn
+	done     chan struct{}
+	once     sync.Once
+}
+
+func newInjectedListener(addr net.Addr) *injectedListener {
+	return &injectedListener{addr: addr, injected: make(chan net.Conn), done: make(chan struct{})}
+}
+
+func (l *injectedListener) Accept() (net.Conn, error) {
+	select {
+	case c := <-l.injected:
+		return c, nil
+	case <-l.done:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *injectedListener) Close() error {
+	l.once.Do(func() { close(l.done) })
+	return nil
+}
+
+func (l *injectedListener) Addr() net.Addr { return l.addr }
+
+func (l *injectedListener) inject(c net.Conn) {
+	select {
+	case l.injected <- c:
+	case <-l.done:
+		_ = c.Close()
 	}
 }
