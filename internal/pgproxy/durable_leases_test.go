@@ -23,6 +23,8 @@ type durableVaultFixture struct {
 	next         int
 	failRevoke   bool
 	denyLookup   bool
+	selfRevokes  int
+	accessorRevs int
 	loseResponse bool
 	live         map[string]bool
 	journal      *store.SQLStore
@@ -90,14 +92,24 @@ func durableFixtureOn(t *testing.T, st *store.SQLStore) (*hashicorp.Client, *sto
 				return
 			}
 			write(map[string]any{"lease_id": "lease-" + ref, "lease_duration": 30, "renewable": true, "data": map[string]any{"username": "user-" + ref, "password": "synthetic-private-password"}})
+		case r.URL.Path == "/v1/auth/token/revoke-self":
+			if f.failRevoke {
+				w.WriteHeader(503)
+				write(map[string]any{"errors": []string{"synthetic cleanup unavailable"}})
+				return
+			}
+			f.selfRevokes++ // the handler holds f.mu
+			delete(f.live, r.Header.Get("X-Vault-Token"))
+			w.WriteHeader(204)
 		case r.URL.Path == "/v1/auth/token/revoke-accessor":
 			if f.failRevoke {
-				w.WriteHeader(403)
+				w.WriteHeader(503)
 				write(map[string]any{"errors": []string{"synthetic cleanup unavailable"}})
 				return
 			}
 			var body map[string]string
 			_ = json.NewDecoder(r.Body).Decode(&body)
+			f.accessorRevs++
 			delete(f.live, body["accessor"])
 			w.WriteHeader(204)
 		case strings.HasPrefix(r.URL.Path, "/v1/sys/leases/revoke/"):
@@ -347,5 +359,25 @@ func TestDurableLeaseRenewalIsBoundedByChildExpiry(t *testing.T) {
 	}
 	if !expiry.Equal(m.active[lease.ID].expires) {
 		t.Fatal("lease renewal escaped child-token maximum lifetime")
+	}
+}
+
+// A session this replica still holds revokes itself with its child token, so
+// the broker needs no right over other tokens; only recovery uses accessors.
+func TestDurableLeaseRevokeUsesTheChildToken(t *testing.T) {
+	client, st, f := durableFixture(t)
+	m := newDurableForTest(t, client, st)
+	ctx := context.Background()
+	lease, err := m.Mint(ctx, AgentScope{VaultID: "vault"}, &DatabaseService{Name: "db", Mount: "database", Role: "reader"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Revoke(ctx, lease.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.selfRevokes != 1 || f.accessorRevs != 0 || len(f.live) != 0 {
+		t.Fatalf("self revokes %d, accessor revokes %d, live %v", f.selfRevokes, f.accessorRevs, f.live)
 	}
 }

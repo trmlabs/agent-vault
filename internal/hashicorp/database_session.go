@@ -17,7 +17,8 @@ import (
 type DatabaseSession struct {
 	Accessor    string
 	ExpiresAt   time.Time
-	client      *Client
+	client      *Client // holds the child token
+	parent      *Client
 	mount, role string
 }
 
@@ -79,7 +80,25 @@ func (c *Client) NewDatabaseSession(ctx context.Context, mount, role string, ttl
 		expiry = ceiling
 	}
 	return &DatabaseSession{Accessor: accessor, ExpiresAt: expiry,
-		client: &Client{api: api, method: c.method, logger: c.logger, now: c.now}, mount: mount, role: role}, nil
+		client: &Client{api: api, method: c.method, logger: c.logger, now: c.now}, parent: c, mount: mount, role: role}, nil
+}
+
+// Revoke ends the session with its own child token (auth/token/revoke-self),
+// which revokes the leases it issued with it. Only this process ever held the
+// token, so the broker needs no right over any other token. If that fails it
+// falls back to the parent's accessor revoke, as crash recovery does.
+func (s *DatabaseSession) Revoke(ctx context.Context) error {
+	if err := s.client.api.Auth().Token().RevokeSelfWithContext(ctx, ""); err == nil {
+		if s.parent != nil && s.parent.logins != nil {
+			s.parent.logins.forget(s.Accessor)
+			s.parent.revokeIdle(ctx)
+		}
+		return nil
+	}
+	if s.parent == nil {
+		return fmt.Errorf("revoke database session failed")
+	}
+	return s.parent.RevokeDatabaseSession(ctx, s.Accessor)
 }
 
 func (s *DatabaseSession) ReadCredential(ctx context.Context) (*DatabaseCredential, error) {
@@ -93,6 +112,11 @@ func (s *DatabaseSession) ReadCredential(ctx context.Context) (*DatabaseCredenti
 	return credential, nil
 }
 
+// RevokeDatabaseSession revokes a session's child token by accessor, the only
+// handle left once the process that held the token is gone. A policy without
+// revoke-accessor refuses it (403); that counts as done, because the token's
+// value died with its process and the token expires within its TTL, which is
+// capped at the session TTL. Its leases are revoked by path separately.
 func (c *Client) RevokeDatabaseSession(ctx context.Context, accessor string) error {
 	if accessor == "" {
 		return fmt.Errorf("database session accessor is required")
@@ -101,6 +125,12 @@ func (c *Client) RevokeDatabaseSession(ctx context.Context, accessor string) err
 	// Retrying after a successful revoke and failed journal deletion is safe.
 	var response *vaultapi.ResponseError
 	if errors.As(err, &response) && response.StatusCode == 400 && len(response.Errors) == 1 && response.Errors[0] == "invalid accessor" {
+		err = nil
+	}
+	if errors.As(err, &response) && response.StatusCode == 403 {
+		if c.logger != nil {
+			c.logger.Info("vault refused accessor revoke; the database session token expires at its TTL")
+		}
 		err = nil
 	}
 	if err != nil {

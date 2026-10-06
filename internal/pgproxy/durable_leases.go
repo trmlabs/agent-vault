@@ -57,6 +57,7 @@ type DurableLeaseOptions struct {
 type durableLease struct {
 	accessor string
 	expires  time.Time
+	session  *hashicorp.DatabaseSession // revokes itself while this process holds it
 }
 
 // DurableLeaseMinter journals a child-token accessor before credential issuance.
@@ -440,7 +441,7 @@ func (m *DurableLeaseMinter) Mint(ctx context.Context, scope AgentScope, svc *Da
 	if err := m.journal.AddDatabaseCleanup(ctx, m.owner, record); err != nil {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
 		defer cleanupCancel()
-		_ = m.client.RevokeDatabaseSession(cleanupCtx, session.Accessor)
+		_ = session.Revoke(cleanupCtx)
 		return nil, fmt.Errorf("persist database cleanup before issuance: %w", err)
 	}
 	issued := time.Now()
@@ -458,7 +459,7 @@ func (m *DurableLeaseMinter) Mint(ctx context.Context, scope AgentScope, svc *Da
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
 		defer cleanupCancel()
 		_ = m.client.RevokeDatabaseLeaseConfirmed(cleanupCtx, credential.LeaseID)
-		_ = m.client.RevokeDatabaseSession(cleanupCtx, session.Accessor)
+		_ = session.Revoke(cleanupCtx)
 		return nil, fmt.Errorf("persist issued database lease: %w", err)
 	}
 	expiry := credential.ExpiresAt(issued)
@@ -466,7 +467,7 @@ func (m *DurableLeaseMinter) Mint(ctx context.Context, scope AgentScope, svc *Da
 		expiry = session.ExpiresAt
 	}
 	m.activeMu.Lock()
-	m.active[credential.LeaseID] = durableLease{accessor: session.Accessor, expires: session.ExpiresAt}
+	m.active[credential.LeaseID] = durableLease{accessor: session.Accessor, expires: session.ExpiresAt, session: session}
 	m.activeMu.Unlock()
 	return &Lease{ID: credential.LeaseID, Username: credential.Username, Password: credential.Password, ExpiresAt: expiry, Renewable: credential.Renewable}, nil
 }
@@ -512,7 +513,11 @@ func (m *DurableLeaseMinter) Revoke(ctx context.Context, id string) error {
 	if err := m.client.RevokeDatabaseLeaseConfirmed(ctx, id); err != nil {
 		return err
 	}
-	if err := m.client.RevokeDatabaseSession(ctx, lease.accessor); err != nil {
+	revoke := func() error { return m.client.RevokeDatabaseSession(ctx, lease.accessor) }
+	if lease.session != nil {
+		revoke = func() error { return lease.session.Revoke(ctx) }
+	}
+	if err := revoke(); err != nil {
 		return err
 	}
 	return m.journal.DeleteDatabaseCleanup(ctx, lease.accessor)

@@ -110,7 +110,8 @@ func TestDatabaseProviderErrorsDoNotExposeResponseBody(t *testing.T) {
 					w.WriteHeader(204)
 					return
 				}
-				w.WriteHeader(403)
+				// 503, not 403: a refused accessor revoke counts as done.
+				w.WriteHeader(503)
 				_ = json.NewEncoder(w).Encode(map[string]any{"errors": []string{canary}})
 			}))
 			defer srv.Close()
@@ -138,5 +139,69 @@ func TestDatabaseProviderErrorsDoNotExposeResponseBody(t *testing.T) {
 				t.Fatalf("phase %s did not return a scrubbed failure", phase)
 			}
 		})
+	}
+}
+
+// A live session revokes itself with its own child token, so the broker needs
+// no right over other tokens. If that fails it falls back to the accessor.
+func TestDatabaseSessionRevokesItself(t *testing.T) {
+	policy := DatabaseCredentialPolicyName("database", "reader")
+	for _, selfFails := range []bool{false, true} {
+		var selfRevoked, accessorRevoked atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/v1/auth/token/create":
+				writeJSON(w, map[string]any{"auth": map[string]any{"client_token": "child-secret", "accessor": "cleanup-ref", "policies": []string{policy}, "lease_duration": 60, "renewable": false}})
+			case "/v1/auth/token/revoke-self":
+				if r.Header.Get("X-Vault-Token") != "child-secret" {
+					t.Error("revoke-self sent without the child token")
+				}
+				if selfFails {
+					w.WriteHeader(503)
+					return
+				}
+				selfRevoked.Add(1)
+				w.WriteHeader(http.StatusNoContent)
+			case "/v1/auth/token/revoke-accessor":
+				accessorRevoked.Add(1)
+				w.WriteHeader(http.StatusNoContent)
+			default:
+				t.Error("unexpected API path", r.URL.Path)
+				http.NotFound(w, r)
+			}
+		}))
+		c := newClientForServer(t, srv.URL)
+		session, err := c.NewDatabaseSession(context.Background(), "database", "reader", time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := session.Revoke(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		want := [2]int32{1, 0}
+		if selfFails {
+			want = [2]int32{0, 1}
+		}
+		if got := [2]int32{selfRevoked.Load(), accessorRevoked.Load()}; got != want {
+			t.Errorf("selfFails=%v: self and accessor revokes %v, want %v", selfFails, got, want)
+		}
+		srv.Close()
+	}
+}
+
+// Without revoke-accessor in its policy, Vault refuses the accessor revoke.
+// That counts as done: the token's value died with its process, and it expires
+// at its TTL. Any other failure is still an error.
+func TestDatabaseSessionAccessorRevokeToleratesRefusal(t *testing.T) {
+	for status, ok := range map[int]bool{403: true, 503: false, 500: false} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(map[string]any{"errors": []string{"permission denied"}})
+		}))
+		err := newClientForServer(t, srv.URL).RevokeDatabaseSession(context.Background(), "ref")
+		if (err == nil) != ok {
+			t.Errorf("status %d: cleanup result %v", status, err)
+		}
+		srv.Close()
 	}
 }
