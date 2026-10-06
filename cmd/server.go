@@ -350,8 +350,17 @@ func attachProxyCertificates(srv *server.Server, resolver *workloadidentity.Reso
 			list = append(list, name)
 		}
 	}
+	// Every certificate issued is a row in the signed audit trail, so there is
+	// no issuing without it.
+	chain, err := sharedAuditChain(context.Background(), srv.HashicorpClient(), srv.CleanupStore(), getenv, logger)
+	if err != nil {
+		return err
+	}
+	if chain == nil {
+		return fmt.Errorf("proxy certificates need the signed audit trail (AGENT_VAULT_AUDIT_CHAIN)")
+	}
 	return srv.EnableProxyCertificates(&proxycert.Issuer{Mount: mount, Role: role, Names: list, TTL: ttl,
-		Signer: srv.HashicorpClient(), Verifier: resolver, Logger: logger})
+		Signer: srv.HashicorpClient(), Verifier: resolver, Audit: chain, Logger: logger})
 }
 
 // attachServerExtensions wires optional subsystems (MITM, Infisical) onto srv.
