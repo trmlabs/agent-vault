@@ -408,3 +408,28 @@ func TestDurableRecoveryNeverRevokesByAccessor(t *testing.T) {
 		t.Fatalf("recovery revoked %d tokens by accessor", f.accessorRevs)
 	}
 }
+
+// A lost credential response: the process still holds the child token, so it
+// revokes it with its own token at once, taking the unknown credential with
+// it. The binding stays quarantined until an operator confirms the database.
+func TestDurableLeaseLostIssuanceRevokesTheHeldChild(t *testing.T) {
+	client, st, f := durableFixture(t)
+	m := newDurableForTest(t, client, st)
+	ctx := context.Background()
+	svc := &DatabaseService{Name: "db", Mount: "database", Role: "reader"}
+	f.mu.Lock()
+	f.loseResponse = true
+	f.mu.Unlock()
+	if _, err := m.Mint(ctx, AgentScope{VaultID: "vault"}, svc); err == nil {
+		t.Fatal("interrupted response accepted")
+	}
+	f.mu.Lock()
+	if f.selfRevokes != 1 || f.accessorRevs != 0 || len(f.live) != 0 {
+		t.Errorf("self revokes %d, accessor revokes %d, live %v", f.selfRevokes, f.accessorRevs, f.live)
+	}
+	f.loseResponse = false
+	f.mu.Unlock()
+	if _, err := m.Mint(ctx, AgentScope{VaultID: "vault"}, svc); err == nil {
+		t.Fatal("unknown issuance reopened without confirmation")
+	}
+}

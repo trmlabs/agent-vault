@@ -56,3 +56,17 @@ func TestUnpooledDatabaseCeilingComesFromTheCatalog(t *testing.T) {
 		}
 	}
 }
+
+// An operator who set MaxConns keeps it as the ceiling for databases without
+// maxConns; the pooled budget fallback is separate.
+func TestExplicitMaxConnsIsTheUnsizedFallback(t *testing.T) {
+	if o := New("127.0.0.1:0", Options{MaxConns: 128}).opts; o.DefaultDatabaseConns != 128 {
+		t.Fatalf("unpooled fallback %d, want 128", o.DefaultDatabaseConns)
+	}
+	if o := New("127.0.0.1:0", Options{MaxConns: 128, DefaultDatabaseConns: 20}).opts; o.DefaultDatabaseConns != 20 {
+		t.Fatalf("explicit fallback %d, want 20", o.DefaultDatabaseConns)
+	}
+	if o := New("127.0.0.1:0", Options{Pool: &PoolOptions{}, MaxConns: 128}).opts; o.DefaultDatabaseConns != 50 {
+		t.Fatalf("pooled fallback %d, want 50", o.DefaultDatabaseConns)
+	}
+}
