@@ -44,13 +44,20 @@ func (c *Client) NewDatabaseSession(ctx context.Context, mount, role string, ttl
 	}
 	// Vault refused the child policy to this login. If the catalog added the
 	// database after the login was issued, a new login holds it: log in
-	// again once and retry once.
+	// again once and retry once. A policy a new login also lacked is missing,
+	// not new: it waits for the next scheduled login instead of minting
+	// logins that would each live out their maximum lifetime.
+	policy := DatabaseCredentialPolicyName(mount, role)
+	if c.policyMissing(policy) {
+		return nil, errSessionPolicy
+	}
 	if err := c.reloginAfterDenial(ctx, denied); err != nil {
 		c.logger.Warn("database session refused: the broker's vault login lacks its policy", slog.String("reason", err.Error()))
 		return nil, errSessionPolicy
 	}
 	if session, denied, err = c.newDatabaseSession(ctx, mount, role, ttl); denied != "" {
-		c.logger.Warn("database session refused: a new vault login also lacks its policy")
+		c.markPolicyMissing(policy)
+		c.logger.Warn("database session refused: a new vault login also lacks its policy; no more logins for it until the next scheduled one")
 		return nil, errSessionPolicy
 	}
 	return session, err

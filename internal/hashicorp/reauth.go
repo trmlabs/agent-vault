@@ -350,6 +350,7 @@ func (c *Client) reauthTick(ctx context.Context) {
 			slog.String("err", err.Error()))
 		return
 	}
+	c.missingPolicies = nil // the scheduled login may hold policies added since
 	retired, sessions := c.logins.counts()
 	c.logger.Info("vault login refreshed", slog.Int("older_logins", retired), slog.Int("live_sessions", sessions))
 }
@@ -365,6 +366,23 @@ func (c *Client) loginAgainLocked(ctx context.Context) error {
 	c.logins.rotate(next)
 	c.api.SetToken(next.token)
 	return nil
+}
+
+// policyMissing reports whether a new login already lacked policy since the
+// last scheduled login.
+func (c *Client) policyMissing(policy string) bool {
+	c.loginMu.Lock()
+	defer c.loginMu.Unlock()
+	return c.missingPolicies[policy]
+}
+
+func (c *Client) markPolicyMissing(policy string) {
+	c.loginMu.Lock()
+	defer c.loginMu.Unlock()
+	if c.missingPolicies == nil {
+		c.missingPolicies = map[string]bool{}
+	}
+	c.missingPolicies[policy] = true
 }
 
 // deniedReloginAfter is how old the current login must be before a denied

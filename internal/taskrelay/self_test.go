@@ -22,7 +22,7 @@ func TestSelfModeAcceptsLoopbackOnly(t *testing.T) {
 		"kubernetes input":      func(c *FixedConfig) { c.Kubernetes.APIURL = "https://10.0.0.1" },
 		"TLS listener files":    func(c *FixedConfig) { c.TLSCertFile = "/tls.crt" },
 		"browser":               func(c *FixedConfig) { c.Browser = &BrowserConfig{Listen: "127.0.0.1:16443"} },
-		"over 8 hours":          func(c *FixedConfig) { c.Deadline = time.Now().Add(9 * time.Hour) },
+		"over a day":            func(c *FixedConfig) { c.Deadline = time.Now().Add(25 * time.Hour) },
 		"no audit":              func(c *FixedConfig) { c.AuditFile = "" },
 		"no listener":           func(c *FixedConfig) { c.PostgresBindings = nil },
 		"relative session file": func(c *FixedConfig) { c.PostgresBindings[0].Upstream.SessionFile = "token" },

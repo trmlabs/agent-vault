@@ -160,42 +160,18 @@ func (s *servingCert) renew(ctx context.Context) error {
 	if e != nil {
 		return e
 	}
-	token, _, e := readProjectedProof(s.upstream)
+	status, response, e := brokerPost(ctx, s.upstream, ProxyCertificatePath, body, 256<<10)
 	if e != nil {
 		return e
 	}
-	ctx, cancel := context.WithTimeout(ctx, handshakeTimeout)
-	defer cancel()
-	conn, e := dialUpstream(ctx, s.upstream)
-	if e != nil {
-		return e
-	}
-	defer func() { _ = conn.Close() }()
-	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
-	defer stop()
-	req, e := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+s.upstream.ServerName+ProxyCertificatePath, bytes.NewReader(body))
-	if e != nil {
-		return e
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	req.Close = true
-	if e = req.Write(conn); e != nil {
-		return e
-	}
-	resp, e := http.ReadResponse(bufio.NewReader(conn), req)
-	if e != nil {
-		return e
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
+	if status != http.StatusOK {
 		return errDenied
 	}
 	var issued struct {
 		Certificate string `json:"certificate"`
 		Chain       string `json:"chain"`
 	}
-	d := json.NewDecoder(io.LimitReader(resp.Body, 256<<10))
+	d := json.NewDecoder(bytes.NewReader(response))
 	d.DisallowUnknownFields()
 	if d.Decode(&issued) != nil {
 		return errDenied
@@ -264,3 +240,43 @@ func (s *servingCert) check(key *ecdsa.PrivateKey, certificate, chain string, no
 	}
 	return &tls.Certificate{Certificate: chainDERs, PrivateKey: key, Leaf: leaf}, leaf, nil
 }
+
+// brokerPost sends one JSON request to the broker's proxy routes over a fresh
+// TLS connection to upstream, as the proxy itself (its projected token), and
+// returns the status and up to limit bytes of the body. It is written by hand
+// as HTTP/1.1 so the broker's cross-cluster router sees "POST /v1" first.
+func brokerPost(ctx context.Context, upstream UpstreamConfig, path string, body []byte, limit int64) (int, []byte, error) {
+	token, _, e := readProjectedProof(upstream)
+	if e != nil {
+		return 0, nil, e
+	}
+	ctx, cancel := context.WithTimeout(ctx, brokerRequestTimeout)
+	defer cancel()
+	conn, e := dialUpstream(ctx, upstream)
+	if e != nil {
+		return 0, nil, e
+	}
+	defer func() { _ = conn.Close() }()
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+	req, e := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+upstream.ServerName+path, bytes.NewReader(body))
+	if e != nil {
+		return 0, nil, e
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Close = true
+	if e = req.Write(conn); e != nil {
+		return 0, nil, e
+	}
+	resp, e := http.ReadResponse(bufio.NewReader(conn), req)
+	if e != nil {
+		return 0, nil, e
+	}
+	defer func() { _ = resp.Body.Close() }()
+	b, e := io.ReadAll(io.LimitReader(resp.Body, limit))
+	return resp.StatusCode, b, e
+}
+
+// brokerRequestTimeout bounds one request to the broker's proxy routes.
+const brokerRequestTimeout = 30 * time.Second

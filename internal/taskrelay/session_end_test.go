@@ -37,7 +37,7 @@ func session(t *testing.T, deadline time.Time) (worker, broker net.Conn) {
 	t.Helper()
 	worker, relayClient := tcpPair(t)
 	relayUp, broker := tcpPair(t)
-	go copyPostgres(context.Background(), relayClient, relayUp, deadline)
+	go copyPostgres(context.Background(), relayClient, relayUp, deadline, &ending{})
 	_ = worker.SetDeadline(time.Now().Add(5 * time.Second))
 	return worker, broker
 }
@@ -133,7 +133,7 @@ func TestTaskDeadlineMidSessionTellsTheWorker(t *testing.T) {
 	deadline := time.Now().Add(200 * time.Millisecond)
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
-	go copyPostgres(ctx, relayClient, relayUp, deadline)
+	go copyPostgres(ctx, relayClient, relayUp, deadline, &ending{})
 	_ = worker.SetDeadline(time.Now().Add(5 * time.Second))
 	typ, body, e := readPGFrame(worker, 4096)
 	if e != nil || typ != 'E' || sqlState(body) != "08006" || !bytes.Contains(body, []byte(sessionEndedMessage)) {
@@ -145,7 +145,7 @@ func TestWithdrawnTaskClosesSilently(t *testing.T) {
 	worker, relayClient := tcpPair(t)
 	relayUp, _ := tcpPair(t)
 	ctx, cancel := context.WithCancel(context.Background())
-	go copyPostgres(ctx, relayClient, relayUp, time.Now().Add(time.Minute))
+	go copyPostgres(ctx, relayClient, relayUp, time.Now().Add(time.Minute), &ending{})
 	time.Sleep(50 * time.Millisecond)
 	cancel()
 	_ = worker.SetDeadline(time.Now().Add(5 * time.Second))

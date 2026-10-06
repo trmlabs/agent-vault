@@ -539,9 +539,30 @@ func TestJWTDeniedMintLoginsAreBounded(t *testing.T) {
 	if logins, _, _ := h.vault.snapshot(); logins != 2 {
 		t.Fatalf("logins=%d", logins)
 	}
+	// A new login also lacked the policy, so it is missing, not new: no more
+	// logins for it until the next scheduled one.
 	h.advance(2 * time.Minute)
 	_, _ = h.session()
-	if logins, _, _ := h.vault.snapshot(); logins != 3 {
-		t.Fatalf("logins=%d; once the login is a minute old, a denial may log in again", logins)
+	if logins, _, _ := h.vault.snapshot(); logins != 2 {
+		t.Fatalf("logins=%d; a policy a new login lacked must wait for the schedule", logins)
+	}
+}
+
+// A policy missing for an hour of minute-by-minute attempts costs at most one
+// extra login per scheduled login, not one a minute.
+func TestJWTMissingPolicyForAnHourStaysBounded(t *testing.T) {
+	h := newJWTHarness(t, 3600, defaultReauthOptions())
+	h.vault.setPolicyFrom(1 << 30)
+	for range 60 {
+		h.advance(time.Minute)
+		if _, err := h.session(); err == nil {
+			t.Fatal("minted without the policy")
+		}
+	}
+	// Scheduled logins every 20 minutes from the newest login, each followed
+	// by at most one login after a denial: well under the 60 a per-minute
+	// re-login would make.
+	if logins, _, _ := h.vault.snapshot(); logins > 7 {
+		t.Fatalf("logins=%d in an hour with a missing policy", logins)
 	}
 }

@@ -152,11 +152,20 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		writeAuthError(w, err)
 		return
 	}
-	// With a catalog, refuse an unlisted host before minting a certificate
-	// for it or opening a tunnel.
-	if p.strictCredentialProxy && p.adapter.valid() && !p.adapter.Catalog.Current().HasHost(host, port) {
-		p.adapterDeny(w, auditchain.Event{Pool: connectScope.Pool, Agent: connectScope.AgentID, PodUID: connectScope.WorkloadID}, http.StatusForbidden, "unlisted")
-		return
+	// With a catalog, refuse a host the caller's pool is not granted before
+	// minting a certificate for it or opening a tunnel. The caller gets the
+	// same 403 whether another pool may reach the host or none may, so a
+	// tunnel attempt reveals nothing about other pools' catalog; only the
+	// audit row tells the two apart.
+	if p.strictCredentialProxy && p.adapter.valid() {
+		if catalog := p.adapter.Catalog.Current(); !catalog.HasHostForPool(host, port, connectScope.Pool) {
+			outcome := "unlisted"
+			if catalog.HasHost(host, port) {
+				outcome = "pool"
+			}
+			p.adapterDeny(w, auditchain.Event{Pool: connectScope.Pool, Agent: connectScope.AgentID, PodUID: connectScope.WorkloadID}, http.StatusForbidden, outcome)
+			return
+		}
 	}
 
 	// A replica shutting down takes no new tunnels; the client retries on

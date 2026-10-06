@@ -36,6 +36,7 @@ import (
 	"github.com/Infisical/agent-vault/internal/notify"
 	"github.com/Infisical/agent-vault/internal/pgproxy"
 	"github.com/Infisical/agent-vault/internal/pidfile"
+	"github.com/Infisical/agent-vault/internal/proxyactivity"
 	"github.com/Infisical/agent-vault/internal/proxycert"
 	"github.com/Infisical/agent-vault/internal/requestlog"
 	"github.com/Infisical/agent-vault/internal/runtimestatus"
@@ -380,8 +381,57 @@ func attachProxyCertificates(srv *server.Server, resolver *workloadidentity.Reso
 	if chain == nil {
 		return fmt.Errorf("proxy certificates need the signed audit trail (AGENT_VAULT_AUDIT_CHAIN)")
 	}
+	// Issuance per proxy binding: AGENT_VAULT_PROXY_CERT_PER_HOUR and
+	// AGENT_VAULT_PROXY_CERT_BURST (default 1,000 each).
 	return srv.EnableProxyCertificates(&proxycert.Issuer{Mount: mount, Role: role, Names: list, TTL: ttl,
-		Signer: srv.HashicorpClient(), Verifier: resolver, Audit: chain, Logger: logger})
+		Signer: srv.HashicorpClient(), Verifier: resolver, Audit: chain, Logger: logger,
+		PerHour: intEnvValue("AGENT_VAULT_PROXY_CERT_PER_HOUR"), Burst: intEnvValue("AGENT_VAULT_PROXY_CERT_BURST")})
+}
+
+// attachProxyActivity keeps shared proxies' Sandbox activity in the shared
+// store whenever the cross-cluster listener and workload identity are on, so
+// the idle janitor's view outlives any proxy replica.
+// AGENT_VAULT_PROXY_ACTIVITY_RETENTION (default 24h) is how long a row is kept;
+// AGENT_VAULT_PROXY_ACTIVITY_MAX_ROWS (default proxyactivity.DefaultMaxRows) is
+// the most rows one proxy binding may hold.
+func attachProxyActivity(srv *server.Server, resolver *workloadidentity.Resolver, db store.Store, logger *slog.Logger, getenv func(string) string) error {
+	raw := getenv("AGENT_VAULT_PROXY_ACTIVITY_RETENTION")
+	if getenv("AGENT_VAULT_CROSS_CLUSTER_PORT") == "" || resolver == nil {
+		if raw != "" {
+			return fmt.Errorf("AGENT_VAULT_PROXY_ACTIVITY_RETENTION needs the cross-cluster listener and workload identity")
+		}
+		return nil
+	}
+	activityStore, ok := db.(proxyactivity.Store)
+	if !ok {
+		return fmt.Errorf("proxy activity needs the SQL store")
+	}
+	retention := 24 * time.Hour
+	if raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil {
+			return fmt.Errorf("AGENT_VAULT_PROXY_ACTIVITY_RETENTION must be a duration such as 24h")
+		}
+		retention = parsed
+	}
+	maxRows := 0
+	if raw := getenv("AGENT_VAULT_PROXY_ACTIVITY_MAX_ROWS"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 {
+			return fmt.Errorf("AGENT_VAULT_PROXY_ACTIVITY_MAX_ROWS must be a positive whole number")
+		}
+		maxRows = parsed
+	}
+	return srv.EnableProxyActivity(&proxyactivity.Service{Store: activityStore, Identifier: proxyIdentifier{resolver}, Retention: retention,
+		MaxRows: maxRows, Logger: logger})
+}
+
+// proxyIdentifier adapts workload identity to proxy activity.
+type proxyIdentifier struct{ r *workloadidentity.Resolver }
+
+func (p proxyIdentifier) IdentifyProxy(ctx context.Context, token string, peer netip.Addr) (proxyactivity.Identity, error) {
+	id, err := p.r.IdentifyProxy(ctx, token, peer)
+	return proxyactivity.Identity{Scope: id.Scope, Namespaces: id.Namespaces}, err
 }
 
 // attachServerExtensions wires optional subsystems (MITM, Infisical) onto srv.
@@ -468,6 +518,9 @@ func attachServerExtensions(srv *server.Server, host string, mitmPort, postgresP
 		proxyResolver.SetProfiles(catalogProfiles(adapter.Catalog))
 	}
 	if err := attachProxyCertificates(srv, proxyResolver, logger, os.Getenv); err != nil {
+		return err
+	}
+	if err := attachProxyActivity(srv, proxyResolver, db, logger, os.Getenv); err != nil {
 		return err
 	}
 	if err := attachMITMIfEnabled(srv, host, mitmPort, masterKey, db, maxRespBytes, maxReqBytes, adapter, sessions); err != nil {

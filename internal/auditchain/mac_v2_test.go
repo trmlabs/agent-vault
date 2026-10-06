@@ -191,12 +191,12 @@ func TestUpgradeFromV2VerifiesAndNeverStepsDown(t *testing.T) {
 // hex serial and an RFC 3339 UTC time are accepted.
 func TestCertificateFieldsAreCoveredAndBounded(t *testing.T) {
 	f := newFixture(t)
-	if err := f.chain.Record(Event{Event: EventCertificate, Outcome: "issued", Peer: "10.0.0.5", Serial: "7f00aa", NotAfter: "2026-10-07T00:00:00Z"}); err != nil {
+	if err := f.chain.Record(Event{Event: EventCertificate, Outcome: "issued", Peer: "10.0.0.5", Serial: "7f00aa", NotAfter: "2026-10-07T00:00:00Z", DNSNames: "proxy.ns.svc,proxy.ns.svc.cluster.local"}); err != nil {
 		t.Fatal(err)
 	}
 	f.checkpoint(t)
 	out := f.out.String()
-	for _, edit := range [][2]string{{`"serial":"7f00aa"`, `"serial":"7f00ab"`}, {`"notAfter":"2026-10-07T00:00:00Z"`, `"notAfter":"2027-10-07T00:00:00Z"`}} {
+	for _, edit := range [][2]string{{`"serial":"7f00aa"`, `"serial":"7f00ab"`}, {`"dnsNames":"proxy.ns.svc,`, `"dnsNames":"vault.ns.svc,`}, {`"notAfter":"2026-10-07T00:00:00Z"`, `"notAfter":"2027-10-07T00:00:00Z"`}} {
 		if !strings.Contains(out, edit[0]) {
 			t.Fatalf("row lacks %s", edit[0])
 		}
@@ -210,6 +210,8 @@ func TestCertificateFieldsAreCoveredAndBounded(t *testing.T) {
 		{Event: EventCertificate, Serial: strings.Repeat("a", 41)},
 		{Event: EventCertificate, NotAfter: "2026-10-07T02:00:00+02:00"},
 		{Event: EventCertificate, NotAfter: "tomorrow"},
+		{Event: EventCertificate, DNSNames: "proxy.svc, other.svc"},
+		{Event: EventCertificate, DNSNames: "Proxy.svc"},
 	} {
 		if e.Validate() == nil {
 			t.Errorf("accepted %+v", e)

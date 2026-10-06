@@ -289,3 +289,67 @@ func TestPostgresBindingBindFailureClosesTask(t *testing.T) {
 		t.Fatal("earlier listener remained open after task startup failed")
 	}
 }
+
+// A sidecar's connection cap comes from its config (the pool render sets it
+// from sessionsPerWorker), well past the old fixed 32.
+func TestSidecarConnectionCapIsConfigured(t *testing.T) {
+	f := newRelayFixture(t)
+	f.c.MaxConnections = 100
+	f.c.PostgresBindings = []PostgresConfig{{Listen: freeAddress(t), Upstream: f.upstream(t, "127.0.0.1:25443"), Database: "database-0", User: "workload", Placeholder: "public-placeholder"}}
+	f.start(t)
+	p := f.c.PostgresBindings[0]
+	for i := 0; i < 100; i++ {
+		c := f.dial(t, p.Listen)
+		packet, _ := (&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber, Parameters: map[string]string{"user": p.User, "database": p.Database}}).Encode(nil)
+		_, _ = c.Write(packet)
+		if typ, _, e := readPGFrame(c, 1024); e != nil || typ != 'R' {
+			t.Fatalf("connection %d of 100 refused", i+1)
+		}
+	}
+	tc, _ := clientTLS(f.c.TLSCertFile, "127.0.0.1")
+	if extra, e := tls.DialWithDialer(&net.Dialer{Timeout: time.Second}, "tcp", p.Listen, tc); e == nil {
+		_ = extra.Close()
+		t.Fatal("the 101st connection was admitted")
+	}
+}
+
+func TestConnectionCapAndHandshakeValidation(t *testing.T) {
+	f := newRelayFixture(t)
+	for _, c := range []func(*FixedConfig){
+		func(c *FixedConfig) { c.MaxConnections = -1 },
+		func(c *FixedConfig) { c.MaxConnections = 65537 },
+		func(c *FixedConfig) { c.HandshakeSeconds = -1 },
+		func(c *FixedConfig) { c.HandshakeSeconds = 301 },
+	} {
+		config := f.c
+		config.Postgres = &PostgresConfig{Listen: "127.0.0.1:15432", Upstream: f.upstream(t, "127.0.0.1:25443"), Database: "d", User: "u", Placeholder: "p"}
+		c(&config)
+		if config.Validate(time.Now()) == nil {
+			t.Errorf("accepted %d connections, %d s handshake", config.MaxConnections, config.HandshakeSeconds)
+		}
+	}
+	sf := startShared(t, false)
+	shared := sf.f.c
+	shared.MaxConnections = 100
+	if shared.Validate(time.Now()) == nil {
+		t.Error("a sidecar cap on a shared proxy accepted")
+	}
+}
+
+// The configured handshake bound is the one applied: a client that sends no
+// startup is dropped after it.
+func TestHandshakeBoundIsConfigured(t *testing.T) {
+	f := newRelayFixture(t)
+	f.c.HandshakeSeconds = 1
+	f.c.Postgres = &PostgresConfig{Listen: freeAddress(t), Upstream: f.upstream(t, "127.0.0.1:25443"), Database: "d", User: "workload", Placeholder: "p"}
+	f.start(t)
+	c := f.dial(t, f.c.Postgres.Listen)
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	start := time.Now()
+	if _, e := c.Read(make([]byte, 1)); e == nil {
+		t.Fatal("the relay sent bytes to a silent client")
+	}
+	if waited := time.Since(start); waited > 3*time.Second {
+		t.Fatalf("a silent client held its slot for %v", waited)
+	}
+}

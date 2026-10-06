@@ -1,6 +1,7 @@
 package taskrelay
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"sort"
@@ -23,11 +24,14 @@ type activity struct {
 	started   time.Time
 	retention time.Duration
 	owners    map[string]activityEntry // by controller UID
+	// durable, when set, adds the broker's view of every replica.
+	durable *durable
 }
 
 type activityEntry struct {
 	namespace string
 	lastSeen  time.Time
+	pushed    time.Time // the last time the broker accepted for it
 }
 
 // defaultActivityRetention keeps a day of history, well past any idle time.
@@ -49,9 +53,34 @@ func (a *activity) record(namespace, owner string, when time.Time) {
 	}
 	a.mu.Lock()
 	if e, ok := a.owners[owner]; !ok || when.After(e.lastSeen) {
-		a.owners[owner] = activityEntry{namespace: namespace, lastSeen: when}
+		a.owners[owner] = activityEntry{namespace: namespace, lastSeen: when, pushed: e.pushed}
 	}
 	a.mu.Unlock()
+}
+
+// pending is every Sandbox whose last use is newer than the broker holds.
+func (a *activity) pending() []SandboxActivity {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var out []SandboxActivity
+	for owner, e := range a.owners {
+		if e.lastSeen.After(e.pushed) {
+			out = append(out, SandboxActivity{Namespace: e.namespace, OwnerUID: owner, LastSeen: e.lastSeen.UTC()})
+		}
+	}
+	return out
+}
+
+// accepted marks rows the broker took.
+func (a *activity) accepted(rows []SandboxActivity) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, r := range rows {
+		if e, ok := a.owners[r.OwnerUID]; ok && r.LastSeen.After(e.pushed) {
+			e.pushed = r.LastSeen
+			a.owners[r.OwnerUID] = e
+		}
+	}
 }
 
 // ActivityReport is the admin listener's one response.
@@ -62,6 +91,14 @@ type ActivityReport struct {
 	ReplicaStarted   time.Time         `json:"replicaStarted"`
 	RetentionSeconds int64             `json:"retentionSeconds"`
 	Sandboxes        []SandboxActivity `json:"sandboxes"`
+	// Durable says Sandboxes include the broker's view of every replica,
+	// read in full for this report, so no replica's going or coming loses
+	// history beyond its last report to the broker.
+	Durable bool `json:"durable"`
+	// HistoryStarted, on a durable report, is when the broker's history for
+	// this proxy's binding began. Zero means none yet: a new, recreated or
+	// emptied history, which vouches for nothing.
+	HistoryStarted time.Time `json:"historyStarted,omitzero"`
 }
 
 // SandboxActivity is one Sandbox's last use through this replica.
@@ -98,8 +135,41 @@ func (a *activity) handler() http.Handler {
 			http.NotFound(w, req)
 			return
 		}
+		report := a.report(time.Now())
+		if a.durable != nil {
+			report = a.withDurable(req.Context(), report)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
-		_ = json.NewEncoder(w).Encode(a.report(time.Now()))
+		_ = json.NewEncoder(w).Encode(report)
 	})
+}
+
+// withDurable merges the broker's view into a report, keeping the later time
+// per Sandbox and the shorter retention. If the view cannot be read in full,
+// the report is this replica's alone and not durable.
+func (a *activity) withDurable(ctx context.Context, report ActivityReport) ActivityReport {
+	view, e := a.durable.read(ctx)
+	if e != nil {
+		return report
+	}
+	rows, retention := view.sandboxes, view.retention
+	byOwner := make(map[string]int, len(report.Sandboxes))
+	for i, s := range report.Sandboxes {
+		byOwner[s.OwnerUID] = i
+	}
+	for _, r := range rows {
+		if i, ok := byOwner[r.OwnerUID]; ok {
+			if r.LastSeen.After(report.Sandboxes[i].LastSeen) {
+				report.Sandboxes[i].LastSeen = r.LastSeen.UTC()
+			}
+			continue
+		}
+		byOwner[r.OwnerUID] = len(report.Sandboxes)
+		report.Sandboxes = append(report.Sandboxes, SandboxActivity{Namespace: r.Namespace, OwnerUID: r.OwnerUID, LastSeen: r.LastSeen.UTC()})
+	}
+	sort.Slice(report.Sandboxes, func(i, j int) bool { return report.Sandboxes[i].OwnerUID < report.Sandboxes[j].OwnerUID })
+	report.RetentionSeconds = min(report.RetentionSeconds, retention)
+	report.Durable, report.HistoryStarted = true, view.historyStarted
+	return report
 }

@@ -63,10 +63,16 @@ func VaultPrefixLoader(vault ListLogical, mount, prefix string) Loader {
 			return nil, 0, errors.New("catalog head incomplete")
 		}
 		listing, err := vault.ListWithContext(ctx, mount+"/metadata/"+prefix+"/entries")
-		if err != nil || listing == nil || listing.Data == nil {
+		if err != nil {
 			return nil, version, errors.New("catalog entry listing failed")
 		}
-		keys, _ := listing.Data["keys"].([]interface{})
+		// Vault answers LIST on an empty folder with 404, which the client
+		// returns as no secret: no entries. The head's digest still decides,
+		// so this loads only a head that itself says there are none.
+		var keys []interface{}
+		if listing != nil && listing.Data != nil {
+			keys, _ = listing.Data["keys"].([]interface{})
+		}
 		names := make([]string, 0, len(keys))
 		for _, k := range keys {
 			name, _ := k.(string)
