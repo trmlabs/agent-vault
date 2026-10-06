@@ -32,6 +32,9 @@ type ServingTLSConfig struct {
 
 const brokerIssued = "broker-issued"
 
+// waitingLogInterval spaces the "still no certificate" rows at startup.
+var waitingLogInterval = time.Minute
+
 // ProxyCertificatePath is the broker's issuing route on its cross-cluster
 // listener.
 const ProxyCertificatePath = "/v1/proxy/certificate"
@@ -61,6 +64,10 @@ type servingCert struct {
 	names    []string
 	upstream UpstreamConfig
 	issued   func(issued, notAfter time.Time) // for the audit; may be nil
+	// waiting is called once a minute while the first certificate has not
+	// arrived: with no readiness probe the proxy looks ready meanwhile, so
+	// the log must say it is serving nothing. May be nil.
+	waiting func()
 
 	mu        sync.RWMutex
 	current   *tls.Certificate
@@ -103,9 +110,14 @@ func (s *servingCert) expiry() time.Time {
 // ends: the proxy serves nothing without a certificate.
 func (s *servingCert) obtain(ctx context.Context) error {
 	wait := time.Second
+	logged := time.Now()
 	for {
 		if s.renew(ctx) == nil {
 			return nil
+		}
+		if s.waiting != nil && time.Since(logged) >= waitingLogInterval {
+			s.waiting()
+			logged = time.Now()
 		}
 		select {
 		case <-ctx.Done():

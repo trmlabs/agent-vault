@@ -3,6 +3,7 @@ package taskrelay
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -395,5 +396,27 @@ func TestServingTLSValidation(t *testing.T) {
 		if e := c.Validate(time.Now()); e == nil {
 			t.Errorf("%s: accepted", name)
 		}
+	}
+}
+
+// While the broker refuses the first certificate, the proxy serves nothing
+// and says so in the audit at each interval.
+func TestBrokerIssuedStartupWaitIsLogged(t *testing.T) {
+	waitingLogInterval = 200 * time.Millisecond
+	t.Cleanup(func() { waitingLogInterval = time.Minute })
+	// No proof file: every request fails before reaching a broker.
+	s := newServingCert(&ServingTLSConfig{Mode: brokerIssued, Names: proxyNames}, UpstreamConfig{})
+	var rows atomic.Int32
+	s.waiting = func() { rows.Add(1) }
+	ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+	defer cancel()
+	if s.obtain(ctx) == nil {
+		t.Fatal("obtained a certificate from a refusing broker")
+	}
+	if n := rows.Load(); n < 1 {
+		t.Fatalf("%d waiting rows", n)
+	}
+	if _, e := s.get(nil); e == nil {
+		t.Fatal("a certificate is served while waiting")
 	}
 }
