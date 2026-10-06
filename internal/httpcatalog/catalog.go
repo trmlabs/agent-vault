@@ -890,11 +890,7 @@ func (e *Entry) validateTier() error {
 	if rank > 0 && len(e.Requires) == 0 {
 		return fmt.Errorf("a %s entry must name its required groups", e.Tier)
 	}
-	// The audit row records the groups checked within its 512-byte identifier
-	// limit; more groups would make every request on the entry fail closed.
-	if len(e.Requires) > maxRequiredGroups {
-		return fmt.Errorf("an entry requires at most %d groups", maxRequiredGroups)
-	}
+	// Any number of groups: the audit row records the full list, under its MAC.
 	for _, g := range e.Requires {
 		if !groupID.MatchString(g) {
 			return fmt.Errorf("required groups must be Entra object IDs")
@@ -902,8 +898,6 @@ func (e *Entry) validateTier() error {
 	}
 	return nil
 }
-
-const maxRequiredGroups = 8
 
 // grantable is the CI rule: an entry above T0 is never granted to a pool that
 // cannot carry it. Without defined pools only T0 entries may be granted.

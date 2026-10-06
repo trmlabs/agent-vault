@@ -3,6 +3,7 @@ package auditchain
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -57,7 +58,7 @@ func authzFixture(t *testing.T) (*fixture, string) {
 	t.Helper()
 	f := newFixture(t)
 	if err := f.chain.Record(Event{Event: EventDenied, Pool: "claude", Binding: "vault/core", Outcome: "not_entitled",
-		RequesterKind: "person", RequesterOID: "oid-1", TokenSHA256: "ab", Tier: "T1", Decision: "not_entitled", Groups: "g1", CacheAgeSec: 3,
+		RequesterKind: "person", RequesterOID: "oid-1", TokenSHA256: "ab", Tier: "T1", Decision: "not_entitled", Groups: "11111111-2222-3333-4444-555555555555", CacheAgeSec: 3,
 		Kid: "invalid", KidSHA256: "0123456789ab", Peer: "10.0.0.5"}); err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +71,7 @@ func TestAuthorizationFieldEditsAreDetected(t *testing.T) {
 	for name, edit := range map[string][2]string{
 		"decision":  {`"decision":"not_entitled"`, `"decision":"entitled"`},
 		"tier":      {`"tier":"T1"`, `"tier":"T0"`},
-		"groups":    {`"groups":"g1"`, `"groups":"g2"`},
+		"groups":    {`"groups":"11111111-2222-3333-4444-555555555555"`, `"groups":"11111111-2222-3333-4444-555555555556"`},
 		"person":    {`"requesterOID":"oid-1"`, `"requesterOID":"oid-2"`},
 		"kind":      {`"requesterKind":"person"`, `"requesterKind":"workload"`},
 		"token":     {`"tokenSHA256":"ab"`, `"tokenSHA256":"cd"`},
@@ -170,5 +171,23 @@ func TestUpgradeFromV2VerifiesAndNeverStepsDown(t *testing.T) {
 	line, _ := json.Marshal(forged)
 	if report := verify(t, f.verifier(), out+string(line)+"\n"); !hasKind(report, FindingEdit) {
 		t.Fatalf("step down from v3 to v2 accepted: %v", kinds(report))
+	}
+}
+
+// A decision may check any number of groups: the row records the full list,
+// which only Entra object IDs may form, and its MAC covers it.
+func TestManyGroupsAreRecordedInFull(t *testing.T) {
+	var groups []string
+	for i := range 1000 {
+		groups = append(groups, fmt.Sprintf("%08x-0000-0000-0000-%012x", i, i))
+	}
+	many := strings.Join(groups, ",")
+	if (Event{Event: EventDenied, Groups: many}).Validate() != nil {
+		t.Fatal("1,000 groups refused")
+	}
+	for _, bad := range []string{"g1", many + ",", many + ",not a group", "11111111-2222-3333-4444-555555555555 "} {
+		if (Event{Event: EventDenied, Groups: bad}).Validate() == nil {
+			t.Errorf("group list %.40q accepted", bad)
+		}
 	}
 }

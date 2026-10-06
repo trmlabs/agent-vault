@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -173,12 +175,33 @@ func (e Event) Validate() error {
 	if e.CacheAgeSec < 0 {
 		return ErrInvalidEvent
 	}
-	for _, v := range []string{e.Pool, e.Agent, e.PodUID, e.Binding, e.Session, e.Outcome, e.Requester, e.RequesterKind, e.RequesterOID, e.TokenSHA256, e.Tier, e.Decision, e.Groups, e.Kid, e.KidSHA256, e.Peer} {
+	for _, v := range []string{e.Pool, e.Agent, e.PodUID, e.Binding, e.Session, e.Outcome, e.Requester, e.RequesterKind, e.RequesterOID, e.TokenSHA256, e.Tier, e.Decision, e.Kid, e.KidSHA256, e.Peer} {
 		if !identifier(v, true) {
 			return ErrInvalidEvent
 		}
 	}
+	if !groupList(e.Groups) {
+		return ErrInvalidEvent
+	}
 	return nil
+}
+
+var groupID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// groupList admits the comma-separated Entra object IDs of the groups a
+// decision checked. It has no length limit: an entry may require any number
+// of groups, the full list is recorded, and the row's MAC covers it. Every
+// element must still be an object ID, so no free text can enter the row.
+func groupList(s string) bool {
+	if s == "" {
+		return true
+	}
+	for _, g := range strings.Split(s, ",") {
+		if !groupID.MatchString(g) {
+			return false
+		}
+	}
+	return true
 }
 
 // Record appends a caller event. An error means the row may not exist, so the
