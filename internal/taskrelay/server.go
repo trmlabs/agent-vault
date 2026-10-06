@@ -244,12 +244,16 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 		if e != nil {
 			return errConfig
 		}
-		catalog := make(map[string]bool, len(pl.Databases))
-		for _, name := range pl.Databases {
-			catalog[name] = true
+		route := brokerRouteDatabase
+		if pl.Routes != routesBroker {
+			catalog := make(map[string]bool, len(pl.Databases))
+			for _, name := range pl.Databases {
+				catalog[name] = true
+			}
+			route = func(name string) bool { return catalog[name] }
 		}
 		binding := pl.route("")
-		servePostgres(l, func(conn net.Conn) { r.postgres(conn, binding, catalog) })
+		servePostgres(l, func(conn net.Conn) { r.postgres(conn, binding, route) })
 	}
 	if c.Browser != nil {
 		bc := c.Browser

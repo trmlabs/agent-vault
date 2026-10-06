@@ -86,7 +86,16 @@ type ConnectConfig struct {
 	Listen         string         `json:"listen"`
 	Upstream       UpstreamConfig `json:"upstream"`
 	AllowedTargets []string       `json:"allowedTargets"`
+	// Routes "broker", in shared mode only and in place of AllowedTargets,
+	// forwards any well-formed host:443 to the broker, whose catalog refuses
+	// a host it does not list. See brokerRouteTarget.
+	Routes string `json:"routes,omitempty"`
 }
+
+// routesBroker leaves routing to the broker's catalog. It must be set
+// explicitly: a config that merely drops its list fails validation.
+const routesBroker = "broker"
+
 type PostgresConfig struct {
 	Listen      string         `json:"listen"`
 	Upstream    UpstreamConfig `json:"upstream"`
@@ -103,9 +112,13 @@ type PostgresConfig struct {
 type PostgresListenerConfig struct {
 	Listen      string         `json:"listen"`
 	Upstream    UpstreamConfig `json:"upstream"`
-	Databases   []string       `json:"databases"`
+	Databases   []string       `json:"databases,omitempty"`
 	User        string         `json:"user"`
 	Placeholder string         `json:"placeholder"`
+	// Routes "broker", in place of Databases, forwards any well-formed
+	// database name to the broker, whose catalog refuses a name not granted
+	// to the agent's pool with the same 3D000 words. See brokerRouteDatabase.
+	Routes string `json:"routes,omitempty"`
 }
 
 // route is the binding for one catalog database on this listener.
@@ -204,7 +217,7 @@ func (c FixedConfig) Validate(now time.Time) error {
 		return nil
 	}
 	if c.Connect != nil {
-		if check(c.Connect.Listen, c.Connect.Upstream) != nil || len(c.Connect.AllowedTargets) == 0 || len(c.Connect.AllowedTargets) > 32 {
+		if check(c.Connect.Listen, c.Connect.Upstream) != nil || c.Connect.Routes != "" || len(c.Connect.AllowedTargets) == 0 || len(c.Connect.AllowedTargets) > 32 {
 			return errConfig
 		}
 		for _, target := range c.Connect.AllowedTargets {
@@ -255,7 +268,7 @@ func (c FixedConfig) validateSelf(now time.Time) error {
 		return nil
 	}
 	if c.Connect != nil {
-		if check(c.Connect.Listen, c.Connect.Upstream) != nil || len(c.Connect.AllowedTargets) == 0 || len(c.Connect.AllowedTargets) > 32 {
+		if check(c.Connect.Listen, c.Connect.Upstream) != nil || c.Connect.Routes != "" || len(c.Connect.AllowedTargets) == 0 || len(c.Connect.AllowedTargets) > 32 {
 			return errConfig
 		}
 		for _, target := range c.Connect.AllowedTargets {

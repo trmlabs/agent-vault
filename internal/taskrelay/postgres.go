@@ -46,10 +46,10 @@ type cancelTarget struct {
 // row by sending a rejected startup or placeholder; a peer that closes without
 // sending a startup packet leaves nothing.
 //
-// On a routed listener (catalog non-nil) the startup's database parameter
-// picks the binding: a name in the catalog fixes Database to it, and any other
+// On a routed listener (route non-nil) the startup's database parameter
+// picks the binding: a name route accepts fixes Database to it, and any other
 // name is refused with the no_database words before admission.
-func (r *relay) postgres(conn net.Conn, binding PostgresConfig, catalog map[string]bool) {
+func (r *relay) postgres(conn net.Conn, binding PostgresConfig, route func(database string) bool) {
 	_ = conn.SetDeadline(minTime(r.config.Deadline, time.Now().Add(handshakeTimeout)))
 	peer := conn.RemoteAddr().String()
 	// The listener hands over the connection before the TLS handshake, so a
@@ -123,8 +123,8 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig, catalog map[stri
 	var startup pgproto3.StartupMessage
 	c := &binding
 	decoded := startup.Decode(packet[4:]) == nil && startup.ProtocolVersion == pgproto3.ProtocolVersionNumber
-	if decoded && catalog != nil {
-		if !catalog[startup.Parameters["database"]] {
+	if decoded && route != nil {
+		if !route(startup.Parameters["database"]) {
 			_ = r.record("postgres", "denied:no-database")
 			refusal := refusalsByReason["no_database"]
 			_, _ = conn.Write(errorFrame(refusal.code, refusal.message))
@@ -642,4 +642,19 @@ func severityFrame(severity, code, message string) []byte {
 		body = append(append(append(body, f.t), f.v...), 0)
 	}
 	return encodePGFrame('E', append(body, 0))
+}
+
+// brokerRouteDatabase is the shape a database name must have to be forwarded
+// under broker routing: 1 to 63 printable ASCII bytes with no space, within
+// PostgreSQL's identifier length. The broker's catalog decides the rest.
+func brokerRouteDatabase(name string) bool {
+	if len(name) == 0 || len(name) > 63 {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		if name[i] < 0x21 || name[i] > 0x7e {
+			return false
+		}
+	}
+	return true
 }

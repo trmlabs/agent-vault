@@ -136,6 +136,8 @@ One PostgreSQL port can serve every catalog database. Set `postgresListener` (sh
 
 The startup packet's `database` parameter picks the route. `databases` is the route table, rendered from the catalog, with no fixed count; a name outside it, or a startup with no database, is refused with SQLSTATE 3D000 ("this database isn't in the Gatehouse catalog for your pool") before the broker is dialed, and audited as `denied:no-database`. A name in it goes to the one upstream, which authorizes it for the agent's pool. An SSLRequest or GSSENCRequest is answered first, as on every PostgreSQL listener, and a cancellation on the port reaches only a session it opened. The config file may be up to 16 MiB, enough for tens of thousands of names.
 
+Neither list has to be kept by hand. In shared mode, `"routes": "broker"` on `connect` (in place of `allowedTargets`) or on `postgresListener` (in place of `databases`) forwards every well-formed request to the broker, whose catalog is then the only route table. A CONNECT target must be a lower-case DNS name of two or more labels on port 443, never an IP literal. A database name must be 1 to 63 printable ASCII bytes with no space. Anything else is refused at the proxy without contacting the broker. The broker refuses a host or database it does not grant the agent's pool: CONNECT gets a 403, and PostgreSQL gets SQLSTATE 3D000 with the same words as a local refusal. The flag is explicit and exclusive. A listener with both a list and the flag, or with neither, fails validation, so dropping a list never opens a listener.
+
 To encrypt the hop from each agent Pod to the proxy, set `tls` (shared mode only) instead of `tlsCertFile` and `tlsKeyFile`:
 
 ```json
