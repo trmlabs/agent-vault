@@ -291,9 +291,9 @@ func (m *DurableLeaseMinter) ConfirmDatabaseCleanup(ctx context.Context, accesso
 	if !unknown {
 		return fmt.Errorf("unknown-issuance record not found")
 	}
-	if err := m.client.RevokeDatabaseSession(ctx, accessor); err != nil {
-		return err
-	}
+	// The record's child token is not revoked here: its value died with the
+	// process that held it, and it expires within its TTL, revoking any lease
+	// it issued. The operator's database evidence is what reopens the binding.
 	return m.journal.ConfirmDatabaseCleanup(ctx, m.owner, accessor, evidence)
 }
 
@@ -387,15 +387,16 @@ func (m *DurableLeaseMinter) reconcile(ctx context.Context, binding string) erro
 		}
 		cleanupCtx, cancel := context.WithTimeout(ctx, leaseRevokeTimeout)
 		var err error
+		// A record no live session holds belongs to a dead or retired session:
+		// its credential is revoked by path. Its child token is not revoked by
+		// accessor, a right no policy could limit to the broker's own tokens;
+		// only that session's process ever held the token, and it expires
+		// within its TTL.
 		if record.LeaseID == "" {
-			_ = m.client.RevokeDatabaseSession(cleanupCtx, record.Accessor)
 			_ = m.journal.QuarantineDatabaseCleanup(cleanupCtx, m.owner, record.Accessor)
 			err = fmt.Errorf("unknown database issuance requires operator reconciliation")
 		} else {
 			err = m.client.RevokeDatabaseLeaseConfirmed(cleanupCtx, record.LeaseID)
-			if err == nil {
-				err = m.client.RevokeDatabaseSession(cleanupCtx, record.Accessor)
-			}
 		}
 		cancel()
 		if err == nil {
@@ -513,12 +514,10 @@ func (m *DurableLeaseMinter) Revoke(ctx context.Context, id string) error {
 	if err := m.client.RevokeDatabaseLeaseConfirmed(ctx, id); err != nil {
 		return err
 	}
-	revoke := func() error { return m.client.RevokeDatabaseSession(ctx, lease.accessor) }
+	// The credential is gone; ending the child token is tidiness, not a
+	// condition for clearing the record (see DatabaseSession.Revoke).
 	if lease.session != nil {
-		revoke = func() error { return lease.session.Revoke(ctx) }
-	}
-	if err := revoke(); err != nil {
-		return err
+		_ = lease.session.Revoke(ctx)
 	}
 	return m.journal.DeleteDatabaseCleanup(ctx, lease.accessor)
 }

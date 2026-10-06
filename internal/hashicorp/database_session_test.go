@@ -143,7 +143,7 @@ func TestDatabaseProviderErrorsDoNotExposeResponseBody(t *testing.T) {
 }
 
 // A live session revokes itself with its own child token, so the broker needs
-// no right over other tokens. If that fails it falls back to the accessor.
+// no right over other tokens. It never falls back to the accessor.
 func TestDatabaseSessionRevokesItself(t *testing.T) {
 	policy := DatabaseCredentialPolicyName("database", "reader")
 	for _, selfFails := range []bool{false, true} {
@@ -175,12 +175,12 @@ func TestDatabaseSessionRevokesItself(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := session.Revoke(context.Background()); err != nil {
-			t.Fatal(err)
+		if err := session.Revoke(context.Background()); (err != nil) != selfFails {
+			t.Fatalf("selfFails=%v: %v", selfFails, err)
 		}
 		want := [2]int32{1, 0}
 		if selfFails {
-			want = [2]int32{0, 1}
+			want = [2]int32{0, 0}
 		}
 		if got := [2]int32{selfRevoked.Load(), accessorRevoked.Load()}; got != want {
 			t.Errorf("selfFails=%v: self and accessor revokes %v, want %v", selfFails, got, want)

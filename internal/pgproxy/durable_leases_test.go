@@ -250,9 +250,12 @@ func TestDurableLeaseLostIssuanceResponseRecoversOnRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The unknown issuance's child token is not revoked by accessor: only its
+	// lost process held it, and Vault revokes it and its credential at its
+	// TTL. The fixture has no TTL, so both sessions are still live here.
 	f.mu.Lock()
-	if len(f.live) != 1 {
-		t.Error("unknown issued credential not removed")
+	if len(f.live) != 2 {
+		t.Errorf("live sessions %d, want the new one and the unknown one", len(f.live))
 	}
 	f.mu.Unlock()
 	if err = m2.Revoke(ctx, lease.ID); err != nil {
@@ -379,5 +382,29 @@ func TestDurableLeaseRevokeUsesTheChildToken(t *testing.T) {
 	defer f.mu.Unlock()
 	if f.selfRevokes != 1 || f.accessorRevs != 0 || len(f.live) != 0 {
 		t.Fatalf("self revokes %d, accessor revokes %d, live %v", f.selfRevokes, f.accessorRevs, f.live)
+	}
+}
+
+// Cleaning up after a dead replica revokes credentials by path and never
+// revokes tokens by accessor, a right no policy can limit to the broker's own.
+func TestDurableRecoveryNeverRevokesByAccessor(t *testing.T) {
+	client, st, f := durableFixture(t)
+	m := newDurableForTest(t, client, st)
+	ctx := context.Background()
+	svc := &DatabaseService{Name: "db", Mount: "database", Role: "reader"}
+	if _, err := m.Mint(ctx, AgentScope{VaultID: "vault"}, svc); err != nil {
+		t.Fatal(err)
+	}
+	// The replica dies without releasing; a survivor reconciles its records.
+	m.activeMu.Lock()
+	m.active = map[string]durableLease{}
+	m.activeMu.Unlock()
+	if _, err := m.Mint(ctx, AgentScope{VaultID: "vault"}, svc); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.accessorRevs != 0 {
+		t.Fatalf("recovery revoked %d tokens by accessor", f.accessorRevs)
 	}
 }

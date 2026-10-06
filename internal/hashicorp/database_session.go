@@ -67,7 +67,11 @@ func (c *Client) NewDatabaseSession(ctx context.Context, mount, role string, ttl
 	if len(secret.Auth.Policies) != 1 || secret.Auth.Policies[0] != DatabaseCredentialPolicyName(mount, role) || len(secret.Auth.IdentityPolicies) != 0 || secret.Auth.Renewable {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 		defer cancel()
-		_ = c.RevokeDatabaseSession(cleanupCtx, secret.Auth.Accessor)
+		api.SetToken(secret.Auth.ClientToken)
+		_ = api.Auth().Token().RevokeSelfWithContext(cleanupCtx, "")
+		if c.logins != nil {
+			c.logins.forget(secret.Auth.Accessor)
+		}
 		return nil, fmt.Errorf("database child token has unexpected policy or renewal authority")
 	}
 	api.SetToken(secret.Auth.ClientToken)
@@ -85,20 +89,20 @@ func (c *Client) NewDatabaseSession(ctx context.Context, mount, role string, ttl
 
 // Revoke ends the session with its own child token (auth/token/revoke-self),
 // which revokes the leases it issued with it. Only this process ever held the
-// token, so the broker needs no right over any other token. If that fails it
-// falls back to the parent's accessor revoke, as crash recovery does.
+// token, so the broker needs no right over any other token. If it fails, the
+// token stays harmless: its value lives only in this process, its leases are
+// revoked by path, and it expires within its TTL, or sooner with its parent
+// login, which no longer waits for it.
 func (s *DatabaseSession) Revoke(ctx context.Context) error {
-	if err := s.client.api.Auth().Token().RevokeSelfWithContext(ctx, ""); err == nil {
-		if s.parent != nil && s.parent.logins != nil {
-			s.parent.logins.forget(s.Accessor)
-			s.parent.revokeIdle(ctx)
-		}
-		return nil
+	err := s.client.api.Auth().Token().RevokeSelfWithContext(ctx, "")
+	if s.parent != nil && s.parent.logins != nil {
+		s.parent.logins.forget(s.Accessor)
+		s.parent.revokeIdle(ctx)
 	}
-	if s.parent == nil {
+	if err != nil {
 		return fmt.Errorf("revoke database session failed")
 	}
-	return s.parent.RevokeDatabaseSession(ctx, s.Accessor)
+	return nil
 }
 
 func (s *DatabaseSession) ReadCredential(ctx context.Context) (*DatabaseCredential, error) {
@@ -112,11 +116,11 @@ func (s *DatabaseSession) ReadCredential(ctx context.Context) (*DatabaseCredenti
 	return credential, nil
 }
 
-// RevokeDatabaseSession revokes a session's child token by accessor, the only
-// handle left once the process that held the token is gone. A policy without
-// revoke-accessor refuses it (403); that counts as done, because the token's
-// value died with its process and the token expires within its TTL, which is
-// capped at the session TTL. Its leases are revoked by path separately.
+// RevokeDatabaseSession revokes a child token by accessor. The broker's own
+// cleanup no longer uses it: a held session revokes itself, and a dead
+// replica's tokens expire within their TTL after their leases are revoked by
+// path. It remains for operators with revoke-accessor. A policy without that
+// right refuses it (403), which counts as done.
 func (c *Client) RevokeDatabaseSession(ctx context.Context, accessor string) error {
 	if accessor == "" {
 		return fmt.Errorf("database session accessor is required")
