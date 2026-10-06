@@ -6,6 +6,7 @@ The broker catalog is the one list of everything workers may reach through the b
 
 - **Source:** a YAML file in trm-infra, next to the Vault roles and key paths its entries use, so one Atlantis pull request creates both. The `gatehouse-catalog` module validates it at plan time and writes it as JSON to the KV version 2 secret `gatehouse/catalog`, field `catalog`.
 - **Broker:** `AGENT_VAULT_CATALOG_VAULT_PATH=gatehouse/catalog`. The broker refuses to start without a valid catalog, then polls every 30 seconds. A new version that passes the broker's parser replaces the old one atomically, and the next request or connection uses it. A version that fails is logged as `broker catalog version rejected` with its number, and the last good catalog stays in force. Alert on that log line.
+- **One secret per entry:** `AGENT_VAULT_CATALOG_VAULT_PREFIX=gatehouse/catalog` reads the same catalog split so no single secret holds all of it, which is how a catalog grows past Vault's size limit for one secret. The layout is below. Set this or `AGENT_VAULT_CATALOG_VAULT_PATH`, never both; the single document stays accepted while catalogs move.
 - **Fixed file:** `AGENT_VAULT_HTTP_CATALOG_FILE` still works for local fixtures. It is read once at start.
 
 ## Format
@@ -67,3 +68,17 @@ Every field is required except `requester`, `crossCluster` and `caSpkiEnv`, and 
 ## Egress
 
 The broker's network policy allows the approved data-plane ranges once. Inside the broker, `AGENT_VAULT_EGRESS_RANGES` (comma-separated CIDRs) confines every resolved destination address to those ranges, public or private. An unparseable value allows nothing. A destination is reachable only when its host is in the catalog and its address is in these ranges. A new database in an existing range needs no network change. Only a new range needs a second change, in the broker's network policy.
+
+## One secret per entry
+
+Under `AGENT_VAULT_CATALOG_VAULT_PREFIX=<mount>/<prefix>`:
+
+| Secret | Field | Holds |
+|---|---|---|
+| `<prefix>/head` | `catalog` | The catalog document without `entries`, for example the `pools` list. |
+| `<prefix>/head` | `entries_sha256` | SHA-256, lowercase hex, over every entry in byte order of name: the name, a newline, the stored entry JSON, a newline. |
+| `<prefix>/entries/<name>` | `entry` | One entry's JSON. Its `name` must equal `<name>`. |
+
+Write every changed entry first and the head last. The head's KV version is the catalog version: each poll reads only the head, and reads every entry only when that version changes. If the entries read do not hash to the head's digest, because an apply is part way through, the broker logs `broker catalog version rejected`, keeps the last good catalog and tries again at the next poll. A head that carries `entries` is refused.
+
+The broker's Vault policy needs `read` on `<mount>/data/<prefix>/head` and `<mount>/data/<prefix>/entries/*`, and `list` on `<mount>/metadata/<prefix>/entries`. Reads run 64 at a time; that sets reload speed, not how many entries the catalog may hold. The tests load 20,000 entries.

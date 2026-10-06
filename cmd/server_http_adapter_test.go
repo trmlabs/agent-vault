@@ -42,6 +42,17 @@ func TestHTTPHeaderAdapterStartupRefusals(t *testing.T) {
 	}
 }
 
+func TestCatalogTakesOneVaultLocation(t *testing.T) {
+	env := map[string]string{"AGENT_VAULT_CATALOG_VAULT_PATH": "gatehouse/catalog", "AGENT_VAULT_CATALOG_VAULT_PREFIX": "gatehouse/catalog"}
+	if _, err := brokerCatalog(context.Background(), nil, func(k string) string { return env[k] }, slog.New(slog.DiscardHandler)); err == nil || !strings.Contains(err.Error(), "not both") {
+		t.Fatalf("both locations accepted: %v", err)
+	}
+	delete(env, "AGENT_VAULT_CATALOG_VAULT_PATH")
+	if _, err := brokerCatalog(context.Background(), nil, func(k string) string { return env[k] }, slog.New(slog.DiscardHandler)); err == nil || !strings.Contains(err.Error(), "Vault client") {
+		t.Fatalf("per-entry catalog without Vault: %v", err)
+	}
+}
+
 func TestGitHubAppSignerRequiresAKeyLocation(t *testing.T) {
 	if _, err := githubAppSigner(nil, func(string) string { return "" }); err == nil || !strings.Contains(err.Error(), "GITHUB_APP") {
 		t.Fatalf("git entries without an App key location: %v", err)
