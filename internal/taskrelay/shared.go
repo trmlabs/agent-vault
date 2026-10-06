@@ -83,9 +83,15 @@ func (s *SharedConfig) namespaces() []string {
 	return out
 }
 
+// maxSharedProfiles matches the broker's proxy binding bound.
+const maxSharedProfiles = 10000
+
 func (s *SharedConfig) validate() error {
-	if len(s.Profiles) == 0 || len(s.Profiles) > 64 || !kindPattern.MatchString(s.OwnerKind) || !apiVersionPattern.MatchString(s.OwnerAPIVersion) ||
-		len(s.ImageDigests) > 16 || s.MaxPodSeconds < 60 || s.MaxPodSeconds > int64(workloadidentity.DefaultSessionCeiling/time.Second) || s.MaxConnections < 0 || s.MaxConnections > 65536 {
+	// No small caps: a shared proxy serves up to as many namespaces as the
+	// broker's proxy binding allows, and the config file's size bounds the
+	// lists.
+	if len(s.Profiles) == 0 || len(s.Profiles) > maxSharedProfiles || !kindPattern.MatchString(s.OwnerKind) || !apiVersionPattern.MatchString(s.OwnerAPIVersion) ||
+		s.MaxPodSeconds < 60 || s.MaxPodSeconds > int64(workloadidentity.DefaultSessionCeiling/time.Second) || s.MaxConnections < 0 || s.MaxConnections > 65536 {
 		return errConfig
 	}
 	for ns, profile := range s.Profiles {
@@ -157,7 +163,7 @@ func (c FixedConfig) validateShared(now time.Time) error {
 		// config is refused, so a dropped list never opens the listener.
 		targets := len(c.Connect.AllowedTargets)
 		if check(c.Connect.Listen, c.Connect.Upstream) != nil || (c.Connect.Routes != "" && c.Connect.Routes != routesBroker) ||
-			(c.Connect.Routes == routesBroker) == (targets != 0) || targets > 32 {
+			(c.Connect.Routes == routesBroker) == (targets != 0) {
 			return errConfig
 		}
 		for _, target := range c.Connect.AllowedTargets {

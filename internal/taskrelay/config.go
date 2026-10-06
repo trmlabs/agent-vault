@@ -231,7 +231,7 @@ func (c FixedConfig) Validate(now time.Time) error {
 		return nil
 	}
 	if c.Connect != nil {
-		if check(c.Connect.Listen, c.Connect.Upstream) != nil || c.Connect.Routes != "" || len(c.Connect.AllowedTargets) == 0 || len(c.Connect.AllowedTargets) > 32 {
+		if check(c.Connect.Listen, c.Connect.Upstream) != nil || c.Connect.Routes != "" || len(c.Connect.AllowedTargets) == 0 {
 			return errConfig
 		}
 		for _, target := range c.Connect.AllowedTargets {
@@ -282,7 +282,7 @@ func (c FixedConfig) validateSelf(now time.Time) error {
 		return nil
 	}
 	if c.Connect != nil {
-		if check(c.Connect.Listen, c.Connect.Upstream) != nil || c.Connect.Routes != "" || len(c.Connect.AllowedTargets) == 0 || len(c.Connect.AllowedTargets) > 32 {
+		if check(c.Connect.Listen, c.Connect.Upstream) != nil || c.Connect.Routes != "" || len(c.Connect.AllowedTargets) == 0 {
 			return errConfig
 		}
 		for _, target := range c.Connect.AllowedTargets {
