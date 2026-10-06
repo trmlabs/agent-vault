@@ -2,6 +2,7 @@ package mitm
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -19,9 +20,10 @@ import (
 const githubTokenPlaceholder = "__vault_GITHUB_TOKEN__"
 
 // forwardGitHubAPI serves the GitHub REST endpoints an agent needs to open a
-// pull request and comment on it, for one listed repository, with a token
-// minted for that repository with pull_requests write only. It can never
-// approve or merge: reviews and merges are unlisted paths.
+// pull request from its pool's own branch, read it and comment on it, for one
+// listed repository, with a token minted for that repository with
+// pull_requests write only. It can never approve, merge or update one:
+// reviews, merges and edits are unlisted paths.
 func (p *Proxy) forwardGitHubAPI(w http.ResponseWriter, r *http.Request, target string, scope *brokercore.ProxyScope, event auditchain.Event, api httpcatalog.GitRequest, matchErr error) {
 	a := p.adapter
 	if api.Entry != nil {
@@ -47,7 +49,7 @@ func (p *Proxy) forwardGitHubAPI(w http.ResponseWriter, r *http.Request, target 
 	expected := hostHeaderForScheme("https", target)
 	if r.URL.IsAbs() || (r.Host != target && r.Host != expected) || r.URL.User != nil || r.URL.Fragment != "" || r.URL.RawPath != "" ||
 		unsafePath(r.URL.Path) || r.Header.Get("Upgrade") != "" || r.Header.Get("Content-Encoding") != "" || len(r.Trailer) > 0 ||
-		!strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+		(api.Write && !strings.HasPrefix(r.Header.Get("Content-Type"), "application/json")) {
 		deny(http.StatusBadRequest, "request_shape")
 		return
 	}
@@ -68,6 +70,13 @@ func (p *Proxy) forwardGitHubAPI(w http.ResponseWriter, r *http.Request, target 
 	case bytes.Contains(body, []byte(placeholderMarker)):
 		deny(http.StatusBadRequest, "placeholder_misplaced")
 		return
+	case !api.Write && len(body) > 0:
+		deny(http.StatusBadRequest, "request_shape")
+		return
+	}
+	if api.OpensPullRequest && !pullRequestFromPoolBranch(body, api.Repo.Repo, api.HeadPrefixes) {
+		deny(http.StatusForbidden, "head")
+		return
 	}
 	enf := p.rateLimit.EnforceProxy(r.Context(), scope.AgentID+"/"+scope.WorkloadID, entry.Name)
 	if !enf.Allowed {
@@ -82,7 +91,11 @@ func (p *Proxy) forwardGitHubAPI(w http.ResponseWriter, r *http.Request, target 
 		return
 	}
 	outURL := &url.URL{Scheme: "https", Host: target, Path: r.URL.Path}
-	out, err := http.NewRequestWithContext(r.Context(), http.MethodPost, outURL.String(), bytes.NewReader(body))
+	method, outBody := http.MethodPost, io.Reader(bytes.NewReader(body))
+	if !api.Write {
+		method, outBody = http.MethodGet, nil
+	}
+	out, err := http.NewRequestWithContext(r.Context(), method, outURL.String(), outBody)
 	if err != nil {
 		deny(http.StatusBadRequest, "request_shape")
 		return
@@ -112,4 +125,49 @@ func (p *Proxy) forwardGitHubAPI(w http.ResponseWriter, r *http.Request, target 
 	p.relayScreened(w, out, needles, entry.MaxResponseBytes, finish, func(*http.Response) {
 		a.GitTokens.Invalidate(app, api.Repo.Repo, githubapp.PullRequestsWrite)
 	}, nil)
+}
+
+// pullRequestFromPoolBranch reports whether a create-pull-request body opens
+// one from a branch of this repository under one of the pool's push prefixes.
+// A head naming another owner ("owner:branch") or another repository, or a
+// pull request made from an issue, is refused, as is any body that is not one
+// JSON object.
+func pullRequestFromPoolBranch(body []byte, repo string, prefixes []string) bool {
+	var req map[string]json.RawMessage
+	if json.Unmarshal(body, &req) != nil {
+		return false
+	}
+	if _, ok := req["issue"]; ok {
+		return false
+	}
+	if raw, ok := req["head_repo"]; ok {
+		var headRepo string
+		if json.Unmarshal(raw, &headRepo) != nil || !strings.EqualFold(headRepo, repo) {
+			return false
+		}
+	}
+	var head string
+	if json.Unmarshal(req["head"], &head) != nil || strings.Contains(head, ":") || unsafeBranch(head) {
+		return false
+	}
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(head, prefix) && len(head) > len(prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// unsafeBranch refuses a branch name with a path step that could leave the
+// prefix (".."), a control character or a space.
+func unsafeBranch(name string) bool {
+	if name == "" || strings.Contains(name, "..") {
+		return true
+	}
+	for _, c := range name {
+		if c <= ' ' || c == 0x7f {
+			return true
+		}
+	}
+	return false
 }

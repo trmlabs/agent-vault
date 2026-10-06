@@ -583,7 +583,12 @@ func (e *Entry) normalizeGit() error {
 type GitRequest struct {
 	Entry *Entry
 	Repo  GitRepo
-	Write bool // receive-pack: the push service
+	Write bool // receive-pack: the push service; for github-api, a POST
+	// OpensPullRequest marks a github-api request that opens a pull request;
+	// its head must start with one of HeadPrefixes, the pool's own push
+	// prefixes (none: no pull request may be opened).
+	OpensPullRequest bool
+	HeadPrefixes     []string
 }
 
 // GitMatch routes a request to a git entry. ok is false when the host has no
@@ -641,11 +646,13 @@ func (c Catalog) GitMatch(host string, port int, method, path, rawQuery, pool st
 }
 
 // GitHubAPIMatch routes a request to a github-api entry. ok is false when the
-// host has none. Only POST to these paths exists, for a listed repository:
-// /repos/{owner}/{repo}/pulls (open a pull request),
-// /repos/{owner}/{repo}/issues/{n}/comments (comment on one),
-// /repos/{owner}/{repo}/pulls/{n}/comments and .../comments/{id}/replies
-// (review comments). Reviews, merges and everything else are unlisted.
+// host has none. For a listed repository only these exist:
+// POST /repos/{owner}/{repo}/pulls (open a pull request, from a branch under
+// the pool's own push prefixes: HeadPrefixes),
+// GET /repos/{owner}/{repo}/pulls/{n} (read one, for its state and checks
+// summary), POST .../issues/{n}/comments (comment on one) and POST
+// .../pulls/{n}/comments and .../comments/{id}/replies (review comments).
+// Reviews, merges, updates and everything else are unlisted.
 func (c Catalog) GitHubAPIMatch(host string, port int, method, path, rawQuery, pool string) (GitRequest, bool, error) {
 	host = strings.ToLower(host)
 	var hostEntries []*Entry
@@ -658,7 +665,11 @@ func (c Catalog) GitHubAPIMatch(host string, port int, method, path, rawQuery, p
 		return GitRequest{}, false, nil
 	}
 	parts := strings.Split(path, "/")
-	if rawQuery != "" || len(parts) < 5 || parts[0] != "" || parts[1] != "repos" || !githubAPIEndpoint(parts[4:]) {
+	if rawQuery != "" || len(parts) < 5 || parts[0] != "" || parts[1] != "repos" {
+		return GitRequest{}, true, ErrUnlisted
+	}
+	want, create := githubAPIEndpoint(parts[4:])
+	if want == "" {
 		return GitRequest{}, true, ErrUnlisted
 	}
 	repo := strings.ToLower(parts[2] + "/" + parts[3])
@@ -667,12 +678,15 @@ func (c Catalog) GitHubAPIMatch(host string, port int, method, path, rawQuery, p
 			if r.Repo != repo {
 				continue
 			}
-			matched := GitRequest{Entry: e, Repo: r, Write: true}
+			matched := GitRequest{Entry: e, Repo: r, Write: want == "POST"}
 			switch {
-			case method != "POST":
+			case method != want:
 				return matched, true, ErrMethod
 			case !contains(e.Pools, pool):
 				return matched, true, ErrPool
+			}
+			if create {
+				matched.OpensPullRequest, matched.HeadPrefixes = true, c.pushBranchPrefixes(repo, pool)
 			}
 			return matched, true, nil
 		}
@@ -680,7 +694,32 @@ func (c Catalog) GitHubAPIMatch(host string, port int, method, path, rawQuery, p
 	return GitRequest{}, true, ErrUnlisted
 }
 
-func githubAPIEndpoint(rest []string) bool {
+// pushBranchPrefixes are the branch names (refs/heads/ removed) a pool may
+// push to in a repository, from its git entries' refPrefixes. A pull request
+// may come only from one of them; none means none may be opened.
+func (c Catalog) pushBranchPrefixes(repo, pool string) []string {
+	var out []string
+	for _, e := range c.entries {
+		if e.Kind != "git" || e.Git == nil || !contains(e.Pools, pool) {
+			continue
+		}
+		for _, r := range e.Git.Repos {
+			if r.Repo != repo || r.Access != "write" {
+				continue
+			}
+			for _, prefix := range r.RefPrefixes {
+				if branch, ok := strings.CutPrefix(prefix, "refs/heads/"); ok && branch != "" {
+					out = append(out, branch)
+				}
+			}
+		}
+	}
+	return out
+}
+
+// githubAPIEndpoint returns the one method a GitHub REST path allows, or ""
+// when it is unlisted, and whether it opens a pull request.
+func githubAPIEndpoint(rest []string) (method string, create bool) {
 	number := func(s string) bool {
 		if s == "" || len(s) > 12 {
 			return false
@@ -692,15 +731,17 @@ func githubAPIEndpoint(rest []string) bool {
 		}
 		return true
 	}
-	switch len(rest) {
-	case 1:
-		return rest[0] == "pulls"
-	case 3:
-		return (rest[0] == "issues" || rest[0] == "pulls") && number(rest[1]) && rest[2] == "comments"
-	case 5:
-		return rest[0] == "pulls" && number(rest[1]) && rest[2] == "comments" && number(rest[3]) && rest[4] == "replies"
+	switch {
+	case len(rest) == 1 && rest[0] == "pulls":
+		return "POST", true
+	case len(rest) == 2 && rest[0] == "pulls" && number(rest[1]):
+		return "GET", false
+	case len(rest) == 3 && (rest[0] == "issues" || rest[0] == "pulls") && number(rest[1]) && rest[2] == "comments":
+		return "POST", false
+	case len(rest) == 5 && rest[0] == "pulls" && number(rest[1]) && rest[2] == "comments" && number(rest[3]) && rest[4] == "replies":
+		return "POST", false
 	}
-	return false
+	return "", false
 }
 
 // Match returns the entry for a request, choosing the longest path prefix

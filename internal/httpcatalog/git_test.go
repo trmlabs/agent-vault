@@ -2,6 +2,7 @@ package httpcatalog
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -118,6 +119,9 @@ func TestGitHubAPIEntries(t *testing.T) {
 		{"POST", "/repos/trmlabs/other/pulls", "", "pool-a", ErrUnlisted},
 		{"POST", "/repos/trmlabs/trm-b2b/pulls", "per_page=1", "pool-a", ErrUnlisted},
 		{"GET", "/repos/trmlabs/trm-b2b/pulls", "", "pool-a", ErrMethod},
+		{"GET", "/repos/trmlabs/trm-b2b/pulls/12", "", "pool-a", nil},
+		{"PATCH", "/repos/trmlabs/trm-b2b/pulls/12", "", "pool-a", ErrMethod},
+		{"GET", "/repos/trmlabs/trm-b2b/pulls/12/files", "", "pool-a", ErrUnlisted},
 		{"POST", "/repos/trmlabs/trm-b2b/pulls", "", "pool-b", ErrPool},
 		{"POST", "/user/repos", "", "pool-a", ErrUnlisted},
 	} {
@@ -127,6 +131,24 @@ func TestGitHubAPIEntries(t *testing.T) {
 	}
 	if _, ok, _ := c.GitHubAPIMatch("github.com", 443, "POST", "/repos/trmlabs/trm-b2b/pulls", "", "pool-a"); ok {
 		t.Fatal("git host routed to the API")
+	}
+	// Opening a pull request carries the pool's own push prefixes; other routes do not.
+	if m, _, _ := c.GitHubAPIMatch("api.github.com", 443, "POST", "/repos/trmlabs/trm-b2b/pulls", "", "pool-a"); !m.OpensPullRequest || fmt.Sprint(m.HeadPrefixes) != "[cursor/]" {
+		t.Fatalf("create: %+v", m)
+	}
+	if m, _, _ := c.GitHubAPIMatch("api.github.com", 443, "POST", "/repos/trmlabs/trm-b2b/issues/1/comments", "", "pool-a"); m.OpensPullRequest || m.HeadPrefixes != nil {
+		t.Fatalf("comment: %+v", m)
+	}
+	if m, _, _ := c.GitHubAPIMatch("api.github.com", 443, "GET", "/repos/trmlabs/trm-b2b/pulls/1", "", "pool-a"); m.Write {
+		t.Fatalf("read marked as a write: %+v", m)
+	}
+	// Without a git entry for the pool, there is no branch to open one from.
+	alone, err := Parse([]byte(`{"entries":[` + apiEntry + `]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m, _, _ := alone.GitHubAPIMatch("api.github.com", 443, "POST", "/repos/trmlabs/trm-b2b/pulls", "", "pool-a"); !m.OpensPullRequest || len(m.HeadPrefixes) != 0 {
+		t.Fatalf("no git entry: %+v", m)
 	}
 }
 
