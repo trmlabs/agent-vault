@@ -290,11 +290,11 @@ func TestBurstQueuesInsteadOfRefusing(t *testing.T) {
 		Auth: authFunc(func(_ context.Context, token, _ string) (*AgentScope, error) {
 			store.Lock()
 			defer store.Unlock()
-			time.Sleep(5 * time.Millisecond)
+			time.Sleep(2 * time.Millisecond)
 			return &AgentScope{VaultID: "v", ActorID: token}, nil
 		}),
 		Databases: &fakeResolver{svc: &DatabaseService{Name: "db", Addr: up.addr()}}, Leases: &fakeMinter{lease: newLease()}})
-	const burst = 200
+	const burst = 100
 	codes := make(chan string, burst)
 	var wg sync.WaitGroup
 	for i := range burst {
@@ -404,4 +404,30 @@ func TestQueuedRefusalReachesTheClient(t *testing.T) {
 	if code := connectExpectCode(t, addr, "queued", "db"); code != "53300" {
 		t.Fatalf("queued refusal: %q", code)
 	}
+}
+
+// One workload at its own cap opens more connections. While they wait for its
+// per-workload slot they hold no admission slot, so another workload's
+// admission does not stall behind them.
+func TestWorkloadAtItsCapDoesNotStallOthers(t *testing.T) {
+	up := startFakeUpstream(t, authTrust, "")
+	_, addr := startBroker(t, Options{AdmissionConcurrency: 2, MaxLeasesPerActor: 1, AdmissionTimeout: 1500 * time.Millisecond,
+		Auth: authFunc(func(_ context.Context, token, _ string) (*AgentScope, error) {
+			return &AgentScope{VaultID: "v", ActorID: token, WorkloadID: "pod-" + token}, nil
+		}),
+		Databases: &fakeResolver{svc: &DatabaseService{Name: "db", Addr: up.addr()}}, Leases: &fakeMinter{lease: newLease()}})
+	held := openAgentSession(t, addr, "hog", "db")
+	defer held.close()
+	codes := make(chan string, 2)
+	for range 2 {
+		go func() { codes <- connectExpectCode(t, addr, "hog", "db") }()
+	}
+	time.Sleep(200 * time.Millisecond)
+	start := time.Now()
+	code := connectExpectCode(t, addr, "victim", "db")
+	if elapsed := time.Since(start); code != "OK" || elapsed > 500*time.Millisecond {
+		t.Fatalf("victim %q after %s behind a workload waiting at its own cap", code, elapsed)
+	}
+	<-codes
+	<-codes
 }

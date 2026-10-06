@@ -85,6 +85,7 @@ type Broker struct {
 	acceptSem     chan struct{} // bounds accepted (handshaking) connections
 	admitSem      chan struct{} // bounds connections running admission's store calls
 	acceptStop    chan struct{} // closed by Shutdown, so a blocked accept loop stops
+	pendingWarned time.Time     // the accept loop's last pending-bound warning
 	serveSem      chan struct{} // bounds TOTAL serving connections across all databases
 
 	cancellations  map[string]*cancelTarget
@@ -283,8 +284,12 @@ func (b *Broker) Serve(l net.Listener) error {
 		select {
 		case b.acceptSem <- struct{}{}:
 		default:
-			b.logger.Warn("pgproxy: max pending connections reached; new connections wait to be accepted",
-				slog.Int("max_pending", b.opts.MaxPendingConns))
+			// One line per pendingWarnEvery, not one per blocked accept.
+			if now := time.Now(); now.Sub(b.pendingWarned) >= pendingWarnEvery {
+				b.pendingWarned = now
+				b.logger.Warn("pgproxy: max pending connections reached; new connections wait to be accepted",
+					slog.Int("max_pending", b.opts.MaxPendingConns))
+			}
 			select {
 			case b.acceptSem <- struct{}{}:
 			case <-b.acceptStop:
@@ -500,6 +505,10 @@ const defaultAdmissionConcurrency = 256
 
 var errAdmissionQueue = errors.New("admission queue wait exceeded")
 
+// pendingWarnEvery spaces the accept loop's warnings while it waits at the
+// pending bound.
+const pendingWarnEvery = 10 * time.Second
+
 // acquireAdmission waits up to the handshake budget for a slot to run
 // admission's store calls. The release is safe to call more than once.
 func (b *Broker) acquireAdmission(ctx context.Context) (func(), bool) {
@@ -630,6 +639,9 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	// wait can outlast the connection's startup deadline, so the refusal
 	// gets a fresh write deadline of its own.
 	busy := func(stage string) {
+		if b.ctx.Err() != nil {
+			return // the broker is stopping, not busy
+		}
 		b.logger.Warn("pgproxy: admission queue wait exceeded; refusing session",
 			slog.String("stage", stage), slog.Int("concurrency", b.opts.AdmissionConcurrency))
 		_ = conn.SetWriteDeadline(time.Now().Add(noticeWriteTimeout))
