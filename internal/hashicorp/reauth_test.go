@@ -35,8 +35,10 @@ type fakeVault struct {
 	parentOf    map[string]string // child accessor -> parent token
 	revoked     []string          // parent tokens revoked by the broker
 	failRevokes int               // revoke-self calls to fail before succeeding
-	policyFrom  int               // logins numbered below this lack the child policy: 403
-	missing     map[string]bool   // child policies no login holds: 403
+	denyRevoke  bool              // the login's policy has no revoke-self: 403
+	revokeCalls int
+	policyFrom  int             // logins numbered below this lack the child policy: 403
+	missing     map[string]bool // child policies no login holds: 403
 	creates     int
 	lastJWT     string
 }
@@ -80,6 +82,11 @@ func (f *fakeVault) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, map[string]any{"auth": map[string]any{"client_token": token, "lease_duration": 600, "renewable": true}})
 	case "/v1/auth/token/revoke-self":
+		f.revokeCalls++
+		if f.denyRevoke && strings.HasPrefix(token, "parent-") {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
 		if f.failRevokes > 0 {
 			f.failRevokes--
 			w.WriteHeader(http.StatusInternalServerError)
@@ -287,54 +294,76 @@ func TestJWTCloseRevokesLoginsWithoutSessions(t *testing.T) {
 	}
 }
 
-func TestJWTOlderLoginCeilingStopsRefreshAndThenMinting(t *testing.T) {
-	opts := defaultReauthOptions()
-	opts.maxRetired = 3
-	h := newJWTHarness(t, 4*3600, opts)
+// There is no ceiling on older logins: long sessions keep their logins in
+// custody, refresh carries on, and minting never stops on that account. Each
+// older login leaves custody at its fixed maximum lifetime.
+func TestJWTOlderLoginsHaveNoCeiling(t *testing.T) {
+	h := newJWTHarness(t, 4*3600, defaultReauthOptions())
 	// One long session per login keeps every older login in custody.
-	var held []*DatabaseSession
-	for i := 0; i < 4; i++ {
-		held = append(held, h.mustSessionFor(3*time.Hour))
-		if i < 3 {
-			h.advance(20 * time.Minute)
-		}
+	for i := 0; i < 8; i++ {
+		h.mustSessionFor(3 * time.Hour)
+		h.advance(20 * time.Minute)
 	}
-	if logins, _, revoked := h.vault.snapshot(); logins != 4 || len(revoked) != 0 {
-		t.Fatalf("logins=%d revoked=%v", logins, revoked)
+	if logins, _, revoked := h.vault.snapshot(); logins != 9 || len(revoked) != 0 {
+		t.Fatalf("logins=%d revoked=%v; refresh must not wait on older logins", logins, revoked)
 	}
-	if retired, sessions := h.c.logins.counts(); retired != 3 || sessions != 4 {
+	if retired, sessions := h.c.logins.counts(); retired != 8 || sessions != 8 {
 		t.Fatalf("retired=%d sessions=%d", retired, sessions)
 	}
-	// The next refresh is due but would hold a fourth older login: it waits.
-	h.advance(20 * time.Minute)
-	if logins, _, _ := h.vault.snapshot(); logins != 4 {
-		t.Fatalf("logins=%d; refresh must wait at the ceiling", logins)
+	if s := h.mustSession(); h.vault.parent(s.Accessor) != "parent-9" {
+		t.Fatal("minting stopped with older logins in custody")
 	}
-	if retired, _ := h.c.logins.counts(); retired != 3 {
-		t.Fatalf("retired=%d", retired)
+	// Past the first login's four-hour maximum it is dropped, not revoked.
+	// Every login still held is inside its lifetime and holds a session.
+	h.advance(80 * time.Minute)
+	h.c.reauthTick(context.Background()) // a login retired on the last tick is released on the next
+	now := h.clock.Now()
+	h.c.logins.mu.Lock()
+	for _, l := range h.c.logins.retired {
+		if !now.Before(l.hardExpiry) || len(l.children) == 0 || l.token == "parent-1" {
+			t.Errorf("held %s: expiry %v, sessions %d", l.token, l.hardExpiry, len(l.children))
+		}
 	}
-	// Once the current login ages out, minting stops without calling Vault.
-	h.advance(3 * time.Minute)
-	_, creates, _ := h.vault.snapshot()
-	if _, err := h.session(); !errors.Is(err, errStaleLogin) {
-		t.Fatalf("err=%v; minting must stop once the current login ages out", err)
+	h.c.logins.mu.Unlock()
+}
+
+// Production's broker login has no revoke-self. An idle older login is then
+// released at once instead of retried every tick, and new logins still mint.
+func TestJWTOlderLoginWithoutRevokeSelfIsReleased(t *testing.T) {
+	h := newJWTHarness(t, 3600, defaultReauthOptions())
+	h.vault.mu.Lock()
+	h.vault.denyRevoke = true
+	h.vault.mu.Unlock()
+	held := h.mustSession()
+	h.advance(21 * time.Minute) // refresh; parent-1 keeps its session
+	if retired, _ := h.c.logins.counts(); retired != 1 {
+		t.Fatalf("retired=%d; the older login with a session stays in custody", retired)
 	}
-	if _, after, _ := h.vault.snapshot(); after != creates {
-		t.Fatal("a refused mint still reached Vault")
-	}
-	// Ending the oldest login's session revokes it at once and frees a place.
-	if err := h.c.RevokeDatabaseSession(context.Background(), held[0].Accessor); err != nil {
+	if err := held.Revoke(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, revoked := h.vault.snapshot(); len(revoked) != 1 || revoked[0] != "parent-1" {
+	h.vault.mu.Lock()
+	calls := h.vault.revokeCalls
+	h.vault.mu.Unlock()
+	if retired, _ := h.c.logins.counts(); retired != 0 {
+		t.Fatalf("retired=%d; a refused revoke must release the idle login", retired)
+	}
+	h.advance(10 * time.Minute)
+	h.vault.mu.Lock()
+	after := h.vault.revokeCalls
+	h.vault.mu.Unlock()
+	if after != calls {
+		t.Fatalf("revoke-self called %d more times; a refused login must not be retried", after-calls)
+	}
+	if _, _, revoked := h.vault.snapshot(); len(revoked) != 1 || revoked[0] != "child-"+held.Accessor {
+		t.Fatalf("revoked=%v; only the session's own token revokes itself", revoked)
+	}
+	if s := h.mustSession(); h.vault.parent(s.Accessor) != "parent-2" {
+		t.Fatal("minting stopped")
+	}
+	h.c.Close() // a refused revoke at close is logged, not retried
+	if _, _, revoked := h.vault.snapshot(); len(revoked) != 1 {
 		t.Fatalf("revoked=%v", revoked)
-	}
-	h.advance(time.Minute)
-	if logins, _, _ := h.vault.snapshot(); logins != 5 {
-		t.Fatalf("logins=%d; refresh should resume below the ceiling", logins)
-	}
-	if s := h.mustSession(); h.vault.parent(s.Accessor) != "parent-5" {
-		t.Fatal("minting did not resume under the new login")
 	}
 }
 

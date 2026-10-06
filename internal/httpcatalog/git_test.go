@@ -136,8 +136,14 @@ func TestGitHubAPIEntries(t *testing.T) {
 	if m, _, _ := c.GitHubAPIMatch("api.github.com", 443, "POST", "/repos/trmlabs/trm-b2b/pulls", "", "pool-a"); !m.OpensPullRequest || fmt.Sprint(m.HeadPrefixes) != "[cursor/]" {
 		t.Fatalf("create: %+v", m)
 	}
-	if m, _, _ := c.GitHubAPIMatch("api.github.com", 443, "POST", "/repos/trmlabs/trm-b2b/issues/1/comments", "", "pool-a"); m.OpensPullRequest || m.HeadPrefixes != nil {
+	if m, _, _ := c.GitHubAPIMatch("api.github.com", 443, "POST", "/repos/trmlabs/trm-b2b/issues/7/comments", "", "pool-a"); m.OpensPullRequest || m.CommentsOn != 7 || fmt.Sprint(m.HeadPrefixes) != "[cursor/]" {
 		t.Fatalf("comment: %+v", m)
+	}
+	if m, _, _ := c.GitHubAPIMatch("api.github.com", 443, "POST", "/repos/trmlabs/trm-b2b/pulls/8/comments/99/replies", "", "pool-a"); m.CommentsOn != 8 {
+		t.Fatalf("reply: %+v", m)
+	}
+	if _, _, err := c.GitHubAPIMatch("api.github.com", 443, "POST", "/repos/trmlabs/trm-b2b/issues/007/comments", "", "pool-a"); !errors.Is(err, ErrUnlisted) {
+		t.Fatalf("a padded number matched: %v", err)
 	}
 	if m, _, _ := c.GitHubAPIMatch("api.github.com", 443, "GET", "/repos/trmlabs/trm-b2b/pulls/1", "", "pool-a"); m.Write {
 		t.Fatalf("read marked as a write: %+v", m)

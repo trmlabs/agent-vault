@@ -14,6 +14,7 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 )
@@ -594,6 +595,9 @@ type GitRequest struct {
 	// prefixes (none: no pull request may be opened).
 	OpensPullRequest bool
 	HeadPrefixes     []string
+	// CommentsOn is the pull request number a comment request targets: the
+	// broker comments only on a pull request whose head is one of HeadPrefixes.
+	CommentsOn int64
 }
 
 // GitMatch routes a request to a git entry. ok is false when the host has no
@@ -673,7 +677,7 @@ func (c Catalog) GitHubAPIMatch(host string, port int, method, path, rawQuery, p
 	if rawQuery != "" || len(parts) < 5 || parts[0] != "" || parts[1] != "repos" {
 		return GitRequest{}, true, ErrUnlisted
 	}
-	want, create := githubAPIEndpoint(parts[4:])
+	want, create, number := githubAPIEndpoint(parts[4:])
 	if want == "" {
 		return GitRequest{}, true, ErrUnlisted
 	}
@@ -692,6 +696,9 @@ func (c Catalog) GitHubAPIMatch(host string, port int, method, path, rawQuery, p
 			}
 			if create {
 				matched.OpensPullRequest, matched.HeadPrefixes = true, c.pushBranchPrefixes(repo, pool)
+			}
+			if number > 0 {
+				matched.CommentsOn, matched.HeadPrefixes = number, c.pushBranchPrefixes(repo, pool)
 			}
 			return matched, true, nil
 		}
@@ -723,30 +730,30 @@ func (c Catalog) pushBranchPrefixes(repo, pool string) []string {
 }
 
 // githubAPIEndpoint returns the one method a GitHub REST path allows, or ""
-// when it is unlisted, and whether it opens a pull request.
-func githubAPIEndpoint(rest []string) (method string, create bool) {
-	number := func(s string) bool {
+// when it is unlisted, whether it opens a pull request, and for a comment the
+// number of the issue or pull request it comments on.
+func githubAPIEndpoint(rest []string) (method string, create bool, commentsOn int64) {
+	number := func(s string) int64 {
 		if s == "" || len(s) > 12 {
-			return false
+			return 0
 		}
-		for _, c := range s {
-			if c < '0' || c > '9' {
-				return false
-			}
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err != nil || n <= 0 || strconv.FormatInt(n, 10) != s {
+			return 0
 		}
-		return true
+		return n
 	}
 	switch {
 	case len(rest) == 1 && rest[0] == "pulls":
-		return "POST", true
-	case len(rest) == 2 && rest[0] == "pulls" && number(rest[1]):
-		return "GET", false
-	case len(rest) == 3 && (rest[0] == "issues" || rest[0] == "pulls") && number(rest[1]) && rest[2] == "comments":
-		return "POST", false
-	case len(rest) == 5 && rest[0] == "pulls" && number(rest[1]) && rest[2] == "comments" && number(rest[3]) && rest[4] == "replies":
-		return "POST", false
+		return "POST", true, 0
+	case len(rest) == 2 && rest[0] == "pulls" && number(rest[1]) > 0:
+		return "GET", false, 0
+	case len(rest) == 3 && (rest[0] == "issues" || rest[0] == "pulls") && number(rest[1]) > 0 && rest[2] == "comments":
+		return "POST", false, number(rest[1])
+	case len(rest) == 5 && rest[0] == "pulls" && number(rest[1]) > 0 && rest[2] == "comments" && number(rest[3]) > 0 && rest[4] == "replies":
+		return "POST", false, number(rest[1])
 	}
-	return "", false
+	return "", false, 0
 }
 
 // Match returns the entry for a request, choosing the longest path prefix

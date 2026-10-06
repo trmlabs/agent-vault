@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -19,12 +20,13 @@ import (
 // and a JWT login has a fixed maximum lifetime. Instead of restarting the
 // broker to replace that login, JWT mode logs in again on a schedule, mints
 // new sessions only under a young login, and keeps each older login until its
-// last session ends. Token and AppRole modes keep their single login.
+// last session ends. There is no ceiling on older logins: each ends at its
+// fixed maximum lifetime, so at most that lifetime divided by the refresh
+// interval are ever held. Token and AppRole modes keep their single login.
 const (
 	defaultReauthInterval     = 20 * time.Minute
 	defaultMinSessionLifetime = 35 * time.Minute
 	defaultMintGrace          = 2 * time.Minute
-	defaultMaxRetiredLogins   = 3
 	defaultReauthTick         = 15 * time.Second
 	reauthCallTimeout         = 10 * time.Second
 	maxJWTBytes               = 64 << 10
@@ -36,12 +38,11 @@ type reauthOptions struct {
 	interval           time.Duration // log in again this long after the current login
 	minSessionLifetime time.Duration // a login stops minting once less than this remains
 	mintGrace          time.Duration // a failed refresh stops minting this long after it was due
-	maxRetired         int           // older logins held at most; a refresh waits beyond this
 	tick               time.Duration
 }
 
 func defaultReauthOptions() reauthOptions {
-	return reauthOptions{defaultReauthInterval, defaultMinSessionLifetime, defaultMintGrace, defaultMaxRetiredLogins, defaultReauthTick}
+	return reauthOptions{defaultReauthInterval, defaultMinSessionLifetime, defaultMintGrace, defaultReauthTick}
 }
 
 // heldLogin is one parent token. Its children are this process's live sessions.
@@ -173,25 +174,14 @@ func (s *loginSet) rotationDue(now time.Time) bool {
 	return s.current == nil || !now.Before(s.current.issued.Add(s.opts.interval))
 }
 
-func (s *loginSet) atCeiling() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.retired) >= s.opts.maxRetired
-}
-
-// rotate makes next current and retires the previous login. It refuses when
-// another older login would exceed the ceiling.
-func (s *loginSet) rotate(next *heldLogin) error {
+// rotate makes next current and retires the previous login.
+func (s *loginSet) rotate(next *heldLogin) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.current != nil {
-		if len(s.retired) >= s.opts.maxRetired {
-			return fmt.Errorf("vault login ceiling reached")
-		}
 		s.retired = append(s.retired, s.current)
 	}
 	s.current = next
-	return nil
 }
 
 func (s *loginSet) all() []*heldLogin {
@@ -355,10 +345,6 @@ func (c *Client) reauthTick(ctx context.Context) {
 	if !c.logins.rotationDue(now) { // a denied mint logged in again meanwhile
 		return
 	}
-	if c.logins.atCeiling() {
-		c.logger.Warn("vault login refresh deferred: older-login ceiling reached; new database sessions stop when the current login ages out")
-		return
-	}
 	if err := c.loginAgainLocked(ctx); err != nil {
 		c.logger.Warn("vault login refresh failed; existing sessions continue, new sessions stop when the current login ages out",
 			slog.String("err", err.Error()))
@@ -379,10 +365,7 @@ func (c *Client) loginAgainLocked(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := c.logins.rotate(next); err != nil {
-		revokeToken(c.api, next.token)
-		return err
-	}
+	c.logins.rotate(next)
 	c.api.SetToken(next.token)
 	return nil
 }
@@ -430,8 +413,6 @@ func (c *Client) reloginAfterDenial(ctx context.Context, denied string) error {
 		return nil // another mint or the schedule already logged in again
 	case young:
 		return errLoginLacksPolicy
-	case c.logins.atCeiling():
-		return fmt.Errorf("vault login ceiling reached; cannot log in again for a database added since the current login")
 	}
 	if err := c.loginAgainLocked(ctx); err != nil {
 		return err
@@ -466,27 +447,49 @@ func (c *Client) renewLogin(ctx context.Context, l *heldLogin, now time.Time) {
 }
 
 // revokeIdle revokes each older login as soon as its last session has ended.
-// A failed revoke is retried at the next tick until the login's maximum
-// lifetime, when Vault ends it anyway.
+// A transient failure is retried at the next tick until the login's maximum
+// lifetime, when Vault ends it anyway. A login whose policy does not grant
+// revoke-self is released at once: it holds no session, and it ends at its
+// maximum lifetime.
 func (c *Client) revokeIdle(ctx context.Context) {
 	for _, l := range c.logins.idle(c.clock()) {
-		if !c.revokeLogin(ctx, l) {
+		switch c.revokeLogin(ctx, l) {
+		case loginRevoked:
+			c.logger.Info("vault older login revoked")
+		case loginRevokeRefused:
+			c.logger.Info("vault older login released: its policy does not grant revoke-self, so it ends at its maximum lifetime")
+		default:
 			c.logins.requeue(l)
 			c.logger.Warn("vault older login revoke failed; retrying")
-			continue
 		}
-		c.logger.Info("vault older login revoked")
 	}
 }
 
-func (c *Client) revokeLogin(ctx context.Context, l *heldLogin) bool {
+type loginRevokeResult int
+
+const (
+	loginRevokeFailed loginRevokeResult = iota
+	loginRevoked
+	loginRevokeRefused // Vault answered 403: no revoke-self in the login's policy
+)
+
+func (c *Client) revokeLogin(ctx context.Context, l *heldLogin) loginRevokeResult {
 	api, err := tokenAPI(c.api, l.token)
 	if err != nil {
-		return false
+		return loginRevokeFailed
 	}
 	callCtx, cancel := context.WithTimeout(ctx, reauthCallTimeout)
 	defer cancel()
-	return api.Auth().Token().RevokeSelfWithContext(callCtx, "") == nil
+	err = api.Auth().Token().RevokeSelfWithContext(callCtx, "")
+	var refused *vaultapi.ResponseError
+	switch {
+	case err == nil:
+		return loginRevoked
+	case errors.As(err, &refused) && refused.StatusCode == http.StatusForbidden:
+		return loginRevokeRefused
+	default:
+		return loginRevokeFailed
+	}
 }
 
 // Close stops login refresh and revokes every held login with no live
@@ -509,7 +512,10 @@ func (c *Client) CloseContext(ctx context.Context) {
 		return
 	}
 	for _, l := range c.logins.drain() {
-		if !c.revokeLogin(ctx, l) {
+		switch c.revokeLogin(ctx, l) {
+		case loginRevokeRefused:
+			c.logger.Info("vault login left to expire at close: its policy does not grant revoke-self")
+		case loginRevokeFailed:
 			c.logger.Warn("vault login revoke at close failed")
 		}
 	}
