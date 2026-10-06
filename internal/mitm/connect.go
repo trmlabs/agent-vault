@@ -25,7 +25,28 @@ func mitmIPKey(r *http.Request) string {
 	if err != nil || host == "" {
 		host = r.RemoteAddr
 	}
-	return "mitm:" + host
+	key := "mitm:" + host
+	// Every sandbox behind one shared proxy arrives from the proxy's
+	// address, so on a listener that admits only proxy-attested identities
+	// the auth-failure budget is the attested sandbox's: refused sandboxes
+	// never lock out the rest. Elsewhere it stays per address.
+	if kinds := connKinds(r.Context()); len(kinds) == 1 && kinds[0] == brokercore.KindProxyAttested {
+		if sandbox := brokercore.AttestedSandbox(r.Header.Get(brokercore.AttestationHeader)); sandbox != "" {
+			key += "/sandbox:" + sandbox
+		}
+	}
+	return key
+}
+
+// proxyLimitActor is the per-actor rate-limit key: the actor, and for a
+// verified workload its Pod too. Many Pods can share one agent identity (a
+// pool, or every sandbox behind a shared proxy), and each gets its own
+// budget instead of splitting one.
+func proxyLimitActor(scope *brokercore.ProxyScope) string {
+	if scope.WorkloadID != "" {
+		return scope.ActorID() + "/" + scope.WorkloadID
+	}
+	return scope.ActorID()
 }
 
 // isLoopbackPeer reports whether the HTTP request came from a loopback

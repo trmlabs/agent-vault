@@ -525,11 +525,14 @@ func attachPostgresBrokerIfEnabled(srv *server.Server, host string, postgresPort
 		// Per-Pod caps hold across every replica sharing this store.
 		opts.Sessions = server.NewSessionLedger(srv.CleanupStore(), minter)
 	}
-	// Each brokered connection is one real upstream DB connection, so MaxConns
-	// must be tuned below the database's max_connections. Operators set it (and
-	// the per-actor cap) via env; unset keeps the conservative defaults.
+	// Each database's ceiling is its catalog entry's maxConns; MaxConns only
+	// bounds the broker across all of them. A database whose entry sets none
+	// gets AGENT_VAULT_DB_DEFAULT_DATABASE_CONNS (default 50).
 	if v := intEnvValue("AGENT_VAULT_DB_MAX_CONNS"); v > 0 {
 		opts.MaxConns = v
+	}
+	if v := intEnvValue("AGENT_VAULT_DB_DEFAULT_DATABASE_CONNS"); v > 0 {
+		opts.DefaultDatabaseConns = v
 	}
 	if v := intEnvValue("AGENT_VAULT_DB_MAX_LEASES_PER_ACTOR"); v > 0 {
 		opts.MaxLeasesPerActor = v
@@ -557,13 +560,23 @@ func attachPostgresBrokerIfEnabled(srv *server.Server, host string, postgresPort
 	// and one rotating credential per pool and database. MaxConns then caps
 	// client sessions; each database's server budget comes from the catalog.
 	if boolEnvValue("AGENT_VAULT_DB_POOLING") {
-		opts.Pool = &pgproxy.PoolOptions{Replicas: intEnvValue("AGENT_VAULT_DB_POOL_REPLICAS"), DefaultBudget: intEnvValue("AGENT_VAULT_DB_POOL_BUDGET"),
+		opts.Pool = &pgproxy.PoolOptions{Replicas: intEnvValue("AGENT_VAULT_DB_POOL_REPLICAS"), DefaultBudget: firstPositive(intEnvValue("AGENT_VAULT_DB_POOL_BUDGET"), intEnvValue("AGENT_VAULT_DB_DEFAULT_DATABASE_CONNS")),
 			QueueFactor: intEnvValue("AGENT_VAULT_DB_POOL_QUEUE_FACTOR"), QueueWait: time.Duration(intEnvValue("AGENT_VAULT_DB_POOL_QUEUE_WAIT_MS")) * time.Millisecond,
 			// A graceful stop ends each session between transactions.
 			DrainSessions: intEnvValue("AGENT_VAULT_SHUTDOWN_SECONDS") > 0}
 	}
 	srv.AttachPostgresBroker(pgproxy.New(net.JoinHostPort(host, strconv.Itoa(postgresPort)), opts))
 	return nil
+}
+
+// firstPositive returns the first value above zero, or 0.
+func firstPositive(values ...int) int {
+	for _, v := range values {
+		if v > 0 {
+			return v
+		}
+	}
+	return 0
 }
 
 // tokenReviewOnly exposes only ResolveForProxy, hiding a resolver's Attest.

@@ -144,7 +144,7 @@ func (p *Proxy) forwardStrict(w http.ResponseWriter, r *http.Request, target, ho
 			return
 		}
 	}
-	enf := p.rateLimit.EnforceProxy(r.Context(), scope.ActorID(), scope.VaultID)
+	enf := p.rateLimit.EnforceProxy(r.Context(), proxyLimitActor(scope), scope.VaultID)
 	if !enf.Allowed {
 		deny(http.StatusTooManyRequests)
 		return

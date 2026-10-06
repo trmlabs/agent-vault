@@ -37,9 +37,12 @@ type Options struct {
 	HandshakeTimeout      time.Duration
 	StartupTimeout        time.Duration // bound on the pre-auth phase (default 5s)
 	MinRenewInterval      time.Duration // floor on the renew cadence (default 5s)
-	MaxConns              int           // cap on concurrent SERVING connections = upstream DB connections (default 50)
-	MaxPendingConns       int           // cap on accepted-but-not-yet-serving connections (default 512)
-	MaxLeasesPerActor     int           // cap on live credentials/connections per workload (Pod), or per agent when no workload is known (default 16; clamped to <= MaxConns)
+	MaxConns              int           // cap on concurrent SERVING connections = upstream DB connections, all databases (default 10,000)
+	// DefaultDatabaseConns is a database's ceiling when its catalog entry
+	// sets no maxConns (default 50).
+	DefaultDatabaseConns int
+	MaxPendingConns      int // cap on accepted-but-not-yet-serving connections (default 512)
+	MaxLeasesPerActor    int // cap on live credentials/connections per workload (Pod), or per agent when no workload is known (default 16; clamped to <= MaxConns)
 	// MaxLeasesPerAgent caps one agent's sessions across all its workloads on
 	// this replica, so a pool agent with many Pods cannot take the whole
 	// serving cap (default MaxConns minus MaxLeasesPerActor, at least
@@ -125,6 +128,9 @@ func New(addr string, opts Options) *Broker {
 	}
 	if opts.MaxConns <= 0 {
 		opts.MaxConns = maxConns
+	}
+	if opts.DefaultDatabaseConns <= 0 {
+		opts.DefaultDatabaseConns = defaultDatabaseConns
 	}
 	if opts.MaxPendingConns <= 0 {
 		// Handshakes in progress scale with the serving cap they feed.
@@ -450,9 +456,10 @@ func (b *Broker) acquireUpstreamSlot(svc *DatabaseService) bool {
 	b.serveMu.Lock()
 	defer b.serveMu.Unlock()
 	limit := svc.MaxConns
-	if limit <= 0 || limit > b.opts.MaxConns {
-		limit = b.opts.MaxConns
+	if limit <= 0 {
+		limit = b.opts.DefaultDatabaseConns
 	}
+	limit = min(limit, b.opts.MaxConns)
 	if b.upstreamCounts[svc.Addr] >= limit {
 		return false
 	}

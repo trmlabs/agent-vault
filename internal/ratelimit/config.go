@@ -51,17 +51,22 @@ func DefaultsFor(profile Profile) Config {
 	}
 	mul := profileMultiplier(profile)
 	// Unauthenticated surface: login/register/forgot/reset/verify,
-	// invite/approval-token redemption, and proxy auth failures.
+	// invite/approval-token redemption, and proxy auth failures. Proxy
+	// failures are keyed per address, or per attested sandbox behind a
+	// shared proxy. AGENT_VAULT_RATELIMIT_AUTH_MAX and _WINDOW override.
 	c.Tiers[TierAuth] = TierConfig{
 		Algorithm: AlgSliding, Window: 5 * time.Minute, Max: scaleMax(50, mul), MaxKeys: defaultMaxKeys,
 	}
-	// MITM proxy: token bucket smooths traffic; Concurrency caps
-	// in-flight slow upstream calls per (actor, vault). Defaults are
-	// intentionally roomy because agent runtimes fan out across model,
-	// gateway, and tool API calls.
+	// MITM proxy: token bucket smooths traffic; Concurrency caps in-flight
+	// upstream calls per (actor and workload, vault), so it bounds one agent
+	// Pod, not a pool. Sized for an agent fanning out in parallel (many tool
+	// and model calls at once, each possibly streaming for minutes); vendors'
+	// own limits bound the real rate, and the global tier is the server's
+	// backstop. AGENT_VAULT_RATELIMIT_PROXY_RATE, _BURST and _CONCURRENCY
+	// override each.
 	c.Tiers[TierProxy] = TierConfig{
-		Algorithm: AlgTokenBucket, Rate: scaleRate(20.0, mul), Burst: scaleMax(200, mul),
-		Concurrency: scaleMax(64, mul), MaxKeys: defaultMaxKeys,
+		Algorithm: AlgTokenBucket, Rate: scaleRate(200.0, mul), Burst: scaleMax(2000, mul),
+		Concurrency: scaleMax(1024, mul), MaxKeys: defaultMaxKeys,
 	}
 	// Everything behind requireAuth — generous; the heaviest legitimate
 	// agent workload can be several discover+CRUD bursts per minute.
