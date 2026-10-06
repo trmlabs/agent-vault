@@ -29,7 +29,7 @@ const (
 	rootKeyFile      = "ca.key.enc"
 	defaultDirName   = "ca"
 	defaultLeafTTL   = 24 * time.Hour
-	defaultCacheSize = 1024
+	defaultCacheSize = 10000 // minted leaves kept, one per destination host; a few KiB each
 	rootValidity     = 10 * 365 * 24 * time.Hour
 	clockSkew        = 5 * time.Minute
 	rootCommonName   = "Agent Vault Root CA"
