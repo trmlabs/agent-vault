@@ -579,3 +579,31 @@ func TestJanitorHoldsUntilAReplicaVouches(t *testing.T) {
 		})
 	}
 }
+
+// A replica reporting during the pass does not read as a loss: the local
+// reports are read before the broker's view, so every acknowledgment they
+// carry was given before it.
+func TestJanitorReportDuringThePassIsNoLoss(t *testing.T) {
+	var stream atomic.Int64
+	stream.Store(3)
+	old := time.Now().Add(-3 * time.Hour)
+	full := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		view := map[string]int64{"aaaa0001": 5, "bbbb0002": stream.Load()}
+		// The other replica's next report lands just after the view was taken.
+		stream.Add(1)
+		json.NewEncoder(w).Encode(ActivityReport{ReplicaStarted: old, RetentionSeconds: 86400, Durable: r.URL.Path == ActivityPath,
+			HistoryStarted: time.Now().Add(-5 * time.Hour), HistoryStreams: view, Replica: "aaaa0001", AckedSeq: 5, FirstAcked: old})
+	}))
+	t.Cleanup(full.Close)
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(50 * time.Millisecond)
+		json.NewEncoder(w).Encode(ActivityReport{ReplicaStarted: old, RetentionSeconds: 86400, Replica: "bbbb0002", AckedSeq: stream.Load(), FirstAcked: old})
+	}))
+	t.Cleanup(local.Close)
+	jf := newJanitor(t, map[string]*httptest.Server{"10.0.0.1": full, "10.0.0.2": local})
+	jf.api.scaleStatus = 403
+	jf.api.sandboxes = []map[string]any{janitorSandbox(1, 3*time.Hour)}
+	if e := jf.j.pass(context.Background()); e != nil || len(jf.api.deleted) != 1 {
+		t.Fatalf("deleted %v, error %v, pass %v", jf.api.deleted, e, jf.events(t, "janitor_pass"))
+	}
+}

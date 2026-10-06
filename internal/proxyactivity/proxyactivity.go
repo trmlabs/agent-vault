@@ -26,7 +26,7 @@ import (
 
 // Store is the shared store's part this service uses.
 type Store interface {
-	RecordProxyActivity(ctx context.Context, scope, replica string, rows []store.ProxyActivity, maxRows int, acked int64) (int64, bool, error)
+	RecordProxyActivity(ctx context.Context, scope, replica string, rows []store.ProxyActivity, maxRows, maxStreams int, acked int64) (int64, bool, error)
 	ReadProxyActivity(ctx context.Context, scope, after string, since time.Time, limit int) ([]store.ProxyActivity, error)
 	ProxyActivityHistory(ctx context.Context, scope string) (time.Time, map[string]int64, bool, error)
 	PruneProxyActivity(ctx context.Context, rows, streams time.Time) error
@@ -120,7 +120,13 @@ type Service struct {
 	// DefaultMaxRows), so a compromised proxy cannot grow the shared store
 	// without bound. A report that would pass it is refused.
 	MaxRows int
-	Logger  *slog.Logger
+	// MaxStreams is the most replica streams one binding may hold (default
+	// DefaultMaxStreams); a stream lives for twice the retention after its
+	// last report, so a compromised proxy minting a replica per report
+	// cannot grow the store or every read's stream map without bound. A
+	// report that would start a stream past it is refused.
+	MaxStreams int
+	Logger     *slog.Logger
 
 	mu         sync.Mutex
 	lastPruned time.Time
@@ -139,6 +145,9 @@ func (s *Service) Validate() error {
 	}
 	if s.MaxRows < 0 || s.MaxRows > 100_000_000 {
 		return errors.New("proxy activity maximum rows must be between 1 and 100,000,000")
+	}
+	if s.MaxStreams < 0 || s.MaxStreams > 10_000_000 {
+		return errors.New("proxy activity maximum streams must be between 1 and 10,000,000")
 	}
 	return nil
 }
@@ -193,11 +202,15 @@ func (s *Service) record(w http.ResponseWriter, r *http.Request) {
 		s.refuse(w, http.StatusBadRequest, "body")
 		return
 	}
-	seq, lost, err := s.Store.RecordProxyActivity(r.Context(), id.Scope, body.Replica, rows, s.maxRows(), body.AckedSeq)
-	if errors.Is(err, store.ErrProxyActivityFull) {
+	seq, lost, err := s.Store.RecordProxyActivity(r.Context(), id.Scope, body.Replica, rows, s.maxRows(), s.maxStreams(), body.AckedSeq)
+	switch {
+	case errors.Is(err, store.ErrProxyActivityFull):
 		s.refuse(w, http.StatusInsufficientStorage, "row_ceiling")
 		return
-	} else if err != nil {
+	case errors.Is(err, store.ErrProxyActivityStreams):
+		s.refuse(w, http.StatusInsufficientStorage, "stream_ceiling")
+		return
+	case err != nil:
 		s.refuse(w, http.StatusServiceUnavailable, "store")
 		return
 	}
@@ -250,6 +263,17 @@ func (s *Service) read(w http.ResponseWriter, r *http.Request) {
 // DefaultMaxRows sizes a binding's ceiling for a fleet of 10,000+ sandboxes
 // with churn: ten times that many used within a day's retention.
 const DefaultMaxRows = 100_000
+
+// DefaultMaxStreams allows a binding 10,000 replica starts in twice the
+// retention (48 hours by default), far past any rollout or autoscaling churn.
+const DefaultMaxStreams = 10_000
+
+func (s *Service) maxStreams() int {
+	if s.MaxStreams == 0 {
+		return DefaultMaxStreams
+	}
+	return s.MaxStreams
+}
 
 func (s *Service) maxRows() int {
 	if s.MaxRows == 0 {

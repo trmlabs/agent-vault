@@ -153,6 +153,11 @@ func TestProxyActivityValidation(t *testing.T) {
 	if err := (&Service{Store: s.Store, Identifier: s.Identifier, Retention: time.Hour, MaxRows: -1}).Validate(); err == nil {
 		t.Error("negative row ceiling accepted")
 	}
+	for _, streams := range []int{-1, 10_000_001} {
+		if err := (&Service{Store: s.Store, Identifier: s.Identifier, Retention: time.Hour, MaxStreams: streams}).Validate(); err == nil {
+			t.Errorf("stream ceiling %d accepted", streams)
+		}
+	}
 	c := &Service{Identifier: s.Identifier, Retention: time.Hour}
 	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "shared store") {
 		t.Errorf("no store: %v", err)
@@ -251,5 +256,22 @@ func TestProxyActivitySequenceOnTheWire(t *testing.T) {
 	}
 	if s := streams(time.Now().Add(49 * time.Hour)); len(s) != 0 {
 		t.Fatalf("a stream kept past two retentions: %v", s)
+	}
+}
+
+// A report that would start a replica stream past the binding's ceiling is
+// refused with 507; the streams already held go on.
+func TestProxyActivityStreamCeilingOnTheWire(t *testing.T) {
+	svc, h := newService(t)
+	svc.MaxStreams = 1
+	row := []Row{{Namespace: "developers", OwnerUID: "sb-1", LastSeen: time.Now()}}
+	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Replica: "aaaa0001", Sandboxes: row}); w.Code != 200 {
+		t.Fatalf("first stream: %d", w.Code)
+	}
+	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Replica: "bbbb0002", Sandboxes: row}); w.Code != http.StatusInsufficientStorage {
+		t.Fatalf("a stream past the ceiling: %d", w.Code)
+	}
+	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Replica: "aaaa0001", Sandboxes: row, AckedSeq: 1}); w.Code != 200 {
+		t.Fatalf("the held stream: %d", w.Code)
 	}
 }

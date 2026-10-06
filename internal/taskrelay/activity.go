@@ -205,12 +205,15 @@ func (a *activity) handler() http.Handler {
 // per Sandbox and the shorter retention. If the view cannot be read in full,
 // the report is this replica's alone and not durable.
 func (a *activity) withDurable(ctx context.Context, report ActivityReport) ActivityReport {
+	// The acknowledgment is read before the view: one given while the view
+	// is read is then not mistaken for a loss.
+	acked, _ := a.durable.verification()
 	view, e := a.durable.read(ctx)
 	if e != nil {
 		return report
 	}
 	a.repushMissing(view.sandboxes)
-	if acked, _ := a.durable.verification(); acked > view.streams[a.durable.replica] {
+	if acked > view.streams[a.durable.replica] {
 		// The store lost writes it acknowledged to this replica: report
 		// everything again, and that report, sent even if this replica
 		// holds nothing, restarts the history.

@@ -318,7 +318,10 @@ func (j *janitor) activity(ctx context.Context, cutoff time.Time) (map[string]ti
 	// One replica, the first by name, answers with the broker's durable view
 	// merged in; the rest answer with their own activity only, which the
 	// durable view does not yet hold. Reads run ReplicaConcurrency at a time;
-	// any failure is doubt and stops the rest.
+	// any failure is doubt and stops the rest. The full report is read last:
+	// every acknowledgment a local report carries was then given before the
+	// broker's view was taken, so a report landing during the pass never
+	// reads as a loss.
 	sort.Slice(live, func(a, b int) bool { return live[a].Metadata.Name < live[b].Metadata.Name })
 	reports := make([]ActivityReport, len(live))
 	ips := make([]string, len(live))
@@ -333,24 +336,28 @@ func (j *janitor) activity(ctx context.Context, cutoff time.Time) (map[string]ti
 			return nil, false, false, errJanitorDoubt
 		}
 		ips[i] = ip
-		path := ActivityLocalPath
-		if i == 0 {
-			path = ActivityPath
+	}
+	read := func(i int, path string) {
+		report, e := j.replica(readCtx, ips[i], path)
+		if e != nil || report.ReplicaStarted.IsZero() || report.RetentionSeconds < j.config.IdleSeconds {
+			failed.Store(true)
+			cancel()
+			return
 		}
+		reports[i] = report
+	}
+	for i := 1; i < len(live); i++ {
 		wg.Add(1)
 		limit <- struct{}{}
-		go func(i int, ip, path string) {
+		go func(i int) {
 			defer func() { <-limit; wg.Done() }()
-			report, e := j.replica(readCtx, ip, path)
-			if e != nil || report.ReplicaStarted.IsZero() || report.RetentionSeconds < j.config.IdleSeconds {
-				failed.Store(true)
-				cancel()
-				return
-			}
-			reports[i] = report
-		}(i, ip, path)
+			read(i, ActivityLocalPath)
+		}(i)
 	}
 	wg.Wait()
+	if !failed.Load() {
+		read(0, ActivityPath)
+	}
 	if failed.Load() {
 		return nil, false, false, errJanitorDoubt
 	}

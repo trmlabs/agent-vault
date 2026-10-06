@@ -20,4 +20,5 @@ func TestRealPostgres_ProxyActivity(t *testing.T) {
 	checkProxyActivity(t, s)
 	checkProxyActivityHistoryAndCeiling(t, s)
 	checkProxyActivitySequence(t, s)
+	checkProxyActivityStreamCeiling(t, s)
 }
