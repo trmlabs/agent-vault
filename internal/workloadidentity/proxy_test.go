@@ -3,6 +3,7 @@ package workloadidentity
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/netip"
 	"testing"
 	"time"
@@ -524,4 +525,44 @@ func setupProfiles(p *proxyFixture) {
 		}
 		return profile, true
 	})
+}
+
+// A shared proxy may serve 10,000 tenant namespaces, and its operator lists
+// stay roomy; past those bounds the configuration is refused as malformed.
+func TestProxyBindingListsAreFleetSized(t *testing.T) {
+	load := func(mutate func(b *Binding)) error {
+		p := setupProxy(t)
+		c := p.r.config
+		c.Bindings = append([]Binding(nil), c.Bindings...)
+		proxy := *c.Bindings[1].Proxy
+		c.Bindings[1].Proxy = &proxy
+		mutate(&c.Bindings[1])
+		_, err := New(c, &fakeStore{status: "active", role: "proxy"})
+		return err
+	}
+	profiles := func(n int) func(b *Binding) {
+		return func(b *Binding) {
+			b.Proxy.Profiles = nil
+			for i := range n {
+				b.Proxy.Profiles = append(b.Proxy.Profiles, ProxyProfile{Namespace: fmt.Sprintf("tenant-%d", i), Profile: "agent-sandbox-developers", Pool: "sandboxes"})
+			}
+		}
+	}
+	ranges := func(n int) func(b *Binding) {
+		return func(b *Binding) {
+			b.Proxy.SourceCIDRs = nil
+			for i := range n {
+				b.Proxy.SourceCIDRs = append(b.Proxy.SourceCIDRs, fmt.Sprintf("10.%d.%d.0/24", i/256, i%256))
+			}
+		}
+	}
+	if err := load(profiles(10000)); err != nil {
+		t.Fatalf("10,000 namespaces: %v", err)
+	}
+	if err := load(ranges(1024)); err != nil {
+		t.Fatalf("1,024 source ranges: %v", err)
+	}
+	if load(profiles(10001)) == nil || load(ranges(1025)) == nil {
+		t.Fatal("a list past its bound was accepted")
+	}
 }

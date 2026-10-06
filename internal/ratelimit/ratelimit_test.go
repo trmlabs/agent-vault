@@ -342,3 +342,17 @@ func pairRelease(rel func(), d Decision) (Decision, func()) {
 	}
 	return d, rel
 }
+
+// The defaults hold a large fleet: the server-wide backstop admits 10,000
+// workers' traffic, and keyed tiers track every workload without evicting.
+func TestDefaultsAreFleetScale(t *testing.T) {
+	c := DefaultsFor(ProfileDefault)
+	if g := c.Tiers[TierGlobal]; g.Concurrency < 10000 || g.Rate < 20000 || g.Burst < 40000 {
+		t.Fatalf("global backstop %+v", g)
+	}
+	for _, tier := range []Tier{TierAuth, TierProxy, TierAuthed, TierVerifyFailure} {
+		if c.Tiers[tier].MaxKeys < 100000 {
+			t.Errorf("%s tracks only %d keys", tier, c.Tiers[tier].MaxKeys)
+		}
+	}
+}

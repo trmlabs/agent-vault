@@ -2,6 +2,7 @@ package httpcatalog
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -289,5 +290,21 @@ func TestHarnessPinnedKeys(t *testing.T) {
 	harnessAt(c, 2)["path"].(map[string]any)["crossCluster"] = false
 	if _, err := parseCatalog(t, c); err == nil {
 		t.Fatal("pinned keys on a same-cluster path accepted")
+	}
+}
+
+// One harness may serve a namespace per tenant: 10,000 load, one more is
+// refused as malformed.
+func TestHarnessServesTenThousandNamespaces(t *testing.T) {
+	for n, ok := range map[int]bool{10000: true, 10001: false} {
+		c := harnessCatalog()
+		namespaces := []any{"cursor"}
+		for i := 1; i < n; i++ {
+			namespaces = append(namespaces, fmt.Sprintf("tenant-%d", i))
+		}
+		harnessAt(c, 0)["identity"].(map[string]any)["namespaces"] = namespaces
+		if _, err := parseCatalog(t, c); (err == nil) != ok {
+			t.Errorf("%d namespaces: %v", n, err)
+		}
 	}
 }

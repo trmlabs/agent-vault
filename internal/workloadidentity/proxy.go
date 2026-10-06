@@ -129,8 +129,8 @@ func decodeAttestation(s string) (Attestation, error) {
 
 // validate checks a proxy binding at load.
 func (p *ProxyBinding) validate() error {
-	if len(p.Profiles) == 0 || len(p.Profiles) > 64 {
-		return errors.New("proxy binding needs 1 to 64 namespace profiles")
+	if len(p.Profiles) == 0 || len(p.Profiles) > maxProxyProfiles {
+		return errors.New("proxy binding needs 1 to 10,000 namespace profiles")
 	}
 	seen := map[string]bool{}
 	for i, pp := range p.Profiles {
@@ -164,8 +164,8 @@ func (p *ProxyBinding) validate() error {
 			return errors.New("proxy binding image digest must be sha256: and 64 lowercase hex characters")
 		}
 	}
-	if len(p.SourceCIDRs) == 0 || len(p.SourceCIDRs) > 16 {
-		return errors.New("proxy binding needs 1 to 16 source ranges")
+	if len(p.SourceCIDRs) == 0 || len(p.SourceCIDRs) > maxListItems {
+		return errors.New("proxy binding needs 1 to 1,024 source ranges")
 	}
 	for _, cidr := range p.SourceCIDRs {
 		prefix, err := netip.ParsePrefix(cidr)

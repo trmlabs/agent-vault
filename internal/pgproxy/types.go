@@ -137,6 +137,14 @@ const (
 	// amplification and, kept below MaxConns, prevents one noisy or compromised
 	// agent from monopolizing the serving cap and starving other agents.
 	defaultMaxLeasesPerActor = 16
+	// With pooling, a client session holds no database connection or
+	// credential of its own: the per-database budget protects the database.
+	// The session caps then only bound broker memory (a goroutine and small
+	// buffers per session), so they default to fleet scale. All are
+	// overridable (AGENT_VAULT_DB_MAX_CONNS, _MAX_PENDING_CONNS,
+	// _MAX_LEASES_PER_ACTOR).
+	defaultPooledMaxConns          = 10000
+	defaultPooledMaxLeasesPerActor = 1024
 )
 
 // ErrSessionLimit is returned by a SessionLedger when a Pod is at its cap.

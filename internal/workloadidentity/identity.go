@@ -104,6 +104,17 @@ var _ brokercore.SessionResolver = (*Resolver)(nil)
 
 var imageDigest = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
+const (
+	// maxConfigBytes bounds the configuration file read at startup: room
+	// for a proxy serving 10,000 tenant namespaces.
+	maxConfigBytes = 16 << 20
+	// maxListItems bounds short lists an operator writes (owner UIDs,
+	// source ranges): only a guard against a malformed file.
+	maxListItems = 1024
+	// maxProxyProfiles is how many namespaces one shared proxy may serve.
+	maxProxyProfiles = 10000
+)
+
 // LoadConfig reads a bounded JSON policy and rejects unknown fields.
 func LoadConfig(path string) (Config, error) {
 	var c Config
@@ -112,8 +123,8 @@ func LoadConfig(path string) (Config, error) {
 		return c, errors.New("cannot open workload identity configuration")
 	}
 	defer func() { _ = f.Close() }()
-	data, err := io.ReadAll(io.LimitReader(f, (1<<20)+1))
-	if err != nil || len(data) > 1<<20 {
+	data, err := io.ReadAll(io.LimitReader(f, maxConfigBytes+1))
+	if err != nil || len(data) > maxConfigBytes {
 		return c, errors.New("workload identity configuration exceeds size limit or cannot be read")
 	}
 	d := json.NewDecoder(bytes.NewReader(data))
@@ -178,8 +189,8 @@ func newResolver(c Config, s Store, observer bool) (*Resolver, error) {
 			if b.Pool != "" && !pathSegment(b.Pool) {
 				return nil, errors.New("pool binding name must be a lowercase DNS-style name")
 			}
-			if observer || len(b.OwnerUIDs) == 0 || len(b.OwnerUIDs) > 16 || b.PodUID != "" || b.MaxPodSeconds < 60 || b.MaxPodSeconds > 8*3600 || (b.ContainerName != "" && !pathSegment(b.ContainerName)) {
-				return nil, errors.New("pool binding requires 1 to 16 owner UIDs, no Pod UID and a 60 s to 8 h Pod lifetime")
+			if observer || len(b.OwnerUIDs) == 0 || len(b.OwnerUIDs) > maxListItems || b.PodUID != "" || b.MaxPodSeconds < 60 || b.MaxPodSeconds > 8*3600 || (b.ContainerName != "" && !pathSegment(b.ContainerName)) {
+				return nil, errors.New("pool binding requires owner UIDs (at most 1,024), no Pod UID and a 60 s to 8 h Pod lifetime")
 			}
 			for _, owner := range b.OwnerUIDs {
 				if owner == "" {

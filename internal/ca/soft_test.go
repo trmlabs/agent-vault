@@ -343,3 +343,14 @@ func TestRootPEM_IsValidCACert(t *testing.T) {
 		t.Errorf("CN = %q, want %q", cert.Subject.CommonName, rootCommonName)
 	}
 }
+
+// The leaf cache holds one certificate per destination host, so its default
+// covers a fleet that reaches thousands of hosts; an explicit size still wins.
+func TestNew_LeafCacheDefaultsToFleetScale(t *testing.T) {
+	if got := newTestCA(t, Options{}).cache.cap; got != 10000 {
+		t.Fatalf("default leaf cache = %d, want 10000", got)
+	}
+	if got := newTestCA(t, Options{CacheSize: 64}).cache.cap; got != 64 {
+		t.Fatalf("explicit leaf cache = %d, want 64", got)
+	}
+}

@@ -82,8 +82,13 @@ type Proxy struct {
 // slog.New(slog.DiscardHandler). RateLimit is shared with the HTTP
 // server so proxy limits and control-plane limits live in one registry;
 // nil disables rate limiting on the MITM path.
+// DefaultMaxTunnels bounds pending or active credential-proxy CONNECT tunnels
+// per replica. A tunnel costs goroutines and one TLS session, so the bound is
+// fleet scale; AGENT_VAULT_MITM_MAX_TUNNELS overrides it.
+const DefaultMaxTunnels = 10000
+
 type Options struct {
-	MaxCredentialProxyTunnels int                // <=0 defaults to 128 pending or active CONNECT tunnels
+	MaxCredentialProxyTunnels int                // <=0 defaults to DefaultMaxTunnels pending or active CONNECT tunnels
 	StrictCredentialProxy     bool               // bounded header-placeholder release path
 	DurableAudit              requestlog.Durable // mandatory when strict mode is enabled, unless HeaderAdapter is set
 	HeaderAdapter             *HeaderAdapter     // strict mode only: catalog destinations with signed audit
@@ -133,7 +138,7 @@ func New(addr string, opts Options) *Proxy {
 
 	tunnelLimit := opts.MaxCredentialProxyTunnels
 	if tunnelLimit <= 0 {
-		tunnelLimit = 128
+		tunnelLimit = DefaultMaxTunnels
 	}
 	p := &Proxy{
 		ca:                    opts.CA,
