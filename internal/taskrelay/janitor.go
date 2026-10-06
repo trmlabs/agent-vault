@@ -359,9 +359,20 @@ func (j *janitor) activity(ctx context.Context, cutoff time.Time) (map[string]ti
 	// A durable report vouches only for as long as the broker's history for
 	// its binding: a new, recreated or emptied history is young.
 	historyYoung := durable && (full.HistoryStarted.IsZero() || full.HistoryStarted.After(cutoff))
+	// The broker's history is whole only as far back as some live replica
+	// can vouch: one whose reports have been acknowledged since before the
+	// cutoff, and none of whose acknowledged writes the store has lost.
+	var vouched time.Time
+	lost := false
 	for _, report := range reports {
 		if report.ReplicaStarted.After(cutoff) {
 			young = true
+		}
+		if report.AckedSeq > full.HistorySeq {
+			lost = true
+		}
+		if !report.FirstAcked.IsZero() && (vouched.IsZero() || report.FirstAcked.Before(vouched)) {
+			vouched = report.FirstAcked
 		}
 		for _, a := range report.Sandboxes {
 			if a.OwnerUID != "" && a.LastSeen.After(seen[a.OwnerUID]) {
@@ -369,8 +380,18 @@ func (j *janitor) activity(ctx context.Context, cutoff time.Time) (map[string]ti
 			}
 		}
 	}
-	if historyYoung {
+	switch {
+	case historyYoung:
 		return nil, false, false, janitorHold{"activity_history_young"}
+	case durable && lost:
+		// A replica saw writes acknowledged that the store no longer holds
+		// (a restore): its next report restarts the history.
+		return nil, false, false, janitorHold{"activity_history_lost"}
+	case durable && (vouched.IsZero() || vouched.After(cutoff)):
+		// Every live replica started without an acknowledgment, or got its
+		// first one within the idle window (a rollout, perhaps over a
+		// restore): none can vouch for the window yet.
+		return nil, false, false, janitorHold{"activity_history_unverified"}
 	}
 	return seen, durable, young, nil
 }

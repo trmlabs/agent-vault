@@ -84,13 +84,13 @@ func TestProxyActivityIsPerBinding(t *testing.T) {
 	for i := 0; i < 4500; i++ {
 		rows = append(rows, Row{Namespace: "developers", OwnerUID: fmt.Sprintf("sb-%05d", i), LastSeen: now.Add(-time.Duration(i) * time.Second)})
 	}
-	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: rows}); w.Code != 204 {
+	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: rows}); w.Code != 200 {
 		t.Fatalf("record: %d", w.Code)
 	}
-	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: []Row{{Namespace: "developers", OwnerUID: "sb-00009", LastSeen: now.Add(-time.Hour)}}}); w.Code != 204 {
+	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: []Row{{Namespace: "developers", OwnerUID: "sb-00009", LastSeen: now.Add(-time.Hour)}}}); w.Code != 200 {
 		t.Fatalf("older record: %d", w.Code)
 	}
-	if w := call(h, "customers-proxy", RecordPath, RecordRequest{Sandboxes: []Row{{Namespace: "customers", OwnerUID: "sb-c", LastSeen: now}}}); w.Code != 204 {
+	if w := call(h, "customers-proxy", RecordPath, RecordRequest{Sandboxes: []Row{{Namespace: "customers", OwnerUID: "sb-c", LastSeen: now}}}); w.Code != 200 {
 		t.Fatalf("customer record: %d", w.Code)
 	}
 	developers := readAll(t, h, "developers-proxy")
@@ -175,7 +175,7 @@ func TestProxyActivityHistoryAndCeiling(t *testing.T) {
 	if first := page(); first.HistoryStarted != nil {
 		t.Fatalf("history before any report: %v", first.HistoryStarted)
 	}
-	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: []Row{}}); w.Code != 204 {
+	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: []Row{}}); w.Code != 200 {
 		t.Fatalf("empty report: %d", w.Code)
 	}
 	started := page().HistoryStarted
@@ -184,16 +184,50 @@ func TestProxyActivityHistoryAndCeiling(t *testing.T) {
 	}
 	now := time.Now()
 	two := []Row{{Namespace: "developers", OwnerUID: "sb-1", LastSeen: now}, {Namespace: "developers", OwnerUID: "sb-2", LastSeen: now}}
-	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: two}); w.Code != 204 {
+	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: two}); w.Code != 200 {
 		t.Fatalf("two rows: %d", w.Code)
 	}
 	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: []Row{{Namespace: "developers", OwnerUID: "sb-3", LastSeen: now}}}); w.Code != http.StatusInsufficientStorage {
 		t.Fatalf("a row past the ceiling: %d", w.Code)
 	}
-	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: two}); w.Code != 204 {
+	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: two}); w.Code != 200 {
 		t.Fatalf("updates at the ceiling: %d", w.Code)
 	}
 	if again := page(); again.HistoryStarted == nil || !again.HistoryStarted.Equal(*started) || len(again.Sandboxes) != 2 {
 		t.Fatalf("after the ceiling: %+v", again)
+	}
+}
+
+// A report is acknowledged with the binding's next sequence; one carrying an
+// acknowledged sequence the store no longer reaches is a loss, and the read
+// gives the current sequence.
+func TestProxyActivitySequenceOnTheWire(t *testing.T) {
+	_, h := newService(t)
+	row := []Row{{Namespace: "developers", OwnerUID: "sb-1", LastSeen: time.Now()}}
+	answer := func(acked int64) RecordResponse {
+		t.Helper()
+		w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: row, AckedSeq: acked})
+		var out RecordResponse
+		if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &out) != nil {
+			t.Fatalf("record: %d %s", w.Code, w.Body)
+		}
+		return out
+	}
+	if a := answer(0); a.Seq != 1 || a.Lost {
+		t.Fatalf("first: %+v", a)
+	}
+	if a := answer(1); a.Seq != 2 || a.Lost {
+		t.Fatalf("second: %+v", a)
+	}
+	if a := answer(7); !a.Lost {
+		t.Fatalf("an acknowledgment the store does not reach: %+v", a)
+	}
+	var page ReadResponse
+	w := call(h, "developers-proxy", ReadPath, ReadRequest{})
+	if json.Unmarshal(w.Body.Bytes(), &page) != nil || page.Seq != 3 {
+		t.Fatalf("read sequence: %s", w.Body)
+	}
+	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: row, AckedSeq: -1}); w.Code != 400 {
+		t.Fatalf("negative acknowledgment: %d", w.Code)
 	}
 }

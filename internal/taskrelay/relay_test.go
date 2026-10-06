@@ -33,6 +33,7 @@ type relayFixture struct {
 	kube              *httptest.Server
 	done              chan struct{}
 	runError          error
+	stop              context.CancelFunc // stops the relay before the test ends
 }
 
 func newRelayFixture(t *testing.T) *relayFixture {
@@ -102,7 +103,8 @@ func freeAddress(t *testing.T) string {
 }
 func (f *relayFixture) start(t *testing.T) {
 	t.Helper()
-	ctx := t.Context()
+	ctx, stop := context.WithCancel(t.Context())
+	f.stop = stop
 	done := make(chan struct{})
 	f.done = done
 	go func() { f.runError = Run(ctx, f.c); close(done) }()

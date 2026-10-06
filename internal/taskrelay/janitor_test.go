@@ -413,6 +413,7 @@ func TestJanitorTrustsDurableReports(t *testing.T) {
 	durable := func(started time.Time) *httptest.Server {
 		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(ActivityReport{ReplicaStarted: started, RetentionSeconds: 86400, Durable: true, HistoryStarted: time.Now().Add(-5 * time.Hour),
+				AckedSeq: 3, HistorySeq: 3, FirstAcked: time.Now().Add(-4 * time.Hour),
 				Sandboxes: []SandboxActivity{{Namespace: tenantNS, OwnerUID: "uid-sb-00002", LastSeen: time.Now().Add(-time.Minute)}}})
 		}))
 		t.Cleanup(s.Close)
@@ -441,7 +442,8 @@ func TestJanitorTrustsDurableReports(t *testing.T) {
 func TestJanitorHoldsOnAYoungDurableHistory(t *testing.T) {
 	durable := func(history time.Time) *httptest.Server {
 		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			json.NewEncoder(w).Encode(ActivityReport{ReplicaStarted: time.Now().Add(-time.Minute), RetentionSeconds: 86400, Durable: true, HistoryStarted: history})
+			json.NewEncoder(w).Encode(ActivityReport{ReplicaStarted: time.Now().Add(-time.Minute), RetentionSeconds: 86400, Durable: true, HistoryStarted: history,
+				AckedSeq: 3, HistorySeq: 3, FirstAcked: time.Now().Add(-4 * time.Hour)})
 		}))
 		t.Cleanup(s.Close)
 		return s
@@ -490,7 +492,8 @@ func TestJanitorReadsTheDurableViewOnce(t *testing.T) {
 			inFlight--
 			mu.Unlock()
 			json.NewEncoder(w).Encode(ActivityReport{ReplicaStarted: time.Now().Add(-2 * time.Hour), RetentionSeconds: 86400,
-				Durable: r.URL.Path == ActivityPath, HistoryStarted: time.Now().Add(-5 * time.Hour)})
+				Durable: r.URL.Path == ActivityPath, HistoryStarted: time.Now().Add(-5 * time.Hour),
+				AckedSeq: 3, HistorySeq: 3, FirstAcked: time.Now().Add(-4 * time.Hour)})
 		}))
 		t.Cleanup(s.Close)
 		return s
@@ -507,5 +510,51 @@ func TestJanitorReadsTheDurableViewOnce(t *testing.T) {
 	}
 	if full != 1 || local != 39 || maxFlight > 8 || maxFlight < 2 {
 		t.Fatalf("full reads %d, local reads %d, most at once %d", full, local, maxFlight)
+	}
+}
+
+// The durable history is trusted only as far as a live replica vouches for
+// it: a replica that saw an acknowledged write the store no longer reaches
+// means a restore, and no replica acknowledged since before the cutoff means
+// nobody can vouch (every replica restarted, perhaps over a restore). Each
+// holds the pass; one replica vouching is enough.
+func TestJanitorHoldsUntilAReplicaVouches(t *testing.T) {
+	report := func(acked, seq int64, first time.Time, durable bool) *httptest.Server {
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			json.NewEncoder(w).Encode(ActivityReport{ReplicaStarted: time.Now().Add(-2 * time.Hour), RetentionSeconds: 86400,
+				Durable: durable && r.URL.Path == ActivityPath, HistoryStarted: time.Now().Add(-5 * time.Hour), HistorySeq: seq,
+				AckedSeq: acked, FirstAcked: first})
+		}))
+		t.Cleanup(s.Close)
+		return s
+	}
+	old, recent := time.Now().Add(-3*time.Hour), time.Now().Add(-time.Minute)
+	for name, tc := range map[string]struct {
+		replicas map[string]*httptest.Server
+		held     string
+	}{
+		"a replica saw writes the store lost": {map[string]*httptest.Server{"10.0.0.1": report(5, 5, old, true), "10.0.0.2": report(9, 5, old, true)}, "activity_history_lost"},
+		"no replica has an acknowledgment":    {map[string]*httptest.Server{"10.0.0.1": report(0, 5, time.Time{}, true), "10.0.0.2": report(0, 5, time.Time{}, true)}, "activity_history_unverified"},
+		"acknowledged only within the window": {map[string]*httptest.Server{"10.0.0.1": report(5, 5, recent, true), "10.0.0.2": report(0, 5, time.Time{}, true)}, "activity_history_unverified"},
+		"one replica vouches":                 {map[string]*httptest.Server{"10.0.0.1": report(0, 5, time.Time{}, true), "10.0.0.2": report(4, 5, old, true)}, ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			jf := newJanitor(t, tc.replicas)
+			jf.api.scaleStatus = 403 // durable passes read no scale records
+			jf.api.sandboxes = []map[string]any{janitorSandbox(1, 3*time.Hour)}
+			if e := jf.j.pass(context.Background()); e != nil {
+				t.Fatal(e)
+			}
+			pass := jf.events(t, "janitor_pass")
+			if tc.held == "" {
+				if len(jf.api.deleted) != 1 || pass[0]["held"] != nil {
+					t.Fatalf("a vouched history held: %v %v", jf.api.deleted, pass)
+				}
+				return
+			}
+			if len(jf.api.deleted) != 0 || pass[0]["held"] != tc.held {
+				t.Fatalf("deleted %v, pass %v, want held %s", jf.api.deleted, pass, tc.held)
+			}
+		})
 	}
 }

@@ -26,9 +26,9 @@ import (
 
 // Store is the shared store's part this service uses.
 type Store interface {
-	RecordProxyActivity(ctx context.Context, scope string, rows []store.ProxyActivity, maxRows int) error
+	RecordProxyActivity(ctx context.Context, scope string, rows []store.ProxyActivity, maxRows int, acked int64) (int64, bool, error)
 	ReadProxyActivity(ctx context.Context, scope, after string, since time.Time, limit int) ([]store.ProxyActivity, error)
-	ProxyActivityHistory(ctx context.Context, scope string) (time.Time, bool, error)
+	ProxyActivityHistory(ctx context.Context, scope string) (time.Time, int64, bool, error)
 	PruneProxyActivity(ctx context.Context, cutoff time.Time) error
 }
 
@@ -46,8 +46,8 @@ type Identifier interface {
 }
 
 const (
-	// RecordPath takes {"sandboxes": [{namespace, ownerUID, lastSeen}]}; an
-	// empty list starts the binding's history.
+	// RecordPath takes {"sandboxes": [{namespace, ownerUID, lastSeen}],
+	// "ackedSeq"} and answers {"seq", "lost"}.
 	RecordPath = "/v1/proxy/activity"
 	// ReadPath takes {"after": cursor} and returns {"retentionSeconds",
 	// "sandboxes", "next"}; an empty next is the last page.
@@ -70,6 +70,19 @@ type Row struct {
 // RecordRequest is a proxy's report.
 type RecordRequest struct {
 	Sandboxes []Row `json:"sandboxes"`
+	// AckedSeq is the binding sequence last acknowledged to this replica, 0
+	// for none (a replica that has not reported since it started).
+	AckedSeq int64 `json:"ackedSeq"`
+}
+
+// RecordResponse acknowledges a report: Seq is the binding sequence it got.
+// Lost says the broker's store no longer reaches AckedSeq: writes it
+// acknowledged are gone (a restore to an earlier point), the binding's
+// history has started again, and the replica should report everything it
+// holds.
+type RecordResponse struct {
+	Seq  int64 `json:"seq"`
+	Lost bool  `json:"lost"`
 }
 
 // ReadRequest asks for the page after a Sandbox UID.
@@ -83,8 +96,11 @@ type ReadRequest struct {
 type ReadResponse struct {
 	RetentionSeconds int64      `json:"retentionSeconds"`
 	HistoryStarted   *time.Time `json:"historyStarted,omitempty"`
-	Sandboxes        []Row      `json:"sandboxes"`
-	Next             string     `json:"next"`
+	// Seq is the binding's current sequence: a replica whose acknowledged
+	// sequence is higher saw writes this store has lost.
+	Seq       int64  `json:"seq"`
+	Sandboxes []Row  `json:"sandboxes"`
+	Next      string `json:"next"`
 }
 
 // Service serves both routes.
@@ -165,15 +181,24 @@ func (s *Service) record(w http.ResponseWriter, r *http.Request) {
 		}
 		rows = append(rows, store.ProxyActivity{Namespace: row.Namespace, OwnerUID: row.OwnerUID, LastSeen: row.LastSeen})
 	}
-	if err := s.Store.RecordProxyActivity(r.Context(), id.Scope, rows, s.maxRows()); errors.Is(err, store.ErrProxyActivityFull) {
+	if body.AckedSeq < 0 {
+		s.refuse(w, http.StatusBadRequest, "body")
+		return
+	}
+	seq, lost, err := s.Store.RecordProxyActivity(r.Context(), id.Scope, rows, s.maxRows(), body.AckedSeq)
+	if errors.Is(err, store.ErrProxyActivityFull) {
 		s.refuse(w, http.StatusInsufficientStorage, "row_ceiling")
 		return
 	} else if err != nil {
 		s.refuse(w, http.StatusServiceUnavailable, "store")
 		return
 	}
+	if lost {
+		s.log().Warn("proxyactivity: the store lost acknowledged reports; history restarted", "scope", id.Scope, "acked", body.AckedSeq, "seq", seq)
+	}
 	s.prune(r.Context(), now)
-	w.WriteHeader(http.StatusNoContent)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(RecordResponse{Seq: seq, Lost: lost})
 }
 
 func (s *Service) read(w http.ResponseWriter, r *http.Request) {
@@ -188,7 +213,7 @@ func (s *Service) read(w http.ResponseWriter, r *http.Request) {
 		s.refuse(w, http.StatusBadRequest, "body")
 		return
 	}
-	started, known, err := s.Store.ProxyActivityHistory(r.Context(), id.Scope)
+	started, seq, known, err := s.Store.ProxyActivityHistory(r.Context(), id.Scope)
 	if err != nil {
 		s.refuse(w, http.StatusServiceUnavailable, "store")
 		return
@@ -198,7 +223,7 @@ func (s *Service) read(w http.ResponseWriter, r *http.Request) {
 		s.refuse(w, http.StatusServiceUnavailable, "store")
 		return
 	}
-	out := ReadResponse{RetentionSeconds: int64(s.Retention / time.Second), Sandboxes: make([]Row, 0, len(rows))}
+	out := ReadResponse{RetentionSeconds: int64(s.Retention / time.Second), Seq: seq, Sandboxes: make([]Row, 0, len(rows))}
 	if known {
 		out.HistoryStarted = &started
 	}
