@@ -3,6 +3,7 @@ package httpcatalog
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -225,6 +226,28 @@ func TestGitGranted(t *testing.T) {
 		if got := c.GitGranted(tc.installation, tc.repo, tc.scope); got != tc.want {
 			t.Errorf("GitGranted(%d, %s, %s) = %v, want %v", tc.installation, tc.repo, tc.scope, got, tc.want)
 		}
+	}
+}
+
+// GitScope lists every repository an installation's entries name, for the
+// broker's installation scope check.
+func TestGitScope(t *testing.T) {
+	doc := `{"entries":[
+		{"name":"git","kind":"git","host":"github.com","pools":["pool-a"],"git":{"appID":7,"installationID":42,"repos":[{"repo":"trmlabs/a","access":"write"},{"repo":"trmlabs/b","access":"read"}]}},
+		{"name":"other","kind":"git","host":"github.com","pools":["pool-b"],"git":{"appID":7,"installationID":43,"repos":[{"repo":"trmlabs/c","access":"read"}]}},
+		{"name":"api","kind":"github-api","host":"api.github.com","pools":["pool-a"],"git":{"appID":7,"installationID":42,"repos":[{"repo":"trmlabs/a","access":"write"}]}}]}`
+	c, err := Parse([]byte(doc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repos, pullRequests := c.GitScope(42); fmt.Sprint(repos) != "[trmlabs/a trmlabs/b trmlabs/a]" || !pullRequests {
+		t.Errorf("GitScope(42) = %v, %v", repos, pullRequests)
+	}
+	if repos, pullRequests := c.GitScope(43); fmt.Sprint(repos) != "[trmlabs/c]" || pullRequests {
+		t.Errorf("GitScope(43) = %v, %v", repos, pullRequests)
+	}
+	if repos, _ := c.GitScope(44); repos != nil {
+		t.Errorf("GitScope(44) = %v", repos)
 	}
 }
 
