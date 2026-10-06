@@ -225,9 +225,12 @@ type response struct {
 // reported. Every refusal is generic to the caller and named in the log.
 func (i *Issuer) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/proxy/certificate", i.serve)
+	i.Register(mux)
 	return mux
 }
+
+// Register adds the certificate route to mux.
+func (i *Issuer) Register(mux *http.ServeMux) { mux.HandleFunc("POST /v1/proxy/certificate", i.serve) }
 
 func (i *Issuer) serve(w http.ResponseWriter, r *http.Request) {
 	refuse := func(status int, reason string) {

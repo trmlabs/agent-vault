@@ -51,6 +51,9 @@ type FixedConfig struct {
 	// Sandbox after its last use (default a day). The janitor refuses a
 	// retention shorter than its idle time.
 	ActivityRetentionSeconds int64 `json:"activityRetentionSeconds,omitempty"`
+	// DurableActivity keeps activity in the broker's shared store; see
+	// DurableActivityConfig.
+	DurableActivity *DurableActivityConfig `json:"durableActivity,omitempty"`
 }
 type SandboxConfig struct {
 	Namespace     string `json:"namespace"`
@@ -148,6 +151,10 @@ func LoadConfig(path string) (FixedConfig, error) {
 
 func (c FixedConfig) Validate(now time.Time) error {
 	if (c.AdminListen != "" || c.PostgresListener != nil || c.TLS != nil) && c.Shared == nil {
+		return errConfig
+	}
+	// Activity reaches the broker over the CONNECT upstream.
+	if d := c.DurableActivity; d != nil && (c.AdminListen == "" || c.Connect == nil || d.PushSeconds < 0 || d.PushSeconds > 3600) {
 		return errConfig
 	}
 	// Up to a year: retention costs one small entry per Sandbox used.

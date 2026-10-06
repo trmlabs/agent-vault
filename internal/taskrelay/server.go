@@ -107,6 +107,17 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 		go func() { defer close(certDone); serving.run(ctx) }()
 	}
 	defer func() { cancel(); <-certDone }()
+	// Durable activity reports until the relay stops, then once more after
+	// every listener has closed.
+	durableDone := make(chan struct{})
+	close(durableDone)
+	if d := c.DurableActivity; d != nil && pair.cache != nil {
+		reporter := &durable{activity: pair.cache.activity, upstream: c.Connect.Upstream, interval: d.interval()}
+		pair.cache.activity.durable = reporter
+		durableDone = make(chan struct{})
+		go func() { defer close(durableDone); reporter.run(ctx) }()
+	}
+	defer func() { cancel(); <-durableDone }()
 	var listeners []net.Listener
 	defer func() {
 		r.workMu.Lock()
