@@ -64,8 +64,12 @@ func attachAuthorization(adapter *mitm.HeaderAdapter, getenv func(string) string
 //     a person, as the Entra user principal name. Unset: no attested login
 //     names a person, and person-mode agent-sandbox pools are refused;
 //   - AGENT_VAULT_ENTITLEMENTS selects the entitlement source: "file:<path>"
-//     (fixtures and tests) or unset. Graph stays off until its Entra app
-//     registration exists; "graph" is refused here until it is wired;
+//     (fixtures and tests), "graph", or unset. "graph" asks Microsoft Graph,
+//     looking the person up by user principal name, with a token from
+//     workload identity federation and no secret: AGENT_VAULT_GRAPH_TENANT_ID
+//     and AGENT_VAULT_GRAPH_CLIENT_ID (the Entra app) and
+//     AGENT_VAULT_GRAPH_TOKEN_FILE (the projected service-account token,
+//     audience api://AzureADTokenExchange) are all required;
 //   - AGENT_VAULT_ENTITLEMENT_CACHE_SECONDS shortens the 5-minute cache.
 //
 // Without a verifier or a source, entries above T0 are refused on the pools
@@ -113,11 +117,29 @@ func loadAuthorization(getenv func(string) string) (authorization, error) {
 	case strings.HasPrefix(source, "file:") && strings.HasPrefix(source, "file:/"):
 		a.entitlements = &entitlement.Cache{Source: entitlement.FileSource{Path: strings.TrimPrefix(source, "file:")}, TTL: ttl}
 	case source == "graph":
-		return a, fmt.Errorf("AGENT_VAULT_ENTITLEMENTS=graph needs the Entra app registration (a Security decision) and is not enabled")
+		g, err := graphSource(getenv, client)
+		if err != nil {
+			return a, err
+		}
+		a.entitlements = &entitlement.Cache{Source: g, TTL: ttl}
 	default:
-		return a, fmt.Errorf("AGENT_VAULT_ENTITLEMENTS must be unset or file:/absolute/path")
+		return a, fmt.Errorf("AGENT_VAULT_ENTITLEMENTS must be unset, graph or file:/absolute/path")
 	}
 	return a, nil
+}
+
+// graphSource reads the Graph settings. Every one is required: a broker told to
+// ask the directory that cannot fails at start, not at its first lookup.
+func graphSource(getenv func(string) string, client *http.Client) (entitlement.GraphSource, error) {
+	tenant, app, file := getenv("AGENT_VAULT_GRAPH_TENANT_ID"), getenv("AGENT_VAULT_GRAPH_CLIENT_ID"), getenv("AGENT_VAULT_GRAPH_TOKEN_FILE")
+	if !uuidPattern.MatchString(tenant) || !uuidPattern.MatchString(app) {
+		return entitlement.GraphSource{}, fmt.Errorf("AGENT_VAULT_ENTITLEMENTS=graph needs AGENT_VAULT_GRAPH_TENANT_ID and AGENT_VAULT_GRAPH_CLIENT_ID as lower-case GUIDs")
+	}
+	if !strings.HasPrefix(file, "/") {
+		return entitlement.GraphSource{}, fmt.Errorf("AGENT_VAULT_ENTITLEMENTS=graph needs AGENT_VAULT_GRAPH_TOKEN_FILE as an absolute path")
+	}
+	token := &entitlement.FederatedToken{TenantID: tenant, ClientID: app, AssertionFile: file, Client: client}
+	return entitlement.GraphSource{Endpoint: entitlement.GraphEndpoint, Token: token.Token, Client: client}, nil
 }
 
 // cursorVerifier reads the Cursor settings. A Cursor audience without a team
@@ -171,6 +193,7 @@ var (
 	domainPattern   = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$`)
 	audiencePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,252}$`)
 	teamPattern     = regexp.MustCompile(`^[0-9]{1,20}$`)
+	uuidPattern     = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 )
 
 // sessionBinder is the store's runner-session pin table, or nil when the

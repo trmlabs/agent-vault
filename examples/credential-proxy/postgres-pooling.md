@@ -34,7 +34,7 @@ The pool key holds everything that decides privileges: the worker pool, the bind
 
 ## Budgets
 
-Each database's server-connection budget is its catalog `maxConns` (for example 150 for core, 300 for others), divided by `AGENT_VAULT_DB_POOL_REPLICAS`. It defaults to `AGENT_VAULT_DB_POOL_BUDGET`, or 50, when unset. When every connection is busy, a statement waits up to 2 seconds in a queue bounded at twice the budget. Past either bound it is refused with SQLSTATE 53300 and can be retried. `AGENT_VAULT_DB_MAX_CONNS` caps client sessions in pooled mode.
+Each database's server-connection budget is its catalog `maxConns` (for example 150 for core, 300 for others), divided by `AGENT_VAULT_DB_POOL_REPLICAS`. It defaults to `AGENT_VAULT_DB_POOL_BUDGET`, then `AGENT_VAULT_DB_DEFAULT_DATABASE_CONNS`, or 50, when unset. When every connection is busy, a statement waits up to 2 seconds in a queue bounded at twice the budget. Past either bound it is refused with SQLSTATE 53300 and can be retried. `AGENT_VAULT_DB_MAX_CONNS` caps client sessions in pooled mode.
 
 ## Credentials
 

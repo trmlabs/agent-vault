@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"log/slog"
+	"net/http"
 	"strings"
 	"time"
 
@@ -36,15 +38,38 @@ func (c *Client) NewDatabaseSession(ctx context.Context, mount, role string, ttl
 	if ttl < time.Second || ttl > 24*time.Hour {
 		return nil, fmt.Errorf("database child token TTL must be between one second and 24 hours")
 	}
+	session, denied, err := c.newDatabaseSession(ctx, mount, role, ttl)
+	if denied == "" || c.logins == nil {
+		return session, err
+	}
+	// Vault refused the child policy to this login. If the catalog added the
+	// database after the login was issued, a new login holds it: log in
+	// again once and retry once.
+	if err := c.reloginAfterDenial(ctx, denied); err != nil {
+		c.logger.Warn("database session refused: the broker's vault login lacks its policy", slog.String("reason", err.Error()))
+		return nil, errSessionPolicy
+	}
+	if session, denied, err = c.newDatabaseSession(ctx, mount, role, ttl); denied != "" {
+		c.logger.Warn("database session refused: a new vault login also lacks its policy")
+		return nil, errSessionPolicy
+	}
+	return session, err
+}
+
+var errSessionPolicy = errors.New("create database session failed: vault login lacks this database's policy")
+
+// newDatabaseSession mints one child token. denied is the parent login's
+// token when Vault answered 403, the login lacking the child policy.
+func (c *Client) newDatabaseSession(ctx context.Context, mount, role string, ttl time.Duration) (session *DatabaseSession, denied string, err error) {
 	api, err := c.api.CloneWithHeaders()
 	if err != nil {
-		return nil, fmt.Errorf("prepare database session failed")
+		return nil, "", fmt.Errorf("prepare database session failed")
 	}
 	parent, ceiling, done := c.api.Token(), time.Time{}, func(string, time.Time) {}
 	if c.logins != nil {
 		// Only a young login may parent a new session; see reauth.go.
 		if parent, ceiling, done, err = c.logins.acquire(c.clock()); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 	}
 	accessor, expiry := "", time.Time{}
@@ -58,11 +83,15 @@ func (c *Client) NewDatabaseSession(ctx context.Context, mount, role string, ttl
 		NoDefaultPolicy: true, Renewable: &renewable, Type: "service",
 		TTL: ttl.String(), ExplicitMaxTTL: ttl.String(), DisplayName: "agent-vault-database-session",
 	})
+	var refused *vaultapi.ResponseError
+	if errors.As(err, &refused) && refused.StatusCode == http.StatusForbidden {
+		return nil, parent, fmt.Errorf("create database session failed")
+	}
 	if err != nil {
-		return nil, fmt.Errorf("create database session failed")
+		return nil, "", fmt.Errorf("create database session failed")
 	}
 	if secret == nil || secret.Auth == nil || secret.Auth.ClientToken == "" || secret.Auth.Accessor == "" || secret.Auth.LeaseDuration <= 0 {
-		return nil, fmt.Errorf("database session response missing token, accessor or positive TTL")
+		return nil, "", fmt.Errorf("database session response missing token, accessor or positive TTL")
 	}
 	if len(secret.Auth.Policies) != 1 || secret.Auth.Policies[0] != DatabaseCredentialPolicyName(mount, role) || len(secret.Auth.IdentityPolicies) != 0 || secret.Auth.Renewable {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
@@ -72,7 +101,7 @@ func (c *Client) NewDatabaseSession(ctx context.Context, mount, role string, ttl
 		if c.logins != nil {
 			c.logins.forget(secret.Auth.Accessor)
 		}
-		return nil, fmt.Errorf("database child token has unexpected policy or renewal authority")
+		return nil, "", fmt.Errorf("database child token has unexpected policy or renewal authority")
 	}
 	api.SetToken(secret.Auth.ClientToken)
 	granted := ttl
@@ -84,7 +113,7 @@ func (c *Client) NewDatabaseSession(ctx context.Context, mount, role string, ttl
 		expiry = ceiling
 	}
 	return &DatabaseSession{Accessor: accessor, ExpiresAt: expiry,
-		client: &Client{api: api, method: c.method, logger: c.logger, now: c.now}, parent: c, mount: mount, role: role}, nil
+		client: &Client{api: api, method: c.method, logger: c.logger, now: c.now}, parent: c, mount: mount, role: role}, "", nil
 }
 
 // Revoke ends the session with its own child token (auth/token/revoke-self),

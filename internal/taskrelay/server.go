@@ -98,6 +98,7 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 	if c.TLS != nil {
 		serving := newServingCert(c.TLS, c.Connect.Upstream)
 		serving.issued = func(time.Time, time.Time) { _ = r.record("tls", "certificate-issued") }
+		serving.waiting = func() { _ = r.record("tls", "waiting-for-certificate") }
 		if serving.obtain(ctx) != nil {
 			return errDenied
 		}

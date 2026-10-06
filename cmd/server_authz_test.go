@@ -87,3 +87,32 @@ func TestSandboxPersonDomains(t *testing.T) {
 		t.Fatal("wildcard domain accepted")
 	}
 }
+
+func TestGraphSettings(t *testing.T) {
+	env := func(values map[string]string) func(string) string { return func(k string) string { return values[k] } }
+	good := map[string]string{"AGENT_VAULT_ENTITLEMENTS": "graph",
+		"AGENT_VAULT_GRAPH_TENANT_ID":  "11111111-1111-1111-1111-111111111111",
+		"AGENT_VAULT_GRAPH_CLIENT_ID":  "22222222-2222-2222-2222-222222222222",
+		"AGENT_VAULT_GRAPH_TOKEN_FILE": "/var/run/secrets/azure/tokens/azure-identity-token"}
+	a, err := loadAuthorization(env(good))
+	if err != nil || a.entitlements == nil {
+		t.Fatalf("set: %+v %v", a.entitlements, err)
+	}
+	for key, bad := range map[string]string{
+		"AGENT_VAULT_GRAPH_TENANT_ID":  "",
+		"AGENT_VAULT_GRAPH_CLIENT_ID":  "22222222-2222-2222-2222-22222222222Z",
+		"AGENT_VAULT_GRAPH_TOKEN_FILE": "relative/token",
+	} {
+		with := map[string]string{}
+		for k, v := range good {
+			with[k] = v
+		}
+		with[key] = bad
+		if _, err := loadAuthorization(env(with)); err == nil {
+			t.Errorf("%s=%q accepted", key, bad)
+		}
+	}
+	if _, err := loadAuthorization(env(map[string]string{"AGENT_VAULT_ENTITLEMENTS": "graph"})); err == nil {
+		t.Error("graph without its settings accepted")
+	}
+}
