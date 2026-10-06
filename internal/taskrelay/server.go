@@ -31,6 +31,9 @@ type relay struct {
 	workMu        sync.Mutex
 	stopping      bool
 	foreignPeer   atomic.Bool // set once a non-paired address has connected
+	// pgTLS, with a broker-issued certificate, answers a PostgreSQL client's
+	// SSLRequest; its listeners are then plain TCP and refuse plaintext.
+	pgTLS *tls.Config
 }
 
 // Run serves native TLS only. Failure of any listener, pairing, deadline or
@@ -88,6 +91,21 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 		}
 		tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}}
 	}
+	// A broker-issued certificate is obtained before any listener binds,
+	// then renewed in the background for as long as the proxy runs.
+	certDone := make(chan struct{})
+	close(certDone)
+	if c.TLS != nil {
+		serving := newServingCert(c.TLS, c.Connect.Upstream)
+		serving.issued = func(time.Time, time.Time) { _ = r.record("tls", "certificate-issued") }
+		if serving.obtain(ctx) != nil {
+			return errDenied
+		}
+		tlsConfig, r.pgTLS = serving.serverTLS("http/1.1"), serving.serverTLS("postgresql")
+		certDone = make(chan struct{})
+		go func() { defer close(certDone); serving.run(ctx) }()
+	}
+	defer func() { cancel(); <-certDone }()
 	var listeners []net.Listener
 	defer func() {
 		r.workMu.Lock()
@@ -103,19 +121,26 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 		}
 	}()
 	listenerSlots := make(chan struct{}, limit)
-	bind := func(address string) (net.Listener, error) {
+	bindAs := func(address string, outer *tls.Config) (net.Listener, error) {
 		plain, e := net.Listen("tcp", address)
 		if e != nil {
 			return nil, e
 		}
 		var l net.Listener = &boundedListener{Listener: plain, slots: listenerSlots}
-		if tlsConfig != nil {
-			l = tls.NewListener(l, tlsConfig)
+		if outer != nil {
+			l = tls.NewListener(l, outer)
 		}
-		if e == nil {
-			listeners = append(listeners, l)
+		listeners = append(listeners, l)
+		return l, nil
+	}
+	bind := func(address string) (net.Listener, error) { return bindAs(address, tlsConfig) }
+	// A PostgreSQL listener with a broker-issued certificate starts in TCP and
+	// upgrades on the client's SSLRequest.
+	bindPostgres := func(address string) (net.Listener, error) {
+		if r.pgTLS != nil {
+			return bindAs(address, nil)
 		}
-		return l, e
+		return bind(address)
 	}
 	failures := make(chan error, 4+len(c.postgresBindings()))
 	var start []func()
@@ -196,14 +221,14 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 		})
 	}
 	for _, binding := range c.postgresBindings() {
-		l, e := bind(binding.Listen)
+		l, e := bindPostgres(binding.Listen)
 		if e != nil {
 			return errConfig
 		}
 		servePostgres(l, func(conn net.Conn) { r.postgres(conn, binding, nil) })
 	}
 	if pl := c.PostgresListener; pl != nil {
-		l, e := bind(pl.Listen)
+		l, e := bindPostgres(pl.Listen)
 		if e != nil {
 			return errConfig
 		}

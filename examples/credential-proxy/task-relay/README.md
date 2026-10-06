@@ -134,6 +134,14 @@ One PostgreSQL port can serve every catalog database. Set `postgresListener` (sh
 
 The startup packet's `database` parameter picks the route. `databases` is the route table, rendered from the catalog, with no fixed count; a name outside it, or a startup with no database, is refused with SQLSTATE 3D000 ("this database isn't in the Gatehouse catalog for your pool") before the broker is dialed, and audited as `denied:no-database`. A name in it goes to the one upstream, which authorizes it for the agent's pool. An SSLRequest or GSSENCRequest is answered first, as on every PostgreSQL listener, and a cancellation on the port reaches only a session it opened. The config file may be up to 16 MiB, enough for tens of thousands of names.
 
+To encrypt the hop from each agent Pod to the proxy, set `tls` (shared mode only) instead of `tlsCertFile` and `tlsKeyFile`:
+
+```json
+"tls": {"mode": "broker-issued", "names": ["gatehouse-proxy.agent-sandbox.svc", "gatehouse-proxy.agent-sandbox.svc.cluster.local"]}
+```
+
+Before any listener binds, the proxy generates a P-256 key in memory and sends a certificate request for exactly `names` to the broker's `POST /v1/proxy/certificate`, over the `connect` upstream with its own projected token; the names must be among the broker's `AGENT_VAULT_PROXY_CERT_NAMES`. It retries with backoff until it gets one. It renews at two thirds of the certificate's lifetime on a new key, keeps serving the current certificate while the broker refuses, and once that certificate expires with no replacement refuses every handshake (open sessions keep their own deadlines). The key is never written anywhere. A returned certificate must be current, for that key, for server authentication, and name nothing else, or it is discarded. The CONNECT listener then serves TLS (agents use an `https://` proxy URL and trust the broker's proxy CA). Every PostgreSQL listener, each binding and the single port, answers an SSLRequest with `S` and continues in TLS, declines GSS encryption with `N`, and refuses a plaintext startup or cancellation with SQLSTATE 28000 ("Gatehouse requires TLS on this port"), audited as `denied:plaintext`. Clients connect with `sslmode=require` or `verify-full` and the proxy CA. The admin listener stays plaintext.
+
 `adminListen` (shared mode only) serves `GET /v1/activity` in plaintext: when each agent Pod last used this replica, for the idle janitor (`task-relay janitor --config`). Every other path and method is 404. Its network policy must admit only the janitor.
 
 ## Client and protocol contract

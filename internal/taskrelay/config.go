@@ -40,6 +40,9 @@ type FixedConfig struct {
 	Self bool `json:"self,omitempty"`
 	// Shared runs the relay as one proxy for many agent Pods; see SharedConfig.
 	Shared *SharedConfig `json:"shared,omitempty"`
+	// TLS, in shared mode only, serves every listener but AdminListen in TLS
+	// with a broker-issued certificate; see ServingTLSConfig.
+	TLS *ServingTLSConfig `json:"tls,omitempty"`
 	// AdminListen, in shared mode only, serves GET /v1/activity in plaintext:
 	// when each agent Pod last used this replica, for the idle janitor. A
 	// network policy must admit only the janitor to it.
@@ -140,7 +143,7 @@ func LoadConfig(path string) (FixedConfig, error) {
 }
 
 func (c FixedConfig) Validate(now time.Time) error {
-	if (c.AdminListen != "" || c.PostgresListener != nil) && c.Shared == nil {
+	if (c.AdminListen != "" || c.PostgresListener != nil || c.TLS != nil) && c.Shared == nil {
 		return errConfig
 	}
 	if c.Shared != nil {
