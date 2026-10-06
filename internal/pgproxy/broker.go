@@ -825,12 +825,15 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		endOnce.Do(func() {
 			if n != nil {
 				notice.notice.Store(n)
+				// Stop relaying the database first, so the cancel below cannot
+				// reach the client as the server's own error ahead of the notice.
+				_ = upstream.conn.Close()
 				time.AfterFunc(2*noticeWriteTimeout, func() { _ = conn.Close() })
 			} else {
 				_ = conn.Close()
 			}
 			// Closing a PostgreSQL socket does not necessarily interrupt a running
-			// query. Send the session's private cancellation capability first.
+			// query. Send the session's private cancellation capability as well.
 			if upstream.backendKey != nil {
 				ctx, cancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
 				b.cancelQuery(ctx, &pgproto3.CancelRequest{ProcessID: upstream.backendKey.ProcessID, SecretKey: upstream.backendKey.SecretKey})

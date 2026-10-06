@@ -126,8 +126,9 @@ type fakeUpstream struct {
 	lastIdleTxn string
 	forbidParam string // a param key that must never be forwarded upstream
 	forbidSeen  bool
-	accepted    int      // upstream connections accepted
-	queries     []string // simple-protocol query text received
+	accepted    int           // upstream connections accepted
+	queries     []string      // simple-protocol query text received
+	cancelled   chan struct{} // closed by the first cancel request, when set
 	// transactions makes BEGIN open a transaction (ReadyForQuery 'T') until
 	// COMMIT or ROLLBACK, and SLEEP take 300ms; off, every query is idle.
 	transactions bool
@@ -218,6 +219,21 @@ func (fu *fakeUpstream) handle(conn net.Conn) {
 			return
 		}
 	}
+	if _, ok := msg.(*pgproto3.CancelRequest); ok {
+		fu.mu.Lock()
+		signalled := fu.cancelled != nil
+		if signalled {
+			close(fu.cancelled)
+			fu.cancelled = nil
+		}
+		fu.mu.Unlock()
+		if signalled {
+			// PostgreSQL ends the statement before it closes the cancel
+			// connection, so its error is on the way by then.
+			time.Sleep(100 * time.Millisecond)
+		}
+		return
+	}
 	startup, ok := msg.(*pgproto3.StartupMessage)
 	if !ok {
 		return
@@ -283,6 +299,23 @@ func (fu *fakeUpstream) handle(conn net.Conn) {
 			fu.mu.Unlock()
 			if q.String == "DROP BACKEND" {
 				return // the connection fails under the client
+			}
+			if q.String == "SLEEP UNTIL CANCELLED" {
+				// As PostgreSQL does: a cancel request ends the running
+				// statement with 57014 on this connection.
+				fu.mu.Lock()
+				wait := fu.cancelled
+				fu.mu.Unlock()
+				select {
+				case <-wait:
+				case <-time.After(5 * time.Second):
+				}
+				be.Send(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "57014", Message: "canceling statement due to user request"})
+				be.Send(&pgproto3.ReadyForQuery{TxStatus: status})
+				if err := be.Flush(); err != nil {
+					return
+				}
+				continue
 			}
 			if transactions {
 				switch q.String {
