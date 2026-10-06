@@ -115,6 +115,7 @@ func (f *relayFixture) start(t *testing.T) {
 			t.Error("relay did not stop")
 		}
 	})
+	t.Cleanup(stop) // runs first: cleanups run last-registered first
 	address := ""
 	switch {
 	case f.c.Connect != nil:
