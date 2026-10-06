@@ -372,7 +372,9 @@ func attachProxyCertificates(srv *server.Server, resolver *workloadidentity.Reso
 // the idle janitor's view outlives any proxy replica.
 // AGENT_VAULT_PROXY_ACTIVITY_RETENTION (default 24h) is how long a row is kept;
 // AGENT_VAULT_PROXY_ACTIVITY_MAX_ROWS (default proxyactivity.DefaultMaxRows) is
-// the most rows one proxy binding may hold.
+// the most rows one proxy binding may hold, and
+// AGENT_VAULT_PROXY_ACTIVITY_MAX_STREAMS (default
+// proxyactivity.DefaultMaxStreams) the most replica streams.
 func attachProxyActivity(srv *server.Server, resolver *workloadidentity.Resolver, db store.Store, logger *slog.Logger, getenv func(string) string) error {
 	raw := getenv("AGENT_VAULT_PROXY_ACTIVITY_RETENTION")
 	if getenv("AGENT_VAULT_CROSS_CLUSTER_PORT") == "" || resolver == nil {
@@ -401,8 +403,16 @@ func attachProxyActivity(srv *server.Server, resolver *workloadidentity.Resolver
 		}
 		maxRows = parsed
 	}
+	maxStreams := 0
+	if raw := getenv("AGENT_VAULT_PROXY_ACTIVITY_MAX_STREAMS"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 {
+			return fmt.Errorf("AGENT_VAULT_PROXY_ACTIVITY_MAX_STREAMS must be a positive whole number")
+		}
+		maxStreams = parsed
+	}
 	return srv.EnableProxyActivity(&proxyactivity.Service{Store: activityStore, Identifier: proxyIdentifier{resolver}, Retention: retention,
-		MaxRows: maxRows, Logger: logger})
+		MaxRows: maxRows, MaxStreams: maxStreams, Logger: logger})
 }
 
 // proxyIdentifier adapts workload identity to proxy activity.

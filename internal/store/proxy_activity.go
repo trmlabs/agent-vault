@@ -24,6 +24,10 @@ const proxyActivityChunk = 500
 // ceiling.
 var ErrProxyActivityFull = errors.New("proxy activity: the scope is at its row ceiling")
 
+// ErrProxyActivityStreams refuses a report that would start a stream past the
+// scope's stream ceiling.
+var ErrProxyActivityStreams = errors.New("proxy activity: the scope is at its stream ceiling")
+
 // RecordProxyActivity keeps, per Sandbox, the latest of the stored and the
 // reported times, in one transaction with the reporting replica's stream. A
 // row repeated within rows keeps its latest time.
@@ -37,8 +41,9 @@ var ErrProxyActivityFull = errors.New("proxy activity: the scope is at its row c
 // accepted report gets the stream's next sequence, returned as seq. A report
 // that would take the binding past maxRows rows is refused whole with
 // ErrProxyActivityFull and changes nothing; rows already held may still be
-// updated by a report that adds none.
-func (s *SQLStore) RecordProxyActivity(ctx context.Context, scope, replica string, rows []ProxyActivity, maxRows int, acked int64) (seq int64, lost bool, err error) {
+// updated by a report that adds none. A report that would start the binding's
+// stream past maxStreams is refused whole with ErrProxyActivityStreams.
+func (s *SQLStore) RecordProxyActivity(ctx context.Context, scope, replica string, rows []ProxyActivity, maxRows, maxStreams int, acked int64) (seq int64, lost bool, err error) {
 	if scope == "" || replica == "" {
 		return 0, false, fmt.Errorf("proxy activity needs a scope and a replica")
 	}
@@ -68,9 +73,20 @@ func (s *SQLStore) RecordProxyActivity(ctx context.Context, scope, replica strin
 	// The stream's row exists before it is locked, so two reports racing on
 	// it serialize. A new stream is at 0: any acknowledgment the replica
 	// holds for it is then a loss.
-	if _, err = tx.ExecContext(ctx, s.dialect.Rebind(`INSERT INTO proxy_activity_stream (scope, replica, seq, used_ms) VALUES (?, ?, 0, `+now+`)
-		ON CONFLICT (scope, replica) DO NOTHING`), scope, replica); err != nil { // #nosec G202 -- constant clock expression
+	created, err := tx.ExecContext(ctx, s.dialect.Rebind(`INSERT INTO proxy_activity_stream (scope, replica, seq, used_ms) VALUES (?, ?, 0, `+now+`)
+		ON CONFLICT (scope, replica) DO NOTHING`), scope, replica) // #nosec G202 -- constant clock expression
+	if err != nil {
 		return 0, false, err
+	}
+	// Counted only when a stream starts: a replica's start, not every report.
+	if fresh, _ := created.RowsAffected(); fresh > 0 {
+		var streams int
+		if err = tx.QueryRowContext(ctx, s.dialect.Rebind(`SELECT COUNT(*) FROM proxy_activity_stream WHERE scope = ?`), scope).Scan(&streams); err != nil {
+			return 0, false, err
+		}
+		if streams > maxStreams {
+			return 0, false, ErrProxyActivityStreams
+		}
 	}
 	var stored int64
 	if err = tx.QueryRowContext(ctx, s.dialect.Rebind(`SELECT seq FROM proxy_activity_stream WHERE scope = ? AND replica = ? `+s.dialect.ForUpdateClause()),

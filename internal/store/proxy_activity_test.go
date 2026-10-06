@@ -22,15 +22,15 @@ func checkProxyActivity(t *testing.T, s *SQLStore) {
 		rows = append(rows, ProxyActivity{Namespace: "developers", OwnerUID: fmt.Sprintf("sb-%05d", i), LastSeen: now.Add(-time.Duration(i) * time.Minute)})
 	}
 	rows = append(rows, ProxyActivity{Namespace: "developers", OwnerUID: "sb-00001", LastSeen: now}) // repeated in one batch: latest wins
-	if _, _, err := s.RecordProxyActivity(ctx, scope, "r1", rows, 100000, 0); err != nil {
+	if _, _, err := s.RecordProxyActivity(ctx, scope, "r1", rows, 100000, 100, 0); err != nil {
 		t.Fatal(err)
 	}
 	// An older report never moves a time back; a newer one moves it forward.
 	if _, _, err := s.RecordProxyActivity(ctx, scope, "r1", []ProxyActivity{{Namespace: "developers", OwnerUID: "sb-00000", LastSeen: now.Add(-time.Hour)},
-		{Namespace: "developers", OwnerUID: "sb-00002", LastSeen: now.Add(time.Second)}}, 100000, 0); err != nil {
+		{Namespace: "developers", OwnerUID: "sb-00002", LastSeen: now.Add(time.Second)}}, 100000, 100, 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.RecordProxyActivity(ctx, scope+"-other", "r1", []ProxyActivity{{Namespace: "customers", OwnerUID: "sb-x", LastSeen: now}}, 100000, 0); err != nil {
+	if _, _, err := s.RecordProxyActivity(ctx, scope+"-other", "r1", []ProxyActivity{{Namespace: "customers", OwnerUID: "sb-x", LastSeen: now}}, 100000, 100, 0); err != nil {
 		t.Fatal(err)
 	}
 	got := map[string]time.Time{}
@@ -63,10 +63,10 @@ func checkProxyActivity(t *testing.T, s *SQLStore) {
 	if kept, err := s.ReadProxyActivity(ctx, scope, "", time.Time{}, 5000); err != nil || len(kept) != 61 {
 		t.Fatalf("after pruning: %d %v", len(kept), err)
 	}
-	if _, _, err := s.RecordProxyActivity(ctx, "", "r1", rows[:1], 100000, 0); err == nil {
+	if _, _, err := s.RecordProxyActivity(ctx, "", "r1", rows[:1], 100000, 100, 0); err == nil {
 		t.Fatal("no scope accepted")
 	}
-	if _, _, err := s.RecordProxyActivity(ctx, scope, "r1", []ProxyActivity{{OwnerUID: "sb"}}, 100000, 0); err == nil {
+	if _, _, err := s.RecordProxyActivity(ctx, scope, "r1", []ProxyActivity{{OwnerUID: "sb"}}, 100000, 100, 0); err == nil {
 		t.Fatal("row with no namespace accepted")
 	}
 }
@@ -86,7 +86,7 @@ func checkProxyActivityHistoryAndCeiling(t *testing.T, s *SQLStore) {
 		t.Fatalf("history before any report: %v %v", known, err)
 	}
 	before := time.Now().Add(-time.Second)
-	if _, _, err := s.RecordProxyActivity(ctx, scope, "r1", nil, 3, 0); err != nil {
+	if _, _, err := s.RecordProxyActivity(ctx, scope, "r1", nil, 3, 100, 0); err != nil {
 		t.Fatal(err)
 	}
 	started, _, known, err := s.ProxyActivityHistory(ctx, scope)
@@ -97,15 +97,15 @@ func checkProxyActivityHistoryAndCeiling(t *testing.T, s *SQLStore) {
 	row := func(owner string) ProxyActivity {
 		return ProxyActivity{Namespace: "developers", OwnerUID: owner, LastSeen: now}
 	}
-	if _, _, err := s.RecordProxyActivity(ctx, scope, "r1", []ProxyActivity{row("a"), row("b"), row("c")}, 3, 0); err != nil {
+	if _, _, err := s.RecordProxyActivity(ctx, scope, "r1", []ProxyActivity{row("a"), row("b"), row("c")}, 3, 100, 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.RecordProxyActivity(ctx, scope, "r1", []ProxyActivity{row("a"), row("d")}, 3, 0); !errors.Is(err, ErrProxyActivityFull) {
+	if _, _, err := s.RecordProxyActivity(ctx, scope, "r1", []ProxyActivity{row("a"), row("d")}, 3, 100, 0); !errors.Is(err, ErrProxyActivityFull) {
 		t.Fatalf("a fourth row: %v", err)
 	}
 	later := row("a")
 	later.LastSeen = now.Add(time.Minute)
-	if _, _, err := s.RecordProxyActivity(ctx, scope, "r1", []ProxyActivity{later, row("b")}, 3, 0); err != nil {
+	if _, _, err := s.RecordProxyActivity(ctx, scope, "r1", []ProxyActivity{later, row("b")}, 3, 100, 0); err != nil {
 		t.Fatalf("updates at the ceiling: %v", err)
 	}
 	rows, err := s.ReadProxyActivity(ctx, scope, "", time.Time{}, 10)
@@ -139,7 +139,7 @@ func checkProxyActivitySequence(t *testing.T, s *SQLStore) {
 	row := []ProxyActivity{{Namespace: "developers", OwnerUID: "sb-1", LastSeen: time.Now()}}
 	record := func(replica string, acked int64) (int64, bool) {
 		t.Helper()
-		seq, lost, err := s.RecordProxyActivity(ctx, scope, replica, row, 100, acked)
+		seq, lost, err := s.RecordProxyActivity(ctx, scope, replica, row, 100, 100, acked)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -205,7 +205,7 @@ func checkProxyActivitySequence(t *testing.T, s *SQLStore) {
 		t.Fatalf("stream lost: %d %v, want a loss", seq, lost)
 	}
 	// A refused report changes nothing, not even the stream.
-	if _, _, err := s.RecordProxyActivity(ctx, scope, "aaaa0001", []ProxyActivity{{Namespace: "developers", OwnerUID: "sb-2", LastSeen: time.Now()}}, 1, 2); !errors.Is(err, ErrProxyActivityFull) {
+	if _, _, err := s.RecordProxyActivity(ctx, scope, "aaaa0001", []ProxyActivity{{Namespace: "developers", OwnerUID: "sb-2", LastSeen: time.Now()}}, 1, 100, 2); !errors.Is(err, ErrProxyActivityFull) {
 		t.Fatalf("over the ceiling: %v", err)
 	}
 	if _, streams, _, _ := s.ProxyActivityHistory(ctx, scope); streams["aaaa0001"] != 2 {
@@ -223,5 +223,37 @@ func checkProxyActivitySequence(t *testing.T, s *SQLStore) {
 	}
 	if _, streams, _, _ := s.ProxyActivityHistory(ctx, scope); len(streams) != 0 {
 		t.Fatalf("streams after pruning: %v", streams)
+	}
+}
+
+func TestProxyActivityStreamCeiling(t *testing.T) { checkProxyActivityStreamCeiling(t, openTestDB(t)) }
+
+// A binding starts at most maxStreams replica streams: a report that would
+// start one more is refused whole and writes nothing, while the streams it
+// holds go on reporting, and another binding is not affected.
+func checkProxyActivityStreamCeiling(t *testing.T, s *SQLStore) {
+	ctx := context.Background()
+	scope := "td/stream-ceiling/" + time.Now().Format("150405.000000000")
+	row := func(owner string) []ProxyActivity {
+		return []ProxyActivity{{Namespace: "developers", OwnerUID: owner, LastSeen: time.Now()}}
+	}
+	for _, replica := range []string{"aaaa0001", "bbbb0002"} {
+		if _, _, err := s.RecordProxyActivity(ctx, scope, replica, row("sb-"+replica), 100, 2, 0); err != nil {
+			t.Fatalf("%s: %v", replica, err)
+		}
+	}
+	if _, _, err := s.RecordProxyActivity(ctx, scope, "cccc0003", row("sb-new"), 100, 2, 0); !errors.Is(err, ErrProxyActivityStreams) {
+		t.Fatalf("a stream past the ceiling: %v", err)
+	}
+	_, streams, _, _ := s.ProxyActivityHistory(ctx, scope)
+	got, _ := s.ReadProxyActivity(ctx, scope, "", time.Time{}, 100)
+	if len(streams) != 2 || len(got) != 2 {
+		t.Fatalf("a refused stream wrote: streams %v, rows %d", streams, len(got))
+	}
+	if seq, _, err := s.RecordProxyActivity(ctx, scope, "aaaa0001", row("sb-aaaa0001"), 100, 2, 1); err != nil || seq != 2 {
+		t.Fatalf("a held stream at the ceiling: %d %v", seq, err)
+	}
+	if _, _, err := s.RecordProxyActivity(ctx, scope+"-other", "cccc0003", row("sb-x"), 100, 2, 0); err != nil {
+		t.Fatalf("another binding: %v", err)
 	}
 }
