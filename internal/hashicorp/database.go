@@ -115,21 +115,26 @@ func (c *Client) RenewLease(ctx context.Context, leaseID string, increment time.
 	return time.Duration(secret.LeaseDuration) * time.Second, nil
 }
 
-// RevokeLease revokes a lease, immediately invalidating its credential — the
+// RevokeLease revokes a lease, immediately invalidating its credential: the
 // database engine drops the generated user. This is the kill switch: a
 // disconnected or compromised session's credential stops working at once rather
 // than lingering until its TTL. An empty leaseID is a no-op (nothing was
 // minted). A revoke that Vault rejects returns an error; callers on the
 // shutdown/cleanup path must retain failed cleanup for retry. Production's
 // durable minter also confirms lease absence before clearing its journal.
+//
+// The lease ID goes in the path, as RevokeDatabaseLeaseConfirmed does, so the
+// broker's policy can grant revoke only under its own credential paths.
 func (c *Client) RevokeLease(ctx context.Context, leaseID string) error {
 	if leaseID == "" {
 		return nil
 	}
-	if _, err := c.api.Logical().WriteWithContext(ctx, "sys/leases/revoke", map[string]interface{}{
-		"lease_id": leaseID,
-		"sync":     true,
-	}); err != nil {
+	for _, part := range strings.Split(leaseID, "/") {
+		if !databasePathSegment.MatchString(part) {
+			return fmt.Errorf("invalid database lease ID")
+		}
+	}
+	if _, err := c.api.Logical().WriteWithContext(ctx, "sys/leases/revoke/"+leaseID, map[string]interface{}{"sync": true}); err != nil {
 		return fmt.Errorf("revoke database lease failed")
 	}
 	return nil
