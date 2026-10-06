@@ -126,14 +126,18 @@ type ActivityReport struct {
 	// read in full for this report, so no replica's going or coming loses
 	// history beyond its last report to the broker.
 	Durable bool `json:"durable"`
-	// HistorySeq, on a durable report, is the binding's current sequence.
-	HistorySeq int64 `json:"historySeq,omitempty"`
-	// AckedSeq is the sequence the broker last acknowledged to this replica,
+	// HistoryStreams, on a durable report, is each replica stream's current
+	// sequence in the broker.
+	HistoryStreams map[string]int64 `json:"historyStreams,omitempty"`
+	// Replica names this replica's report stream; AckedSeq is the sequence
+	// the broker last acknowledged on it,
 	// and FirstAcked when it first acknowledged one; zero for a replica that
 	// has had no report accepted since it started. A replica's AckedSeq above
-	// the HistorySeq means the broker lost writes; no replica with a
+	// its own stream's sequence, or a missing stream, means the broker lost
+	// writes; no replica with a
 	// FirstAcked older than the janitor's idle window means none can vouch
 	// the history is whole.
+	Replica    string    `json:"replica,omitempty"`
 	AckedSeq   int64     `json:"ackedSeq,omitempty"`
 	FirstAcked time.Time `json:"firstAcked,omitzero"`
 	// HistoryStarted, on a durable report, is when the broker's history for
@@ -186,6 +190,7 @@ func (a *activity) handler() http.Handler {
 		report := a.report(time.Now())
 		if a.durable != nil {
 			report.AckedSeq, report.FirstAcked = a.durable.verification()
+			report.Replica = a.durable.replica
 			if req.URL.Path == ActivityPath {
 				report = a.withDurable(req.Context(), report)
 			}
@@ -205,10 +210,12 @@ func (a *activity) withDurable(ctx context.Context, report ActivityReport) Activ
 		return report
 	}
 	a.repushMissing(view.sandboxes)
-	if acked, _ := a.durable.verification(); acked > view.seq {
+	if acked, _ := a.durable.verification(); acked > view.streams[a.durable.replica] {
 		// The store lost writes it acknowledged to this replica: report
-		// everything again, and that report restarts the history.
+		// everything again, and that report, sent even if this replica
+		// holds nothing, restarts the history.
 		a.repushAll()
+		a.durable.oweLoss()
 	}
 	rows, retention := view.sandboxes, view.retention
 	byOwner := make(map[string]int, len(report.Sandboxes))
@@ -227,6 +234,6 @@ func (a *activity) withDurable(ctx context.Context, report ActivityReport) Activ
 	}
 	sort.Slice(report.Sandboxes, func(i, j int) bool { return report.Sandboxes[i].OwnerUID < report.Sandboxes[j].OwnerUID })
 	report.RetentionSeconds = min(report.RetentionSeconds, retention)
-	report.Durable, report.HistoryStarted, report.HistorySeq = true, view.historyStarted, view.seq
+	report.Durable, report.HistoryStarted, report.HistoryStreams = true, view.historyStarted, view.streams
 	return report
 }

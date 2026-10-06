@@ -26,10 +26,10 @@ import (
 
 // Store is the shared store's part this service uses.
 type Store interface {
-	RecordProxyActivity(ctx context.Context, scope string, rows []store.ProxyActivity, maxRows int, acked int64) (int64, bool, error)
+	RecordProxyActivity(ctx context.Context, scope, replica string, rows []store.ProxyActivity, maxRows int, acked int64) (int64, bool, error)
 	ReadProxyActivity(ctx context.Context, scope, after string, since time.Time, limit int) ([]store.ProxyActivity, error)
-	ProxyActivityHistory(ctx context.Context, scope string) (time.Time, int64, bool, error)
-	PruneProxyActivity(ctx context.Context, cutoff time.Time) error
+	ProxyActivityHistory(ctx context.Context, scope string) (time.Time, map[string]int64, bool, error)
+	PruneProxyActivity(ctx context.Context, rows, streams time.Time) error
 }
 
 // Identity is an admitted shared proxy: Scope names its binding, and
@@ -47,7 +47,7 @@ type Identifier interface {
 
 const (
 	// RecordPath takes {"sandboxes": [{namespace, ownerUID, lastSeen}],
-	// "ackedSeq"} and answers {"seq", "lost"}.
+	// "replica", "ackedSeq"} and answers {"seq", "lost"}.
 	RecordPath = "/v1/proxy/activity"
 	// ReadPath takes {"after": cursor} and returns {"retentionSeconds",
 	// "sandboxes", "next"}; an empty next is the last page.
@@ -70,19 +70,25 @@ type Row struct {
 // RecordRequest is a proxy's report.
 type RecordRequest struct {
 	Sandboxes []Row `json:"sandboxes"`
-	// AckedSeq is the binding sequence last acknowledged to this replica, 0
+	// Replica names the reporting replica's stream: an identifier the
+	// replica chooses when it starts.
+	Replica string `json:"replica"`
+	// AckedSeq is the sequence last acknowledged on this replica's stream, 0
 	// for none (a replica that has not reported since it started).
 	AckedSeq int64 `json:"ackedSeq"`
 }
 
-// RecordResponse acknowledges a report: Seq is the binding sequence it got.
-// Lost says the broker's store no longer reaches AckedSeq: writes it
+// RecordResponse acknowledges a report: Seq is the sequence it got on the
+// replica's stream. Lost says the broker's store no longer reaches AckedSeq: writes it
 // acknowledged are gone (a restore to an earlier point), the binding's
 // history has started again, and the replica should report everything it
 // holds.
 type RecordResponse struct {
 	Seq  int64 `json:"seq"`
 	Lost bool  `json:"lost"`
+	// RetentionSeconds is how long the broker keeps rows. The replica
+	// forgets its acknowledgment once it is that old.
+	RetentionSeconds int64 `json:"retentionSeconds"`
 }
 
 // ReadRequest asks for the page after a Sandbox UID.
@@ -96,11 +102,12 @@ type ReadRequest struct {
 type ReadResponse struct {
 	RetentionSeconds int64      `json:"retentionSeconds"`
 	HistoryStarted   *time.Time `json:"historyStarted,omitempty"`
-	// Seq is the binding's current sequence: a replica whose acknowledged
-	// sequence is higher saw writes this store has lost.
-	Seq       int64  `json:"seq"`
-	Sandboxes []Row  `json:"sandboxes"`
-	Next      string `json:"next"`
+	// Streams is each replica stream's current sequence: a replica whose
+	// acknowledged sequence is higher than its own stream's, or whose stream
+	// is missing, saw writes this store has lost.
+	Streams   map[string]int64 `json:"streams"`
+	Sandboxes []Row            `json:"sandboxes"`
+	Next      string           `json:"next"`
 }
 
 // Service serves both routes.
@@ -119,6 +126,7 @@ type Service struct {
 	lastPruned time.Time
 }
 
+var replicaID = regexp.MustCompile(`^[a-f0-9]{8,64}$`)
 var ownerUID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]{0,127}$`)
 
 // Validate checks the settings at startup.
@@ -181,11 +189,11 @@ func (s *Service) record(w http.ResponseWriter, r *http.Request) {
 		}
 		rows = append(rows, store.ProxyActivity{Namespace: row.Namespace, OwnerUID: row.OwnerUID, LastSeen: row.LastSeen})
 	}
-	if body.AckedSeq < 0 {
+	if body.AckedSeq < 0 || !replicaID.MatchString(body.Replica) {
 		s.refuse(w, http.StatusBadRequest, "body")
 		return
 	}
-	seq, lost, err := s.Store.RecordProxyActivity(r.Context(), id.Scope, rows, s.maxRows(), body.AckedSeq)
+	seq, lost, err := s.Store.RecordProxyActivity(r.Context(), id.Scope, body.Replica, rows, s.maxRows(), body.AckedSeq)
 	if errors.Is(err, store.ErrProxyActivityFull) {
 		s.refuse(w, http.StatusInsufficientStorage, "row_ceiling")
 		return
@@ -194,11 +202,12 @@ func (s *Service) record(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if lost {
-		s.log().Warn("proxyactivity: the store lost acknowledged reports; history restarted", "scope", id.Scope, "acked", body.AckedSeq, "seq", seq)
+		s.log().Warn("proxyactivity: the store lost acknowledged reports; history restarted", "scope", id.Scope, "replica", body.Replica,
+			"acked", body.AckedSeq, "seq", seq)
 	}
 	s.prune(r.Context(), now)
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(RecordResponse{Seq: seq, Lost: lost})
+	_ = json.NewEncoder(w).Encode(RecordResponse{Seq: seq, Lost: lost, RetentionSeconds: int64(s.Retention / time.Second)})
 }
 
 func (s *Service) read(w http.ResponseWriter, r *http.Request) {
@@ -213,7 +222,7 @@ func (s *Service) read(w http.ResponseWriter, r *http.Request) {
 		s.refuse(w, http.StatusBadRequest, "body")
 		return
 	}
-	started, seq, known, err := s.Store.ProxyActivityHistory(r.Context(), id.Scope)
+	started, streams, known, err := s.Store.ProxyActivityHistory(r.Context(), id.Scope)
 	if err != nil {
 		s.refuse(w, http.StatusServiceUnavailable, "store")
 		return
@@ -223,7 +232,7 @@ func (s *Service) read(w http.ResponseWriter, r *http.Request) {
 		s.refuse(w, http.StatusServiceUnavailable, "store")
 		return
 	}
-	out := ReadResponse{RetentionSeconds: int64(s.Retention / time.Second), Seq: seq, Sandboxes: make([]Row, 0, len(rows))}
+	out := ReadResponse{RetentionSeconds: int64(s.Retention / time.Second), Streams: streams, Sandboxes: make([]Row, 0, len(rows))}
 	if known {
 		out.HistoryStarted = &started
 	}
@@ -258,7 +267,10 @@ func (s *Service) prune(ctx context.Context, now time.Time) {
 	}
 	s.mu.Unlock()
 	if due {
-		if err := s.Store.PruneProxyActivity(ctx, now.Add(-s.Retention)); err != nil {
+		// A replica forgets its acknowledgment once it is a retention old,
+		// so a stream is kept twice that: an idle replica's stream is never
+		// gone while the replica still counts on it.
+		if err := s.Store.PruneProxyActivity(ctx, now.Add(-s.Retention), now.Add(-2*s.Retention)); err != nil {
 			s.log().Warn("proxyactivity: prune failed", "error", err.Error())
 		}
 	}

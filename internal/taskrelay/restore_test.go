@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -107,17 +108,45 @@ func (rig *restoreRig) int64(t *testing.T, query string) int64 {
 // admin address.
 func (rig *restoreRig) replica(t *testing.T) (*sharedFixture, string) {
 	t.Helper()
+	sf, admin := rig.start(t, sandboxPod("sandbox-a", "pod-a", "127.0.0.1"))
+	pod := sandboxPod("sandbox-a", "pod-a", "127.0.0.1")
+	pod["metadata"].(map[string]any)["ownerReferences"].([]any)[0].(map[string]any)["uid"] = "uid-sb-00007"
+	sf.api.send(t, "MODIFIED", pod)
+	return sf, admin
+}
+
+// idleReplica starts a proxy replica that sees no agent Pod and so has no
+// activity to report.
+func (rig *restoreRig) idleReplica(t *testing.T) (*sharedFixture, string) {
+	t.Helper()
+	return rig.start(t)
+}
+
+func (rig *restoreRig) start(t *testing.T, pods ...map[string]any) (*sharedFixture, string) {
+	t.Helper()
 	admin := freeAddress(t)
-	sf := startSharedWith(t, false, true, func(c *FixedConfig) {
+	sf := startSharedPods(t, false, true, pods, func(c *FixedConfig) {
 		u, _ := url.Parse(rig.srv.URL)
 		c.Connect.Upstream.Address, c.Connect.Upstream.CAFile = u.Host, rig.ca
 		c.AdminListen = admin
 		c.DurableActivity = &DurableActivityConfig{PushSeconds: 1}
 	})
-	pod := sandboxPod("sandbox-a", "pod-a", "127.0.0.1")
-	pod["metadata"].(map[string]any)["ownerReferences"].([]any)[0].(map[string]any)["uid"] = "uid-sb-00007"
-	sf.api.send(t, "MODIFIED", pod)
 	return sf, admin
+}
+
+// local is the replica at admin's own report.
+func local(t *testing.T, admin string) ActivityReport {
+	t.Helper()
+	var r ActivityReport
+	resp, err := http.Get("http://" + admin + ActivityLocalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		t.Fatal(err)
+	}
+	return r
 }
 
 // use opens and closes one tunnel for sb-00007 and waits until its use is in
@@ -142,9 +171,21 @@ func (rig *restoreRig) use(t *testing.T, sf *sharedFixture) {
 // with an idle window of idle.
 func pass(t *testing.T, admin string, idle time.Duration) *janitorFixture {
 	t.Helper()
+	return passOver(t, idle, admin)
+}
+
+// passOver is pass over several replicas; the first is asked for the durable
+// view.
+func passOver(t *testing.T, idle time.Duration, admins ...string) *janitorFixture {
+	t.Helper()
 	jf := newJanitor(t, nil)
-	jf.api.replicas = append(jf.api.replicas, replicaPod("proxy-0", "10.9.9.9"))
-	jf.j.replicaURL = func(_, path string) string { return "http://" + admin + path }
+	byIP := map[string]string{}
+	for i, admin := range admins {
+		ip := fmt.Sprintf("10.9.9.%d", i+1)
+		byIP[ip] = admin
+		jf.api.replicas = append(jf.api.replicas, replicaPod(fmt.Sprintf("proxy-%d", i), ip))
+	}
+	jf.j.replicaURL = func(ip, path string) string { return "http://" + byIP[ip] + path }
 	jf.j.config.IdleSeconds = int64(idle / time.Second)
 	jf.api.sandboxes = []map[string]any{janitorSandbox(1, 3*time.Hour), janitorSandbox(7, 3*time.Hour)}
 	if e := jf.j.pass(context.Background()); e != nil {
@@ -191,7 +232,7 @@ func TestJanitorFirstPassAfterARestore(t *testing.T) {
 	// it holds and deletes nothing.
 	rig.use(t, sf)
 	rig.exec(t, `DELETE FROM proxy_activity`)
-	rig.exec(t, `UPDATE proxy_activity_scope SET seq = seq - 3`)
+	rig.exec(t, `UPDATE proxy_activity_stream SET seq = seq - 3`)
 	jf = pass(t, admin, idle)
 	if len(jf.api.deleted) != 0 || held(t, jf) != "activity_history_lost" {
 		t.Fatalf("restore past acknowledged reports: deleted %v, held %v", jf.api.deleted, held(t, jf))
@@ -259,5 +300,78 @@ func TestJanitorHoldsAfterEveryReplicaRestarts(t *testing.T) {
 	time.Sleep(idle + time.Second)
 	if jf = pass(t, admin, idle); held(t, jf) != nil || !jf.api.deleted["sb-00001"] {
 		t.Fatalf("one idle window later: deleted %v, held %v", jf.api.deleted, held(t, jf))
+	}
+}
+
+// A restore that set back only an idle replica's stream, after which a busy
+// replica reports before the idle one does: the busy replica's reports never
+// advance the idle one's stream, so its loss stays visible. The janitor holds,
+// shows the idle replica its loss, the idle replica reports it once with
+// nothing new, and the history restarts: one idle window, then on.
+func TestJanitorSeesAnIdleReplicasLossPastABusyOne(t *testing.T) {
+	const idle = 4 * time.Second
+	rig := newRestoreRig(t)
+	busy, busyAdmin := rig.replica(t)
+	quiet, quietAdmin := rig.replica(t)
+	rig.use(t, busy)
+	rig.use(t, quiet)
+	waitUntil(t, "both acknowledgments", func() bool {
+		return local(t, busyAdmin).AckedSeq > 0 && local(t, quietAdmin).AckedSeq > 0
+	})
+	rig.exec(t, `UPDATE proxy_activity_scope SET history_started_ms = history_started_ms - 7200000`)
+	time.Sleep(idle + time.Second)
+	// The backup was taken just before the idle replica's last report.
+	rig.use(t, quiet)
+	stream := local(t, quietAdmin).Replica
+	waitUntil(t, "the idle replica's last report", func() bool {
+		return rig.int64(t, `SELECT seq FROM proxy_activity_stream WHERE replica = '`+stream+`'`) == local(t, quietAdmin).AckedSeq
+	})
+	rig.exec(t, `UPDATE proxy_activity_stream SET seq = seq - 1 WHERE replica = '`+stream+`'`)
+	history := rig.int64(t, `SELECT history_started_ms FROM proxy_activity_scope`)
+	for range 5 {
+		rig.use(t, busy)
+	}
+	if rig.int64(t, `SELECT history_started_ms FROM proxy_activity_scope`) != history {
+		t.Fatal("the busy replica's reports restarted the history; the test would prove nothing")
+	}
+	jf := passOver(t, idle, busyAdmin, quietAdmin)
+	if len(jf.api.deleted) != 0 || held(t, jf) != "activity_history_lost" {
+		t.Fatalf("after the busy replica's reports: deleted %v, held %v", jf.api.deleted, held(t, jf))
+	}
+	waitUntil(t, "the idle replica's report of its loss", func() bool {
+		return rig.int64(t, `SELECT history_started_ms FROM proxy_activity_scope`) != history
+	})
+	jf = passOver(t, idle, busyAdmin, quietAdmin)
+	if len(jf.api.deleted) != 0 || held(t, jf) != "activity_history_young" {
+		t.Fatalf("after the idle replica's report: deleted %v, held %v", jf.api.deleted, held(t, jf))
+	}
+	time.Sleep(idle + time.Second)
+	rig.use(t, busy)
+	if jf = passOver(t, idle, busyAdmin, quietAdmin); held(t, jf) != nil || !jf.api.deleted["sb-00001"] || jf.api.deleted["sb-00007"] {
+		t.Fatalf("one idle window after the loss: deleted %v, held %v", jf.api.deleted, held(t, jf))
+	}
+}
+
+// Every replica restarted and nothing has used any Sandbox since, so no
+// replica ever reports: the hold ends once every live replica has been up a
+// whole idle window, its own memory covering it, and not before.
+func TestJanitorHoldEndsAWindowAfterAQuietRestart(t *testing.T) {
+	const idle = 4 * time.Second
+	rig := newRestoreRig(t)
+	sf, _ := rig.replica(t)
+	rig.use(t, sf)
+	rig.exec(t, `UPDATE proxy_activity_scope SET history_started_ms = history_started_ms - 7200000`)
+	_, first := rig.idleReplica(t)
+	_, second := rig.idleReplica(t)
+	jf := passOver(t, idle, first, second)
+	if len(jf.api.deleted) != 0 || held(t, jf) != "activity_history_unverified" {
+		t.Fatalf("within the window: deleted %v, held %v", jf.api.deleted, held(t, jf))
+	}
+	time.Sleep(idle + time.Second)
+	if r := local(t, first); r.AckedSeq != 0 {
+		t.Fatalf("an idle replica reported: %+v", r)
+	}
+	if jf = passOver(t, idle, first, second); held(t, jf) != nil || !jf.api.deleted["sb-00001"] || !jf.api.deleted["sb-00007"] {
+		t.Fatalf("one window after the restart: deleted %v, held %v", jf.api.deleted, held(t, jf))
 	}
 }

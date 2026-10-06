@@ -25,20 +25,22 @@ const proxyActivityChunk = 500
 var ErrProxyActivityFull = errors.New("proxy activity: the scope is at its row ceiling")
 
 // RecordProxyActivity keeps, per Sandbox, the latest of the stored and the
-// reported times, in one transaction with the binding's sequence. A row
-// repeated within rows keeps its latest time.
+// reported times, in one transaction with the reporting replica's stream. A
+// row repeated within rows keeps its latest time.
 //
-// acked is the sequence the reporting proxy last had acknowledged (0 for
-// none). If the binding's stored sequence is lower, or the binding is gone
-// while acked is not 0, the store lost writes the proxy saw accepted (a
-// restore to an earlier point): lost is true and the binding's history
-// starts again now. The accepted report gets the next sequence, returned as
-// seq. A report that would take the binding past maxRows rows is refused
-// whole with ErrProxyActivityFull and changes nothing; rows already held may
-// still be updated by a report that adds none.
-func (s *SQLStore) RecordProxyActivity(ctx context.Context, scope string, rows []ProxyActivity, maxRows int, acked int64) (seq int64, lost bool, err error) {
-	if scope == "" {
-		return 0, false, fmt.Errorf("proxy activity needs a scope")
+// replica names the reporting proxy replica's stream within the binding, and
+// acked is the sequence last acknowledged on it (0 for none). If the stream's
+// stored sequence is lower, or the stream is gone while acked is not 0, the
+// store lost writes the replica saw accepted (a restore to an earlier point):
+// lost is true and the binding's history starts again now. Only this replica
+// advances its stream, so other replicas' reports cannot hide the loss. The
+// accepted report gets the stream's next sequence, returned as seq. A report
+// that would take the binding past maxRows rows is refused whole with
+// ErrProxyActivityFull and changes nothing; rows already held may still be
+// updated by a report that adds none.
+func (s *SQLStore) RecordProxyActivity(ctx context.Context, scope, replica string, rows []ProxyActivity, maxRows int, acked int64) (seq int64, lost bool, err error) {
+	if scope == "" || replica == "" {
+		return 0, false, fmt.Errorf("proxy activity needs a scope and a replica")
 	}
 	latest := make(map[string]ProxyActivity, len(rows))
 	for _, r := range rows {
@@ -59,30 +61,35 @@ func (s *SQLStore) RecordProxyActivity(ctx context.Context, scope string, rows [
 	}
 	defer func() { _ = tx.Rollback() }()
 	now := s.dbNowMs()
-	// The binding's row exists before it is locked, so two first reports
-	// racing serialize on it.
-	created, err := tx.ExecContext(ctx, s.dialect.Rebind(`INSERT INTO proxy_activity_scope (scope, history_started_ms, seq) VALUES (?, `+now+`, 0)
-		ON CONFLICT (scope) DO NOTHING`), scope) // #nosec G202 -- constant clock expression
-	if err != nil {
+	if _, err = tx.ExecContext(ctx, s.dialect.Rebind(`INSERT INTO proxy_activity_scope (scope, history_started_ms) VALUES (?, `+now+`)
+		ON CONFLICT (scope) DO NOTHING`), scope); err != nil { // #nosec G202 -- constant clock expression
 		return 0, false, err
 	}
-	fresh, _ := created.RowsAffected()
+	// The stream's row exists before it is locked, so two reports racing on
+	// it serialize. A new stream is at 0: any acknowledgment the replica
+	// holds for it is then a loss.
+	if _, err = tx.ExecContext(ctx, s.dialect.Rebind(`INSERT INTO proxy_activity_stream (scope, replica, seq, used_ms) VALUES (?, ?, 0, `+now+`)
+		ON CONFLICT (scope, replica) DO NOTHING`), scope, replica); err != nil { // #nosec G202 -- constant clock expression
+		return 0, false, err
+	}
 	var stored int64
-	if err = tx.QueryRowContext(ctx, s.dialect.Rebind(`SELECT seq FROM proxy_activity_scope WHERE scope = ? `+s.dialect.ForUpdateClause()), scope).Scan(&stored); err != nil {
+	if err = tx.QueryRowContext(ctx, s.dialect.Rebind(`SELECT seq FROM proxy_activity_stream WHERE scope = ? AND replica = ? `+s.dialect.ForUpdateClause()),
+		scope, replica).Scan(&stored); err != nil {
 		return 0, false, err
 	}
-	lost = acked > stored || (fresh > 0 && acked > 0)
+	lost = acked > stored
 	if err = s.proxyActivityRoom(ctx, tx, scope, unique, maxRows); err != nil {
 		return 0, false, err
 	}
 	seq = stored + 1
-	restart := `history_started_ms`
-	if lost {
-		restart = now
-	}
-	if _, err = tx.ExecContext(ctx, s.dialect.Rebind(`UPDATE proxy_activity_scope SET seq = ?, history_started_ms = `+restart+` WHERE scope = ?`),
-		seq, scope); err != nil { // #nosec G202 -- constant expressions
+	if _, err = tx.ExecContext(ctx, s.dialect.Rebind(`UPDATE proxy_activity_stream SET seq = ?, used_ms = `+now+` WHERE scope = ? AND replica = ?`),
+		seq, scope, replica); err != nil { // #nosec G202 -- constant clock expression
 		return 0, false, err
+	}
+	if lost {
+		if _, err = tx.ExecContext(ctx, s.dialect.Rebind(`UPDATE proxy_activity_scope SET history_started_ms = `+now+` WHERE scope = ?`), scope); err != nil { // #nosec G202 -- constant clock expression
+			return 0, false, err
+		}
 	}
 	for start := 0; start < len(unique); start += proxyActivityChunk {
 		chunk := unique[start:min(start+proxyActivityChunk, len(unique))]
@@ -124,9 +131,13 @@ func (s *SQLStore) ReadProxyActivity(ctx context.Context, scope, after string, s
 	return out, rows.Err()
 }
 
-// PruneProxyActivity drops rows last seen before cutoff.
-func (s *SQLStore) PruneProxyActivity(ctx context.Context, cutoff time.Time) error {
-	_, err := s.db.ExecContext(ctx, s.dialect.Rebind(`DELETE FROM proxy_activity WHERE last_seen_ms < ?`), cutoff.UnixMilli())
+// PruneProxyActivity drops rows last seen before rows and replica streams
+// last used before streams.
+func (s *SQLStore) PruneProxyActivity(ctx context.Context, rows, streams time.Time) error {
+	if _, err := s.db.ExecContext(ctx, s.dialect.Rebind(`DELETE FROM proxy_activity WHERE last_seen_ms < ?`), rows.UnixMilli()); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, s.dialect.Rebind(`DELETE FROM proxy_activity_stream WHERE used_ms < ?`), streams.UnixMilli())
 	return err
 }
 
@@ -162,16 +173,30 @@ func (s *SQLStore) proxyActivityRoom(ctx context.Context, tx *sql.Tx, scope stri
 	return nil
 }
 
-// ProxyActivityHistory returns when scope's history began and its current
-// sequence, and false if it has none.
-func (s *SQLStore) ProxyActivityHistory(ctx context.Context, scope string) (time.Time, int64, bool, error) {
-	var ms, seq int64
-	err := s.db.QueryRowContext(ctx, s.dialect.Rebind(`SELECT history_started_ms, seq FROM proxy_activity_scope WHERE scope = ?`), scope).Scan(&ms, &seq)
+// ProxyActivityHistory returns when scope's history began and every
+// replica stream's current sequence, and false if it has no history.
+func (s *SQLStore) ProxyActivityHistory(ctx context.Context, scope string) (time.Time, map[string]int64, bool, error) {
+	var ms int64
+	err := s.db.QueryRowContext(ctx, s.dialect.Rebind(`SELECT history_started_ms FROM proxy_activity_scope WHERE scope = ?`), scope).Scan(&ms)
 	if errors.Is(err, sql.ErrNoRows) {
-		return time.Time{}, 0, false, nil
+		return time.Time{}, nil, false, nil
 	}
 	if err != nil {
-		return time.Time{}, 0, false, err
+		return time.Time{}, nil, false, err
 	}
-	return time.UnixMilli(ms).UTC(), seq, true, nil
+	rows, err := s.db.QueryContext(ctx, s.dialect.Rebind(`SELECT replica, seq FROM proxy_activity_stream WHERE scope = ?`), scope)
+	if err != nil {
+		return time.Time{}, nil, false, err
+	}
+	defer func() { _ = rows.Close() }()
+	streams := map[string]int64{}
+	for rows.Next() {
+		var replica string
+		var seq int64
+		if err := rows.Scan(&replica, &seq); err != nil {
+			return time.Time{}, nil, false, err
+		}
+		streams[replica] = seq
+	}
+	return time.UnixMilli(ms).UTC(), streams, true, rows.Err()
 }

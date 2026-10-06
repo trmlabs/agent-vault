@@ -84,13 +84,13 @@ func TestProxyActivityIsPerBinding(t *testing.T) {
 	for i := 0; i < 4500; i++ {
 		rows = append(rows, Row{Namespace: "developers", OwnerUID: fmt.Sprintf("sb-%05d", i), LastSeen: now.Add(-time.Duration(i) * time.Second)})
 	}
-	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: rows}); w.Code != 200 {
+	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Replica: "aaaa0001", Sandboxes: rows}); w.Code != 200 {
 		t.Fatalf("record: %d", w.Code)
 	}
-	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: []Row{{Namespace: "developers", OwnerUID: "sb-00009", LastSeen: now.Add(-time.Hour)}}}); w.Code != 200 {
+	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Replica: "aaaa0001", Sandboxes: []Row{{Namespace: "developers", OwnerUID: "sb-00009", LastSeen: now.Add(-time.Hour)}}}); w.Code != 200 {
 		t.Fatalf("older record: %d", w.Code)
 	}
-	if w := call(h, "customers-proxy", RecordPath, RecordRequest{Sandboxes: []Row{{Namespace: "customers", OwnerUID: "sb-c", LastSeen: now}}}); w.Code != 200 {
+	if w := call(h, "customers-proxy", RecordPath, RecordRequest{Replica: "aaaa0001", Sandboxes: []Row{{Namespace: "customers", OwnerUID: "sb-c", LastSeen: now}}}); w.Code != 200 {
 		t.Fatalf("customer record: %d", w.Code)
 	}
 	developers := readAll(t, h, "developers-proxy")
@@ -118,14 +118,14 @@ func TestProxyActivityRefusals(t *testing.T) {
 		body  any
 		code  int
 	}{
-		"no token":          {"", RecordRequest{Sandboxes: []Row{good}}, 401},
-		"not a proxy":       {"worker-token", RecordRequest{Sandboxes: []Row{good}}, 403},
-		"another namespace": {"developers-proxy", RecordRequest{Sandboxes: []Row{{Namespace: "customers", OwnerUID: "sb-1", LastSeen: now}}}, 400},
-		"bad owner":         {"developers-proxy", RecordRequest{Sandboxes: []Row{{Namespace: "developers", OwnerUID: "../x", LastSeen: now}}}, 400},
-		"no time":           {"developers-proxy", RecordRequest{Sandboxes: []Row{{Namespace: "developers", OwnerUID: "sb-1"}}}, 400},
-		"future time":       {"developers-proxy", RecordRequest{Sandboxes: []Row{{Namespace: "developers", OwnerUID: "sb-1", LastSeen: now.Add(time.Hour)}}}, 400},
-		"too many rows":     {"developers-proxy", RecordRequest{Sandboxes: many}, 400},
-		"unknown field":     {"developers-proxy", map[string]any{"sandboxes": []Row{good}, "scope": "td/customer-proxy/uid-2"}, 400},
+		"no token":          {"", RecordRequest{Replica: "aaaa0001", Sandboxes: []Row{good}}, 401},
+		"not a proxy":       {"worker-token", RecordRequest{Replica: "aaaa0001", Sandboxes: []Row{good}}, 403},
+		"another namespace": {"developers-proxy", RecordRequest{Replica: "aaaa0001", Sandboxes: []Row{{Namespace: "customers", OwnerUID: "sb-1", LastSeen: now}}}, 400},
+		"bad owner":         {"developers-proxy", RecordRequest{Replica: "aaaa0001", Sandboxes: []Row{{Namespace: "developers", OwnerUID: "../x", LastSeen: now}}}, 400},
+		"no time":           {"developers-proxy", RecordRequest{Replica: "aaaa0001", Sandboxes: []Row{{Namespace: "developers", OwnerUID: "sb-1"}}}, 400},
+		"future time":       {"developers-proxy", RecordRequest{Replica: "aaaa0001", Sandboxes: []Row{{Namespace: "developers", OwnerUID: "sb-1", LastSeen: now.Add(time.Hour)}}}, 400},
+		"too many rows":     {"developers-proxy", RecordRequest{Replica: "aaaa0001", Sandboxes: many}, 400},
+		"unknown field":     {"developers-proxy", map[string]any{"sandboxes": []Row{good}, "replica": "aaaa0001", "scope": "td/customer-proxy/uid-2"}, 400},
 	} {
 		if w := call(h, tc.token, RecordPath, tc.body); w.Code != tc.code {
 			t.Errorf("%s: %d, want %d", name, w.Code, tc.code)
@@ -175,7 +175,7 @@ func TestProxyActivityHistoryAndCeiling(t *testing.T) {
 	if first := page(); first.HistoryStarted != nil {
 		t.Fatalf("history before any report: %v", first.HistoryStarted)
 	}
-	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: []Row{}}); w.Code != 200 {
+	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Replica: "aaaa0001", Sandboxes: []Row{}}); w.Code != 200 {
 		t.Fatalf("empty report: %d", w.Code)
 	}
 	started := page().HistoryStarted
@@ -184,13 +184,13 @@ func TestProxyActivityHistoryAndCeiling(t *testing.T) {
 	}
 	now := time.Now()
 	two := []Row{{Namespace: "developers", OwnerUID: "sb-1", LastSeen: now}, {Namespace: "developers", OwnerUID: "sb-2", LastSeen: now}}
-	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: two}); w.Code != 200 {
+	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Replica: "aaaa0001", Sandboxes: two}); w.Code != 200 {
 		t.Fatalf("two rows: %d", w.Code)
 	}
-	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: []Row{{Namespace: "developers", OwnerUID: "sb-3", LastSeen: now}}}); w.Code != http.StatusInsufficientStorage {
+	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Replica: "aaaa0001", Sandboxes: []Row{{Namespace: "developers", OwnerUID: "sb-3", LastSeen: now}}}); w.Code != http.StatusInsufficientStorage {
 		t.Fatalf("a row past the ceiling: %d", w.Code)
 	}
-	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: two}); w.Code != 200 {
+	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Replica: "aaaa0001", Sandboxes: two}); w.Code != 200 {
 		t.Fatalf("updates at the ceiling: %d", w.Code)
 	}
 	if again := page(); again.HistoryStarted == nil || !again.HistoryStarted.Equal(*started) || len(again.Sandboxes) != 2 {
@@ -198,22 +198,24 @@ func TestProxyActivityHistoryAndCeiling(t *testing.T) {
 	}
 }
 
-// A report is acknowledged with the binding's next sequence; one carrying an
-// acknowledged sequence the store no longer reaches is a loss, and the read
-// gives the current sequence.
+// A report is acknowledged with its stream's next sequence and the broker's
+// retention; one carrying an acknowledged sequence the store no longer
+// reaches is a loss, and the read gives each stream's sequence. Rows go after
+// one retention and streams after two, so a stream outlives the
+// acknowledgment its replica keeps.
 func TestProxyActivitySequenceOnTheWire(t *testing.T) {
-	_, h := newService(t)
+	svc, h := newService(t)
 	row := []Row{{Namespace: "developers", OwnerUID: "sb-1", LastSeen: time.Now()}}
 	answer := func(acked int64) RecordResponse {
 		t.Helper()
-		w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: row, AckedSeq: acked})
+		w := call(h, "developers-proxy", RecordPath, RecordRequest{Replica: "aaaa0001", Sandboxes: row, AckedSeq: acked})
 		var out RecordResponse
 		if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &out) != nil {
 			t.Fatalf("record: %d %s", w.Code, w.Body)
 		}
 		return out
 	}
-	if a := answer(0); a.Seq != 1 || a.Lost {
+	if a := answer(0); a.Seq != 1 || a.Lost || a.RetentionSeconds != 86400 {
 		t.Fatalf("first: %+v", a)
 	}
 	if a := answer(1); a.Seq != 2 || a.Lost {
@@ -224,10 +226,30 @@ func TestProxyActivitySequenceOnTheWire(t *testing.T) {
 	}
 	var page ReadResponse
 	w := call(h, "developers-proxy", ReadPath, ReadRequest{})
-	if json.Unmarshal(w.Body.Bytes(), &page) != nil || page.Seq != 3 {
+	if json.Unmarshal(w.Body.Bytes(), &page) != nil || page.Streams["aaaa0001"] != 3 {
 		t.Fatalf("read sequence: %s", w.Body)
 	}
-	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: row, AckedSeq: -1}); w.Code != 400 {
+	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Replica: "aaaa0001", Sandboxes: row, AckedSeq: -1}); w.Code != 400 {
 		t.Fatalf("negative acknowledgment: %d", w.Code)
+	}
+	for _, replica := range []string{"", "AAAA0001", "short", "aaaa0001/../x"} {
+		if w := call(h, "developers-proxy", RecordPath, RecordRequest{Replica: replica, Sandboxes: row}); w.Code != 400 {
+			t.Fatalf("replica %q: %d", replica, w.Code)
+		}
+	}
+	streams := func(at time.Time) map[string]int64 {
+		t.Helper()
+		svc.prune(context.Background(), at)
+		_, s, _, err := svc.Store.ProxyActivityHistory(context.Background(), "td/gatehouse-proxy/uid-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	if s := streams(time.Now().Add(36 * time.Hour)); s["aaaa0001"] != 3 {
+		t.Fatalf("a stream pruned within two retentions: %v", s)
+	}
+	if s := streams(time.Now().Add(49 * time.Hour)); len(s) != 0 {
+		t.Fatalf("a stream kept past two retentions: %v", s)
 	}
 }

@@ -22,15 +22,15 @@ func checkProxyActivity(t *testing.T, s *SQLStore) {
 		rows = append(rows, ProxyActivity{Namespace: "developers", OwnerUID: fmt.Sprintf("sb-%05d", i), LastSeen: now.Add(-time.Duration(i) * time.Minute)})
 	}
 	rows = append(rows, ProxyActivity{Namespace: "developers", OwnerUID: "sb-00001", LastSeen: now}) // repeated in one batch: latest wins
-	if _, _, err := s.RecordProxyActivity(ctx, scope, rows, 100000, 0); err != nil {
+	if _, _, err := s.RecordProxyActivity(ctx, scope, "r1", rows, 100000, 0); err != nil {
 		t.Fatal(err)
 	}
 	// An older report never moves a time back; a newer one moves it forward.
-	if _, _, err := s.RecordProxyActivity(ctx, scope, []ProxyActivity{{Namespace: "developers", OwnerUID: "sb-00000", LastSeen: now.Add(-time.Hour)},
+	if _, _, err := s.RecordProxyActivity(ctx, scope, "r1", []ProxyActivity{{Namespace: "developers", OwnerUID: "sb-00000", LastSeen: now.Add(-time.Hour)},
 		{Namespace: "developers", OwnerUID: "sb-00002", LastSeen: now.Add(time.Second)}}, 100000, 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.RecordProxyActivity(ctx, scope+"-other", []ProxyActivity{{Namespace: "customers", OwnerUID: "sb-x", LastSeen: now}}, 100000, 0); err != nil {
+	if _, _, err := s.RecordProxyActivity(ctx, scope+"-other", "r1", []ProxyActivity{{Namespace: "customers", OwnerUID: "sb-x", LastSeen: now}}, 100000, 0); err != nil {
 		t.Fatal(err)
 	}
 	got := map[string]time.Time{}
@@ -57,16 +57,16 @@ func checkProxyActivity(t *testing.T, s *SQLStore) {
 	if recent, err := s.ReadProxyActivity(ctx, scope, "", now.Add(-10*time.Minute), 5000); err != nil || len(recent) != 11 {
 		t.Fatalf("since filter: %d %v", len(recent), err)
 	}
-	if err := s.PruneProxyActivity(ctx, now.Add(-time.Hour)); err != nil {
+	if err := s.PruneProxyActivity(ctx, now.Add(-time.Hour), now.Add(-time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if kept, err := s.ReadProxyActivity(ctx, scope, "", time.Time{}, 5000); err != nil || len(kept) != 61 {
 		t.Fatalf("after pruning: %d %v", len(kept), err)
 	}
-	if _, _, err := s.RecordProxyActivity(ctx, "", rows[:1], 100000, 0); err == nil {
+	if _, _, err := s.RecordProxyActivity(ctx, "", "r1", rows[:1], 100000, 0); err == nil {
 		t.Fatal("no scope accepted")
 	}
-	if _, _, err := s.RecordProxyActivity(ctx, scope, []ProxyActivity{{OwnerUID: "sb"}}, 100000, 0); err == nil {
+	if _, _, err := s.RecordProxyActivity(ctx, scope, "r1", []ProxyActivity{{OwnerUID: "sb"}}, 100000, 0); err == nil {
 		t.Fatal("row with no namespace accepted")
 	}
 }
@@ -86,7 +86,7 @@ func checkProxyActivityHistoryAndCeiling(t *testing.T, s *SQLStore) {
 		t.Fatalf("history before any report: %v %v", known, err)
 	}
 	before := time.Now().Add(-time.Second)
-	if _, _, err := s.RecordProxyActivity(ctx, scope, nil, 3, 0); err != nil {
+	if _, _, err := s.RecordProxyActivity(ctx, scope, "r1", nil, 3, 0); err != nil {
 		t.Fatal(err)
 	}
 	started, _, known, err := s.ProxyActivityHistory(ctx, scope)
@@ -97,15 +97,15 @@ func checkProxyActivityHistoryAndCeiling(t *testing.T, s *SQLStore) {
 	row := func(owner string) ProxyActivity {
 		return ProxyActivity{Namespace: "developers", OwnerUID: owner, LastSeen: now}
 	}
-	if _, _, err := s.RecordProxyActivity(ctx, scope, []ProxyActivity{row("a"), row("b"), row("c")}, 3, 0); err != nil {
+	if _, _, err := s.RecordProxyActivity(ctx, scope, "r1", []ProxyActivity{row("a"), row("b"), row("c")}, 3, 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.RecordProxyActivity(ctx, scope, []ProxyActivity{row("a"), row("d")}, 3, 0); !errors.Is(err, ErrProxyActivityFull) {
+	if _, _, err := s.RecordProxyActivity(ctx, scope, "r1", []ProxyActivity{row("a"), row("d")}, 3, 0); !errors.Is(err, ErrProxyActivityFull) {
 		t.Fatalf("a fourth row: %v", err)
 	}
 	later := row("a")
 	later.LastSeen = now.Add(time.Minute)
-	if _, _, err := s.RecordProxyActivity(ctx, scope, []ProxyActivity{later, row("b")}, 3, 0); err != nil {
+	if _, _, err := s.RecordProxyActivity(ctx, scope, "r1", []ProxyActivity{later, row("b")}, 3, 0); err != nil {
 		t.Fatalf("updates at the ceiling: %v", err)
 	}
 	rows, err := s.ReadProxyActivity(ctx, scope, "", time.Time{}, 10)
@@ -116,7 +116,7 @@ func checkProxyActivityHistoryAndCeiling(t *testing.T, s *SQLStore) {
 		t.Fatalf("history moved: %v then %v", started, again)
 	}
 	// Pruning every row keeps the history's start.
-	if err := s.PruneProxyActivity(ctx, now.Add(time.Hour)); err != nil {
+	if err := s.PruneProxyActivity(ctx, now.Add(time.Hour), now.Add(-time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if again, _, known, _ := s.ProxyActivityHistory(ctx, scope); !known || !again.Equal(started) {
@@ -126,72 +126,102 @@ func checkProxyActivityHistoryAndCeiling(t *testing.T, s *SQLStore) {
 
 func TestProxyActivitySequence(t *testing.T) { checkProxyActivitySequence(t, openTestDB(t)) }
 
-// Each accepted report takes the binding's next sequence. A report carrying an
-// acknowledged sequence the store no longer reaches (a restore), or one for a
-// binding the store lost entirely, is a loss and restarts the history; an
-// acknowledged sequence the store still reaches, as after a broker restart
-// with nothing lost, changes nothing.
+// Each accepted report takes its replica stream's next sequence. A report
+// carrying an acknowledged sequence its stream no longer reaches (a
+// restore), or one for a stream the store lost, is a loss and restarts the
+// history; one its stream still reaches, as after a broker restart with
+// nothing lost, changes nothing. Another replica's reports never advance a
+// stream, so a busy replica cannot overtake an idle one's loss.
 func checkProxyActivitySequence(t *testing.T, s *SQLStore) {
 	t.Helper()
 	ctx := context.Background()
 	scope := fmt.Sprintf("td/gatehouse-proxy/seq-%d", time.Now().UnixNano())
 	row := []ProxyActivity{{Namespace: "developers", OwnerUID: "sb-1", LastSeen: time.Now()}}
-	record := func(acked int64) (int64, bool) {
+	record := func(replica string, acked int64) (int64, bool) {
 		t.Helper()
-		seq, lost, err := s.RecordProxyActivity(ctx, scope, row, 100, acked)
+		seq, lost, err := s.RecordProxyActivity(ctx, scope, replica, row, 100, acked)
 		if err != nil {
 			t.Fatal(err)
 		}
 		return seq, lost
 	}
-	if seq, lost := record(0); seq != 1 || lost {
+	exec := func(query string) {
+		t.Helper()
+		if _, err := s.db.ExecContext(ctx, s.dialect.Rebind(query), scope); err != nil {
+			t.Fatal(err)
+		}
+	}
+	history := func() time.Time {
+		t.Helper()
+		started, _, _, err := s.ProxyActivityHistory(ctx, scope)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return started
+	}
+	if seq, lost := record("aaaa0001", 0); seq != 1 || lost {
 		t.Fatalf("first report: %d %v", seq, lost)
 	}
-	if seq, lost := record(1); seq != 2 || lost {
+	if seq, lost := record("aaaa0001", 1); seq != 2 || lost {
 		t.Fatalf("second report: %d %v", seq, lost)
 	}
-	// Another replica that last saw 1 is behind, not a loss.
-	if seq, lost := record(1); seq != 3 || lost {
-		t.Fatalf("a replica behind: %d %v", seq, lost)
+	if seq, lost := record("bbbb0002", 0); seq != 1 || lost {
+		t.Fatalf("another replica's own stream: %d %v", seq, lost)
 	}
-	// Backdate the history, as a long-running binding's is.
-	if _, err := s.db.ExecContext(ctx, s.dialect.Rebind(`UPDATE proxy_activity_scope SET history_started_ms = history_started_ms - 7200000 WHERE scope = ?`), scope); err != nil {
-		t.Fatal(err)
-	}
-	old, seq, _, _ := s.ProxyActivityHistory(ctx, scope)
-	if seq != 3 {
-		t.Fatalf("stored sequence %d", seq)
-	}
-	// A broker restart loses nothing: the sequence lives in the database.
-	if seq, lost := record(3); seq != 4 || lost {
+	exec(`UPDATE proxy_activity_scope SET history_started_ms = history_started_ms - 7200000 WHERE scope = ?`)
+	old := history()
+	// A broker restart loses nothing: the streams live in the database.
+	if seq, lost := record("aaaa0001", 2); seq != 3 || lost || !history().Equal(old) {
 		t.Fatalf("after a broker restart: %d %v", seq, lost)
 	}
-	if again, _, _, _ := s.ProxyActivityHistory(ctx, scope); !again.Equal(old) {
-		t.Fatal("a report with no loss moved the history")
+	// A restore to when replica A's stream stood at 1 and B's at 0. B is busy
+	// and reports ten times before A reports again: it cannot overtake A's
+	// loss, since it advances only its own stream.
+	exec(`UPDATE proxy_activity_stream SET seq = 1 WHERE scope = ? AND replica = 'aaaa0001'`)
+	exec(`DELETE FROM proxy_activity_stream WHERE scope = ? AND replica = 'bbbb0002'`)
+	acked := int64(0)
+	for i := 0; i < 10; i++ {
+		seq, _ := record("bbbb0002", acked)
+		acked = seq
 	}
-	// A restore to when the sequence was 2: a replica that saw 4 reports.
-	if _, err := s.db.ExecContext(ctx, s.dialect.Rebind(`UPDATE proxy_activity_scope SET seq = 2 WHERE scope = ?`), scope); err != nil {
-		t.Fatal(err)
+	if !history().Equal(old) {
+		t.Fatal("B's reports, with nothing B saw lost, moved the history")
+	}
+	_, streams, _, _ := s.ProxyActivityHistory(ctx, scope)
+	if streams["aaaa0001"] != 1 || streams["bbbb0002"] != 10 {
+		t.Fatalf("streams %v", streams)
 	}
 	before := time.Now().Add(-time.Second)
-	if seq, lost := record(4); seq != 3 || !lost {
-		t.Fatalf("after a restore: %d %v, want a loss", seq, lost)
+	if seq, lost := record("aaaa0001", 3); seq != 2 || !lost {
+		t.Fatalf("A after the restore: %d %v, want a loss", seq, lost)
 	}
-	if restarted, _, _, _ := s.ProxyActivityHistory(ctx, scope); restarted.Before(before) {
+	if restarted := history(); restarted.Before(before) {
 		t.Fatalf("the history did not restart: %v", restarted)
 	}
-	// The binding lost entirely while a replica holds an acknowledgment.
-	if _, err := s.db.ExecContext(ctx, s.dialect.Rebind(`DELETE FROM proxy_activity_scope WHERE scope = ?`), scope); err != nil {
-		t.Fatal(err)
+	// A stream the store lost entirely while its replica holds an
+	// acknowledgment.
+	exec(`DELETE FROM proxy_activity_stream WHERE scope = ? AND replica = 'bbbb0002'`)
+	if seq, lost := record("bbbb0002", 10); seq != 1 || !lost {
+		t.Fatalf("stream lost: %d %v, want a loss", seq, lost)
 	}
-	if seq, lost := record(3); seq != 1 || !lost {
-		t.Fatalf("binding lost: %d %v, want a loss", seq, lost)
-	}
-	// A refused report changes nothing, not even the sequence.
-	if _, _, err := s.RecordProxyActivity(ctx, scope, []ProxyActivity{{Namespace: "developers", OwnerUID: "sb-2", LastSeen: time.Now()}}, 1, 1); !errors.Is(err, ErrProxyActivityFull) {
+	// A refused report changes nothing, not even the stream.
+	if _, _, err := s.RecordProxyActivity(ctx, scope, "aaaa0001", []ProxyActivity{{Namespace: "developers", OwnerUID: "sb-2", LastSeen: time.Now()}}, 1, 2); !errors.Is(err, ErrProxyActivityFull) {
 		t.Fatalf("over the ceiling: %v", err)
 	}
-	if _, seq, _, _ := s.ProxyActivityHistory(ctx, scope); seq != 1 {
-		t.Fatalf("a refused report moved the sequence to %d", seq)
+	if _, streams, _, _ := s.ProxyActivityHistory(ctx, scope); streams["aaaa0001"] != 2 {
+		t.Fatalf("a refused report moved the stream to %d", streams["aaaa0001"])
+	}
+	// Streams are pruned on their own cutoff, not the rows'.
+	if err := s.PruneProxyActivity(ctx, time.Now().Add(time.Hour), time.Now().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, streams, _, _ := s.ProxyActivityHistory(ctx, scope); len(streams) != 2 {
+		t.Fatalf("streams pruned with the rows: %v", streams)
+	}
+	if err := s.PruneProxyActivity(ctx, time.Now().Add(time.Hour), time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, streams, _, _ := s.ProxyActivityHistory(ctx, scope); len(streams) != 0 {
+		t.Fatalf("streams after pruning: %v", streams)
 	}
 }
