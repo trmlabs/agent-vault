@@ -293,8 +293,7 @@ func (j *janitor) activity(ctx context.Context, cutoff time.Time) (map[string]ti
 	}); e != nil {
 		return nil, false, false, fmt.Errorf("list proxy replicas: %w", e)
 	}
-	seen := map[string]time.Time{}
-	answered, young, durable, historyYoung := 0, false, true, false
+	var ips []string
 	for _, r := range replicas {
 		if r.Status.Phase == "Succeeded" || r.Status.Phase == "Failed" {
 			continue
@@ -303,34 +302,68 @@ func (j *janitor) activity(ctx context.Context, cutoff time.Time) (map[string]ti
 		if e != nil {
 			return nil, false, false, errJanitorDoubt
 		}
-		report, e := j.replica(ctx, ip)
-		if e != nil || report.ReplicaStarted.IsZero() || report.RetentionSeconds < j.config.IdleSeconds {
+		ips = append(ips, ip)
+	}
+	if len(ips) == 0 {
+		return nil, false, false, errJanitorDoubt
+	}
+	sort.Strings(ips) // a stable choice of the replica that merges the durable view
+	// Every replica's durable view is the broker's same view of the binding,
+	// so one replica merges it and the rest report their own memory: one
+	// broker read a pass, not one per replica. Replicas are read in
+	// parallel, replicaReadConcurrency at a time (read speed, not a cap).
+	reports := make([]ActivityReport, len(ips))
+	failed := make([]bool, len(ips))
+	next := make(chan int)
+	var wg sync.WaitGroup
+	for range min(replicaReadConcurrency, len(ips)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range next {
+				url := j.replicaURL(ips[i])
+				if i > 0 {
+					url = strings.TrimSuffix(url, ActivityPath) + ActivityLocalPath
+				}
+				report, e := j.replica(ctx, url)
+				reports[i], failed[i] = report, e != nil
+			}
+		}()
+	}
+	for i := range ips {
+		next <- i
+	}
+	close(next)
+	wg.Wait()
+	seen := map[string]time.Time{}
+	young := false
+	for i, report := range reports {
+		if failed[i] || report.ReplicaStarted.IsZero() || report.RetentionSeconds < j.config.IdleSeconds {
 			return nil, false, false, errJanitorDoubt
 		}
 		if report.ReplicaStarted.After(cutoff) {
 			young = true
 		}
-		durable = durable && report.Durable
-		// A durable report vouches only for as long as the broker's history
-		// for its binding: a new, recreated or emptied history is young.
-		if report.Durable && (report.HistoryStarted.IsZero() || report.HistoryStarted.After(cutoff)) {
-			historyYoung = true
-		}
-		answered++
 		for _, a := range report.Sandboxes {
 			if a.OwnerUID != "" && a.LastSeen.After(seen[a.OwnerUID]) {
 				seen[a.OwnerUID] = a.LastSeen
 			}
 		}
 	}
-	if answered == 0 {
-		return nil, false, false, errJanitorDoubt
-	}
+	// The pass is durable when the merged report is: the broker's view then
+	// covers every replica, including one removed by a scale-down. A durable
+	// report vouches only for as long as the broker's history for its
+	// binding: a new, recreated or emptied history is young.
+	durable := reports[0].Durable
+	historyYoung := durable && (reports[0].HistoryStarted.IsZero() || reports[0].HistoryStarted.After(cutoff))
 	if historyYoung {
 		return nil, false, false, janitorHold{"activity_history_young"}
 	}
 	return seen, durable, young, nil
 }
+
+// replicaReadConcurrency is how many proxy replicas a pass reads at once.
+const replicaReadConcurrency = 64
 
 func netipString(s string) (string, error) {
 	ip := net.ParseIP(s)
@@ -340,9 +373,9 @@ func netipString(s string) (string, error) {
 	return ip.String(), nil
 }
 
-func (j *janitor) replica(ctx context.Context, ip string) (ActivityReport, error) {
+func (j *janitor) replica(ctx context.Context, url string) (ActivityReport, error) {
 	var report ActivityReport
-	req, e := http.NewRequestWithContext(ctx, http.MethodGet, j.replicaURL(ip), nil)
+	req, e := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if e != nil {
 		return report, e
 	}

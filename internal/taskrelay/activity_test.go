@@ -108,6 +108,7 @@ func TestActivityListenerServesOneRoute(t *testing.T) {
 	for _, probe := range []struct{ method, path string }{
 		{"POST", ActivityPath}, {"PUT", ActivityPath}, {"DELETE", ActivityPath}, {"HEAD", ActivityPath},
 		{"GET", "/"}, {"GET", ActivityPath + "/x"}, {"GET", ActivityPath + "?pod=x"}, {"GET", "/v1/activity/"},
+		{"POST", ActivityLocalPath}, {"GET", ActivityLocalPath + "/x"}, {"GET", ActivityLocalPath + "?pod=x"},
 		{"GET", "/debug/pprof/"}, {"GET", "/metrics"}, {"GET", "/healthz"}, {"GET", "/v1/config"},
 	} {
 		req, _ := http.NewRequest(probe.method, "http://"+admin+probe.path, strings.NewReader(""))
