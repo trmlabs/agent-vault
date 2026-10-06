@@ -48,13 +48,13 @@ func TestResolveRateLimitConfigDefault(t *testing.T) {
 	if cfg.Tiers[ratelimit.TierAuth].Max < 5 {
 		t.Fatalf("AUTH max below floor, cfg misbuilt: %+v", cfg.Tiers[ratelimit.TierAuth])
 	}
-	if cfg.Tiers[ratelimit.TierProxy].Rate != 20 {
+	if cfg.Tiers[ratelimit.TierProxy].Rate != 200 {
 		t.Fatalf("PROXY rate should allow normal agent fan-out, got %v", cfg.Tiers[ratelimit.TierProxy].Rate)
 	}
-	if cfg.Tiers[ratelimit.TierProxy].Burst != 200 {
+	if cfg.Tiers[ratelimit.TierProxy].Burst != 2000 {
 		t.Fatalf("PROXY burst should allow normal agent fan-out, got %v", cfg.Tiers[ratelimit.TierProxy].Burst)
 	}
-	if cfg.Tiers[ratelimit.TierProxy].Concurrency != 64 {
+	if cfg.Tiers[ratelimit.TierProxy].Concurrency != 1024 {
 		t.Fatalf("PROXY concurrency should allow normal agent fan-out, got %v", cfg.Tiers[ratelimit.TierProxy].Concurrency)
 	}
 	if cfg.Tiers[ratelimit.TierAuthed].Rate != 10 {
