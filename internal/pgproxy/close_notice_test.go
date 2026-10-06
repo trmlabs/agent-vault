@@ -301,3 +301,26 @@ func endShowsTheNotice(t *testing.T, pooled bool) {
 		t.Fatal("the running statement was not cancelled")
 	}
 }
+
+// A pooled session killed while another write is finishing its message still
+// gets its notice once that write releases the client, instead of none.
+func TestPooledKillWaitsForAWriteInProgress(t *testing.T) {
+	b := New("127.0.0.1:0", Options{Logger: slog.New(slog.DiscardHandler)})
+	brokerSide, client := net.Pipe()
+	defer func() { _ = client.Close() }()
+	s := &pooledSession{b: b, client: brokerSide, backend: pgproto3.NewBackend(brokerSide, brokerSide)}
+	s.writeMu.Lock() // a relay write in progress
+	killed := make(chan struct{})
+	go func() {
+		s.killWith(&noticeAudit)
+		close(killed)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	s.writeMu.Unlock()
+	fe := pgproto3.NewFrontend(client, client)
+	_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if code, reason := readCloseNotice(t, fe); code != "08004" || reason != "audit_unavailable" {
+		t.Fatalf("session ended with %q %q", code, reason)
+	}
+	<-killed
+}
