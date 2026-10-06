@@ -48,9 +48,13 @@ func TestV1InputIsUnchanged(t *testing.T) {
 	if !bytes.HasPrefix(r.macInput(), []byte("gatehouse-audit-v2\x00")) {
 		t.Fatal("a v2 row does not use the v2 input")
 	}
-	r.MACVersion = MACVersionCurrent
+	r.MACVersion = 3
 	if !bytes.HasPrefix(r.macInput(), []byte("gatehouse-audit-v3\x00")) {
-		t.Fatal("a current row does not use the v3 input")
+		t.Fatal("a v3 row does not use the v3 input")
+	}
+	r.MACVersion = MACVersionCurrent
+	if !bytes.HasPrefix(r.macInput(), []byte("gatehouse-audit-v4\x00")) {
+		t.Fatal("a current row does not use the v4 input")
 	}
 }
 
@@ -79,7 +83,7 @@ func TestAuthorizationFieldEditsAreDetected(t *testing.T) {
 		"kid":       {`"kid":"invalid"`, `"kid":"k1"`},
 		"kid hash":  {`"kidSHA256":"0123456789ab"`, `"kidSHA256":"ba9876543210"`},
 		"peer":      {`"peer":"10.0.0.5"`, `"peer":"10.0.0.6"`},
-		"version":   {`"macVersion":3`, `"macVersion":2`},
+		"version":   {`"macVersion":4`, `"macVersion":3`},
 	} {
 		t.Run(name, func(t *testing.T) {
 			f, out := authzFixture(t)
@@ -106,6 +110,8 @@ func TestV1RowsCannotCarryAuthorizationOrDowngrade(t *testing.T) {
 		"v1 row with a decision": func(r *Row) { r.Decision = "entitled" },
 		"v2 row with a peer":     func(r *Row) { r.MACVersion, r.Peer = 2, "10.0.0.5" },
 		"v2 row with a kid":      func(r *Row) { r.MACVersion, r.Kid = 2, "k1" },
+		"v3 row with a serial":   func(r *Row) { r.MACVersion, r.Serial = 3, "1a" },
+		"v3 row with a notAfter": func(r *Row) { r.MACVersion, r.NotAfter = 3, "2026-10-07T00:00:00Z" },
 		"plain downgrade":        func(*Row) {},
 		"unknown version":        func(r *Row) { r.MACVersion = 9 },
 	} {
@@ -135,17 +141,23 @@ func hasKind(r Report, kind string) bool {
 	return false
 }
 
-// A trail written by a v2 broker and then, after an upgrade, a v3 one
-// verifies; a v2 row after a v3 row is a step down and does not.
+// A trail written by a v2 broker, then after upgrades by v3 and v4 ones,
+// verifies; an older row after a newer one is a step down and does not.
 func TestUpgradeFromV2VerifiesAndNeverStepsDown(t *testing.T) {
 	writeMACVersion = 2
 	t.Cleanup(func() { writeMACVersion = MACVersionCurrent })
 	f := newFixture(t)
 	f.session(t, 1)
 	f.checkpoint(t)
-	writeMACVersion = MACVersionCurrent
+	writeMACVersion = 3
 	f.restart(t)
 	if err := f.chain.Record(Event{Event: EventDenied, Outcome: "authentication", Decision: "identity_token_signature", Kid: "k1", Peer: "10.0.0.5"}); err != nil {
+		t.Fatal(err)
+	}
+	f.checkpoint(t)
+	writeMACVersion = MACVersionCurrent
+	f.restart(t)
+	if err := f.chain.Record(Event{Event: EventCertificate, Outcome: "issued", Peer: "10.0.0.5", Serial: "1a2b", NotAfter: "2026-10-07T00:00:00Z"}); err != nil {
 		t.Fatal(err)
 	}
 	f.session(t, 2)
@@ -155,22 +167,53 @@ func TestUpgradeFromV2VerifiesAndNeverStepsDown(t *testing.T) {
 	for _, r := range rows(t, out) {
 		versions[r.MACVersion]++
 	}
-	if versions[2] == 0 || versions[3] == 0 || len(versions) != 2 {
-		t.Fatalf("trail versions %v, want v2 then v3", versions)
+	if versions[2] == 0 || versions[3] == 0 || versions[MACVersionCurrent] == 0 || len(versions) != 3 {
+		t.Fatalf("trail versions %v, want v2, v3 then v4", versions)
 	}
 	if report := verify(t, f.verifier(), out); len(report.Findings) != 0 {
 		t.Fatalf("upgraded trail: %v", kinds(report))
 	}
-	// A forged v2 row with a valid MAC after the v3 rows.
 	parsed := rows(t, out)
 	last := parsed[len(parsed)-1]
 	key, _ := f.keys.lookup(last.KeyVersion)
-	forged := Row{Type: RowType, Replica: last.Replica, Boot: last.Boot, Seq: last.Seq + 1, Time: last.Time,
-		Event: EventSessionOpen, Pool: "claude", KeyVersion: last.KeyVersion, Prev: last.MAC, MACVersion: 2}
-	forged.MAC = forged.computeMAC(key)
-	line, _ := json.Marshal(forged)
-	if report := verify(t, f.verifier(), out+string(line)+"\n"); !hasKind(report, FindingEdit) {
-		t.Fatalf("step down from v3 to v2 accepted: %v", kinds(report))
+	for _, older := range []int{2, 3} {
+		forged := Row{Type: RowType, Replica: last.Replica, Boot: last.Boot, Seq: last.Seq + 1, Time: last.Time,
+			Event: EventSessionOpen, Pool: "claude", KeyVersion: last.KeyVersion, Prev: last.MAC, MACVersion: older}
+		forged.MAC = forged.computeMAC(key)
+		line, _ := json.Marshal(forged)
+		if report := verify(t, f.verifier(), out+string(line)+"\n"); !hasKind(report, FindingEdit) {
+			t.Fatalf("step down from v4 to v%d accepted: %v", older, kinds(report))
+		}
+	}
+}
+
+// A certificate row's serial and notAfter are covered by the MAC, and only a
+// hex serial and an RFC 3339 UTC time are accepted.
+func TestCertificateFieldsAreCoveredAndBounded(t *testing.T) {
+	f := newFixture(t)
+	if err := f.chain.Record(Event{Event: EventCertificate, Outcome: "issued", Peer: "10.0.0.5", Serial: "7f00aa", NotAfter: "2026-10-07T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	f.checkpoint(t)
+	out := f.out.String()
+	for _, edit := range [][2]string{{`"serial":"7f00aa"`, `"serial":"7f00ab"`}, {`"notAfter":"2026-10-07T00:00:00Z"`, `"notAfter":"2027-10-07T00:00:00Z"`}} {
+		if !strings.Contains(out, edit[0]) {
+			t.Fatalf("row lacks %s", edit[0])
+		}
+		if report := verify(t, f.verifier(), strings.Replace(out, edit[0], edit[1], 1)); !hasKind(report, FindingEdit) {
+			t.Fatalf("%s edit not detected", edit[0])
+		}
+	}
+	for _, e := range []Event{
+		{Event: EventCertificate, Serial: "7F00AA"},
+		{Event: EventCertificate, Serial: "007f"},
+		{Event: EventCertificate, Serial: strings.Repeat("a", 41)},
+		{Event: EventCertificate, NotAfter: "2026-10-07T02:00:00+02:00"},
+		{Event: EventCertificate, NotAfter: "tomorrow"},
+	} {
+		if e.Validate() == nil {
+			t.Errorf("accepted %+v", e)
+		}
 	}
 }
 

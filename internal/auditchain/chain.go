@@ -74,9 +74,12 @@ type Event struct {
 	Kid       string
 	KidSHA256 string
 	Peer      string
-	Method    string
-	Status    int
-	Duration  int64 // milliseconds
+	// Proxy certificate issuance: see Row.
+	Serial   string
+	NotAfter string
+	Method   string
+	Status   int
+	Duration int64 // milliseconds
 }
 
 var (
@@ -160,7 +163,7 @@ func (c *Chain) Admit() error {
 // method, and every text field a bounded identifier.
 func (e Event) Validate() error {
 	switch e.Event {
-	case EventSessionOpen, EventSessionClose, EventDenied, EventHTTPRequest, EventHTTPResponse, EventTransaction, EventStateLeak:
+	case EventSessionOpen, EventSessionClose, EventDenied, EventHTTPRequest, EventHTTPResponse, EventTransaction, EventStateLeak, EventCertificate:
 	default:
 		return ErrInvalidEvent
 	}
@@ -183,8 +186,20 @@ func (e Event) Validate() error {
 	if !groupList(e.Groups) {
 		return ErrInvalidEvent
 	}
+	if e.Serial != "" && !serialHex.MatchString(e.Serial) {
+		return ErrInvalidEvent
+	}
+	if e.NotAfter != "" {
+		if t, err := time.Parse(time.RFC3339, e.NotAfter); err != nil || t.UTC().Format(time.RFC3339) != e.NotAfter {
+			return ErrInvalidEvent
+		}
+	}
 	return nil
 }
+
+// serialHex is a certificate serial number: at most 20 octets (RFC 5280), in
+// lower-case hex with no leading zeros.
+var serialHex = regexp.MustCompile(`^(0|[1-9a-f][0-9a-f]{0,39})$`)
 
 var groupID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
@@ -214,7 +229,7 @@ func (c *Chain) Record(e Event) error {
 	defer c.mu.Unlock()
 	_, err := c.appendLocked(Row{Event: e.Event, Pool: e.Pool, Agent: e.Agent, PodUID: e.PodUID, Binding: e.Binding, Session: e.Session, Outcome: e.Outcome, Requester: e.Requester,
 		RequesterKind: e.RequesterKind, RequesterOID: e.RequesterOID, TokenSHA256: e.TokenSHA256, Tier: e.Tier, Decision: e.Decision, Groups: e.Groups, CacheAgeSec: e.CacheAgeSec,
-		Kid: e.Kid, KidSHA256: e.KidSHA256, Peer: e.Peer,
+		Kid: e.Kid, KidSHA256: e.KidSHA256, Peer: e.Peer, Serial: e.Serial, NotAfter: e.NotAfter,
 		Method: e.Method, Status: e.Status, Duration: e.Duration})
 	return err
 }
