@@ -44,6 +44,11 @@ type SharedConfig struct {
 	ImageDigests  []string          `json:"imageDigests,omitempty"`
 	// MaxPodSeconds bounds an agent Pod's admission from its start (60 s to 8 h).
 	MaxPodSeconds int64 `json:"maxPodSeconds"`
+	// RequesterNamespaces are the namespaces whose attestations carry the
+	// requester: the Pod's gatehouse.trmlabs.com/requester annotation, which
+	// admission policy there fixes to the creator's login. A Pod in one of
+	// them without a valid requester is not admitted.
+	RequesterNamespaces []string `json:"requesterNamespaces,omitempty"`
 	// MaxConnections bounds the open connections of one replica (default
 	// 4096). Scale out with replicas, not by raising it.
 	MaxConnections int `json:"maxConnections,omitempty"`
@@ -88,6 +93,11 @@ func (s *SharedConfig) validate() error {
 		}
 		// A namespace with no prefix runs listed digests only.
 		if s.ImagePrefixes[ns] == "" && len(s.ImageDigests) == 0 {
+			return errConfig
+		}
+	}
+	for i, ns := range s.RequesterNamespaces {
+		if s.Profiles[ns] == "" || slices.Contains(s.RequesterNamespaces[:i], ns) {
 			return errConfig
 		}
 	}
@@ -192,7 +202,11 @@ type agentPod struct {
 		Namespace         string  `json:"namespace"`
 		UID               string  `json:"uid"`
 		DeletionTimestamp *string `json:"deletionTimestamp"`
-		OwnerReferences   []struct {
+		// Only the requester annotation is kept.
+		Annotations struct {
+			Requester string `json:"gatehouse.trmlabs.com/requester"`
+		} `json:"annotations"`
+		OwnerReferences []struct {
 			APIVersion         string `json:"apiVersion"`
 			Kind               string `json:"kind"`
 			UID                string `json:"uid"`
@@ -263,6 +277,12 @@ func (p *agentPod) attest(s *SharedConfig, now time.Time) (workloadidentity.Atte
 			images = append(images, image)
 		}
 	}
+	requester := ""
+	if slices.Contains(s.RequesterNamespaces, m.Namespace) {
+		if requester = m.Annotations.Requester; !workloadidentity.ValidRequester(requester) {
+			return a, false
+		}
+	}
 	end := p.Status.StartTime.Add(time.Duration(s.MaxPodSeconds) * time.Second)
 	if d := p.Spec.ActiveDeadlineSeconds; d != nil {
 		if active := p.Status.StartTime.Add(time.Duration(*d) * time.Second); active.Before(end) {
@@ -273,7 +293,7 @@ func (p *agentPod) attest(s *SharedConfig, now time.Time) (workloadidentity.Atte
 		return a, false
 	}
 	return workloadidentity.Attestation{Namespace: m.Namespace, PodName: m.Name, PodUID: m.UID, OwnerKind: s.OwnerKind, OwnerUID: owner,
-		Images: images, NotAfter: end.Unix(), Profile: s.Profiles[m.Namespace]}, true
+		Images: images, NotAfter: end.Unix(), Profile: s.Profiles[m.Namespace], Requester: requester}, true
 }
 
 // podCache holds the agent Pods of every watched namespace, kept current by

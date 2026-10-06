@@ -397,16 +397,17 @@ func (r *relay) attest(peer string) (encoded string, agent agentIdentity, err er
 	if encoded, err = workloadidentity.EncodeAttestation(a); err != nil {
 		return "", agent, errDenied
 	}
-	return encoded, agentIdentity{pod: a.PodUID, owner: a.OwnerUID}, nil
+	return encoded, agentIdentity{pod: a.PodUID, owner: a.OwnerUID, requester: a.Requester}, nil
 }
 
-// agentIdentity is the Pod and controller UIDs a connection was admitted for.
-type agentIdentity struct{ pod, owner string }
+// agentIdentity is the Pod and controller UIDs, and the requester, a
+// connection was admitted for.
+type agentIdentity struct{ pod, owner, requester string }
 
 // watchPeer, in shared mode, rechecks the connection's agent Pod every
 // second and calls end once it is no longer the same admissible Pod under the
-// same controller: deleted, its Sandbox gone or replaced, past its deadline,
-// or its watch down. The returned function stops the watch.
+// same controller and requester: deleted, its Sandbox gone or replaced, past
+// its deadline, or its watch down. The returned function stops the watch.
 func (r *relay) watchPeer(peer string, admitted agentIdentity, end func()) func() {
 	if r.pair.cache == nil {
 		return func() {}
@@ -424,7 +425,7 @@ func (r *relay) watchPeer(peer string, admitted agentIdentity, end func()) func(
 				return
 			case <-ticker.C:
 				a, ok := r.pair.attestation(peer)
-				if !ok || a.PodUID != admitted.pod || a.OwnerUID != admitted.owner {
+				if !ok || a.PodUID != admitted.pod || a.OwnerUID != admitted.owner || a.Requester != admitted.requester {
 					end()
 					return
 				}
