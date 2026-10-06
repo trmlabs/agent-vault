@@ -159,6 +159,18 @@ func (c FixedConfig) validateShared(now time.Time) error {
 			return errConfig
 		}
 	}
+	if l := c.PostgresListener; l != nil {
+		if check(l.Listen, l.Upstream) != nil || len(l.Databases) == 0 || !safeName.MatchString(l.User) || !safeName.MatchString(l.Placeholder) {
+			return errConfig
+		}
+		seen := make(map[string]bool, len(l.Databases))
+		for _, name := range l.Databases {
+			if !safeName.MatchString(name) || seen[name] {
+				return errConfig
+			}
+			seen[name] = true
+		}
+	}
 	if len(used) == 0 {
 		return errConfig
 	}

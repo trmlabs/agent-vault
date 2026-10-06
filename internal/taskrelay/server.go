@@ -117,7 +117,7 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 		}
 		return l, e
 	}
-	failures := make(chan error, 2+len(c.postgresBindings()))
+	failures := make(chan error, 4+len(c.postgresBindings()))
 	var start []func()
 	startHTTP := func(l net.Listener, h http.Handler) {
 		tracked := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -159,11 +159,7 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 		listeners = append(listeners, l)
 		serveHTTP(l, pair.cache.activity.handler())
 	}
-	for _, binding := range c.postgresBindings() {
-		l, e := bind(binding.Listen)
-		if e != nil {
-			return errConfig
-		}
+	servePostgres := func(l net.Listener, handle func(net.Conn)) {
 		start = append(start, func() {
 			r.wg.Add(1)
 			go func() {
@@ -193,11 +189,30 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 						defer func() { _ = conn.Close() }()
 						stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 						defer stop()
-						r.postgres(conn, binding)
+						handle(conn)
 					}()
 				}
 			}()
 		})
+	}
+	for _, binding := range c.postgresBindings() {
+		l, e := bind(binding.Listen)
+		if e != nil {
+			return errConfig
+		}
+		servePostgres(l, func(conn net.Conn) { r.postgres(conn, binding, nil) })
+	}
+	if pl := c.PostgresListener; pl != nil {
+		l, e := bind(pl.Listen)
+		if e != nil {
+			return errConfig
+		}
+		catalog := make(map[string]bool, len(pl.Databases))
+		for _, name := range pl.Databases {
+			catalog[name] = true
+		}
+		binding := pl.route("")
+		servePostgres(l, func(conn net.Conn) { r.postgres(conn, binding, catalog) })
 	}
 	if c.Browser != nil {
 		bc := c.Browser
