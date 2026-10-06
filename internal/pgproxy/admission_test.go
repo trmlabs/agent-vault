@@ -3,6 +3,7 @@ package pgproxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -50,9 +51,7 @@ func TestAdmissionWaitsForCleanupWithoutMintingOrUnboundedPending(t *testing.T) 
 	if m.mintCallCount() != 1 {
 		t.Fatal("queued connection minted before cleanup released capacity")
 	}
-	if code := connectExpectCode(t, addr, "overflow", "db"); code != "" {
-		t.Fatalf("overflow should be closed before authentication: %s", code)
-	}
+	overflow := overflowWaits(t, b, addr)
 	select {
 	case <-done:
 		t.Fatal("admission failed instead of waiting for cleanup")
@@ -68,6 +67,11 @@ func TestAdmissionWaitsForCleanupWithoutMintingOrUnboundedPending(t *testing.T) 
 		t.Fatal("queued connection did not establish")
 	}
 	defer second.close()
+	// The overflow is accepted once the queued connection is served, and is
+	// refused at serving capacity without a mint.
+	if code := <-overflow; code != "53300" {
+		t.Fatalf("overflow ended with %q", code)
+	}
 	if m.mintCallCount() != 2 || len(b.acceptSem) != 0 {
 		t.Fatal("admission did not release pending slot or mint exactly once")
 	}
@@ -135,9 +139,7 @@ func TestActorAdmissionWaitsForCleanupWithoutMintingOrUnboundedPending(t *testin
 	if m.mintCallCount() != 1 {
 		t.Fatal("queued connection minted before cleanup released capacity")
 	}
-	if code := connectExpectCode(t, addr, "overflow", "db"); code != "" {
-		t.Fatalf("overflow should be closed before authentication: %s", code)
-	}
+	overflow := overflowWaits(t, b, addr)
 	select {
 	case <-done:
 		t.Fatal("admission failed instead of waiting for cleanup")
@@ -153,8 +155,13 @@ func TestActorAdmissionWaitsForCleanupWithoutMintingOrUnboundedPending(t *testin
 		t.Fatal("queued connection did not establish")
 	}
 	defer second.close()
-	if m.mintCallCount() != 2 || len(b.acceptSem) != 0 {
-		t.Fatal("admission did not release pending slot or mint exactly once")
+	// The overflow, another actor, is accepted and served once the queued
+	// connection is.
+	if code := <-overflow; code != "OK" {
+		t.Fatalf("overflow ended with %q", code)
+	}
+	if m.mintCallCount() != 3 || len(b.acceptSem) != 0 {
+		t.Fatal("admission did not release pending slot or mint once per session")
 	}
 }
 
@@ -252,5 +259,95 @@ func TestActorAdmissionRechecksRevocationAndScopeBeforeMint(t *testing.T) {
 			}
 			waitFor(t, time.Second, func() bool { b.mu.Lock(); defer b.mu.Unlock(); return len(b.leaseCounts) == 0 }, "actor slot leaked")
 		})
+	}
+}
+
+// overflowWaits starts a connection past the pending bound and checks that it
+// waits to be accepted: no answer and no pending slot while the bound holds.
+func overflowWaits(t *testing.T, b *Broker, addr string) <-chan string {
+	t.Helper()
+	overflow := make(chan string, 1)
+	go func() { overflow <- connectExpectCode(t, addr, "overflow", "db") }()
+	time.Sleep(200 * time.Millisecond)
+	select {
+	case code := <-overflow:
+		t.Fatalf("overflow answered while the pending slot was held: %q", code)
+	default:
+	}
+	if len(b.acceptSem) != 1 {
+		t.Fatal("overflow took a pending slot")
+	}
+	return overflow
+}
+
+// A burst far past the pending bound and the admission concurrency is
+// queued, not refused: with a store that answers one call at a time, every
+// connection of the burst is served.
+func TestBurstQueuesInsteadOfRefusing(t *testing.T) {
+	up := startFakeUpstream(t, authTrust, "")
+	var store sync.Mutex // one connection, like the SQLite store
+	_, addr := startBroker(t, Options{MaxPendingConns: 4, AdmissionConcurrency: 2,
+		Auth: authFunc(func(_ context.Context, token, _ string) (*AgentScope, error) {
+			store.Lock()
+			defer store.Unlock()
+			time.Sleep(5 * time.Millisecond)
+			return &AgentScope{VaultID: "v", ActorID: token}, nil
+		}),
+		Databases: &fakeResolver{svc: &DatabaseService{Name: "db", Addr: up.addr()}}, Leases: &fakeMinter{lease: newLease()}})
+	const burst = 200
+	codes := make(chan string, burst)
+	var wg sync.WaitGroup
+	for i := range burst {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			codes <- connectExpectCode(t, addr, fmt.Sprintf("agent-%d", i), "db")
+		}()
+	}
+	wg.Wait()
+	close(codes)
+	counts := map[string]int{}
+	for code := range codes {
+		counts[code]++
+	}
+	if counts["OK"] != burst {
+		t.Fatalf("burst of %d: %v", burst, counts)
+	}
+}
+
+// slowLedger answers each Add after delay, unless its deadline comes first.
+type slowLedger struct{ delay time.Duration }
+
+func (l slowLedger) Add(ctx context.Context, _, _ string, _ int) error {
+	select {
+	case <-time.After(l.delay):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (slowLedger) Remove(context.Context, string) error { return nil }
+
+// A slow session ledger has its own deadline and does not spend the wait for
+// serving capacity: an Add that outlasts AdmissionTimeout but not
+// LedgerTimeout still admits, and one past LedgerTimeout is refused as the
+// ledger, not as the serving cap.
+func TestSlowLedgerHasItsOwnDeadline(t *testing.T) {
+	up := startFakeUpstream(t, authTrust, "")
+	start := func(ledger time.Duration) string {
+		_, addr := startBroker(t, Options{AdmissionTimeout: 100 * time.Millisecond, LedgerTimeout: 400 * time.Millisecond,
+			Sessions: slowLedger{delay: ledger},
+			Auth: authFunc(func(_ context.Context, token, _ string) (*AgentScope, error) {
+				return &AgentScope{VaultID: "v", ActorID: token, WorkloadID: "pod-1"}, nil
+			}),
+			Databases: &fakeResolver{svc: &DatabaseService{Name: "db", Addr: up.addr()}}, Leases: &fakeMinter{lease: newLease()}})
+		return connectExpectCode(t, addr, "agent", "db")
+	}
+	if code := start(200 * time.Millisecond); code != "OK" {
+		t.Fatalf("ledger slower than the admission timeout: %q", code)
+	}
+	if code := start(time.Second); code != "08004" {
+		t.Fatalf("ledger past its own deadline: %q", code)
 	}
 }

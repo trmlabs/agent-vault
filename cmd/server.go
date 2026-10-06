@@ -671,13 +671,28 @@ func attachPostgresBrokerIfEnabled(srv *server.Server, host string, postgresPort
 	if v := intEnvValue("AGENT_VAULT_DB_MAX_LEASES_PER_AGENT"); v > 0 {
 		opts.MaxLeasesPerAgent = v
 	}
-	// MaxPendingConns bounds accepted-but-not-yet-serving connections. The
-	// half-open mitigation protects the serving cap, not the accept cap: a
-	// sustained flood above this bound is refused at accept until stalled
-	// sockets are reclaimed at StartupTimeout. Operators facing hostile clients
-	// raise it (or front the listener with a connection limiter).
+	// MaxPendingConns bounds accepted-but-not-yet-serving connections. At the
+	// bound the broker stops accepting, so further connections wait in the
+	// listen backlog until stalled sockets are reclaimed at StartupTimeout.
 	if v := intEnvValue("AGENT_VAULT_DB_MAX_PENDING_CONNS"); v > 0 {
 		opts.MaxPendingConns = v
+	}
+	// Admission: how many connections run its store calls at once (the rest
+	// queue), its wait for capacity, and each session-ledger call's deadline.
+	if v := intEnvValue("AGENT_VAULT_DB_ADMISSION_CONCURRENCY"); v > 0 {
+		opts.AdmissionConcurrency = v
+	}
+	for name, field := range map[string]*time.Duration{
+		"AGENT_VAULT_DB_ADMISSION_TIMEOUT": &opts.AdmissionTimeout,
+		"AGENT_VAULT_DB_LEDGER_TIMEOUT":    &opts.LedgerTimeout,
+	} {
+		if raw := os.Getenv(name); raw != "" {
+			d, err := time.ParseDuration(raw)
+			if err != nil || d <= 0 {
+				return fmt.Errorf("%s must be a positive duration such as 2s", name)
+			}
+			*field = d
+		}
 	}
 	// The PROXY header names the worker's address for pool admission. Only the
 	// in-Pod TLS terminator may send it, so it is refused off loopback.
