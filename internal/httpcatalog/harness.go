@@ -148,8 +148,10 @@ func (h Harness) validate() error {
 	if !kubernetesKind.MatchString(id.OwnerKind) {
 		return errors.New("identity.ownerKind must be a Kubernetes kind")
 	}
-	if len(id.Namespaces) == 0 || len(id.Namespaces) > 16 {
-		return errors.New("identity.namespaces needs 1 to 16 namespaces")
+	// One harness may serve a namespace per tenant, so the list is fleet
+	// sized; the bound only guards against a malformed catalog.
+	if len(id.Namespaces) == 0 || len(id.Namespaces) > 10000 {
+		return errors.New("identity.namespaces needs 1 to 10,000 namespaces")
 	}
 	seen := map[string]bool{}
 	for _, ns := range id.Namespaces {
