@@ -71,6 +71,26 @@ func (a *activity) pending() []SandboxActivity {
 	return out
 }
 
+// repushMissing marks pending again every entry the broker once took but no
+// longer holds at that time (a restored or emptied table), so the next report
+// puts it back. A janitor pass merges every replica's own entries anyway; this
+// keeps the durable view whole for when this replica is gone.
+func (a *activity) repushMissing(view []SandboxActivity) {
+	held := make(map[string]time.Time, len(view))
+	for _, r := range view {
+		held[r.OwnerUID] = r.LastSeen
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for owner, e := range a.owners {
+		// The broker keeps milliseconds.
+		if !e.pushed.IsZero() && held[owner].Before(e.pushed.Truncate(time.Millisecond)) {
+			e.pushed = time.Time{}
+			a.owners[owner] = e
+		}
+	}
+}
+
 // accepted marks rows the broker took.
 func (a *activity) accepted(rows []SandboxActivity) {
 	a.mu.Lock()
@@ -124,19 +144,26 @@ func (a *activity) report(now time.Time) ActivityReport {
 	return out
 }
 
-// ActivityPath is the admin listener's only route.
-const ActivityPath = "/v1/activity"
+// ActivityPath is the admin listener's full report: this replica's
+// activity merged with the broker's durable view. ActivityLocalPath is this
+// replica's own activity alone, so a janitor reads the durable view from one
+// replica and not from every one.
+const (
+	ActivityPath      = "/v1/activity"
+	ActivityLocalPath = "/v1/activity/local"
+)
 
-// handler serves GET /v1/activity and nothing else: every other path and
-// method is 404, so the admin port exposes last-seen times and no more.
+// handler serves GET on the two activity paths and nothing else: every other
+// path and method is 404, so the admin port exposes last-seen times and no
+// more.
 func (a *activity) handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.Method != http.MethodGet || req.URL.Path != ActivityPath || req.URL.RawQuery != "" {
+		if req.Method != http.MethodGet || (req.URL.Path != ActivityPath && req.URL.Path != ActivityLocalPath) || req.URL.RawQuery != "" {
 			http.NotFound(w, req)
 			return
 		}
 		report := a.report(time.Now())
-		if a.durable != nil {
+		if a.durable != nil && req.URL.Path == ActivityPath {
 			report = a.withDurable(req.Context(), report)
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -153,6 +180,7 @@ func (a *activity) withDurable(ctx context.Context, report ActivityReport) Activ
 	if e != nil {
 		return report
 	}
+	a.repushMissing(view.sandboxes)
 	rows, retention := view.sandboxes, view.retention
 	byOwner := make(map[string]int, len(report.Sandboxes))
 	for i, s := range report.Sandboxes {
