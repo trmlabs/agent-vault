@@ -53,7 +53,8 @@ type HarnessTrustDomain struct {
 //   - "pod-token": the agent Pod's own projected token, checked against the
 //     live Pod and the connection's source address (Cursor workers).
 //   - "session-jwt": the same Pod check, plus a runner session token naming
-//     the person, pinned to the first Pod that presents it (Claude sessions).
+//     the person, pinned to the first Pod that presents it (Claude sessions,
+//     and Cursor runs whose sidecar mints the run's identity token).
 //   - "proxy-attested": a shared proxy in the agent's cluster runs the Pod
 //     check and presents its own token; the broker trusts that one proxy
 //     account and the Pod it attests (agent-sandbox).
@@ -73,8 +74,12 @@ type HarnessIdentity struct {
 }
 
 // HarnessRequester is where the person behind a session comes from:
-// "session-jwt" (a runner session token) or "signed-assertion" (a statement
-// the launching runtime signs onto the agent's controller object).
+// "session-jwt" (a Claude runner session token), "cursor-oidc" (a Cursor
+// run's identity token, minted by the sidecar from the worker's per-run
+// socket), "pod-annotation" (the login a shared proxy attests from the agent
+// Pod's requester annotation, which admission policy fixes to the creator of
+// its controller) or "signed-assertion" (a statement the launching runtime
+// signs onto the agent's controller object).
 type HarnessRequester struct {
 	Kind string `json:"kind"`
 }
@@ -102,7 +107,9 @@ const (
 	IdentityProxyAttested = "proxy-attested"
 
 	RequesterSessionJWT      = "session-jwt"
+	RequesterCursorOIDC      = "cursor-oidc"
 	RequesterSignedAssertion = "signed-assertion"
+	RequesterPodAnnotation   = "pod-annotation"
 
 	PathSidecar     = "sidecar"
 	PathSharedProxy = "shared-proxy"
@@ -176,8 +183,8 @@ func (h Harness) validate() error {
 	requester := ""
 	if id.Requester != nil {
 		requester = id.Requester.Kind
-		if requester != RequesterSessionJWT && requester != RequesterSignedAssertion {
-			return fmt.Errorf("identity.requester.kind %q: session-jwt or signed-assertion", requester)
+		if requester != RequesterSessionJWT && requester != RequesterCursorOIDC && requester != RequesterSignedAssertion && requester != RequesterPodAnnotation {
+			return fmt.Errorf("identity.requester.kind %q: session-jwt, cursor-oidc, pod-annotation or signed-assertion", requester)
 		}
 	}
 	switch h.Path.Kind {
@@ -207,11 +214,11 @@ func (h Harness) validate() error {
 			return errors.New("pod-token identity runs a sidecar, names no requester and authorizes the pool")
 		}
 	case IdentitySessionJWT:
-		if h.Path.Kind != PathSidecar || (requester != "" && requester != RequesterSessionJWT) || h.Authorization.Mode != AuthorizePerson {
+		if h.Path.Kind != PathSidecar || requester == RequesterSignedAssertion || requester == RequesterPodAnnotation || h.Authorization.Mode != AuthorizePerson {
 			return errors.New("session-jwt identity runs a sidecar, takes its person from the session and authorizes the person")
 		}
 	case IdentityProxyAttested:
-		if h.Path.Kind != PathSharedProxy || requester == RequesterSessionJWT {
+		if h.Path.Kind != PathSharedProxy || requester == RequesterSessionJWT || requester == RequesterCursorOIDC {
 			return errors.New("proxy-attested identity runs a shared proxy and takes no session token")
 		}
 		if requester == RequesterSignedAssertion {
@@ -219,8 +226,11 @@ func (h Harness) validate() error {
 			// names one must not silently run at pool level.
 			return errors.New("signed-assertion requesters are not verified by this broker yet")
 		}
-		if h.Authorization.Mode != AuthorizePool {
-			return errors.New("person authorization needs a requester")
+		// A person only from the proxy's attested requester, and the
+		// requester only where the person is authorized: a pool-mode
+		// namespace never borrows one.
+		if (requester == RequesterPodAnnotation) != (h.Authorization.Mode == AuthorizePerson) {
+			return errors.New("a proxy-attested harness authorizes the person exactly when its requester is pod-annotation")
 		}
 		// The broker picks a proxy's profile by namespace, so each names one.
 		if len(id.Namespaces) != 1 {
@@ -264,9 +274,14 @@ func validateHarnesses(harnesses []Harness, pools map[string]Pool) (map[string]H
 		if _, taken := byPool[pool.Name]; taken {
 			return nil, fmt.Errorf("pool %q belongs to more than one harness", pool.Name)
 		}
-		person := pool.Identity == "claude-session"
+		personPool, person := personIdentities[pool.Identity]
 		if person != (h.Authorization.Mode == AuthorizePerson) {
 			return nil, fmt.Errorf("harness %q authorizes the %s, but pool %q has identity %q", h.Name, h.Authorization.Mode, pool.Name, pool.Identity)
+		}
+		// Each source of a person is trusted only on its own kind of pool.
+		requester := (Profile{Harness: h}).RequesterKind()
+		if person && requester != personPool {
+			return nil, fmt.Errorf("harness %q takes its person from %q, but pool %q has identity %q", h.Name, requester, pool.Name, pool.Identity)
 		}
 		if pool.Namespace != "" && !contains(h.Identity.Namespaces, pool.Namespace) {
 			return nil, fmt.Errorf("harness %q does not list pool %q's namespace", h.Name, pool.Name)
@@ -312,8 +327,12 @@ func (p Pool) Profile() Profile {
 	}
 	h := Harness{Name: p.Name, Identity: HarnessIdentity{Kind: IdentityPodToken}, Path: HarnessPath{Kind: PathSidecar},
 		Authorization: HarnessAuthorization{Mode: AuthorizePool, PoolName: p.Name}}
-	if p.Identity == "claude-session" {
+	switch p.Identity {
+	case "claude-session":
 		h.Identity = HarnessIdentity{Kind: IdentitySessionJWT, Requester: &HarnessRequester{Kind: RequesterSessionJWT}}
+		h.Authorization.Mode = AuthorizePerson
+	case "cursor-session":
+		h.Identity = HarnessIdentity{Kind: IdentitySessionJWT, Requester: &HarnessRequester{Kind: RequesterCursorOIDC}}
 		h.Authorization.Mode = AuthorizePerson
 	}
 	return Profile{Harness: h}
@@ -328,6 +347,14 @@ func (p Profile) RequesterKind() string {
 		return RequesterSessionJWT
 	}
 	return ""
+}
+
+// personIdentities maps each pool identity that names a person to the only
+// requester kind that may name it.
+var personIdentities = map[string]string{
+	"claude-session":  RequesterSessionJWT,
+	"cursor-session":  RequesterCursorOIDC,
+	"attested-person": RequesterPodAnnotation,
 }
 
 // Harnesses returns the declared profiles.

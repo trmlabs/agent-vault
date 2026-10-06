@@ -76,6 +76,16 @@ func TestProxyAttestedAdmitsTheAttestedPod(t *testing.T) {
 	if scope.WorkloadID != "agent-pod-uid" || scope.Pool != "sandboxes" || scope.AgentID != "agent" || !scope.NotAfter.Equal(time.Unix(p.a.NotAfter, 0)) {
 		t.Fatalf("scope %+v", scope)
 	}
+	if scope.AttestedRequester != "" {
+		t.Fatalf("a requester the proxy did not attest: %q", scope.AttestedRequester)
+	}
+	// The attested requester reaches the scope as is; authorization decides
+	// whether the pool's profile takes one.
+	withRequester := p.a
+	withRequester.Requester = "alice.smith@trmlabs.com"
+	if scope, err := p.r.Attest(p.ctx(t, withRequester), p.rc.token(p.rc.claims()), linkIP); err != nil || scope.AttestedRequester != "alice.smith@trmlabs.com" {
+		t.Fatalf("requester not carried: %+v %v", scope, err)
+	}
 	// A recheck after the proxy token expired still holds, but only for one
 	// token lifetime (3600 s in this domain) past its expiry.
 	c := p.rc.claims()
@@ -589,6 +599,26 @@ func TestVerifyProxyAdmitsOnlyTheProxy(t *testing.T) {
 	} {
 		if err := p.r.VerifyProxy(context.Background(), tc.token, tc.peer); err == nil {
 			t.Errorf("%s: admitted", name)
+		}
+	}
+}
+
+// A requester, when present, must be a lower-case login; the broker refuses
+// any other value before it looks at the rest of the attestation.
+func TestAttestationRequester(t *testing.T) {
+	a := setupProxy(t).a
+	for _, requester := range []string{"", "alice.smith@trmlabs.com", "a+b@sub.trmlabs.com"} {
+		a.Requester = requester
+		encoded, _ := EncodeAttestation(a)
+		if got, err := decodeAttestation(encoded); err != nil || got.Requester != requester {
+			t.Errorf("%q refused: %v", requester, err)
+		}
+	}
+	for _, requester := range []string{"Alice@trmlabs.com", "alice", "alice@trmlabs", "@trmlabs.com", "alice@-trmlabs.com", "alice@trmlabs.com ", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@trmlabs.com"} {
+		a.Requester = requester
+		encoded, _ := EncodeAttestation(a)
+		if _, err := decodeAttestation(encoded); err == nil {
+			t.Errorf("%q accepted", requester)
 		}
 	}
 }

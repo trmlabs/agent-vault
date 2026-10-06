@@ -54,8 +54,8 @@ func TestExplicitProfilesDecideAsDerivedOnes(t *testing.T) {
 		if dp.Profile().Explicit || !ep.Profile().Explicit {
 			t.Fatalf("%s: profiles not as built", c.pool)
 		}
-		dWho, dRefusal := Resolve(ctx, dp, c.session, c.pod, oneToken{}, &authorizetest.MemBinder{})
-		eWho, eRefusal := Resolve(ctx, ep, c.session, c.pod, oneToken{}, &authorizetest.MemBinder{})
+		dWho, dRefusal := Resolve(ctx, dp, c.session, Claims{Pod: c.pod}, oneToken{}, &authorizetest.MemBinder{})
+		eWho, eRefusal := Resolve(ctx, ep, c.session, Claims{Pod: c.pod}, oneToken{}, &authorizetest.MemBinder{})
 		if dWho != eWho || dRefusal != eRefusal {
 			t.Errorf("%+v: derived %+v %q, explicit %+v %q", c, dWho, dRefusal, eWho, eRefusal)
 		}
@@ -64,10 +64,10 @@ func TestExplicitProfilesDecideAsDerivedOnes(t *testing.T) {
 	// its first Pod.
 	ep, _ := explicit.Pool("claude")
 	b := &authorizetest.MemBinder{}
-	if _, refusal := Resolve(ctx, ep, "alice", "pod-a", oneToken{}, b); refusal != "" {
+	if _, refusal := Resolve(ctx, ep, "alice", Claims{Pod: "pod-a"}, oneToken{}, b); refusal != "" {
 		t.Fatalf("first Pod: %q", refusal)
 	}
-	if _, refusal := Resolve(ctx, ep, "alice", "pod-b", oneToken{}, b); refusal != "session_pod_mismatch" {
+	if _, refusal := Resolve(ctx, ep, "alice", Claims{Pod: "pod-b"}, oneToken{}, b); refusal != "session_pod_mismatch" {
 		t.Fatalf("second Pod: %q", refusal)
 	}
 }

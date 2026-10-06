@@ -31,6 +31,9 @@ type relay struct {
 	workMu        sync.Mutex
 	stopping      bool
 	foreignPeer   atomic.Bool // set once a non-paired address has connected
+	// pgTLS, with a broker-issued certificate, answers a PostgreSQL client's
+	// SSLRequest; its listeners are then plain TCP and refuse plaintext.
+	pgTLS *tls.Config
 }
 
 // Run serves native TLS only. Failure of any listener, pairing, deadline or
@@ -88,6 +91,21 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 		}
 		tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}}
 	}
+	// A broker-issued certificate is obtained before any listener binds,
+	// then renewed in the background for as long as the proxy runs.
+	certDone := make(chan struct{})
+	close(certDone)
+	if c.TLS != nil {
+		serving := newServingCert(c.TLS, c.Connect.Upstream)
+		serving.issued = func(time.Time, time.Time) { _ = r.record("tls", "certificate-issued") }
+		if serving.obtain(ctx) != nil {
+			return errDenied
+		}
+		tlsConfig, r.pgTLS = serving.serverTLS("http/1.1"), serving.serverTLS("postgresql")
+		certDone = make(chan struct{})
+		go func() { defer close(certDone); serving.run(ctx) }()
+	}
+	defer func() { cancel(); <-certDone }()
 	var listeners []net.Listener
 	defer func() {
 		r.workMu.Lock()
@@ -103,21 +121,28 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 		}
 	}()
 	listenerSlots := make(chan struct{}, limit)
-	bind := func(address string) (net.Listener, error) {
+	bindAs := func(address string, outer *tls.Config) (net.Listener, error) {
 		plain, e := net.Listen("tcp", address)
 		if e != nil {
 			return nil, e
 		}
 		var l net.Listener = &boundedListener{Listener: plain, slots: listenerSlots}
-		if tlsConfig != nil {
-			l = tls.NewListener(l, tlsConfig)
+		if outer != nil {
+			l = tls.NewListener(l, outer)
 		}
-		if e == nil {
-			listeners = append(listeners, l)
-		}
-		return l, e
+		listeners = append(listeners, l)
+		return l, nil
 	}
-	failures := make(chan error, 2+len(c.postgresBindings()))
+	bind := func(address string) (net.Listener, error) { return bindAs(address, tlsConfig) }
+	// A PostgreSQL listener with a broker-issued certificate starts in TCP and
+	// upgrades on the client's SSLRequest.
+	bindPostgres := func(address string) (net.Listener, error) {
+		if r.pgTLS != nil {
+			return bindAs(address, nil)
+		}
+		return bind(address)
+	}
+	failures := make(chan error, 4+len(c.postgresBindings()))
 	var start []func()
 	startHTTP := func(l net.Listener, h http.Handler) {
 		tracked := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -149,11 +174,17 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 		}
 		serveHTTP(l, http.HandlerFunc(r.connect))
 	}
-	for _, binding := range c.postgresBindings() {
-		l, e := bind(binding.Listen)
+	if c.AdminListen != "" && pair.cache != nil {
+		// Plaintext and outside the connection slots: it serves one read-only
+		// report, and its network policy admits only the janitor.
+		l, e := net.Listen("tcp", c.AdminListen)
 		if e != nil {
 			return errConfig
 		}
+		listeners = append(listeners, l)
+		serveHTTP(l, pair.cache.activity.handler())
+	}
+	servePostgres := func(l net.Listener, handle func(net.Conn)) {
 		start = append(start, func() {
 			r.wg.Add(1)
 			go func() {
@@ -183,11 +214,30 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 						defer func() { _ = conn.Close() }()
 						stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 						defer stop()
-						r.postgres(conn, binding)
+						handle(conn)
 					}()
 				}
 			}()
 		})
+	}
+	for _, binding := range c.postgresBindings() {
+		l, e := bindPostgres(binding.Listen)
+		if e != nil {
+			return errConfig
+		}
+		servePostgres(l, func(conn net.Conn) { r.postgres(conn, binding, nil) })
+	}
+	if pl := c.PostgresListener; pl != nil {
+		l, e := bindPostgres(pl.Listen)
+		if e != nil {
+			return errConfig
+		}
+		catalog := make(map[string]bool, len(pl.Databases))
+		for _, name := range pl.Databases {
+			catalog[name] = true
+		}
+		binding := pl.route("")
+		servePostgres(l, func(conn net.Conn) { r.postgres(conn, binding, catalog) })
 	}
 	if c.Browser != nil {
 		bc := c.Browser
@@ -328,6 +378,7 @@ func (r *relay) admit(ctx context.Context, peer, protocol string) error {
 			r.cancel()
 			return e
 		}
+		r.pair.cache.activity.seen(a, time.Now())
 		return nil
 	}
 	return r.record(protocol, "admitted")
@@ -346,16 +397,17 @@ func (r *relay) attest(peer string) (encoded string, agent agentIdentity, err er
 	if encoded, err = workloadidentity.EncodeAttestation(a); err != nil {
 		return "", agent, errDenied
 	}
-	return encoded, agentIdentity{pod: a.PodUID, owner: a.OwnerUID}, nil
+	return encoded, agentIdentity{pod: a.PodUID, owner: a.OwnerUID, requester: a.Requester}, nil
 }
 
-// agentIdentity is the Pod and controller UIDs a connection was admitted for.
-type agentIdentity struct{ pod, owner string }
+// agentIdentity is the Pod and controller UIDs, and the requester, a
+// connection was admitted for.
+type agentIdentity struct{ pod, owner, requester string }
 
 // watchPeer, in shared mode, rechecks the connection's agent Pod every
 // second and calls end once it is no longer the same admissible Pod under the
-// same controller: deleted, its Sandbox gone or replaced, past its deadline,
-// or its watch down. The returned function stops the watch.
+// same controller and requester: deleted, its Sandbox gone or replaced, past
+// its deadline, or its watch down. The returned function stops the watch.
 func (r *relay) watchPeer(peer string, admitted agentIdentity, end func()) func() {
 	if r.pair.cache == nil {
 		return func() {}
@@ -372,10 +424,13 @@ func (r *relay) watchPeer(peer string, admitted agentIdentity, end func()) func(
 				end()
 				return
 			case <-ticker.C:
-				if a, ok := r.pair.attestation(peer); !ok || a.PodUID != admitted.pod || a.OwnerUID != admitted.owner {
+				a, ok := r.pair.attestation(peer)
+				if !ok || a.PodUID != admitted.pod || a.OwnerUID != admitted.owner || a.Requester != admitted.requester {
 					end()
 					return
 				}
+				// An open connection is use: the janitor never retires a Sandbox mid-session.
+				r.pair.cache.activity.seen(a, time.Now())
 			}
 		}
 	}()

@@ -44,6 +44,11 @@ type SharedConfig struct {
 	ImageDigests  []string          `json:"imageDigests,omitempty"`
 	// MaxPodSeconds bounds an agent Pod's admission from its start (60 s to 8 h).
 	MaxPodSeconds int64 `json:"maxPodSeconds"`
+	// RequesterNamespaces are the namespaces whose attestations carry the
+	// requester: the Pod's gatehouse.trmlabs.com/requester annotation, which
+	// admission policy there fixes to the creator's login. A Pod in one of
+	// them without a valid requester is not admitted.
+	RequesterNamespaces []string `json:"requesterNamespaces,omitempty"`
 	// MaxConnections bounds the open connections of one replica (default
 	// 4096). Scale out with replicas, not by raising it.
 	MaxConnections int `json:"maxConnections,omitempty"`
@@ -91,6 +96,11 @@ func (s *SharedConfig) validate() error {
 			return errConfig
 		}
 	}
+	for i, ns := range s.RequesterNamespaces {
+		if s.Profiles[ns] == "" || slices.Contains(s.RequesterNamespaces[:i], ns) {
+			return errConfig
+		}
+	}
 	for ns, prefix := range s.ImagePrefixes {
 		if s.Profiles[ns] == "" || !imagerule.ValidPrefix(prefix) {
 			return errConfig
@@ -135,7 +145,7 @@ func (c FixedConfig) validateShared(now time.Time) error {
 	}
 	used := map[string]bool{}
 	check := func(listen string, upstream UpstreamConfig) error {
-		if !validAddress(listen) || used[listen] || upstream.SessionFile != "" || !validAddress(upstream.Address) || upstream.ServerName == "" || upstream.CAFile == "" || upstream.ProofFile == "" || upstream.Audience == "" {
+		if !validAddress(listen) || used[listen] || upstream.hasSession() || !validAddress(upstream.Address) || upstream.ServerName == "" || upstream.CAFile == "" || upstream.ProofFile == "" || upstream.Audience == "" {
 			return errConfig
 		}
 		used[listen] = true
@@ -159,7 +169,27 @@ func (c FixedConfig) validateShared(now time.Time) error {
 			return errConfig
 		}
 	}
+	// A broker-issued certificate replaces the files, and is requested over
+	// the CONNECT listener's upstream: the broker's cross-cluster listener.
+	if c.TLS != nil && (c.TLS.validate() != nil || c.TLSCertFile != "" || c.Connect == nil) {
+		return errConfig
+	}
+	if l := c.PostgresListener; l != nil {
+		if check(l.Listen, l.Upstream) != nil || len(l.Databases) == 0 || !safeName.MatchString(l.User) || !safeName.MatchString(l.Placeholder) {
+			return errConfig
+		}
+		seen := make(map[string]bool, len(l.Databases))
+		for _, name := range l.Databases {
+			if !safeName.MatchString(name) || seen[name] {
+				return errConfig
+			}
+			seen[name] = true
+		}
+	}
 	if len(used) == 0 {
+		return errConfig
+	}
+	if c.AdminListen != "" && (!validAddress(c.AdminListen) || used[c.AdminListen]) {
 		return errConfig
 	}
 	return nil
@@ -172,7 +202,11 @@ type agentPod struct {
 		Namespace         string  `json:"namespace"`
 		UID               string  `json:"uid"`
 		DeletionTimestamp *string `json:"deletionTimestamp"`
-		OwnerReferences   []struct {
+		// Only the requester annotation is kept.
+		Annotations struct {
+			Requester string `json:"gatehouse.trmlabs.com/requester"`
+		} `json:"annotations"`
+		OwnerReferences []struct {
 			APIVersion         string `json:"apiVersion"`
 			Kind               string `json:"kind"`
 			UID                string `json:"uid"`
@@ -211,6 +245,17 @@ func (p *agentPod) addresses() []netip.Addr {
 	return out
 }
 
+// controller is the UID of the Pod's controller when it is of the agent
+// kind, or "".
+func (p *agentPod) controller(s *SharedConfig) string {
+	for _, o := range p.Metadata.OwnerReferences {
+		if o.Controller != nil && *o.Controller && o.Kind == s.OwnerKind && o.APIVersion == s.OwnerAPIVersion {
+			return o.UID
+		}
+	}
+	return ""
+}
+
 // attest returns the Pod's attestation if it is an admissible agent right now.
 func (p *agentPod) attest(s *SharedConfig, now time.Time) (workloadidentity.Attestation, bool) {
 	var a workloadidentity.Attestation
@@ -243,6 +288,12 @@ func (p *agentPod) attest(s *SharedConfig, now time.Time) (workloadidentity.Atte
 			images = append(images, image)
 		}
 	}
+	requester := ""
+	if slices.Contains(s.RequesterNamespaces, m.Namespace) {
+		if requester = m.Annotations.Requester; !workloadidentity.ValidRequester(requester) {
+			return a, false
+		}
+	}
 	end := p.Status.StartTime.Add(time.Duration(s.MaxPodSeconds) * time.Second)
 	if d := p.Spec.ActiveDeadlineSeconds; d != nil {
 		if active := p.Status.StartTime.Add(time.Duration(*d) * time.Second); active.Before(end) {
@@ -253,7 +304,7 @@ func (p *agentPod) attest(s *SharedConfig, now time.Time) (workloadidentity.Atte
 		return a, false
 	}
 	return workloadidentity.Attestation{Namespace: m.Namespace, PodName: m.Name, PodUID: m.UID, OwnerKind: s.OwnerKind, OwnerUID: owner,
-		Images: images, NotAfter: end.Unix(), Profile: s.Profiles[m.Namespace]}, true
+		Images: images, NotAfter: end.Unix(), Profile: s.Profiles[m.Namespace], Requester: requester}, true
 }
 
 // podCache holds the agent Pods of every watched namespace, kept current by
@@ -269,6 +320,9 @@ type podCache struct {
 	byIP   map[netip.Addr]map[string]struct{} // address to namespace/name
 	inSync map[string]bool                    // namespace to whether its watch is open
 	lostAt map[string]time.Time               // namespace to when its watch last went down
+	// activity is each agent Sandbox's last use through this replica; a
+	// Pod's start counts as use.
+	activity *activity
 }
 
 func newPodCache(c FixedConfig) (*podCache, error) {
@@ -281,7 +335,8 @@ func newPodCache(c FixedConfig) (*podCache, error) {
 	client := &http.Client{Transport: &http.Transport{TLSClientConfig: t, Proxy: nil, MaxResponseHeaderBytes: 8192},
 		CheckRedirect: func(*http.Request, []*http.Request) error { return errDenied }}
 	return &podCache{config: c.Shared, k8s: c.Kubernetes, client: client, now: time.Now,
-		pods: map[string]*agentPod{}, byIP: map[netip.Addr]map[string]struct{}{}, inSync: map[string]bool{}, lostAt: map[string]time.Time{}}, nil
+		pods: map[string]*agentPod{}, byIP: map[netip.Addr]map[string]struct{}{}, inSync: map[string]bool{}, lostAt: map[string]time.Time{},
+		activity: newActivity(time.Now(), c.activityRetention())}, nil
 }
 
 // lookup returns the attestation of the one admissible agent Pod at peer.
@@ -308,6 +363,11 @@ func (c *podCache) lookup(peer netip.Addr) (workloadidentity.Attestation, bool) 
 func (c *podCache) put(key string, p *agentPod) {
 	c.remove(key)
 	c.pods[key] = p
+	// A Pod's start is use of its Sandbox, so a replaced or fresh Pod that
+	// has made no request yet is not idle.
+	if owner := p.controller(c.config); owner != "" && p.Status.StartTime != nil {
+		c.activity.record(p.Metadata.Namespace, owner, *p.Status.StartTime)
+	}
 	for _, a := range p.addresses() {
 		if c.byIP[a] == nil {
 			c.byIP[a] = map[string]struct{}{}

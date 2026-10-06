@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -113,7 +114,7 @@ func startShared(t *testing.T, postgres bool) *sharedFixture {
 }
 
 // startSharedWith can run the listeners in plaintext, with no certificate.
-func startSharedWith(t *testing.T, postgres, plaintext bool) *sharedFixture {
+func startSharedWith(t *testing.T, postgres, plaintext bool, options ...func(*FixedConfig)) *sharedFixture {
 	t.Helper()
 	f := newRelayFixture(t)
 	sf := &sharedFixture{f: f, api: newFakeAPI(t, f, sandboxPod("sandbox-a", "pod-a", "127.0.0.1")), attested: make(chan string, 8)}
@@ -153,6 +154,9 @@ func startSharedWith(t *testing.T, postgres, plaintext bool) *sharedFixture {
 		}
 		f.c = loaded
 	}
+	for _, option := range options {
+		option(&f.c)
+	}
 	f.start(t)
 	return sf
 }
@@ -191,7 +195,9 @@ func tunnelCloses(t *testing.T, c net.Conn, b *bufio.Reader) bool {
 	t.Helper()
 	c.SetReadDeadline(time.Now().Add(4 * time.Second))
 	_, e := b.ReadByte()
-	return e != nil
+	// A read that times out found the tunnel still open.
+	var timeout net.Error
+	return e != nil && (!errors.As(e, &timeout) || !timeout.Timeout())
 }
 
 // The shared proxy attests the agent Pod at the connection's source, and
@@ -389,6 +395,7 @@ func TestSharedConfigValidation(t *testing.T) {
 		},
 		"browser":              func(c *FixedConfig) { c.Browser = &BrowserConfig{Listen: "0.0.0.0:9443", Upstream: c.Connect.Upstream} },
 		"session file":         func(c *FixedConfig) { c.Connect.Upstream.SessionFile = "/var/run/session" },
+		"Cursor socket":        func(c *FixedConfig) { c.Connect.Upstream.SessionSocketDir = "/var/run/cursor-identity" },
 		"no TLS":               func(c *FixedConfig) { c.TLSCertFile = "" },
 		"no Kubernetes access": func(c *FixedConfig) { c.Kubernetes.ReviewerTokenFile = "" },
 		"no profiles":          func(c *FixedConfig) { c.Shared.Profiles = nil },
@@ -587,5 +594,90 @@ func TestStagingSharedConfig(t *testing.T) {
 	}
 	if _, err := LoadConfig(write(true)); err != nil {
 		t.Errorf("the staging shared config with one listener refused: %v", err)
+	}
+}
+
+func withRequester(pod map[string]any, requester string) map[string]any {
+	pod["metadata"].(map[string]any)["annotations"] = map[string]any{workloadidentity.RequesterAnnotation: requester, "other": "ignored"}
+	return pod
+}
+
+// connectUntil retries a CONNECT until it gets want, for cache updates that
+// land a moment after the watch event.
+func (sf *sharedFixture) connectUntil(t *testing.T, want int) (net.Conn, *bufio.Reader, int) {
+	t.Helper()
+	for end := time.Now().Add(3 * time.Second); ; {
+		c, b, status := sf.connect(t, "")
+		if status == want || time.Now().After(end) {
+			return c, b, status
+		}
+		c.Close()
+		if status == 200 {
+			<-sf.attested
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// In a namespace configured to carry it, the attestation and the admission
+// row name the requester from the Pod's annotation. A Pod there without a
+// valid one is not admitted, and an open connection ends if it changes.
+func TestSharedProxyAttestsTheRequester(t *testing.T) {
+	sf := startSharedWith(t, false, false, func(c *FixedConfig) { c.Shared.RequesterNamespaces = []string{"agent-sandboxes"} })
+	if _, _, status := sf.connect(t, ""); status == 200 {
+		t.Fatal("a Pod with no requester was admitted")
+	}
+	sf.api.send(t, "MODIFIED", withRequester(sandboxPod("sandbox-a", "pod-a", "127.0.0.1"), "alice.smith@trmlabs.com"))
+	c, b, status := sf.connectUntil(t, 200)
+	if status != 200 {
+		t.Fatalf("connect: %d", status)
+	}
+	raw, _ := base64.RawURLEncoding.DecodeString(<-sf.attested)
+	var a workloadidentity.Attestation
+	if json.Unmarshal(raw, &a) != nil || a.Requester != "alice.smith@trmlabs.com" || a.PodUID != "pod-a" {
+		t.Fatalf("attestation %s", raw)
+	}
+	audit, _ := os.ReadFile(sf.f.c.AuditFile)
+	if !bytes.Contains(audit, []byte(`"requester":"alice.smith@trmlabs.com"`)) {
+		t.Fatalf("admission row lacks the requester: %s", audit)
+	}
+	sf.api.send(t, "MODIFIED", withRequester(sandboxPod("sandbox-a", "pod-a", "127.0.0.1"), "bob.jones@trmlabs.com"))
+	if !tunnelCloses(t, c, b) {
+		t.Fatal("a connection stayed open after its requester changed")
+	}
+	for _, bad := range []string{"", "Alice.Smith@trmlabs.com", "alice", "alice@", "alice@trmlabs", "alice smith@trmlabs.com", "alice@trmlabs.com\n", strings.Repeat("a", 65) + "@trmlabs.com"} {
+		sf.api.send(t, "MODIFIED", withRequester(sandboxPod("sandbox-a", "pod-a", "127.0.0.1"), "carol@trmlabs.com"))
+		if _, _, status := sf.connectUntil(t, 200); status != 200 {
+			t.Fatalf("valid requester refused: %d", status)
+		}
+		<-sf.attested
+		sf.api.send(t, "MODIFIED", withRequester(sandboxPod("sandbox-a", "pod-a", "127.0.0.1"), bad))
+		if _, _, status := sf.connectUntil(t, 403); status == 200 {
+			t.Fatalf("requester %q admitted", bad)
+		}
+	}
+}
+
+// Elsewhere the attestation never carries a requester, even when the Pod has
+// the annotation, and the namespace list must name configured namespaces.
+func TestSharedProxyRequesterIsOptIn(t *testing.T) {
+	s := sharedConfig()
+	pod := decodePods(t, []map[string]any{withRequester(sandboxPod("sandbox-a", "pod-a", "127.0.0.1"), "alice.smith@trmlabs.com")})[0]
+	if a, ok := pod.attest(s, time.Now()); !ok || a.Requester != "" {
+		t.Fatalf("requester attested without opt-in: %+v %v", a, ok)
+	}
+	s.RequesterNamespaces = []string{"agent-sandboxes"}
+	if a, ok := pod.attest(s, time.Now()); !ok || a.Requester != "alice.smith@trmlabs.com" {
+		t.Fatalf("opted-in requester: %+v %v", a, ok)
+	}
+	for name, namespaces := range map[string][]string{
+		"unknown namespace": {"other-sandboxes"},
+		"repeated":          {"agent-sandboxes", "agent-sandboxes"},
+	} {
+		s := sharedConfig()
+		s.RequesterNamespaces = namespaces
+		if s.validate() == nil {
+			t.Errorf("%s: accepted", name)
+		}
 	}
 }

@@ -78,7 +78,20 @@ type Attestation struct {
 	// Profile is the harness profile the proxy maps the namespace to; the
 	// broker refuses it unless its own map agrees.
 	Profile string `json:"profile"`
+	// Requester is the person who created the agent's controller, from the
+	// Pod's gatehouse.trmlabs.com/requester annotation, which admission
+	// policy fixes to the creator's login. The proxy sets it only for a
+	// namespace configured to carry it; elsewhere it is empty.
+	Requester string `json:"requester,omitempty"`
 }
+
+// RequesterAnnotation names the Pod annotation a requester is read from.
+const RequesterAnnotation = "gatehouse.trmlabs.com/requester"
+
+var requesterLogin = regexp.MustCompile(`^[a-z0-9._%+-]{1,64}@[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`)
+
+// ValidRequester accepts a lower-case login of the form name@domain.
+func ValidRequester(s string) bool { return len(s) <= 254 && requesterLogin.MatchString(s) }
 
 const maxAttestationBytes = 4096
 
@@ -116,7 +129,8 @@ func decodeAttestation(s string) (Attestation, error) {
 		return a, errors.New("invalid attestation")
 	}
 	if !pathSegment(a.Namespace) || !pathSegment(a.PodName) || !objectUID.MatchString(a.PodUID) || !kubernetesKind.MatchString(a.OwnerKind) ||
-		!objectUID.MatchString(a.OwnerUID) || len(a.Images) == 0 || len(a.Images) > 32 || a.NotAfter <= 0 || !pathSegment(a.Profile) {
+		!objectUID.MatchString(a.OwnerUID) || len(a.Images) == 0 || len(a.Images) > 32 || a.NotAfter <= 0 || !pathSegment(a.Profile) ||
+		(a.Requester != "" && !ValidRequester(a.Requester)) {
 		return a, errors.New("invalid attestation")
 	}
 	for _, image := range a.Images {
@@ -236,6 +250,7 @@ func (r *Resolver) attestProxied(ctx context.Context, binding *Binding, c claims
 		return nil, brokercore.Denied("deadline")
 	}
 	scope.WorkloadID, scope.NotAfter, scope.Pool, scope.IdentityKind = a.PodUID, notAfter, profile.Pool, brokercore.KindProxyAttested
+	scope.AttestedRequester = a.Requester
 	return scope, nil
 }
 

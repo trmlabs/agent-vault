@@ -30,13 +30,27 @@ type FixedConfig struct {
 	Connect          *ConnectConfig   `json:"connect,omitempty"`
 	Postgres         *PostgresConfig  `json:"postgres,omitempty"`
 	PostgresBindings []PostgresConfig `json:"postgresBindings,omitempty"`
-	Browser          *BrowserConfig   `json:"browser,omitempty"`
+	// PostgresListener, in shared mode only, is one port for every catalog
+	// database; see PostgresListenerConfig.
+	PostgresListener *PostgresListenerConfig `json:"postgresListener,omitempty"`
+	Browser          *BrowserConfig          `json:"browser,omitempty"`
 	// Self runs the relay as a sidecar in the worker's own Pod: loopback,
 	// plaintext listeners only, and no Kubernetes pairing, because the broker
 	// verifies this Pod's token and address on every connection.
 	Self bool `json:"self,omitempty"`
 	// Shared runs the relay as one proxy for many agent Pods; see SharedConfig.
 	Shared *SharedConfig `json:"shared,omitempty"`
+	// TLS, in shared mode only, serves every listener but AdminListen in TLS
+	// with a broker-issued certificate; see ServingTLSConfig.
+	TLS *ServingTLSConfig `json:"tls,omitempty"`
+	// AdminListen, in shared mode only, serves GET /v1/activity in plaintext:
+	// when each agent Pod last used this replica, for the idle janitor. A
+	// network policy must admit only the janitor to it.
+	AdminListen string `json:"adminListen,omitempty"`
+	// ActivityRetentionSeconds is how long the activity report keeps a
+	// Sandbox after its last use (default a day). The janitor refuses a
+	// retention shorter than its idle time.
+	ActivityRetentionSeconds int64 `json:"activityRetentionSeconds,omitempty"`
 }
 type SandboxConfig struct {
 	Namespace     string `json:"namespace"`
@@ -62,7 +76,35 @@ type UpstreamConfig struct {
 	// broker can verify the person behind the session. A missing or empty
 	// file sends nothing.
 	SessionFile string `json:"sessionFile,omitempty"`
+	// SessionSocketDir, in self mode and instead of SessionFile, is the
+	// Cursor worker's identity socket directory (<data dir>/identity). The
+	// relay mints the claimed run's identity token for SessionAudience from
+	// the one socket there and sends it as SessionFile's token is sent. No
+	// claim, or more than one socket, sends nothing.
+	SessionSocketDir string `json:"sessionSocketDir,omitempty"`
+	SessionAudience  string `json:"sessionAudience,omitempty"`
 }
+
+// hasSession reports whether the upstream relays a session in any form.
+func (u UpstreamConfig) hasSession() bool {
+	return u.SessionFile != "" || u.SessionSocketDir != "" || u.SessionAudience != ""
+}
+
+// validSession checks a self-mode session source: one absolute source, and an
+// audience exactly when the source is a Cursor socket directory.
+func (u UpstreamConfig) validSession() bool {
+	if u.SessionFile != "" && u.SessionSocketDir != "" {
+		return false
+	}
+	if u.SessionFile != "" && !strings.HasPrefix(u.SessionFile, "/") {
+		return false
+	}
+	if u.SessionSocketDir == "" {
+		return u.SessionAudience == ""
+	}
+	return strings.HasPrefix(u.SessionSocketDir, "/") && sessionAudience.MatchString(u.SessionAudience)
+}
+
 type ConnectConfig struct {
 	Listen         string         `json:"listen"`
 	Upstream       UpstreamConfig `json:"upstream"`
@@ -75,6 +117,25 @@ type PostgresConfig struct {
 	User        string         `json:"user"`
 	Placeholder string         `json:"placeholder"`
 }
+
+// PostgresListenerConfig is one PostgreSQL port routed by the startup
+// packet's database parameter. Databases is the route table, rendered from
+// the catalog: a name outside it is refused before the broker is dialed, and a
+// name in it goes to the one upstream, which authorizes it per pool. There is
+// no fixed route count.
+type PostgresListenerConfig struct {
+	Listen      string         `json:"listen"`
+	Upstream    UpstreamConfig `json:"upstream"`
+	Databases   []string       `json:"databases"`
+	User        string         `json:"user"`
+	Placeholder string         `json:"placeholder"`
+}
+
+// route is the binding for one catalog database on this listener.
+func (l *PostgresListenerConfig) route(database string) PostgresConfig {
+	return PostgresConfig{Listen: l.Listen, Upstream: l.Upstream, Database: database, User: l.User, Placeholder: l.Placeholder}
+}
+
 type BrowserConfig struct {
 	Listen   string         `json:"listen"`
 	Upstream UpstreamConfig `json:"upstream"`
@@ -82,12 +143,19 @@ type BrowserConfig struct {
 
 var safeName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,252}$`)
 var containerName = regexp.MustCompile(`^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$`)
+
+// sessionAudience matches the broker's AGENT_VAULT_CURSOR_AUDIENCE pattern.
+var sessionAudience = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,252}$`)
 var errConfig = errors.New("invalid fixed task relay configuration")
+
+const maxConfigBytes = 16 << 20
 
 // LoadConfig rejects unknown fields, trailing data and oversized configuration.
 func LoadConfig(path string) (FixedConfig, error) {
 	var c FixedConfig
-	b, err := readBoundedFile(path, 64<<10)
+	// A shared proxy's route table lists every catalog database, so the bound
+	// is sized for tens of thousands of names, not for one binding.
+	b, err := readBoundedFile(path, maxConfigBytes)
 	if err != nil {
 		return c, errConfig
 	}
@@ -110,17 +178,24 @@ func LoadConfig(path string) (FixedConfig, error) {
 }
 
 func (c FixedConfig) Validate(now time.Time) error {
+	if (c.AdminListen != "" || c.PostgresListener != nil || c.TLS != nil) && c.Shared == nil {
+		return errConfig
+	}
+	// Up to a year: retention costs one small entry per Sandbox used.
+	if c.ActivityRetentionSeconds != 0 && (c.AdminListen == "" || c.ActivityRetentionSeconds < 60 || c.ActivityRetentionSeconds > 366*24*3600) {
+		return errConfig
+	}
 	if c.Shared != nil {
 		return c.validateShared(now)
 	}
 	if c.Self {
 		return c.validateSelf(now)
 	}
-	if (c.Connect != nil && c.Connect.Upstream.SessionFile != "") || c.Browser != nil && c.Browser.Upstream.SessionFile != "" {
+	if (c.Connect != nil && c.Connect.Upstream.hasSession()) || c.Browser != nil && c.Browser.Upstream.hasSession() {
 		return errConfig // only a sidecar in the session's own Pod forwards its token
 	}
 	for _, p := range c.postgresBindings() {
-		if p.Upstream.SessionFile != "" {
+		if p.Upstream.hasSession() {
 			return errConfig
 		}
 	}
@@ -179,11 +254,11 @@ func (c FixedConfig) Validate(now time.Time) error {
 
 // validateSelf allows only loopback listeners, no browser and no pairing input.
 func (c FixedConfig) validateSelf(now time.Time) error {
-	if c.Connect != nil && c.Connect.Upstream.SessionFile != "" && !strings.HasPrefix(c.Connect.Upstream.SessionFile, "/") {
+	if c.Connect != nil && !c.Connect.Upstream.validSession() {
 		return errConfig
 	}
 	for _, p := range c.postgresBindings() {
-		if p.Upstream.SessionFile != "" && !strings.HasPrefix(p.Upstream.SessionFile, "/") {
+		if !p.Upstream.validSession() {
 			return errConfig
 		}
 	}
@@ -226,6 +301,13 @@ func (c FixedConfig) validateSelf(now time.Time) error {
 }
 
 // postgresBindings preserves the legacy single binding without mixing authority.
+func (c FixedConfig) activityRetention() time.Duration {
+	if c.ActivityRetentionSeconds == 0 {
+		return defaultActivityRetention
+	}
+	return time.Duration(c.ActivityRetentionSeconds) * time.Second
+}
+
 func (c FixedConfig) postgresBindings() []PostgresConfig {
 	if c.Postgres != nil {
 		return []PostgresConfig{*c.Postgres}

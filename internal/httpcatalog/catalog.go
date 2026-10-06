@@ -104,9 +104,12 @@ type Pool struct {
 	Name           string `json:"name"`
 	Namespace      string `json:"namespace"`
 	ServiceAccount string `json:"serviceAccount"`
-	// Identity says who can stand behind a request: "none" (Cursor; the
-	// default), "claude-session" (a runner session token naming the person)
-	// or "workload" (CI and automation: Entitlements, never a person).
+	// Identity says who can stand behind a request: "none" (the default),
+	// "claude-session" (a runner session token naming the person),
+	// "cursor-session" (a Cursor run's identity token naming the person),
+	// "attested-person" (a shared proxy's attestation naming the person who
+	// created the agent, from its Pod's requester annotation) or "workload"
+	// (CI and automation: Entitlements, never a person).
 	Identity string `json:"identity,omitempty"`
 	// Ceiling is the highest tier the pool may reach (default T0). "external"
 	// is below T0: the pool's workers may reach nothing, and no entry may
@@ -800,6 +803,21 @@ func (c Catalog) GitGranted(installation int64, repo, scope string) bool {
 	return false
 }
 
+// GitScope returns every repository the catalog lists for an installation,
+// and whether any github-api entry on it opens pull requests.
+func (c Catalog) GitScope(installation int64) (repos []string, pullRequests bool) {
+	for _, e := range c.entries {
+		if e.Git == nil || e.Git.InstallationID != installation {
+			continue
+		}
+		pullRequests = pullRequests || e.Kind == "github-api"
+		for _, r := range e.Git.Repos {
+			repos = append(repos, r.Repo)
+		}
+	}
+	return repos, pullRequests
+}
+
 // clusterLocal reports whether host is a Kubernetes Service name, the only
 // kind of host a plaintext database entry may name.
 func clusterLocal(host string) bool {
@@ -869,6 +887,18 @@ func (p Pool) validate() error {
 		if !ccpoolID.MatchString(p.CCPoolID) || len(p.Entitlements) != 0 {
 			return fmt.Errorf("a claude-session pool needs its ccpool_ ID and takes no fixed entitlements")
 		}
+	case "cursor-session":
+		// The broker's Cursor teams and audience bind the token; no session
+		// start gate exists for Cursor, so a base group would promise nothing.
+		if p.CCPoolID != "" || p.BaseGroup != "" || len(p.Entitlements) != 0 {
+			return fmt.Errorf("a cursor-session pool takes no ccpool_ ID, base group or fixed entitlements")
+		}
+	case "attested-person":
+		// The person comes from the proxy's attestation; there is no runner
+		// pool, and a base group would gate nothing.
+		if p.CCPoolID != "" || p.BaseGroup != "" || len(p.Entitlements) != 0 {
+			return fmt.Errorf("an attested-person pool takes no ccpool_ ID, base group or fixed entitlements")
+		}
 	case "workload":
 		if p.CCPoolID != "" || p.BaseGroup != "" || tierRank[p.Ceiling] > 1 {
 			return fmt.Errorf("a workload pool takes fixed entitlements only and never reaches T2")
@@ -916,7 +946,7 @@ func grantable(e Entry, p Pool, defined bool) error {
 		return fmt.Errorf("%s exceeds the pool's ceiling", e.Tier)
 	}
 	switch p.Identity {
-	case "claude-session":
+	case "claude-session", "cursor-session", "attested-person":
 		return nil
 	case "workload":
 		if rank >= 2 {
