@@ -30,13 +30,20 @@ type FixedConfig struct {
 	Connect          *ConnectConfig   `json:"connect,omitempty"`
 	Postgres         *PostgresConfig  `json:"postgres,omitempty"`
 	PostgresBindings []PostgresConfig `json:"postgresBindings,omitempty"`
-	Browser          *BrowserConfig   `json:"browser,omitempty"`
+	// PostgresListener, in shared mode only, is one port for every catalog
+	// database; see PostgresListenerConfig.
+	PostgresListener *PostgresListenerConfig `json:"postgresListener,omitempty"`
+	Browser          *BrowserConfig          `json:"browser,omitempty"`
 	// Self runs the relay as a sidecar in the worker's own Pod: loopback,
 	// plaintext listeners only, and no Kubernetes pairing, because the broker
 	// verifies this Pod's token and address on every connection.
 	Self bool `json:"self,omitempty"`
 	// Shared runs the relay as one proxy for many agent Pods; see SharedConfig.
 	Shared *SharedConfig `json:"shared,omitempty"`
+	// AdminListen, in shared mode only, serves GET /v1/activity in plaintext:
+	// when each agent Pod last used this replica, for the idle janitor. A
+	// network policy must admit only the janitor to it.
+	AdminListen string `json:"adminListen,omitempty"`
 }
 type SandboxConfig struct {
 	Namespace     string `json:"namespace"`
@@ -75,6 +82,25 @@ type PostgresConfig struct {
 	User        string         `json:"user"`
 	Placeholder string         `json:"placeholder"`
 }
+
+// PostgresListenerConfig is one PostgreSQL port routed by the startup
+// packet's database parameter. Databases is the route table, rendered from
+// the catalog: a name outside it is refused before the broker is dialed, and a
+// name in it goes to the one upstream, which authorizes it per pool. There is
+// no fixed route count.
+type PostgresListenerConfig struct {
+	Listen      string         `json:"listen"`
+	Upstream    UpstreamConfig `json:"upstream"`
+	Databases   []string       `json:"databases"`
+	User        string         `json:"user"`
+	Placeholder string         `json:"placeholder"`
+}
+
+// route is the binding for one catalog database on this listener.
+func (l *PostgresListenerConfig) route(database string) PostgresConfig {
+	return PostgresConfig{Listen: l.Listen, Upstream: l.Upstream, Database: database, User: l.User, Placeholder: l.Placeholder}
+}
+
 type BrowserConfig struct {
 	Listen   string         `json:"listen"`
 	Upstream UpstreamConfig `json:"upstream"`
@@ -84,10 +110,14 @@ var safeName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,252}$`)
 var containerName = regexp.MustCompile(`^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$`)
 var errConfig = errors.New("invalid fixed task relay configuration")
 
+const maxConfigBytes = 16 << 20
+
 // LoadConfig rejects unknown fields, trailing data and oversized configuration.
 func LoadConfig(path string) (FixedConfig, error) {
 	var c FixedConfig
-	b, err := readBoundedFile(path, 64<<10)
+	// A shared proxy's route table lists every catalog database, so the bound
+	// is sized for tens of thousands of names, not for one binding.
+	b, err := readBoundedFile(path, maxConfigBytes)
 	if err != nil {
 		return c, errConfig
 	}
@@ -110,6 +140,9 @@ func LoadConfig(path string) (FixedConfig, error) {
 }
 
 func (c FixedConfig) Validate(now time.Time) error {
+	if (c.AdminListen != "" || c.PostgresListener != nil) && c.Shared == nil {
+		return errConfig
+	}
 	if c.Shared != nil {
 		return c.validateShared(now)
 	}
