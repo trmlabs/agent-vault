@@ -51,7 +51,8 @@ func TestCrossClusterRoutesByFirstBytes(t *testing.T) {
 		"no PROXY header, PostgreSQL":     {"GHATTS1 abc\n", false, false},
 		"a second PROXY line":             {proxyLine + proxyLine + "CONNECT h:443 HTTP/1.1\r\n\r\n", false, false},
 	} {
-		routed, postgres, err := routeCrossCluster(loopbackPair(t, c.send))
+		routed, route, err := routeCrossCluster(loopbackPair(t, c.send))
+		postgres := route == routePostgres
 		if (err == nil) != c.ok || (c.ok && postgres != c.postgres) {
 			t.Errorf("%s: postgres %v err %v", name, postgres, err)
 			continue
@@ -133,5 +134,29 @@ func TestCrossClusterTrustsPROXYOnlyFromLoopback(t *testing.T) {
 	peer := remoteConn{Conn: c, remote: &net.TCPAddr{IP: net.ParseIP("10.200.0.7"), Port: 51000}}
 	if _, _, err := routeCrossCluster(peer); err == nil {
 		t.Fatal("a PROXY header from a non-loopback peer was trusted")
+	}
+}
+
+// A shared proxy's certificate request is HTTP, routed to the certificate
+// server with the PROXY header consumed and the proxy's address as the
+// connection's remote address.
+func TestCrossClusterRoutesCertificateRequests(t *testing.T) {
+	request := "POST /v1/proxy/certificate HTTP/1.1\r\nHost: x\r\n\r\n"
+	routed, route, err := routeCrossCluster(loopbackPair(t, proxyLine+request))
+	if err != nil || route != routeCertificate {
+		t.Fatalf("route %q err %v", route, err)
+	}
+	if got := routed.RemoteAddr().String(); got != "10.200.0.7:0" {
+		t.Errorf("remote address %s, want the proxy's", got)
+	}
+	b, _ := io.ReadAll(routed)
+	if string(b) != request {
+		t.Errorf("replayed %q", b)
+	}
+	// Any other HTTP method or path start is not routed.
+	for _, start := range []string{"POST /v2/x HTTP/1.1\r\n\r\n", "PUT /v1/x HTTP/1.1\r\n\r\n", "GET /v1/proxy/certificate HTTP/1.1\r\n\r\n"} {
+		if _, _, err := routeCrossCluster(loopbackPair(t, proxyLine+start)); err == nil {
+			t.Errorf("%q routed", start)
+		}
 	}
 }

@@ -241,3 +241,33 @@ func (r *Resolver) attestProxied(ctx context.Context, binding *Binding, c claims
 	scope.WorkloadID, scope.NotAfter, scope.Pool, scope.IdentityKind = a.PodUID, notAfter, profile.Pool, brokercore.KindProxyAttested
 	return scope, nil
 }
+
+// VerifyProxy admits a shared proxy itself, not an agent behind it: a current
+// token from a proxy binding's own account, from the binding's source ranges.
+// It is how a proxy asks the broker for its serving certificate.
+func (r *Resolver) VerifyProxy(ctx context.Context, token string, peer netip.Addr) error {
+	if !peer.IsValid() || peer.IsLoopback() || peer.IsUnspecified() {
+		return brokercore.Denied("peer")
+	}
+	peer = peer.Unmap()
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(r.config.TimeoutSeconds)*time.Second)
+	defer cancel()
+	c, d, err := r.verifyLocally(ctx, token, false)
+	if err != nil {
+		return err
+	}
+	k := c.Kubernetes
+	for i := range r.config.Bindings {
+		b := &r.config.Bindings[i]
+		if b.TrustDomain == d.name && b.Namespace == k.Namespace && b.ServiceAccount == k.ServiceAccount.Name && b.ServiceAccountUID == k.ServiceAccount.UID {
+			if b.Proxy == nil {
+				return brokercore.Denied("not_proxy")
+			}
+			if !b.Proxy.fromSource(peer) {
+				return brokercore.Denied("proxy_source")
+			}
+			return nil
+		}
+	}
+	return brokercore.Denied("no_binding")
+}

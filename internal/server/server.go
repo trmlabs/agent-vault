@@ -29,6 +29,7 @@ import (
 	"github.com/Infisical/agent-vault/internal/oauth"
 	"github.com/Infisical/agent-vault/internal/pgproxy"
 	"github.com/Infisical/agent-vault/internal/pidfile"
+	"github.com/Infisical/agent-vault/internal/proxycert"
 	"github.com/Infisical/agent-vault/internal/ratelimit"
 	"github.com/Infisical/agent-vault/internal/requestlog"
 	"github.com/Infisical/agent-vault/internal/store"
@@ -100,7 +101,8 @@ type Server struct {
 	// pgBroker is the PostgreSQL credential-brokering TCP listener; nil when
 	// --postgres-port is 0 or no database services are configured.
 	cleanupObserverServer *http.Server
-	crossClusterAddr      string // loopback address of the cross-cluster listener, or ""
+	crossClusterAddr      string            // loopback address of the cross-cluster listener, or ""
+	proxyCerts            *proxycert.Issuer // signs shared proxies' serving certificates on that listener, or nil
 	pgBroker              *pgproxy.Broker
 	readiness             []readinessCheck
 	pgLeaseCloser         interface{ Close(context.Context) error }
@@ -144,6 +146,16 @@ func (s *Server) HashicorpClient() *hashicorp.Client { return s.hashicorpClient 
 // SIGINT/SIGTERM/Shutdown stops it alongside the HTTP server. Must be called
 // before Start.
 func (s *Server) AttachPostgresBroker(b *pgproxy.Broker) { s.pgBroker = b }
+
+// EnableProxyCertificates serves shared proxies' certificate requests on the
+// cross-cluster listener, which must also be enabled.
+func (s *Server) EnableProxyCertificates(i *proxycert.Issuer) error {
+	if err := i.Validate(); err != nil {
+		return err
+	}
+	s.proxyCerts = i
+	return nil
+}
 
 // SetShutdownTimeout sets how long a graceful stop waits for in-flight work,
 // such as tunnel requests the proxy drains. Zero keeps the default 5s.
@@ -1145,8 +1157,16 @@ func (s *Server) Start() error {
 			pgMerged = newMergedListener(pgLn)
 			pgLn = pgMerged
 		}
+		var certLn *injectedListener
+		if s.proxyCerts != nil {
+			certLn = newInjectedListener(crossLn.Addr())
+			certServer := &http.Server{Handler: s.proxyCerts.Handler(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second,
+				WriteTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
+			defer func() { _ = certServer.Close() }()
+			go func() { _ = certServer.Serve(certLn) }()
+		}
 		fmt.Printf("Agent Vault cross-cluster listener on %s (proxy-attested only)\n", crossLn.Addr())
-		go func() { _ = serveCrossCluster(crossLn, httpMerged, pgMerged) }()
+		go func() { _ = serveCrossCluster(crossLn, httpMerged, pgMerged, certLn) }()
 	}
 	observerLn, err := s.listenCleanupObserver()
 	if err != nil {
