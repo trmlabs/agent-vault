@@ -84,13 +84,13 @@ func TestProxyActivityIsPerBinding(t *testing.T) {
 	for i := 0; i < 4500; i++ {
 		rows = append(rows, Row{Namespace: "developers", OwnerUID: fmt.Sprintf("sb-%05d", i), LastSeen: now.Add(-time.Duration(i) * time.Second)})
 	}
-	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: rows}); w.Code != 204 {
+	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Replica: "aaaa0001", Sandboxes: rows}); w.Code != 200 {
 		t.Fatalf("record: %d", w.Code)
 	}
-	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: []Row{{Namespace: "developers", OwnerUID: "sb-00009", LastSeen: now.Add(-time.Hour)}}}); w.Code != 204 {
+	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Replica: "aaaa0001", Sandboxes: []Row{{Namespace: "developers", OwnerUID: "sb-00009", LastSeen: now.Add(-time.Hour)}}}); w.Code != 200 {
 		t.Fatalf("older record: %d", w.Code)
 	}
-	if w := call(h, "customers-proxy", RecordPath, RecordRequest{Sandboxes: []Row{{Namespace: "customers", OwnerUID: "sb-c", LastSeen: now}}}); w.Code != 204 {
+	if w := call(h, "customers-proxy", RecordPath, RecordRequest{Replica: "aaaa0001", Sandboxes: []Row{{Namespace: "customers", OwnerUID: "sb-c", LastSeen: now}}}); w.Code != 200 {
 		t.Fatalf("customer record: %d", w.Code)
 	}
 	developers := readAll(t, h, "developers-proxy")
@@ -118,14 +118,14 @@ func TestProxyActivityRefusals(t *testing.T) {
 		body  any
 		code  int
 	}{
-		"no token":          {"", RecordRequest{Sandboxes: []Row{good}}, 401},
-		"not a proxy":       {"worker-token", RecordRequest{Sandboxes: []Row{good}}, 403},
-		"another namespace": {"developers-proxy", RecordRequest{Sandboxes: []Row{{Namespace: "customers", OwnerUID: "sb-1", LastSeen: now}}}, 400},
-		"bad owner":         {"developers-proxy", RecordRequest{Sandboxes: []Row{{Namespace: "developers", OwnerUID: "../x", LastSeen: now}}}, 400},
-		"no time":           {"developers-proxy", RecordRequest{Sandboxes: []Row{{Namespace: "developers", OwnerUID: "sb-1"}}}, 400},
-		"future time":       {"developers-proxy", RecordRequest{Sandboxes: []Row{{Namespace: "developers", OwnerUID: "sb-1", LastSeen: now.Add(time.Hour)}}}, 400},
-		"too many rows":     {"developers-proxy", RecordRequest{Sandboxes: many}, 400},
-		"unknown field":     {"developers-proxy", map[string]any{"sandboxes": []Row{good}, "scope": "td/customer-proxy/uid-2"}, 400},
+		"no token":          {"", RecordRequest{Replica: "aaaa0001", Sandboxes: []Row{good}}, 401},
+		"not a proxy":       {"worker-token", RecordRequest{Replica: "aaaa0001", Sandboxes: []Row{good}}, 403},
+		"another namespace": {"developers-proxy", RecordRequest{Replica: "aaaa0001", Sandboxes: []Row{{Namespace: "customers", OwnerUID: "sb-1", LastSeen: now}}}, 400},
+		"bad owner":         {"developers-proxy", RecordRequest{Replica: "aaaa0001", Sandboxes: []Row{{Namespace: "developers", OwnerUID: "../x", LastSeen: now}}}, 400},
+		"no time":           {"developers-proxy", RecordRequest{Replica: "aaaa0001", Sandboxes: []Row{{Namespace: "developers", OwnerUID: "sb-1"}}}, 400},
+		"future time":       {"developers-proxy", RecordRequest{Replica: "aaaa0001", Sandboxes: []Row{{Namespace: "developers", OwnerUID: "sb-1", LastSeen: now.Add(time.Hour)}}}, 400},
+		"too many rows":     {"developers-proxy", RecordRequest{Replica: "aaaa0001", Sandboxes: many}, 400},
+		"unknown field":     {"developers-proxy", map[string]any{"sandboxes": []Row{good}, "replica": "aaaa0001", "scope": "td/customer-proxy/uid-2"}, 400},
 	} {
 		if w := call(h, tc.token, RecordPath, tc.body); w.Code != tc.code {
 			t.Errorf("%s: %d, want %d", name, w.Code, tc.code)
@@ -153,6 +153,11 @@ func TestProxyActivityValidation(t *testing.T) {
 	if err := (&Service{Store: s.Store, Identifier: s.Identifier, Retention: time.Hour, MaxRows: -1}).Validate(); err == nil {
 		t.Error("negative row ceiling accepted")
 	}
+	for _, streams := range []int{-1, 10_000_001} {
+		if err := (&Service{Store: s.Store, Identifier: s.Identifier, Retention: time.Hour, MaxStreams: streams}).Validate(); err == nil {
+			t.Errorf("stream ceiling %d accepted", streams)
+		}
+	}
 	c := &Service{Identifier: s.Identifier, Retention: time.Hour}
 	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "shared store") {
 		t.Errorf("no store: %v", err)
@@ -175,7 +180,7 @@ func TestProxyActivityHistoryAndCeiling(t *testing.T) {
 	if first := page(); first.HistoryStarted != nil {
 		t.Fatalf("history before any report: %v", first.HistoryStarted)
 	}
-	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: []Row{}}); w.Code != 204 {
+	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Replica: "aaaa0001", Sandboxes: []Row{}}); w.Code != 200 {
 		t.Fatalf("empty report: %d", w.Code)
 	}
 	started := page().HistoryStarted
@@ -184,16 +189,89 @@ func TestProxyActivityHistoryAndCeiling(t *testing.T) {
 	}
 	now := time.Now()
 	two := []Row{{Namespace: "developers", OwnerUID: "sb-1", LastSeen: now}, {Namespace: "developers", OwnerUID: "sb-2", LastSeen: now}}
-	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: two}); w.Code != 204 {
+	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Replica: "aaaa0001", Sandboxes: two}); w.Code != 200 {
 		t.Fatalf("two rows: %d", w.Code)
 	}
-	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: []Row{{Namespace: "developers", OwnerUID: "sb-3", LastSeen: now}}}); w.Code != http.StatusInsufficientStorage {
+	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Replica: "aaaa0001", Sandboxes: []Row{{Namespace: "developers", OwnerUID: "sb-3", LastSeen: now}}}); w.Code != http.StatusInsufficientStorage {
 		t.Fatalf("a row past the ceiling: %d", w.Code)
 	}
-	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: two}); w.Code != 204 {
+	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Replica: "aaaa0001", Sandboxes: two}); w.Code != 200 {
 		t.Fatalf("updates at the ceiling: %d", w.Code)
 	}
 	if again := page(); again.HistoryStarted == nil || !again.HistoryStarted.Equal(*started) || len(again.Sandboxes) != 2 {
 		t.Fatalf("after the ceiling: %+v", again)
+	}
+}
+
+// A report is acknowledged with its stream's next sequence and the broker's
+// retention; one carrying an acknowledged sequence the store no longer
+// reaches is a loss, and the read gives each stream's sequence. Rows go after
+// one retention and streams after two, so a stream outlives the
+// acknowledgment its replica keeps.
+func TestProxyActivitySequenceOnTheWire(t *testing.T) {
+	svc, h := newService(t)
+	row := []Row{{Namespace: "developers", OwnerUID: "sb-1", LastSeen: time.Now()}}
+	answer := func(acked int64) RecordResponse {
+		t.Helper()
+		w := call(h, "developers-proxy", RecordPath, RecordRequest{Replica: "aaaa0001", Sandboxes: row, AckedSeq: acked})
+		var out RecordResponse
+		if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &out) != nil {
+			t.Fatalf("record: %d %s", w.Code, w.Body)
+		}
+		return out
+	}
+	if a := answer(0); a.Seq != 1 || a.Lost || a.RetentionSeconds != 86400 {
+		t.Fatalf("first: %+v", a)
+	}
+	if a := answer(1); a.Seq != 2 || a.Lost {
+		t.Fatalf("second: %+v", a)
+	}
+	if a := answer(7); !a.Lost {
+		t.Fatalf("an acknowledgment the store does not reach: %+v", a)
+	}
+	var page ReadResponse
+	w := call(h, "developers-proxy", ReadPath, ReadRequest{})
+	if json.Unmarshal(w.Body.Bytes(), &page) != nil || page.Streams["aaaa0001"] != 3 {
+		t.Fatalf("read sequence: %s", w.Body)
+	}
+	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Replica: "aaaa0001", Sandboxes: row, AckedSeq: -1}); w.Code != 400 {
+		t.Fatalf("negative acknowledgment: %d", w.Code)
+	}
+	for _, replica := range []string{"", "AAAA0001", "short", "aaaa0001/../x"} {
+		if w := call(h, "developers-proxy", RecordPath, RecordRequest{Replica: replica, Sandboxes: row}); w.Code != 400 {
+			t.Fatalf("replica %q: %d", replica, w.Code)
+		}
+	}
+	streams := func(at time.Time) map[string]int64 {
+		t.Helper()
+		svc.prune(context.Background(), at)
+		_, s, _, err := svc.Store.ProxyActivityHistory(context.Background(), "td/gatehouse-proxy/uid-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	if s := streams(time.Now().Add(36 * time.Hour)); s["aaaa0001"] != 3 {
+		t.Fatalf("a stream pruned within two retentions: %v", s)
+	}
+	if s := streams(time.Now().Add(49 * time.Hour)); len(s) != 0 {
+		t.Fatalf("a stream kept past two retentions: %v", s)
+	}
+}
+
+// A report that would start a replica stream past the binding's ceiling is
+// refused with 507; the streams already held go on.
+func TestProxyActivityStreamCeilingOnTheWire(t *testing.T) {
+	svc, h := newService(t)
+	svc.MaxStreams = 1
+	row := []Row{{Namespace: "developers", OwnerUID: "sb-1", LastSeen: time.Now()}}
+	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Replica: "aaaa0001", Sandboxes: row}); w.Code != 200 {
+		t.Fatalf("first stream: %d", w.Code)
+	}
+	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Replica: "bbbb0002", Sandboxes: row}); w.Code != http.StatusInsufficientStorage {
+		t.Fatalf("a stream past the ceiling: %d", w.Code)
+	}
+	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Replica: "aaaa0001", Sandboxes: row, AckedSeq: 1}); w.Code != 200 {
+		t.Fatalf("the held stream: %d", w.Code)
 	}
 }

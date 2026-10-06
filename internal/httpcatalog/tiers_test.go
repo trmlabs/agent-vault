@@ -18,18 +18,23 @@ func TestTierGrantRules(t *testing.T) {
 		pool, tier string
 		ok         bool
 	}{
-		"T0 to Cursor pool":          {`{"name":"p","namespace":"n","serviceAccount":"s"}`, ``, true},
-		"T1 to Cursor pool":          {`{"name":"p","namespace":"n","serviceAccount":"s"}`, `,"tier":"T1","requires":["` + group + `"]`, false},
-		"T1 to claude pool":          {`{"name":"p","namespace":"n","serviceAccount":"s","identity":"claude-session","ccpoolID":"ccpool_abc","ceiling":"T1"}`, `,"tier":"T1","requires":["` + group + `"]`, true},
-		"T2 over a T1 ceiling":       {`{"name":"p","namespace":"n","serviceAccount":"s","identity":"claude-session","ccpoolID":"ccpool_abc","ceiling":"T1"}`, `,"tier":"T2","requires":["` + group + `"]`, false},
-		"T1 to entitled workload":    {`{"name":"p","namespace":"n","serviceAccount":"s","identity":"workload","ceiling":"T1","entitlements":["` + group + `"]}`, `,"tier":"T1","requires":["` + group + `"]`, true},
-		"T1 to unentitled workload":  {`{"name":"p","namespace":"n","serviceAccount":"s","identity":"workload","ceiling":"T1"}`, `,"tier":"T1","requires":["` + group + `"]`, false},
-		"T1 without groups":          {`{"name":"p","namespace":"n","serviceAccount":"s","identity":"claude-session","ccpoolID":"ccpool_abc","ceiling":"T1"}`, `,"tier":"T1"`, false},
-		"T0 with groups":             {`{"name":"p","namespace":"n","serviceAccount":"s"}`, `,"requires":["` + group + `"]`, false},
-		"group not an object ID":     {`{"name":"p","namespace":"n","serviceAccount":"s","identity":"claude-session","ccpoolID":"ccpool_abc","ceiling":"T1"}`, `,"tier":"T1","requires":["admins"]`, false},
-		"claude pool without ccpool": {`{"name":"p","namespace":"n","serviceAccount":"s","identity":"claude-session","ceiling":"T1"}`, ``, false},
-		"workload with a T2 ceiling": {`{"name":"p","namespace":"n","serviceAccount":"s","identity":"workload","ceiling":"T2"}`, ``, false},
-		"Cursor pool with a ceiling": {`{"name":"p","namespace":"n","serviceAccount":"s","ceiling":"T1"}`, ``, false},
+		"T0 to Cursor pool":                    {`{"name":"p","namespace":"n","serviceAccount":"s"}`, ``, true},
+		"T1 to Cursor pool":                    {`{"name":"p","namespace":"n","serviceAccount":"s"}`, `,"tier":"T1","requires":["` + group + `"]`, false},
+		"T1 to claude pool":                    {`{"name":"p","namespace":"n","serviceAccount":"s","identity":"claude-session","ccpoolID":"ccpool_abc","ceiling":"T1"}`, `,"tier":"T1","requires":["` + group + `"]`, true},
+		"T2 over a T1 ceiling":                 {`{"name":"p","namespace":"n","serviceAccount":"s","identity":"claude-session","ccpoolID":"ccpool_abc","ceiling":"T1"}`, `,"tier":"T2","requires":["` + group + `"]`, false},
+		"T1 to entitled workload":              {`{"name":"p","namespace":"n","serviceAccount":"s","identity":"workload","ceiling":"T1","entitlements":["` + group + `"]}`, `,"tier":"T1","requires":["` + group + `"]`, true},
+		"T1 to unentitled workload":            {`{"name":"p","namespace":"n","serviceAccount":"s","identity":"workload","ceiling":"T1"}`, `,"tier":"T1","requires":["` + group + `"]`, false},
+		"T1 without groups":                    {`{"name":"p","namespace":"n","serviceAccount":"s","identity":"claude-session","ccpoolID":"ccpool_abc","ceiling":"T1"}`, `,"tier":"T1"`, false},
+		"T0 with groups":                       {`{"name":"p","namespace":"n","serviceAccount":"s"}`, `,"requires":["` + group + `"]`, false},
+		"group not an object ID":               {`{"name":"p","namespace":"n","serviceAccount":"s","identity":"claude-session","ccpoolID":"ccpool_abc","ceiling":"T1"}`, `,"tier":"T1","requires":["admins"]`, false},
+		"claude pool without ccpool":           {`{"name":"p","namespace":"n","serviceAccount":"s","identity":"claude-session","ceiling":"T1"}`, ``, false},
+		"workload with a T2 ceiling":           {`{"name":"p","namespace":"n","serviceAccount":"s","identity":"workload","ceiling":"T2"}`, ``, false},
+		"Cursor pool with a ceiling":           {`{"name":"p","namespace":"n","serviceAccount":"s","ceiling":"T1"}`, ``, false},
+		"T2 to Cursor person pool":             {`{"name":"p","namespace":"n","serviceAccount":"s","identity":"cursor-session","ceiling":"T2"}`, `,"tier":"T2","requires":["` + group + `"]`, true},
+		"T1 to Cursor person pool":             {`{"name":"p","namespace":"n","serviceAccount":"s","identity":"cursor-session","ceiling":"T1"}`, `,"tier":"T1","requires":["` + group + `"]`, true},
+		"Cursor person pool with a ccpool":     {`{"name":"p","namespace":"n","serviceAccount":"s","identity":"cursor-session","ccpoolID":"ccpool_abc","ceiling":"T1"}`, ``, false},
+		"Cursor person pool with a base group": {`{"name":"p","namespace":"n","serviceAccount":"s","identity":"cursor-session","baseGroup":"` + group + `","ceiling":"T1"}`, ``, false},
+		"Cursor person pool with fixed groups": {`{"name":"p","namespace":"n","serviceAccount":"s","identity":"cursor-session","entitlements":["` + group + `"],"ceiling":"T1"}`, ``, false},
 	}
 	for name, c := range cases {
 		_, err := Parse([]byte(catalogWith(c.pool, "{"+entryBase+c.tier+"}")))

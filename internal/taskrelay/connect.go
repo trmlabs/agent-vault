@@ -147,6 +147,9 @@ func minTime(a, b time.Time) time.Time {
 // readSession reads the runner session token fresh for each connection. It
 // returns "" when none is configured or the file holds no single-line token.
 func readSession(c UpstreamConfig) string {
+	if c.SessionSocketDir != "" {
+		return cursorTokens.token(c.SessionSocketDir, c.SessionAudience)
+	}
 	if c.SessionFile == "" {
 		return ""
 	}

@@ -86,7 +86,8 @@ func TestTunnelEndsAreLoggedWithTheirReason(t *testing.T) {
 		}
 	}
 	broker.dropTunnels()
-	waitUntil(t, "every broker-side end", func() bool { return len(sink.lines(t, "session_closed")) == 6 })
+	// A burst logs its first five ends on their own lines and counts the rest.
+	waitUntil(t, "the burst's own lines", func() bool { return len(sink.lines(t, "session_closed")) == massCloseMinimum })
 	for _, line := range sink.lines(t, "session_closed") {
 		if line["reason"] != endUpstreamReset || line["level"] != "WARN" {
 			t.Fatalf("a reset tunnel logged as %v", line)
@@ -94,7 +95,7 @@ func TestTunnelEndsAreLoggedWithTheirReason(t *testing.T) {
 	}
 	waitUntil(t, "the one upstream event", func() bool { return len(sink.lines(t, "upstream_dropped_sessions")) == 1 })
 	event := sink.lines(t, "upstream_dropped_sessions")[0]
-	if event["sessions"] != float64(6) || event["level"] != "WARN" || event["upstream"] != sf.f.c.Connect.Upstream.Address {
+	if event["sessions"] != float64(6) || event["suppressed"] != float64(1) || event["level"] != "WARN" || event["upstream"] != sf.f.c.Connect.Upstream.Address {
 		t.Fatalf("upstream event: %v", event)
 	}
 	time.Sleep(massCloseWindow + 200*time.Millisecond)
@@ -207,5 +208,66 @@ func TestRefusalsAtTheLimitAreLoggedAndSpareOpenSessions(t *testing.T) {
 	}
 	if n := len(sink.lines(t, "session_closed")); n != 0 {
 		t.Fatalf("%d open sessions ended at the limit", n)
+	}
+}
+
+// A broker restart drops thousands of sessions at once: only the first few
+// get their own line, and the window's single event counts the rest.
+func TestAMassDropLogsAFewLinesAndACount(t *testing.T) {
+	sink := captureLog(t)
+	var w upstreamWatch
+	log := newRelayLog()
+	individual := 0
+	for i := 0; i < 2000; i++ {
+		if w.ended(log, "broker:16443", endUpstreamReset) {
+			individual++
+		}
+	}
+	if individual != massCloseMinimum {
+		t.Fatalf("%d of 2,000 ends logged on their own", individual)
+	}
+	waitUntil(t, "the window's event", func() bool { return len(sink.lines(t, "upstream_dropped_sessions")) == 1 })
+	if e := sink.lines(t, "upstream_dropped_sessions")[0]; e["sessions"] != float64(2000) || e["suppressed"] != float64(2000-massCloseMinimum) {
+		t.Fatalf("event %v", e)
+	}
+	// After the window a lone end gets its own line again.
+	if !w.ended(log, "broker:16443", endUpstreamReset) {
+		t.Fatal("a lone end after the burst was suppressed")
+	}
+}
+
+// The relay logs the counts of normal ends that its next summary would have
+// carried when it stops, so none are lost at shutdown.
+func TestCloseCountsAreFlushedWhenTheRelayStops(t *testing.T) {
+	sink := captureLog(t)
+	sessionSummaryWindow = time.Hour // only a flush can log them
+	broker := newActivityBroker(t)
+	sf := startSharedWith(t, false, true, func(c *FixedConfig) {
+		c.Connect.Routes, c.Connect.AllowedTargets = routesBroker, nil
+		c.Connect.Upstream = broker.upstream(c.Connect.Upstream)
+	})
+	for i := 0; i < 3; i++ {
+		c, _, status := sf.connect(t, "")
+		if status != 200 {
+			t.Fatalf("connect: %d", status)
+		}
+		c.Close()
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n := len(sink.lines(t, "sessions_closed")); n != 0 {
+		t.Fatalf("%d summaries before the stop", n)
+	}
+	sf.f.stop()
+	select {
+	case <-sf.f.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("relay did not stop")
+	}
+	lines := sink.lines(t, "sessions_closed")
+	if len(lines) != 1 || lines[0]["final"] != true {
+		t.Fatalf("summaries at stop: %v", lines)
+	}
+	if counts, _ := lines[0]["counts"].(map[string]any); counts["connect:"+endClientClosed] != float64(3) {
+		t.Fatalf("flushed counts: %v", lines[0])
 	}
 }

@@ -131,7 +131,7 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 	durableDone := make(chan struct{})
 	close(durableDone)
 	if d := c.DurableActivity; d != nil && pair.cache != nil {
-		reporter := &durable{activity: pair.cache.activity, upstream: c.Connect.Upstream, interval: d.interval()}
+		reporter := &durable{activity: pair.cache.activity, upstream: c.Connect.Upstream, interval: d.interval(), replica: newReplicaID()}
 		pair.cache.activity.durable = reporter
 		durableDone = make(chan struct{})
 		go func() { defer close(durableDone); reporter.run(ctx) }()
@@ -147,6 +147,8 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 			_ = l.Close()
 		}
 		r.wg.Wait()
+		// Every session has ended: log the counts the next window would have.
+		r.closes.flush(r.log)
 		if audit.record("relay", "terminal") != nil {
 			result = errDenied
 		}

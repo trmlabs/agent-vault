@@ -29,15 +29,16 @@ type HeaderAdapter struct {
 	// Catalog is read once per request, so a reloaded catalog applies to the
 	// next request; an httpcatalog.Catalog or a live *httpcatalog.Source.
 	Catalog interface{ Current() httpcatalog.Catalog }
-	// Runner verifies Claude runner session tokens for claude-session pools;
-	// Entitlements answers live group membership. Without them, entries above
-	// T0 are refused on those pools.
+	// Runner verifies Claude runner session tokens for claude-session pools,
+	// and Cursor run tokens for cursor-session pools when it is a
+	// runnerid.Verifiers; Entitlements answers live group membership. Without
+	// them, entries above T0 are refused on those pools.
 	Runner interface {
 		Verify(context.Context, string) (runnerid.Session, error)
 	}
 	Entitlements *entitlement.Cache
 	// Sessions pins each runner session to the first Pod presenting it.
-	// Without it, claude-session pools refuse every session.
+	// Without it, claude-session and cursor-session pools refuse every session.
 	Sessions authorize.Binder
 	Keys     interface {
 		Get(context.Context, httpcatalog.KeyRef) (httpcatalog.Secret, error)

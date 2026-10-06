@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -67,10 +68,17 @@ type GraphSource struct {
 	Endpoint string // https://graph.microsoft.com/v1.0
 	Token    func(context.Context) (string, error)
 	Client   *http.Client
-	// SubjectIsObjectID: the SSO subject is the Entra object ID. Otherwise it
-	// is looked up as a user principal name. Email alone is never used.
+	// SubjectIsObjectID: the subject is the Entra object ID. Otherwise it is
+	// looked up as a user principal name: a Claude or Cursor session names its
+	// person by a lower-case email in a configured domain, and the user Graph
+	// returns must carry exactly that UPN (Entra compares UPNs without case),
+	// never a mail alias.
 	SubjectIsObjectID bool
 }
+
+// checkMemberGroupsMax is Graph's limit on groupIds per checkMemberGroups
+// call. An entry may require more groups; they are asked in batches.
+const checkMemberGroupsMax = 20
 
 func (g GraphSource) Lookup(ctx context.Context, subject string, groups []string) (Person, error) {
 	for _, group := range groups {
@@ -80,23 +88,32 @@ func (g GraphSource) Lookup(ctx context.Context, subject string, groups []string
 	}
 	var user struct {
 		ID      string `json:"id"`
+		UPN     string `json:"userPrincipalName"`
 		Enabled *bool  `json:"accountEnabled"`
 	}
-	path := "/users/" + url.PathEscape(subject) + "?$select=id,accountEnabled"
+	path := "/users/" + url.PathEscape(subject) + "?$select=id,userPrincipalName,accountEnabled"
 	if g.SubjectIsObjectID && !objectID.MatchString(subject) {
 		return Person{}, errors.New("subject is not an object ID")
 	}
 	if err := g.call(ctx, http.MethodGet, path, nil, &user); err != nil || user.Enabled == nil || !objectID.MatchString(user.ID) {
 		return Person{}, errors.New("directory user lookup failed")
 	}
-	var member struct {
-		Value []string `json:"value"`
+	if (g.SubjectIsObjectID && user.ID != subject) || (!g.SubjectIsObjectID && (subject == "" || !strings.EqualFold(user.UPN, subject))) {
+		return Person{}, errors.New("directory user lookup failed")
 	}
-	body, _ := json.Marshal(map[string][]string{"groupIds": groups})
-	if err := g.call(ctx, http.MethodPost, "/users/"+user.ID+"/checkMemberGroups", body, &member); err != nil {
-		return Person{}, errors.New("directory membership lookup failed")
+	var memberOf []string
+	for start := 0; start < len(groups); start += checkMemberGroupsMax {
+		batch := groups[start:min(start+checkMemberGroupsMax, len(groups))]
+		var member struct {
+			Value []string `json:"value"`
+		}
+		body, _ := json.Marshal(map[string][]string{"groupIds": batch})
+		if err := g.call(ctx, http.MethodPost, "/users/"+user.ID+"/checkMemberGroups", body, &member); err != nil {
+			return Person{}, errors.New("directory membership lookup failed")
+		}
+		memberOf = append(memberOf, intersect(batch, member.Value)...)
 	}
-	return Person{ObjectID: user.ID, Enabled: *user.Enabled, MemberOf: intersect(groups, member.Value)}, nil
+	return Person{ObjectID: user.ID, Enabled: *user.Enabled, MemberOf: memberOf}, nil
 }
 
 func (g GraphSource) call(ctx context.Context, method, path string, body []byte, out any) error {

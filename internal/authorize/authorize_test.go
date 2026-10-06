@@ -32,13 +32,13 @@ var claude = httpcatalog.Pool{Identity: "claude-session", CCPoolID: "ccpool_abc"
 func TestSessionIsPinnedToItsFirstPod(t *testing.T) {
 	b := &authorizetest.MemBinder{}
 	ctx := context.Background()
-	if who, refusal := Resolve(ctx, claude, "alice", "pod-a", oneToken{}, b); refusal != "" || who.Subject != "sso|alice" {
+	if who, refusal := Resolve(ctx, claude, "alice", Claims{Pod: "pod-a"}, oneToken{}, b); refusal != "" || who.Subject != "sso|alice" {
 		t.Fatalf("first use on pod A: %q %+v", refusal, who)
 	}
-	if _, refusal := Resolve(ctx, claude, "alice", "pod-a", oneToken{}, b); refusal != "" {
+	if _, refusal := Resolve(ctx, claude, "alice", Claims{Pod: "pod-a"}, oneToken{}, b); refusal != "" {
 		t.Fatalf("recheck on pod A refused: %q", refusal)
 	}
-	if who, refusal := Resolve(ctx, claude, "alice", "pod-b", oneToken{}, b); refusal != "session_pod_mismatch" || who.Kind != "none" {
+	if who, refusal := Resolve(ctx, claude, "alice", Claims{Pod: "pod-b"}, oneToken{}, b); refusal != "session_pod_mismatch" || who.Kind != "none" {
 		t.Fatalf("same token on pod B: %q %+v", refusal, who)
 	}
 }
@@ -53,12 +53,12 @@ func TestSessionWithoutABindingIsRefused(t *testing.T) {
 		"no pod":         {"", &authorizetest.MemBinder{}},
 		"binder failing": {"pod-a", failingBinder{}},
 	} {
-		if _, refusal := Resolve(ctx, claude, "alice", c.pod, oneToken{}, c.b); refusal != "session_unbindable" {
+		if _, refusal := Resolve(ctx, claude, "alice", Claims{Pod: c.pod}, oneToken{}, c.b); refusal != "session_unbindable" {
 			t.Errorf("%s: %q, want session_unbindable", name, refusal)
 		}
 	}
 	// No session at all needs no binding: no person, T0 only.
-	if who, refusal := Resolve(ctx, claude, "", "pod-a", oneToken{}, nil); refusal != "" || who.Kind != "none" {
+	if who, refusal := Resolve(ctx, claude, "", Claims{Pod: "pod-a"}, oneToken{}, nil); refusal != "" || who.Kind != "none" {
 		t.Fatalf("no session: %q %+v", refusal, who)
 	}
 }

@@ -32,7 +32,18 @@ type ProxyScope struct {
 	// IdentityKind is how the workload proved itself (KindPodToken,
 	// KindTokenReview or KindProxyAttested); empty for a legacy session.
 	IdentityKind string
+	// ClaimedRun is the Cursor run the spawn hook recorded on the live Pod
+	// (CursorRunAnnotation), read at attestation; empty when there is none.
+	ClaimedRun string
+	// AttestedRequester is the login a shared proxy attested for the agent,
+	// from its Pod's requester annotation; empty when the proxy names none.
+	AttestedRequester string
 }
+
+// CursorRunAnnotation is where Cursor's spawn hook records the claimed run
+// (CURSOR_REQUEST_ID, the run's bc- ID) on the worker Pod it creates. The
+// worker cannot change its own Pod, so this is the controller's word.
+const CursorRunAnnotation = "gatehouse.trmlabs.com/cursor-request-id"
 
 // ActorID returns the non-empty principal ID — UserID for user
 // sessions, AgentID for agent tokens. Used as the actor dimension in

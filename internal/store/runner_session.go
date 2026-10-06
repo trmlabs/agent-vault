@@ -10,7 +10,9 @@ import (
 
 // BindRunnerSession pins a runner session token hash to the first Pod that
 // presents it and returns the Pod it is pinned to. A pin lasts until the
-// token's own expiry; expired pins are removed as new ones are written.
+// token's own expiry; expired pins are removed as new ones are written. The
+// same table pins a Cursor worker Pod ("cursor-pod:<uid>") to its first run
+// owner, so any key and value pair works.
 func (s *SQLStore) BindRunnerSession(ctx context.Context, tokenSHA256, pod string, expires time.Time) (string, error) {
 	if tokenSHA256 == "" || pod == "" {
 		return "", fmt.Errorf("incomplete runner session binding")

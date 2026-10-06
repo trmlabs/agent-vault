@@ -91,6 +91,17 @@ func (a *activity) repushMissing(view []SandboxActivity) {
 	}
 }
 
+// repushAll marks every entry pending, after the broker lost writes it had
+// acknowledged.
+func (a *activity) repushAll() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for owner, e := range a.owners {
+		e.pushed = time.Time{}
+		a.owners[owner] = e
+	}
+}
+
 // accepted marks rows the broker took.
 func (a *activity) accepted(rows []SandboxActivity) {
 	a.mu.Lock()
@@ -115,6 +126,20 @@ type ActivityReport struct {
 	// read in full for this report, so no replica's going or coming loses
 	// history beyond its last report to the broker.
 	Durable bool `json:"durable"`
+	// HistoryStreams, on a durable report, is each replica stream's current
+	// sequence in the broker.
+	HistoryStreams map[string]int64 `json:"historyStreams,omitempty"`
+	// Replica names this replica's report stream; AckedSeq is the sequence
+	// the broker last acknowledged on it,
+	// and FirstAcked when it first acknowledged one; zero for a replica that
+	// has had no report accepted since it started. A replica's AckedSeq above
+	// its own stream's sequence, or a missing stream, means the broker lost
+	// writes; no replica with a
+	// FirstAcked older than the janitor's idle window means none can vouch
+	// the history is whole.
+	Replica    string    `json:"replica,omitempty"`
+	AckedSeq   int64     `json:"ackedSeq,omitempty"`
+	FirstAcked time.Time `json:"firstAcked,omitzero"`
 	// HistoryStarted, on a durable report, is when the broker's history for
 	// this proxy's binding began. Zero means none yet: a new, recreated or
 	// emptied history, which vouches for nothing.
@@ -163,8 +188,12 @@ func (a *activity) handler() http.Handler {
 			return
 		}
 		report := a.report(time.Now())
-		if a.durable != nil && req.URL.Path == ActivityPath {
-			report = a.withDurable(req.Context(), report)
+		if a.durable != nil {
+			report.AckedSeq, report.FirstAcked = a.durable.verification()
+			report.Replica = a.durable.replica
+			if req.URL.Path == ActivityPath {
+				report = a.withDurable(req.Context(), report)
+			}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
@@ -176,11 +205,21 @@ func (a *activity) handler() http.Handler {
 // per Sandbox and the shorter retention. If the view cannot be read in full,
 // the report is this replica's alone and not durable.
 func (a *activity) withDurable(ctx context.Context, report ActivityReport) ActivityReport {
+	// The acknowledgment is read before the view: one given while the view
+	// is read is then not mistaken for a loss.
+	acked, _ := a.durable.verification()
 	view, e := a.durable.read(ctx)
 	if e != nil {
 		return report
 	}
 	a.repushMissing(view.sandboxes)
+	if acked > view.streams[a.durable.replica] {
+		// The store lost writes it acknowledged to this replica: report
+		// everything again, and that report, sent even if this replica
+		// holds nothing, restarts the history.
+		a.repushAll()
+		a.durable.oweLoss()
+	}
 	rows, retention := view.sandboxes, view.retention
 	byOwner := make(map[string]int, len(report.Sandboxes))
 	for i, s := range report.Sandboxes {
@@ -198,6 +237,6 @@ func (a *activity) withDurable(ctx context.Context, report ActivityReport) Activ
 	}
 	sort.Slice(report.Sandboxes, func(i, j int) bool { return report.Sandboxes[i].OwnerUID < report.Sandboxes[j].OwnerUID })
 	report.RetentionSeconds = min(report.RetentionSeconds, retention)
-	report.Durable, report.HistoryStarted = true, view.historyStarted
+	report.Durable, report.HistoryStarted, report.HistoryStreams = true, view.historyStarted, view.streams
 	return report
 }

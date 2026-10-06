@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -49,6 +50,9 @@ func TestDecide(t *testing.T) {
 		{"Cursor pool, T1", member, Pool{Identity: "none", Ceiling: "T1"}, t1, alice, false, "no_identity"},
 		{"agent session", member, claude, t1, Requester{Kind: "agent", Subject: "agent:x"}, false, "no_person"},
 		{"member", member, claude, t1, alice, true, "entitled"},
+		{"Cursor person pool member", member, Pool{Identity: "cursor-session", Ceiling: "T1"}, t1, alice, true, "entitled"},
+		{"Cursor service account run", member, Pool{Identity: "cursor-session", Ceiling: "T1"}, t1, Requester{Kind: "agent", Subject: "service_account:9"}, false, "no_person"},
+		{"Cursor run without a person", member, Pool{Identity: "cursor-session", Ceiling: "T1"}, t1, Requester{Kind: "none"}, false, "no_person"},
 		{"non-member", &fakeSource{person: Person{ObjectID: "oid", Enabled: true}}, claude, t1, alice, false, "not_entitled"},
 		{"disabled", &fakeSource{person: Person{ObjectID: "oid", MemberOf: []string{g1}}}, claude, t1, alice, false, "account_disabled"},
 		{"lookup error", &fakeSource{err: errors.New("down")}, claude, t1, alice, false, "entitlement_unavailable"},
@@ -116,6 +120,7 @@ func TestFileSource(t *testing.T) {
 
 func TestGraphSource(t *testing.T) {
 	user := "22222222-2222-2222-2222-222222222222"
+	var batches []int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer app-token" {
 			w.WriteHeader(401)
@@ -123,8 +128,20 @@ func TestGraphSource(t *testing.T) {
 		}
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/users/alice@example.test":
-			_ = json.NewEncoder(w).Encode(map[string]any{"id": user, "accountEnabled": true})
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": user, "userPrincipalName": "Alice@example.test", "accountEnabled": true})
+		case r.Method == http.MethodGet && r.URL.Path == "/users/"+user:
+			// Graph resolves an object ID too; its UPN is not the subject.
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": user, "userPrincipalName": "alice@example.test", "accountEnabled": true})
 		case r.Method == http.MethodPost && r.URL.Path == "/users/"+user+"/checkMemberGroups":
+			var in struct {
+				GroupIDs []string `json:"groupIds"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&in)
+			if len(in.GroupIDs) > 20 {
+				w.WriteHeader(400)
+				return
+			}
+			batches = append(batches, len(in.GroupIDs))
 			_ = json.NewEncoder(w).Encode(map[string]any{"value": []string{g1}})
 		default:
 			w.WriteHeader(404)
@@ -139,7 +156,21 @@ func TestGraphSource(t *testing.T) {
 	if _, err := g.Lookup(context.Background(), "bob@example.test", []string{g1}); err == nil {
 		t.Fatal("missing user resolved")
 	}
+	if _, err := g.Lookup(context.Background(), user, []string{g1}); err == nil {
+		t.Fatal("a subject that is not the user's UPN resolved")
+	}
 	if _, err := g.Lookup(context.Background(), "alice@example.test", []string{"not-an-id"}); err == nil {
 		t.Fatal("non-ID group accepted")
+	}
+	many := []string{g1}
+	for i := 0; i < 44; i++ {
+		many = append(many, fmt.Sprintf("33333333-3333-3333-3333-%012d", i))
+	}
+	batches = nil
+	if p, err := g.Lookup(context.Background(), "alice@example.test", many); err != nil || len(p.MemberOf) != 1 || p.MemberOf[0] != g1 {
+		t.Fatalf("many groups: %+v %v", p, err)
+	}
+	if len(batches) != 3 || batches[0] != 20 || batches[2] != 5 {
+		t.Fatalf("groups asked in batches %v, want 20, 20, 5", batches)
 	}
 }

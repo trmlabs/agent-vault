@@ -5,6 +5,7 @@ package authorize
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/Infisical/agent-vault/internal/entitlement"
@@ -16,6 +17,33 @@ import (
 type Verifier interface {
 	Verify(context.Context, string) (runnerid.Session, error)
 }
+
+// CursorVerifier checks a Cursor run's identity token. A Verifier that also
+// implements it (runnerid.Verifiers) serves cursor-session pools.
+type CursorVerifier interface {
+	VerifyCursor(context.Context, string) (runnerid.Session, error)
+}
+
+// AttestedPersons names the person behind a login a shared proxy attested:
+// the Entra user principal name, or "" for no person. runnerid.ErrUnverifiable
+// means no domain is configured.
+type AttestedPersons interface {
+	AttestedPerson(login string) (string, error)
+}
+
+// Claims is what the broker learned about the agent's Pod at admission.
+type Claims struct {
+	Pod        string // the verified Pod UID
+	ClaimedRun string // the Cursor run the spawn hook recorded on the Pod
+	// AttestedRequester is the login a shared proxy attested from the Pod's
+	// requester annotation.
+	AttestedRequester string
+}
+
+// podOwnerPin is how long a Pod stays pinned to the first Cursor run owner it
+// presents. Pod UIDs never repeat, so the pin only has to outlive the Pod;
+// a day is far past any worker's lifetime and costs one row.
+const podOwnerPin = 24 * time.Hour
 
 // Binder pins a runner session to the first Pod that presents it, across
 // every broker replica, and returns the Pod it is pinned to. The pin lasts
@@ -43,12 +71,26 @@ type Requester struct {
 // that presents it: the same token from another Pod is refused
 // (session_pod_mismatch), and without a binder or a Pod the session is
 // refused (session_unbindable).
-func Resolve(ctx context.Context, pool httpcatalog.Pool, session, pod string, v Verifier, b Binder) (Requester, string) {
+//
+// A Cursor token is a bearer credential any process on a worker can mint for
+// that worker's run, so it counts only on the Pod the spawn hook created for
+// that run: its run must equal claimedRun, the run the controller recorded on
+// the live Pod (session_run). And since runs on one Pod share its workspace, a
+// cursor-session Pod is also pinned to the first run owner it presents: a run
+// by anyone else on that Pod is refused (session_pod_owner).
+func Resolve(ctx context.Context, pool httpcatalog.Pool, session string, claims Claims, v Verifier, b Binder) (Requester, string) {
+	pod, claimedRun := claims.Pod, claims.ClaimedRun
 	who := Requester{Kind: "none"}
 	requester := pool.Profile().RequesterKind()
-	// Only a session-jwt sidecar relays a session. One arriving on any other
+	// An attested requester counts only on a profile that takes its person
+	// from one; on any other, a proxy fault must not lend a person to a pool,
+	// so it is refused rather than ignored.
+	if claims.AttestedRequester != "" && requester != httpcatalog.RequesterPodAnnotation {
+		return who, "requester_unexpected"
+	}
+	// Only a session sidecar relays a session. One arriving on any other
 	// profile is a misconfigured or forged channel, never ignored.
-	if session != "" && requester != httpcatalog.RequesterSessionJWT {
+	if session != "" && requester != httpcatalog.RequesterSessionJWT && requester != httpcatalog.RequesterCursorOIDC {
 		return who, "session_unexpected"
 	}
 	switch requester {
@@ -57,20 +99,34 @@ func Resolve(ctx context.Context, pool httpcatalog.Pool, session, pod string, v 
 		if pool.Identity == "workload" {
 			who.Kind = "workload"
 		}
-	case httpcatalog.RequesterSessionJWT:
+	case httpcatalog.RequesterSessionJWT, httpcatalog.RequesterCursorOIDC:
 		if session == "" {
 			return who, ""
 		}
-		if v == nil {
+		var s runnerid.Session
+		var err error
+		cursor := requester == httpcatalog.RequesterCursorOIDC
+		if cv, ok := v.(CursorVerifier); cursor && ok {
+			s, err = cv.VerifyCursor(ctx, session)
+		} else if v != nil && !cursor {
+			s, err = v.Verify(ctx, session)
+		} else {
 			return who, "session_unverifiable"
 		}
-		s, err := v.Verify(ctx, session)
+		if errors.Is(err, runnerid.ErrUnverifiable) {
+			return who, "session_unverifiable"
+		}
 		if err != nil {
 			return who, "session_token"
 		}
 		who.TokenSHA256 = s.TokenSHA256
-		if !s.InPool(pool.CCPoolID) {
+		// A Cursor token is bound to the broker's teams and audience instead,
+		// and to the run the controller started this Pod for.
+		if !cursor && !s.InPool(pool.CCPoolID) {
 			return who, "session_pool"
+		}
+		if cursor && (claimedRun == "" || s.Run != claimedRun) {
+			return who, "session_run"
 		}
 		if b == nil || pod == "" {
 			return who, "session_unbindable"
@@ -82,7 +138,36 @@ func Resolve(ctx context.Context, pool httpcatalog.Pool, session, pod string, v 
 		if bound != pod {
 			return who, "session_pod_mismatch"
 		}
+		if cursor {
+			if s.Owner == "" {
+				return who, "session_token"
+			}
+			owner, err := b.BindRunnerSession(ctx, "cursor-pod:"+pod, s.Owner, time.Now().Add(podOwnerPin))
+			if err != nil {
+				return who, "session_unbindable"
+			}
+			if owner != s.Owner {
+				return who, "session_pod_owner"
+			}
+		}
 		who.Kind, who.Subject = string(s.Kind), s.Subject
+	case httpcatalog.RequesterPodAnnotation:
+		// The proxy admits no Pod in such a namespace without a requester,
+		// so a missing one is a fault, never a pool-level session.
+		if claims.AttestedRequester == "" {
+			return who, "requester_missing"
+		}
+		persons, ok := v.(AttestedPersons)
+		if !ok {
+			return who, "requester_unverifiable"
+		}
+		person, err := persons.AttestedPerson(claims.AttestedRequester)
+		if err != nil {
+			return who, "requester_unverifiable"
+		}
+		if person != "" {
+			who.Kind, who.Subject = "person", person
+		}
 	default:
 		// A requester kind this broker cannot verify. The catalog refuses
 		// such a profile at load; this keeps the decision closed regardless.

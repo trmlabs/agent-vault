@@ -118,12 +118,16 @@ var sessionSummaryWindow = time.Minute
 // so a front that disappears is named once.
 func (r *relay) logClose(protocol, peer string, agent agentIdentity, upstream, target string, started time.Time, end *ending) {
 	reason := end.get()
+	individually := true
 	if reason == endUpstreamReset || reason == endUpstreamClosed {
-		r.upstreams.ended(r.log, upstream, reason)
+		individually = r.upstreams.ended(r.log, upstream, reason)
 	}
 	if normalEnds[reason] {
 		r.closes.count(r.log, protocol, reason)
 		return
+	}
+	if !individually {
+		return // counted into this window's upstream_dropped_sessions
 	}
 	level := slog.LevelInfo
 	if reason == endUpstreamReset {
@@ -159,8 +163,21 @@ func (c *closeCounts) count(log *slog.Logger, protocol, reason string) {
 		counts := c.counts
 		c.counts, c.pending = nil, false
 		c.mu.Unlock()
-		log.Info("sessions_closed", "counts", counts, "windowMs", window.Milliseconds())
+		if len(counts) != 0 {
+			log.Info("sessions_closed", "counts", counts, "windowMs", window.Milliseconds())
+		}
 	})
+}
+
+// flush logs the counts not yet logged, as the relay stops.
+func (c *closeCounts) flush(log *slog.Logger) {
+	c.mu.Lock()
+	counts := c.counts
+	c.counts, c.pending = nil, false
+	c.mu.Unlock()
+	if len(counts) != 0 {
+		log.Info("sessions_closed", "counts", counts, "final", true)
+	}
 }
 
 // massCloseWindow and massCloseMinimum: this many broker-side ends within the
@@ -182,6 +199,7 @@ type upstreamState struct {
 	downSince  time.Time
 	windowEnds int
 	resets     int
+	suppressed int // ends in this window logged only in the window's count
 	windowOpen bool
 }
 
@@ -199,7 +217,11 @@ func (w *upstreamWatch) get(address string) *upstreamState {
 
 // ended counts one broker-side end; the first in a quiet spell opens a
 // window, and at its close a burst is logged once.
-func (w *upstreamWatch) ended(log *slog.Logger, address, reason string) {
+// ended counts one broker-side end and says whether it still gets its own
+// log line: the first massCloseMinimum in a window do, and the rest of a burst
+// (a broker restart drops thousands at once) are only counted, as
+// "suppressed" in the window's upstream_dropped_sessions.
+func (w *upstreamWatch) ended(log *slog.Logger, address, reason string) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	s := w.get(address)
@@ -207,20 +229,25 @@ func (w *upstreamWatch) ended(log *slog.Logger, address, reason string) {
 	if reason == endUpstreamReset {
 		s.resets++
 	}
+	individually := s.windowEnds <= massCloseMinimum
+	if !individually {
+		s.suppressed++
+	}
 	if s.windowOpen {
-		return
+		return individually
 	}
 	s.windowOpen = true
 	time.AfterFunc(massCloseWindow, func() {
 		w.mu.Lock()
-		ends, resets := s.windowEnds, s.resets
-		s.windowEnds, s.resets, s.windowOpen = 0, 0, false
+		ends, resets, suppressed := s.windowEnds, s.resets, s.suppressed
+		s.windowEnds, s.resets, s.suppressed, s.windowOpen = 0, 0, 0, false
 		w.mu.Unlock()
 		if ends >= massCloseMinimum {
 			log.Warn("upstream_dropped_sessions", "upstream", address, "sessions", ends, "resets", resets,
-				"windowMs", massCloseWindow.Milliseconds())
+				"suppressed", suppressed, "windowMs", massCloseWindow.Milliseconds())
 		}
 	})
+	return individually
 }
 
 // dialed records a dial's outcome: the first failure after success, and the
