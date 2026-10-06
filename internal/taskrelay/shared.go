@@ -159,7 +159,22 @@ func (c FixedConfig) validateShared(now time.Time) error {
 			return errConfig
 		}
 	}
+	if l := c.PostgresListener; l != nil {
+		if check(l.Listen, l.Upstream) != nil || len(l.Databases) == 0 || !safeName.MatchString(l.User) || !safeName.MatchString(l.Placeholder) {
+			return errConfig
+		}
+		seen := make(map[string]bool, len(l.Databases))
+		for _, name := range l.Databases {
+			if !safeName.MatchString(name) || seen[name] {
+				return errConfig
+			}
+			seen[name] = true
+		}
+	}
 	if len(used) == 0 {
+		return errConfig
+	}
+	if c.AdminListen != "" && (!validAddress(c.AdminListen) || used[c.AdminListen]) {
 		return errConfig
 	}
 	return nil
@@ -269,6 +284,9 @@ type podCache struct {
 	byIP   map[netip.Addr]map[string]struct{} // address to namespace/name
 	inSync map[string]bool                    // namespace to whether its watch is open
 	lostAt map[string]time.Time               // namespace to when its watch last went down
+	// activity is each agent Pod's last use of this replica; a Pod that
+	// leaves the cache is forgotten.
+	activity *activity
 }
 
 func newPodCache(c FixedConfig) (*podCache, error) {
@@ -281,7 +299,8 @@ func newPodCache(c FixedConfig) (*podCache, error) {
 	client := &http.Client{Transport: &http.Transport{TLSClientConfig: t, Proxy: nil, MaxResponseHeaderBytes: 8192},
 		CheckRedirect: func(*http.Request, []*http.Request) error { return errDenied }}
 	return &podCache{config: c.Shared, k8s: c.Kubernetes, client: client, now: time.Now,
-		pods: map[string]*agentPod{}, byIP: map[netip.Addr]map[string]struct{}{}, inSync: map[string]bool{}, lostAt: map[string]time.Time{}}, nil
+		pods: map[string]*agentPod{}, byIP: map[netip.Addr]map[string]struct{}{}, inSync: map[string]bool{}, lostAt: map[string]time.Time{},
+		activity: newActivity(time.Now())}, nil
 }
 
 // lookup returns the attestation of the one admissible agent Pod at peer.
@@ -328,6 +347,7 @@ func (c *podCache) remove(key string) {
 		}
 	}
 	delete(c.pods, key)
+	c.activity.forget(old.Metadata.UID)
 }
 
 // replace swaps one namespace's Pods for a fresh list.

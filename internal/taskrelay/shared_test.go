@@ -113,7 +113,7 @@ func startShared(t *testing.T, postgres bool) *sharedFixture {
 }
 
 // startSharedWith can run the listeners in plaintext, with no certificate.
-func startSharedWith(t *testing.T, postgres, plaintext bool) *sharedFixture {
+func startSharedWith(t *testing.T, postgres, plaintext bool, options ...func(*FixedConfig)) *sharedFixture {
 	t.Helper()
 	f := newRelayFixture(t)
 	sf := &sharedFixture{f: f, api: newFakeAPI(t, f, sandboxPod("sandbox-a", "pod-a", "127.0.0.1")), attested: make(chan string, 8)}
@@ -152,6 +152,9 @@ func startSharedWith(t *testing.T, postgres, plaintext bool) *sharedFixture {
 			t.Fatalf("a shared config with no deadline and no certificate: %v", err)
 		}
 		f.c = loaded
+	}
+	for _, option := range options {
+		option(&f.c)
 	}
 	f.start(t)
 	return sf
