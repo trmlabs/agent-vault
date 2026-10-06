@@ -150,8 +150,50 @@ func TestProxyActivityValidation(t *testing.T) {
 			t.Errorf("retention %v accepted", retention)
 		}
 	}
+	if err := (&Service{Store: s.Store, Identifier: s.Identifier, Retention: time.Hour, MaxRows: -1}).Validate(); err == nil {
+		t.Error("negative row ceiling accepted")
+	}
 	c := &Service{Identifier: s.Identifier, Retention: time.Hour}
 	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "shared store") {
 		t.Errorf("no store: %v", err)
+	}
+}
+
+// A binding's history starts at its first report, empty or not, and the read
+// returns it; a report past the binding's row ceiling is refused whole.
+func TestProxyActivityHistoryAndCeiling(t *testing.T) {
+	s, h := newService(t)
+	s.MaxRows = 2
+	page := func() ReadResponse {
+		var out ReadResponse
+		w := call(h, "developers-proxy", ReadPath, ReadRequest{})
+		if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &out) != nil {
+			t.Fatalf("read: %d", w.Code)
+		}
+		return out
+	}
+	if first := page(); first.HistoryStarted != nil {
+		t.Fatalf("history before any report: %v", first.HistoryStarted)
+	}
+	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: []Row{}}); w.Code != 204 {
+		t.Fatalf("empty report: %d", w.Code)
+	}
+	started := page().HistoryStarted
+	if started == nil || time.Since(*started) > time.Minute {
+		t.Fatalf("history after an empty report: %v", started)
+	}
+	now := time.Now()
+	two := []Row{{Namespace: "developers", OwnerUID: "sb-1", LastSeen: now}, {Namespace: "developers", OwnerUID: "sb-2", LastSeen: now}}
+	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: two}); w.Code != 204 {
+		t.Fatalf("two rows: %d", w.Code)
+	}
+	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: []Row{{Namespace: "developers", OwnerUID: "sb-3", LastSeen: now}}}); w.Code != http.StatusInsufficientStorage {
+		t.Fatalf("a row past the ceiling: %d", w.Code)
+	}
+	if w := call(h, "developers-proxy", RecordPath, RecordRequest{Sandboxes: two}); w.Code != 204 {
+		t.Fatalf("updates at the ceiling: %d", w.Code)
+	}
+	if again := page(); again.HistoryStarted == nil || !again.HistoryStarted.Equal(*started) || len(again.Sandboxes) != 2 {
+		t.Fatalf("after the ceiling: %+v", again)
 	}
 }

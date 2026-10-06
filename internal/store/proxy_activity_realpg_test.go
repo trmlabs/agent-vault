@@ -18,4 +18,5 @@ func TestRealPostgres_ProxyActivity(t *testing.T) {
 	}
 	defer func() { s.Close() }()
 	checkProxyActivity(t, s)
+	checkProxyActivityHistoryAndCeiling(t, s)
 }

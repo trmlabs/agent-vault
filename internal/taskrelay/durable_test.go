@@ -28,6 +28,8 @@ type activityBroker struct {
 	records    atomic.Int32
 	failRead   atomic.Bool
 	failRecord atomic.Bool
+	// history is when the binding's history began; zero until a report.
+	history time.Time
 }
 
 func newActivityBroker(t *testing.T) *activityBroker {
@@ -51,6 +53,9 @@ func newActivityBroker(t *testing.T) *activityBroker {
 				return
 			}
 			b.mu.Lock()
+			if b.history.IsZero() {
+				b.history = time.Now().UTC()
+			}
 			for _, row := range body.Sandboxes {
 				if have, ok := b.rows[row.OwnerUID]; !ok || row.LastSeen.After(have.LastSeen) {
 					b.rows[row.OwnerUID] = row
@@ -71,6 +76,9 @@ func newActivityBroker(t *testing.T) *activityBroker {
 			}
 			sort.Strings(owners)
 			page := map[string]any{"retentionSeconds": 7200, "next": ""}
+			if !b.history.IsZero() {
+				page["historyStarted"] = b.history
+			}
 			var rows []SandboxActivity
 			for i, owner := range owners {
 				if i == 2 {
@@ -112,6 +120,8 @@ func (b *activityBroker) row(owner string) (SandboxActivity, bool) {
 func TestDurableActivityOutlivesTheReplica(t *testing.T) {
 	broker := newActivityBroker(t)
 	departed := time.Now().Add(-5 * time.Minute).Truncate(time.Second).UTC()
+	history := time.Now().Add(-3 * time.Hour).Truncate(time.Second).UTC()
+	broker.history = history
 	broker.rows["sandbox-departed"] = SandboxActivity{Namespace: "agent-sandboxes", OwnerUID: "sandbox-departed", LastSeen: departed}
 	broker.rows["sandbox-pod-a"] = SandboxActivity{Namespace: "agent-sandboxes", OwnerUID: "sandbox-pod-a", LastSeen: time.Now().Add(-time.Hour)}
 	for i := 0; i < 5; i++ {
@@ -139,7 +149,7 @@ func TestDurableActivityOutlivesTheReplica(t *testing.T) {
 		}
 	}
 	report := readActivity(t, admin)
-	if !report.Durable || report.RetentionSeconds != 7200 || len(report.Sandboxes) != 7 {
+	if !report.Durable || report.RetentionSeconds != 7200 || len(report.Sandboxes) != 7 || !report.HistoryStarted.Equal(history) {
 		t.Fatalf("durable report: durable %v, retention %d, %d Sandboxes", report.Durable, report.RetentionSeconds, len(report.Sandboxes))
 	}
 	if seen, _ := sandboxSeen(report, "sandbox-departed"); !seen.Equal(departed) {
@@ -149,7 +159,7 @@ func TestDurableActivityOutlivesTheReplica(t *testing.T) {
 		t.Fatalf("the later time did not win: %v", seen)
 	}
 	broker.failRead.Store(true)
-	if local := readActivity(t, admin); local.Durable || len(local.Sandboxes) != 1 || local.RetentionSeconds != 86400 {
+	if local := readActivity(t, admin); local.Durable || len(local.Sandboxes) != 1 || local.RetentionSeconds != 86400 || !local.HistoryStarted.IsZero() {
 		t.Fatalf("unreadable broker view: %+v", local)
 	}
 }
@@ -161,9 +171,16 @@ func TestDurableActivityReportsNewerTimesAndOnStop(t *testing.T) {
 	f := newRelayFixture(t)
 	a := newActivity(time.Now(), time.Hour)
 	d := &durable{activity: a, upstream: broker.upstream(f.upstream(t, "")), interval: time.Hour}
+	// With nothing to report, the first report still starts the history.
+	if e := d.push(context.Background()); e != nil || broker.records.Load() != 1 || broker.history.IsZero() {
+		t.Fatalf("empty first report: %v", e)
+	}
+	if e := d.push(context.Background()); e != nil || broker.records.Load() != 1 {
+		t.Fatal("an empty report was repeated")
+	}
 	now := time.Now().UTC()
 	a.record("ns", "sb-1", now.Add(-time.Minute))
-	if e := d.push(context.Background()); e != nil || broker.records.Load() != 1 {
+	if e := d.push(context.Background()); e != nil || broker.records.Load() != 2 {
 		t.Fatalf("first report: %v", e)
 	}
 	if rows := a.pending(); len(rows) != 0 {
