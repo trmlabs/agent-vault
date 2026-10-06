@@ -49,15 +49,15 @@ vault write database/config/appdb plugin_name=postgresql-database-plugin allowed
 vault write database/roles/readonly db_name=appdb creation_statements="CREATE ROLE \"{{name}}\" WITH LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}' IN ROLE pg_read_all_data;" revocation_statements="SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = '{{name}}'; DROP ROLE IF EXISTS \"{{name}}\";" default_ttl=8s max_ttl=90s >/dev/null
 vault write database/config/appdb2 plugin_name=postgresql-database-plugin allowed_roles=readonly2 connection_url="postgresql://{{username}}:{{password}}@127.0.0.1:$pg_port/appdb2?sslmode=disable" username=review_admin password="$admin_pw" >/dev/null
 vault write database/roles/readonly2 db_name=appdb2 creation_statements="CREATE ROLE \"{{name}}\" WITH LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}' IN ROLE pg_read_all_data;" revocation_statements="SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = '{{name}}'; DROP ROLE IF EXISTS \"{{name}}\";" default_ttl=8s max_ttl=90s >/dev/null
-# Each child token can read only its selected role. The parent needs these
-# policies plus token creation/revocation and lease-renewal permissions.
+# Each child token can read only its selected role and end itself, which
+# revokes the credential it issued. The parent needs these policies plus token
+# creation and lease renewal; it holds no right to revoke tokens by accessor.
 for db_role in readonly readonly2; do
   db_policy_hash=$(printf '%s' "database/creds/$db_role" | openssl dgst -sha256 | awk '{print $NF}')
-  printf 'path "database/creds/%s" { capabilities = ["read"] }\n' "$db_role" | vault policy write "agent-vault-db-$db_policy_hash" - >/dev/null
+  printf 'path "database/creds/%s" { capabilities = ["read"] }\npath "auth/token/revoke-self" { capabilities = ["update"] }\n' "$db_role" | vault policy write "agent-vault-db-$db_policy_hash" - >/dev/null
 done
 vault policy write agent-vault-database-parent - >/dev/null <<'POLICY'
 path "auth/token/create" { capabilities = ["update"] }
-path "auth/token/revoke-accessor" { capabilities = ["update"] }
 path "sys/leases/renew" {
   capabilities = ["update"]
   required_parameters = ["lease_id"]

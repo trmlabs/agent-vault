@@ -301,9 +301,6 @@ func (b *Broker) Shutdown(ctx context.Context) error {
 	if !b.closed {
 		b.closed = true
 		drain := b.opts.Pool != nil && b.opts.Pool.DrainSessions && !b.authorityLost.Load()
-		if !drain {
-			b.cancel()
-		}
 		if b.listener != nil {
 			_ = b.listener.Close()
 		}
@@ -313,6 +310,11 @@ func (b *Broker) Shutdown(ctx context.Context) error {
 				continue
 			}
 			b.endConnLocked(conn, noticeRestarting)
+		}
+		// Only after every session has its notice: a relay that sees the
+		// broker's context end first would otherwise close without one.
+		if !drain {
+			b.cancel()
 		}
 		if drain {
 			go func() {
@@ -840,9 +842,11 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	var notice closeState
 	var endOnce sync.Once
 	endWith := func(n *closeNotice) {
+		if n != nil {
+			notice.notice.CompareAndSwap(nil, n) // the first reason stands
+		}
 		endOnce.Do(func() {
 			if n != nil {
-				notice.notice.Store(n)
 				// Stop relaying the database first, so the cancel below cannot
 				// reach the client as the server's own error ahead of the notice.
 				_ = upstream.conn.Close()
@@ -861,7 +865,12 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		})
 	}
 	terminate := func() { endWith(nil) }
-	defer b.registerCloser(conn, func(n closeNotice) { endWith(&n) })()
+	// The broker's closer records the notice at once, before it cancels any
+	// context the relay watches, and ends the session off its lock.
+	defer b.registerCloser(conn, func(n closeNotice) {
+		notice.notice.CompareAndSwap(nil, &n)
+		go endWith(&n)
+	})()
 	authorizationDone := make(chan struct{})
 	go func() {
 		defer close(authorizationDone)

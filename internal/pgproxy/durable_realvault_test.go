@@ -196,16 +196,9 @@ func TestRealVault_DurableInterruptedIssuance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var failCleanup atomic.Bool
-	failCleanup.Store(true)
 	var interrupted atomic.Bool
 	var orphanName atomic.Value
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/auth/token/revoke-accessor" && failCleanup.Load() {
-			w.WriteHeader(403)
-			_, _ = w.Write([]byte(`{"errors":["injected Vault outage"]}`))
-			return
-		}
 		request := r.Clone(r.Context())
 		request.RequestURI = ""
 		request.URL.Scheme = upstream.Scheme
@@ -254,14 +247,17 @@ func TestRealVault_DurableInterruptedIssuance(t *testing.T) {
 	if orphanName.Load() == nil || orphanName.Load().(string) == "" {
 		t.Fatal("fixture did not observe actual issued role")
 	}
+	// The process still held the child token, so it revoked it with its own
+	// token: the lost credential is gone at once. The issuance stays unknown
+	// to the journal, so the binding stays quarantined.
+	assertDatabaseRemoved(t, admin, orphanName.Load().(string))
 	if err = m.Close(ctx); err == nil {
-		t.Fatal("Vault cleanup outage accepted")
+		t.Fatal("unknown issuance closed as clean")
 	}
 	m2 := newDurableForTest(t, client, st)
 	if _, err = m2.Mint(ctx, AgentScope{VaultID: "vault"}, svc); err == nil {
 		t.Fatal("restart reopened unresolved binding")
 	}
-	failCleanup.Store(false)
 	started := time.Now()
 	if _, err = m2.Mint(ctx, AgentScope{VaultID: "vault"}, svc); err == nil {
 		t.Fatal("unknown issuance automatically reopened")
@@ -271,7 +267,7 @@ func TestRealVault_DurableInterruptedIssuance(t *testing.T) {
 	if err != nil || len(records) != 1 {
 		t.Fatal("missing quarantine", err)
 	}
-	if err = m2.ConfirmDatabaseCleanup(ctx, records[0].Accessor, "real fixture: matched issued username; observed zero roles and sessions after accessor revoke"); err != nil {
+	if err = m2.ConfirmDatabaseCleanup(ctx, records[0].Accessor, "real fixture: matched issued username; observed zero roles and sessions after the child token revoked itself"); err != nil {
 		t.Fatal(err)
 	}
 	lease, err := m2.Mint(ctx, AgentScope{VaultID: "vault"}, svc)
