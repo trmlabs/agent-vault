@@ -30,6 +30,7 @@ import (
 
 	"github.com/Infisical/agent-vault/internal/auditchain"
 	"github.com/Infisical/agent-vault/internal/brokercore"
+	"github.com/Infisical/agent-vault/internal/ca"
 	"github.com/Infisical/agent-vault/internal/httpcatalog"
 	"github.com/Infisical/agent-vault/internal/ratelimit"
 )
@@ -593,5 +594,29 @@ func TestBrowserFailedSignInIsCapped(t *testing.T) {
 	f.loginErr.Store(false)
 	if resp, _ := f.do(t, "GET", "https://api.example.com"+httpcatalog.BrowserSeedPath, nil); resp == nil || resp.StatusCode != http.StatusServiceUnavailable || f.logins.Load() != 1 {
 		t.Fatalf("inside the minute: %v, %d sign-ins", resp, f.logins.Load())
+	}
+}
+
+// A web app's hosts get leaves from the browser CA, so a browser pinning that
+// CA trusts Gatehouse for them alone; the SNI must name the CONNECT host.
+func TestBrowserHostsGetBrowserCALeaves(t *testing.T) {
+	f := newBrowserFixture(t)
+	for _, target := range []string{"https://app.example.com/index.html", "https://api.example.com" + httpcatalog.BrowserSeedPath} {
+		resp, err := f.client.Get(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		chain := resp.TLS.PeerCertificates
+		if len(chain) != 3 || chain[0].Issuer.CommonName != ca.BrowserCommonName || chain[1].Subject.CommonName != ca.BrowserCommonName {
+			t.Fatalf("%s: leaf issuer %q, chain length %d", target, chain[0].Issuer.CommonName, len(chain))
+		}
+	}
+	transport := f.client.Transport.(*http.Transport).Clone()
+	transport.TLSClientConfig.ServerName = "other.example.com"
+	t.Cleanup(transport.CloseIdleConnections)
+	if resp, err := (&http.Client{Transport: transport, Timeout: 5 * time.Second}).Get("https://api.example.com" + httpcatalog.BrowserSeedPath); err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("a browser host served a leaf for a different SNI")
 	}
 }

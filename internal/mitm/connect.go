@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Infisical/agent-vault/internal/auditchain"
@@ -168,6 +169,10 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A web app's host gets a leaf from the browser CA, which signs nothing
+	// else, so a browser pinning it trusts Gatehouse for those hosts only. Its
+	// SNI must be that host.
+	browser := p.adapter.valid() && p.adapter.Catalog.Current().BrowserHost(host, port)
 	tlsConf := &tls.Config{
 		MinVersion: tls.VersionTLS12,
 		NextProtos: []string{"http/1.1"},
@@ -175,6 +180,12 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 			sni := hello.ServerName
 			if sni == "" {
 				sni = host
+			}
+			if browser {
+				if !strings.EqualFold(sni, host) {
+					return nil, errors.New("browser host SNI differs from the CONNECT host")
+				}
+				return p.ca.MintBrowserLeaf(sni)
 			}
 			return p.ca.MintLeaf(sni)
 		},

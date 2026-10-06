@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
@@ -300,8 +302,27 @@ func newInterceptionCA(masterKey []byte, opts ca.Options, logger *slog.Logger, c
 	}
 	if credentialProxy {
 		logInterceptionCA(logger, caProv.RootPEM())
+		logBrowserCA(logger, caProv.BrowserCAPEM())
 	}
 	return caProv, nil
+}
+
+// logBrowserCA logs the browser CA's public key hash, the value a browser
+// pins with --ignore-certificate-errors-spki-list, and its PEM. The hash is
+// the same on every replica sharing the root; the PEM's signature differs.
+func logBrowserCA(logger *slog.Logger, browserPEM []byte) {
+	block, rest := pem.Decode(browserPEM)
+	if block == nil || block.Type != "CERTIFICATE" || len(bytes.TrimSpace(rest)) != 0 {
+		logger.Warn("browser CA is not a single certificate; not logged", "event", "mitm-browser-ca")
+		return
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		logger.Warn("browser CA does not parse; not logged", "event", "mitm-browser-ca")
+		return
+	}
+	spki := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
+	logger.Info("browser CA", "event", "mitm-browser-ca", "spki_sha256", base64.StdEncoding.EncodeToString(spki[:]), "pem", string(browserPEM))
 }
 
 // logInterceptionCA logs the root certificate's SHA-256 (over its DER) and the

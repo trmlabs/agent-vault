@@ -12,4 +12,11 @@ type Provider interface {
 	// RootPEM returns the root CA certificate in PEM form.
 	// It is safe to expose publicly.
 	RootPEM() []byte
+
+	// MintBrowserLeaf returns a leaf for a web app's host, signed by the
+	// browser CA, which signs nothing else. A browser pins the browser CA.
+	MintBrowserLeaf(sni string) (*tls.Certificate, error)
+
+	// BrowserCAPEM returns the browser CA certificate in PEM form.
+	BrowserCAPEM() []byte
 }

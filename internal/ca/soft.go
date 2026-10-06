@@ -83,9 +83,13 @@ type SoftCA struct {
 	rootCert *x509.Certificate
 	rootKey  *ecdsa.PrivateKey
 	rootPEM  []byte
-	cache    *lru
-	extraDNS []string
-	extraIPs []net.IP
+	// The browser CA, derived from the root; see deriveBrowserCA.
+	browserCert *x509.Certificate
+	browserKey  *ecdsa.PrivateKey
+	browserPEM  []byte
+	cache       *lru
+	extraDNS    []string
+	extraIPs    []net.IP
 }
 
 type encryptedKeyFile struct {
@@ -238,8 +242,7 @@ func (c *SoftCA) loadFromRecord(state *CAStateRecord, masterKey []byte) error {
 		return fmt.Errorf("parsing root key from database: %w", err)
 	}
 
-	c.setRoot(cert, key, state.RootCert)
-	return nil
+	return c.setRoot(cert, key, state.RootCert)
 }
 
 // generateMaterials creates a new CA root cert and encrypted key without
@@ -320,8 +323,7 @@ func (c *SoftCA) load(certPath, keyPath string, masterKey []byte) error {
 		return fmt.Errorf("parsing root key: %w", err)
 	}
 
-	c.setRoot(cert, key, certPEM)
-	return nil
+	return c.setRoot(cert, key, certPEM)
 }
 
 func (c *SoftCA) generate(certPath, keyPath string, masterKey []byte) error {
@@ -375,14 +377,19 @@ func (c *SoftCA) generate(certPath, keyPath string, masterKey []byte) error {
 		return fmt.Errorf("writing root key: %w", err)
 	}
 
-	c.setRoot(cert, key, certPEM)
-	return nil
+	return c.setRoot(cert, key, certPEM)
 }
 
-func (c *SoftCA) setRoot(cert *x509.Certificate, key *ecdsa.PrivateKey, pemBytes []byte) {
+func (c *SoftCA) setRoot(cert *x509.Certificate, key *ecdsa.PrivateKey, pemBytes []byte) error {
+	browserCert, browserKey, browserPEM, err := deriveBrowserCA(cert, key)
+	if err != nil {
+		return err
+	}
 	c.rootCert = cert
 	c.rootKey = key
 	c.rootPEM = pemBytes
+	c.browserCert, c.browserKey, c.browserPEM = browserCert, browserKey, browserPEM
+	return nil
 }
 
 // RootPEM returns a copy of the root CA certificate in PEM form.
