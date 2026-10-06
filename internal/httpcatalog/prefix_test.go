@@ -53,6 +53,9 @@ func (v *prefixVault) ListWithContext(_ context.Context, path string) (*vaultapi
 	if path != "gatehouse/metadata/catalog/entries" {
 		return nil, nil
 	}
+	if len(v.entries)+len(v.deleted) == 0 {
+		return nil, nil // as Vault's client returns LIST's 404 on an empty folder
+	}
 	keys := make([]interface{}, 0, len(v.entries))
 	for name := range v.entries {
 		keys = append(keys, name)
@@ -208,5 +211,25 @@ func TestPrefixLoaderNamesWhatChangedOnAMismatch(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "serpapi") || strings.Contains(err.Error(), "/other") {
 		t.Errorf("error carries entry contents: %v", err)
+	}
+}
+
+// Vault answers LIST on an empty folder with 404, which the client returns as
+// no secret. That reads as no entries, not as a failed listing: a head naming
+// none reaches Parse, which refuses an empty catalog in either mode, and a
+// head naming entries fails its digest.
+func TestPrefixLoaderReadsVaultsEmptyListing(t *testing.T) {
+	v := newPrefixVault(0)
+	raw, _, err := VaultPrefixLoader(v, "gatehouse", "catalog")(context.Background())
+	if err != nil {
+		t.Fatalf("empty listing: %v", err)
+	}
+	if _, err := Parse(raw); err == nil || !strings.Contains(err.Error(), "no entries") {
+		t.Fatalf("empty catalog: %v", err)
+	}
+	v = newPrefixVault(2)
+	v.entries = map[string]string{}
+	if _, _, err := VaultPrefixLoader(v, "gatehouse", "catalog")(context.Background()); err == nil || !strings.Contains(err.Error(), "do not match") {
+		t.Fatalf("a head naming entries loaded from an empty listing: %v", err)
 	}
 }
