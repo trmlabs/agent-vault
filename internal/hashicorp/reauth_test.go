@@ -37,7 +37,8 @@ type fakeVault struct {
 	failRevokes int               // revoke-self calls to fail before succeeding
 	denyRevoke  bool              // the login's policy has no revoke-self: 403
 	revokeCalls int
-	policyFrom  int // logins numbered below this lack the child policy: 403
+	policyFrom  int             // logins numbered below this lack the child policy: 403
+	missing     map[string]bool // child policies no login holds: 403
 	creates     int
 	lastJWT     string
 }
@@ -102,11 +103,13 @@ func (f *fakeVault) serve(w http.ResponseWriter, r *http.Request) {
 	case "/v1/auth/token/create":
 		var n int
 		_, _ = fmt.Sscanf(token, "parent-%d", &n)
-		if !f.alive[token] || n < f.policyFrom {
+		body := decodeBody(f.t, r)
+		policies, _ := body["policies"].([]any)
+		if !f.alive[token] || n < f.policyFrom || (len(policies) == 1 && f.missing[fmt.Sprint(policies[0])]) {
 			w.WriteHeader(http.StatusForbidden)
 			return
 		}
-		ttl, err := time.ParseDuration(decodeBody(f.t, r)["ttl"].(string))
+		ttl, err := time.ParseDuration(body["ttl"].(string))
 		if err != nil {
 			f.t.Error("child TTL not a duration")
 		}
@@ -568,5 +571,29 @@ func TestJWTMissingPolicyForAnHourStaysBounded(t *testing.T) {
 	// re-login would make.
 	if logins, _, _ := h.vault.snapshot(); logins > 7 {
 		t.Fatalf("logins=%d in an hour with a missing policy", logins)
+	}
+}
+
+// Each distinct missing policy can add one login per scheduled login, never
+// one a minute: three missing for an hour stays within 1 + 3 + 3 x 3.
+func TestJWTSeveralMissingPoliciesStayBounded(t *testing.T) {
+	h := newJWTHarness(t, 3600, defaultReauthOptions())
+	roles := []string{"orders", "ledger", "audit"}
+	h.vault.mu.Lock()
+	h.vault.missing = map[string]bool{}
+	for _, role := range roles {
+		h.vault.missing[DatabaseCredentialPolicyName("database", role)] = true
+	}
+	h.vault.mu.Unlock()
+	for range 60 {
+		h.advance(time.Minute)
+		for _, role := range roles {
+			if _, err := h.c.NewDatabaseSession(context.Background(), "database", role, 30*time.Minute); err == nil {
+				t.Fatal("minted without the policy")
+			}
+		}
+	}
+	if logins, _, _ := h.vault.snapshot(); logins > 1+3+3*3 {
+		t.Fatalf("logins=%d in an hour with three missing policies", logins)
 	}
 }
