@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -47,6 +48,9 @@ func attachAuthorization(adapter *mitm.HeaderAdapter, getenv func(string) string
 // HTTP adapter and the PostgreSQL broker:
 //   - AGENT_VAULT_RUNNER_JWKS_URL (and AGENT_VAULT_RUNNER_ISSUER, default ccr)
 //     verify Claude runner session tokens;
+//   - AGENT_VAULT_RUNNER_PERSON_DOMAINS lists the email domains (comma
+//     separated, lower case) whose user sessions name a person, by act.email as
+//     the Entra user principal name. Unset: no session names a person;
 //   - AGENT_VAULT_ENTITLEMENTS selects the entitlement source: "file:<path>"
 //     (fixtures and tests) or unset. Graph stays off until its Entra app
 //     registration exists; "graph" is refused here until it is wired;
@@ -66,7 +70,11 @@ func loadAuthorization(getenv func(string) string) (authorization, error) {
 		if issuer == "" {
 			issuer = "ccr"
 		}
-		a.runner = &runnerid.Verifier{JWKSURL: url, Issuer: issuer, Client: client}
+		domains, err := personDomains(getenv("AGENT_VAULT_RUNNER_PERSON_DOMAINS"))
+		if err != nil {
+			return a, err
+		}
+		a.runner = &runnerid.Verifier{JWKSURL: url, Issuer: issuer, PersonDomains: domains, Client: client}
 	}
 	ttl := entitlement.MaxCacheTTL
 	if raw := getenv("AGENT_VAULT_ENTITLEMENT_CACHE_SECONDS"); raw != "" {
@@ -87,6 +95,23 @@ func loadAuthorization(getenv func(string) string) (authorization, error) {
 	}
 	return a, nil
 }
+
+// personDomains parses the person email domains: lower-case DNS names only.
+func personDomains(raw string) ([]string, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	var domains []string
+	for _, d := range strings.Split(raw, ",") {
+		if !domainPattern.MatchString(d) {
+			return nil, fmt.Errorf("AGENT_VAULT_RUNNER_PERSON_DOMAINS must be lower-case domain names, comma separated")
+		}
+		domains = append(domains, d)
+	}
+	return domains, nil
+}
+
+var domainPattern = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$`)
 
 // sessionBinder is the store's runner-session pin table, or nil when the
 // store cannot hold one (claude-session pools then refuse every session).
