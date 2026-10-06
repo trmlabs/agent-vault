@@ -124,26 +124,19 @@ func (a *activity) report(now time.Time) ActivityReport {
 	return out
 }
 
-// ActivityPath reports this replica's activity merged with the broker's
-// durable view; ActivityLocalPath reports this replica's own alone. The
-// janitor reads the durable view from one replica a pass and the rest
-// locally, since every replica's durable view is the same.
-const (
-	ActivityPath      = "/v1/activity"
-	ActivityLocalPath = "/v1/activity/local"
-)
+// ActivityPath is the admin listener's only route.
+const ActivityPath = "/v1/activity"
 
-// handler serves GET on the two activity paths and nothing else: every other
-// path and method is 404, so the admin port exposes last-seen times and no
-// more.
+// handler serves GET /v1/activity and nothing else: every other path and
+// method is 404, so the admin port exposes last-seen times and no more.
 func (a *activity) handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.Method != http.MethodGet || (req.URL.Path != ActivityPath && req.URL.Path != ActivityLocalPath) || req.URL.RawQuery != "" {
+		if req.Method != http.MethodGet || req.URL.Path != ActivityPath || req.URL.RawQuery != "" {
 			http.NotFound(w, req)
 			return
 		}
 		report := a.report(time.Now())
-		if a.durable != nil && req.URL.Path == ActivityPath {
+		if a.durable != nil {
 			report = a.withDurable(req.Context(), report)
 		}
 		w.Header().Set("Content-Type", "application/json")
