@@ -34,6 +34,7 @@ import (
 	"github.com/Infisical/agent-vault/internal/notify"
 	"github.com/Infisical/agent-vault/internal/pgproxy"
 	"github.com/Infisical/agent-vault/internal/pidfile"
+	"github.com/Infisical/agent-vault/internal/proxycert"
 	"github.com/Infisical/agent-vault/internal/requestlog"
 	"github.com/Infisical/agent-vault/internal/runtimestatus"
 	"github.com/Infisical/agent-vault/internal/server"
@@ -317,6 +318,40 @@ func logInterceptionCA(logger *slog.Logger, rootPEM []byte) {
 	logger.Info("interception CA", "event", "mitm-ca", "sha256", hex.EncodeToString(sum[:]), "pem", string(rootPEM))
 }
 
+// attachProxyCertificates lets shared proxies in another cluster ask for
+// their serving certificate on the cross-cluster listener, signed by a Vault
+// PKI role limited to their names. Set all of AGENT_VAULT_PROXY_PKI_MOUNT,
+// AGENT_VAULT_PROXY_PKI_ROLE and AGENT_VAULT_PROXY_CERT_NAMES, or none;
+// AGENT_VAULT_PROXY_CERT_TTL defaults to 24h.
+func attachProxyCertificates(srv *server.Server, resolver *workloadidentity.Resolver, logger *slog.Logger, getenv func(string) string) error {
+	mount, role, names := getenv("AGENT_VAULT_PROXY_PKI_MOUNT"), getenv("AGENT_VAULT_PROXY_PKI_ROLE"), getenv("AGENT_VAULT_PROXY_CERT_NAMES")
+	if mount == "" && role == "" && names == "" && getenv("AGENT_VAULT_PROXY_CERT_TTL") == "" {
+		return nil
+	}
+	if mount == "" || role == "" || names == "" {
+		return fmt.Errorf("proxy certificates need AGENT_VAULT_PROXY_PKI_MOUNT, AGENT_VAULT_PROXY_PKI_ROLE and AGENT_VAULT_PROXY_CERT_NAMES")
+	}
+	if getenv("AGENT_VAULT_CROSS_CLUSTER_PORT") == "" || resolver == nil || srv.HashicorpClient() == nil {
+		return fmt.Errorf("proxy certificates need the cross-cluster listener, workload identity and Vault")
+	}
+	ttl := proxycert.MaxTTL
+	if raw := getenv("AGENT_VAULT_PROXY_CERT_TTL"); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil {
+			return fmt.Errorf("AGENT_VAULT_PROXY_CERT_TTL must be a duration such as 24h")
+		}
+		ttl = parsed
+	}
+	var list []string
+	for _, name := range strings.Split(names, ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			list = append(list, name)
+		}
+	}
+	return srv.EnableProxyCertificates(&proxycert.Issuer{Mount: mount, Role: role, Names: list, TTL: ttl,
+		Signer: srv.HashicorpClient(), Verifier: resolver, Logger: logger})
+}
+
 // attachServerExtensions wires optional subsystems (MITM, Infisical) onto srv.
 // Both bootstrap paths (foreground and detached child) call this.
 func attachServerExtensions(srv *server.Server, host string, mitmPort, postgresPort int, masterKey []byte, db store.Store, logger *slog.Logger, maxRespBytes, maxReqBytes int64) error {
@@ -399,6 +434,9 @@ func attachServerExtensions(srv *server.Server, host string, mitmPort, postgresP
 	}
 	if proxyResolver != nil && adapter != nil {
 		proxyResolver.SetProfiles(catalogProfiles(adapter.Catalog))
+	}
+	if err := attachProxyCertificates(srv, proxyResolver, logger, os.Getenv); err != nil {
+		return err
 	}
 	if err := attachMITMIfEnabled(srv, host, mitmPort, masterKey, db, maxRespBytes, maxReqBytes, adapter, sessions); err != nil {
 		return err
