@@ -39,7 +39,7 @@ var (
 )
 
 func TestCursorRunNamesItsPerson(t *testing.T) {
-	who, refusal := Resolve(context.Background(), cursorPool, "alice-1", "pod-a", "bc-1", runs, &authorizetest.MemBinder{})
+	who, refusal := Resolve(context.Background(), cursorPool, "alice-1", Claims{Pod: "pod-a", ClaimedRun: "bc-1"}, runs, &authorizetest.MemBinder{})
 	if refusal != "" || who.Kind != "person" || who.Subject != "alice@example.com" || who.TokenSHA256 != "sha-alice-1" {
 		t.Fatalf("%q %+v", refusal, who)
 	}
@@ -50,19 +50,19 @@ func TestCursorRunNamesItsPerson(t *testing.T) {
 func TestCursorTokenCountsOnlyOnItsRunsPod(t *testing.T) {
 	b := &authorizetest.MemBinder{}
 	ctx := context.Background()
-	if _, refusal := Resolve(ctx, cursorPool, "alice-1", "pod-a", "bc-1", runs, b); refusal != "" {
+	if _, refusal := Resolve(ctx, cursorPool, "alice-1", Claims{Pod: "pod-a", ClaimedRun: "bc-1"}, runs, b); refusal != "" {
 		t.Fatalf("her run on its Pod: %q", refusal)
 	}
 	// Minted on another worker and carried here, or served by a swapped socket.
-	if who, refusal := Resolve(ctx, cursorPool, "alice-2", "pod-a", "bc-1", runs, b); refusal != "session_run" || who.Kind != "none" {
+	if who, refusal := Resolve(ctx, cursorPool, "alice-2", Claims{Pod: "pod-a", ClaimedRun: "bc-1"}, runs, b); refusal != "session_run" || who.Kind != "none" {
 		t.Fatalf("another run's token: %q %+v", refusal, who)
 	}
 	// A Pod with no recorded run (no spawn hook) names nobody.
-	if _, refusal := Resolve(ctx, cursorPool, "alice-2", "pod-b", "", runs, b); refusal != "session_run" {
+	if _, refusal := Resolve(ctx, cursorPool, "alice-2", Claims{Pod: "pod-b"}, runs, b); refusal != "session_run" {
 		t.Fatalf("no recorded run: %q", refusal)
 	}
 	// The same run continued on a fresh Pod the controller started for it.
-	if _, refusal := Resolve(ctx, cursorPool, "alice-1b", "pod-c", "bc-1", runs, b); refusal != "" {
+	if _, refusal := Resolve(ctx, cursorPool, "alice-1b", Claims{Pod: "pod-c", ClaimedRun: "bc-1"}, runs, b); refusal != "" {
 		t.Fatalf("her run on a fresh Pod: %q", refusal)
 	}
 }
@@ -72,23 +72,23 @@ func TestCursorTokenCountsOnlyOnItsRunsPod(t *testing.T) {
 func TestCursorPodIsPinnedToItsFirstOwner(t *testing.T) {
 	b := &authorizetest.MemBinder{}
 	ctx := context.Background()
-	if _, refusal := Resolve(ctx, cursorPool, "alice-1", "pod-a", "bc-1", runs, b); refusal != "" {
+	if _, refusal := Resolve(ctx, cursorPool, "alice-1", Claims{Pod: "pod-a", ClaimedRun: "bc-1"}, runs, b); refusal != "" {
 		t.Fatalf("alice's first run: %q", refusal)
 	}
-	if _, refusal := Resolve(ctx, cursorPool, "alice-2", "pod-a", "bc-2", runs, b); refusal != "" {
+	if _, refusal := Resolve(ctx, cursorPool, "alice-2", Claims{Pod: "pod-a", ClaimedRun: "bc-2"}, runs, b); refusal != "" {
 		t.Fatalf("alice's second run on her Pod: %q", refusal)
 	}
-	if who, refusal := Resolve(ctx, cursorPool, "bob", "pod-a", "bc-3", runs, b); refusal != "session_pod_owner" || who.Kind != "none" {
+	if who, refusal := Resolve(ctx, cursorPool, "bob", Claims{Pod: "pod-a", ClaimedRun: "bc-3"}, runs, b); refusal != "session_pod_owner" || who.Kind != "none" {
 		t.Fatalf("bob on alice's Pod: %q %+v", refusal, who)
 	}
-	if _, refusal := Resolve(ctx, cursorPool, "alice-1", "pod-b", "bc-1", runs, b); refusal != "session_pod_mismatch" {
+	if _, refusal := Resolve(ctx, cursorPool, "alice-1", Claims{Pod: "pod-b", ClaimedRun: "bc-1"}, runs, b); refusal != "session_pod_mismatch" {
 		t.Fatalf("alice's token on another Pod: %q", refusal)
 	}
 	// A run with no mappable person still owns its Pod; it just names nobody.
-	if who, refusal := Resolve(ctx, cursorPool, "no-mail", "pod-c", "bc-4", runs, b); refusal != "" || who.Kind != "none" {
+	if who, refusal := Resolve(ctx, cursorPool, "no-mail", Claims{Pod: "pod-c", ClaimedRun: "bc-4"}, runs, b); refusal != "" || who.Kind != "none" {
 		t.Fatalf("no email: %q %+v", refusal, who)
 	}
-	if _, refusal := Resolve(ctx, cursorPool, "team", "pod-d", "bc-5", runs, b); refusal != "session_token" {
+	if _, refusal := Resolve(ctx, cursorPool, "team", Claims{Pod: "pod-d", ClaimedRun: "bc-5"}, runs, b); refusal != "session_token" {
 		t.Fatalf("no owner: %q", refusal)
 	}
 }
@@ -96,29 +96,29 @@ func TestCursorPodIsPinnedToItsFirstOwner(t *testing.T) {
 func TestCursorRefusals(t *testing.T) {
 	ctx := context.Background()
 	b := &authorizetest.MemBinder{}
-	if _, refusal := Resolve(ctx, cursorPool, "forged", "pod-a", "", runs, b); refusal != "session_token" {
+	if _, refusal := Resolve(ctx, cursorPool, "forged", Claims{Pod: "pod-a"}, runs, b); refusal != "session_token" {
 		t.Errorf("invalid token: %q", refusal)
 	}
 	// A broker with only a Claude verifier cannot verify a Cursor run.
-	if _, refusal := Resolve(ctx, cursorPool, "alice-1", "pod-a", "", oneToken{}, b); refusal != "session_unverifiable" {
+	if _, refusal := Resolve(ctx, cursorPool, "alice-1", Claims{Pod: "pod-a"}, oneToken{}, b); refusal != "session_unverifiable" {
 		t.Errorf("Claude-only verifier: %q", refusal)
 	}
-	if _, refusal := Resolve(ctx, cursorPool, "alice-1", "pod-a", "", runnerid.Verifiers{}, b); refusal != "session_unverifiable" {
+	if _, refusal := Resolve(ctx, cursorPool, "alice-1", Claims{Pod: "pod-a"}, runnerid.Verifiers{}, b); refusal != "session_unverifiable" {
 		t.Errorf("no Cursor verifier: %q", refusal)
 	}
 	// A Cursor token on a Claude pool goes to the Claude verifier and fails.
-	if _, refusal := Resolve(ctx, claude, "alice-1", "pod-a", "", runs, b); refusal != "session_unverifiable" {
+	if _, refusal := Resolve(ctx, claude, "alice-1", Claims{Pod: "pod-a"}, runs, b); refusal != "session_unverifiable" {
 		t.Errorf("Cursor token on a Claude pool: %q", refusal)
 	}
 	// No token: no person, T0 only.
-	if who, refusal := Resolve(ctx, cursorPool, "", "pod-a", "", runs, nil); refusal != "" || who.Kind != "none" {
+	if who, refusal := Resolve(ctx, cursorPool, "", Claims{Pod: "pod-a"}, runs, nil); refusal != "" || who.Kind != "none" {
 		t.Errorf("no token: %q %+v", refusal, who)
 	}
-	if _, refusal := Resolve(ctx, cursorPool, "alice-1", "", "bc-1", runs, b); refusal != "session_unbindable" {
+	if _, refusal := Resolve(ctx, cursorPool, "alice-1", Claims{Pod: "", ClaimedRun: "bc-1"}, runs, b); refusal != "session_unbindable" {
 		t.Errorf("no Pod: %q", refusal)
 	}
 	// A session on a pool whose requester is not a session is refused.
-	if _, refusal := Resolve(ctx, httpcatalog.Pool{}, "alice-1", "pod-a", "", runs, b); refusal != "session_unexpected" {
+	if _, refusal := Resolve(ctx, httpcatalog.Pool{}, "alice-1", Claims{Pod: "pod-a"}, runs, b); refusal != "session_unexpected" {
 		t.Errorf("pool without a session requester: %q", refusal)
 	}
 }

@@ -35,6 +35,9 @@ type ProxyScope struct {
 	// ClaimedRun is the Cursor run the spawn hook recorded on the live Pod
 	// (CursorRunAnnotation), read at attestation; empty when there is none.
 	ClaimedRun string
+	// AttestedRequester is the login a shared proxy attested for the agent,
+	// from its Pod's requester annotation; empty when the proxy names none.
+	AttestedRequester string
 }
 
 // CursorRunAnnotation is where Cursor's spawn hook records the claimed run

@@ -366,3 +366,53 @@ func TestHarnessServesTenThousandNamespaces(t *testing.T) {
 		}
 	}
 }
+
+// An agent-sandbox pool decides per person when its proxy attests the Pod's
+// requester; the requester counts only there, and only on such a pool.
+func TestAttestedPersonProfile(t *testing.T) {
+	person := func(c map[string]any) {
+		h := harnessAt(c, 2)
+		h["identity"].(map[string]any)["requester"] = map[string]any{"kind": "pod-annotation"}
+		h["authorization"].(map[string]any)["mode"] = "person"
+		pool := c["pools"].([]any)[2].(map[string]any)
+		pool["identity"], pool["ceiling"] = "attested-person", "T2"
+	}
+	c := harnessCatalog()
+	person(c)
+	catalog, err := parseCatalog(t, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, _ := catalog.Pool("sandboxes")
+	if profile := p.Profile(); profile.Authorization.Mode != AuthorizePerson || profile.RequesterKind() != RequesterPodAnnotation {
+		t.Fatalf("%+v", profile)
+	}
+	for name, mutate := range map[string]func(c map[string]any){
+		"requester on a pool-mode proxy": func(c map[string]any) {
+			harnessAt(c, 2)["authorization"].(map[string]any)["mode"] = "pool"
+			c["pools"].([]any)[2].(map[string]any)["identity"] = "none"
+			c["pools"].([]any)[2].(map[string]any)["ceiling"] = "T0"
+		},
+		"attested person behind a sidecar session": func(c map[string]any) {
+			harnessAt(c, 1)["identity"].(map[string]any)["requester"] = map[string]any{"kind": "pod-annotation"}
+		},
+		"attested requester on a Claude pool": func(c map[string]any) {
+			c["pools"].([]any)[2].(map[string]any)["identity"] = "claude-session"
+			c["pools"].([]any)[2].(map[string]any)["ccpoolID"] = "ccpool_xyz"
+		},
+		"Claude session on an attested pool": func(c map[string]any) {
+			c["pools"].([]any)[1].(map[string]any)["identity"] = "attested-person"
+			delete(c["pools"].([]any)[1].(map[string]any), "ccpoolID")
+		},
+		"attested pool with fixed groups": func(c map[string]any) {
+			c["pools"].([]any)[2].(map[string]any)["entitlements"] = []any{"11111111-2222-3333-4444-555555555555"}
+		},
+	} {
+		c := harnessCatalog()
+		person(c)
+		mutate(c)
+		if _, err := parseCatalog(t, c); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}

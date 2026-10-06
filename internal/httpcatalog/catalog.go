@@ -106,8 +106,10 @@ type Pool struct {
 	ServiceAccount string `json:"serviceAccount"`
 	// Identity says who can stand behind a request: "none" (the default),
 	// "claude-session" (a runner session token naming the person),
-	// "cursor-session" (a Cursor run's identity token naming the person) or
-	// "workload" (CI and automation: Entitlements, never a person).
+	// "cursor-session" (a Cursor run's identity token naming the person),
+	// "attested-person" (a shared proxy's attestation naming the person who
+	// created the agent, from its Pod's requester annotation) or "workload"
+	// (CI and automation: Entitlements, never a person).
 	Identity string `json:"identity,omitempty"`
 	// Ceiling is the highest tier the pool may reach (default T0). "external"
 	// is below T0: the pool's workers may reach nothing, and no entry may
@@ -891,6 +893,12 @@ func (p Pool) validate() error {
 		if p.CCPoolID != "" || p.BaseGroup != "" || len(p.Entitlements) != 0 {
 			return fmt.Errorf("a cursor-session pool takes no ccpool_ ID, base group or fixed entitlements")
 		}
+	case "attested-person":
+		// The person comes from the proxy's attestation; there is no runner
+		// pool, and a base group would gate nothing.
+		if p.CCPoolID != "" || p.BaseGroup != "" || len(p.Entitlements) != 0 {
+			return fmt.Errorf("an attested-person pool takes no ccpool_ ID, base group or fixed entitlements")
+		}
 	case "workload":
 		if p.CCPoolID != "" || p.BaseGroup != "" || tierRank[p.Ceiling] > 1 {
 			return fmt.Errorf("a workload pool takes fixed entitlements only and never reaches T2")
@@ -938,7 +946,7 @@ func grantable(e Entry, p Pool, defined bool) error {
 		return fmt.Errorf("%s exceeds the pool's ceiling", e.Tier)
 	}
 	switch p.Identity {
-	case "claude-session", "cursor-session":
+	case "claude-session", "cursor-session", "attested-person":
 		return nil
 	case "workload":
 		if rank >= 2 {

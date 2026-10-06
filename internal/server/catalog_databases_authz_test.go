@@ -153,3 +153,46 @@ func TestCatalogDatabaseResolverFreshT2AdmissionsAndPurge(t *testing.T) {
 		t.Fatal("T1 after a refused recheck rode the cache")
 	}
 }
+
+// An agent-sandbox pool in person mode authorizes the person its shared proxy
+// attested, on the database path as on HTTP; a pool-mode pool refuses one.
+func TestCatalogDatabaseResolverAuthorizesTheAttestedPerson(t *testing.T) {
+	httpcatalog.Environment.Store("staging")
+	t.Cleanup(func() { httpcatalog.Environment.Store("") })
+	domain := `"trustDomain":{"issuer":"https://container.googleapis.com/v1/projects/s/locations/l/clusters/sandbox","keys":"remote","audience":"gatehouse"}`
+	harness := func(name, requester, mode string) string {
+		return `{"name":"` + name + `",` + domain + `,"identity":{"kind":"proxy-attested","ownerKind":"Sandbox","namespaces":["` + name + `"],"imageDigests":["sha256:1111111111111111111111111111111111111111111111111111111111111111"]` + requester + `},` +
+			`"path":{"kind":"shared-proxy","crossCluster":true},"authorization":{"mode":"` + mode + `","poolName":"` + name + `"},"client":{"proxyEnv":"HTTPS_PROXY","caFileEnv":"SSL_CERT_FILE"}}`
+	}
+	catalog, err := httpcatalog.Parse([]byte(`{"harnesses":[` + harness("developers", `,"requester":{"kind":"pod-annotation"}`, "person") + `,` + harness("shared", "", "pool") + `],
+	 "pools":[{"name":"developers","namespace":"developers","serviceAccount":"sandbox","identity":"attested-person","ceiling":"T2"},
+	  {"name":"shared","namespace":"shared","serviceAccount":"sandbox"}],
+	 "entries":[
+	  {"name":"open","kind":"postgres","host":"db.example","pools":["developers","shared"],"postgres":{"database":"open","mount":"database","role":"staging.us.crunchy.open-readonly"}},
+	  {"name":"t1db","kind":"postgres","host":"db.example","pools":["developers"],"tier":"T1","requires":["` + t1Group + `"],"postgres":{"database":"t1db","mount":"database","role":"staging.us.crunchy.t1-readonly"}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache := &entitlement.Cache{Source: directory{"alice.smith@trmlabs.com": {t1Group}, "bob@trmlabs.com": {}}}
+	r := NewCatalogDatabaseResolver(httpcatalog.NewSource(catalog, 1), runnerid.Verifiers{SandboxDomains: []string{"trmlabs.com"}}, cache, &authorizetest.MemBinder{})
+	for _, c := range []struct{ name, pool, requester, database, want string }{
+		{"T1 member", "developers", "alice.smith@trmlabs.com", "t1db", ""},
+		{"T1 non-member", "developers", "bob@trmlabs.com", "t1db", "not_entitled"},
+		{"outside the person domains", "developers", "alice@example.com", "t1db", "no_person"},
+		{"no requester attested", "developers", "", "open", "requester_missing"},
+		{"pool mode, no requester", "shared", "", "open", ""},
+		{"pool mode with a requester", "shared", "alice.smith@trmlabs.com", "open", "requester_unexpected"},
+	} {
+		_, err := r.ResolveDatabase(context.Background(), pgproxy.AgentScope{ActorID: "a", Pool: c.pool, WorkloadID: "pod-a", AttestedRequester: c.requester}, c.database)
+		var refused *pgproxy.RefusedError
+		got := ""
+		if errors.As(err, &refused) {
+			got = refused.Outcome
+		} else if err != nil {
+			got = err.Error()
+		}
+		if got != c.want {
+			t.Errorf("%s: got %q want %q", c.name, got, c.want)
+		}
+	}
+}

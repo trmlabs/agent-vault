@@ -76,6 +76,16 @@ func TestProxyAttestedAdmitsTheAttestedPod(t *testing.T) {
 	if scope.WorkloadID != "agent-pod-uid" || scope.Pool != "sandboxes" || scope.AgentID != "agent" || !scope.NotAfter.Equal(time.Unix(p.a.NotAfter, 0)) {
 		t.Fatalf("scope %+v", scope)
 	}
+	if scope.AttestedRequester != "" {
+		t.Fatalf("a requester the proxy did not attest: %q", scope.AttestedRequester)
+	}
+	// The attested requester reaches the scope as is; authorization decides
+	// whether the pool's profile takes one.
+	withRequester := p.a
+	withRequester.Requester = "alice.smith@trmlabs.com"
+	if scope, err := p.r.Attest(p.ctx(t, withRequester), p.rc.token(p.rc.claims()), linkIP); err != nil || scope.AttestedRequester != "alice.smith@trmlabs.com" {
+		t.Fatalf("requester not carried: %+v %v", scope, err)
+	}
 	// A recheck after the proxy token expired still holds, but only for one
 	// token lifetime (3600 s in this domain) past its expiry.
 	c := p.rc.claims()

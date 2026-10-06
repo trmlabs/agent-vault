@@ -24,6 +24,22 @@ type CursorVerifier interface {
 	VerifyCursor(context.Context, string) (runnerid.Session, error)
 }
 
+// AttestedPersons names the person behind a login a shared proxy attested:
+// the Entra user principal name, or "" for no person. runnerid.ErrUnverifiable
+// means no domain is configured.
+type AttestedPersons interface {
+	AttestedPerson(login string) (string, error)
+}
+
+// Claims is what the broker learned about the agent's Pod at admission.
+type Claims struct {
+	Pod        string // the verified Pod UID
+	ClaimedRun string // the Cursor run the spawn hook recorded on the Pod
+	// AttestedRequester is the login a shared proxy attested from the Pod's
+	// requester annotation.
+	AttestedRequester string
+}
+
 // podOwnerPin is how long a Pod stays pinned to the first Cursor run owner it
 // presents. Pod UIDs never repeat, so the pin only has to outlive the Pod;
 // a day is far past any worker's lifetime and costs one row.
@@ -62,9 +78,16 @@ type Requester struct {
 // the live Pod (session_run). And since runs on one Pod share its workspace, a
 // cursor-session Pod is also pinned to the first run owner it presents: a run
 // by anyone else on that Pod is refused (session_pod_owner).
-func Resolve(ctx context.Context, pool httpcatalog.Pool, session, pod, claimedRun string, v Verifier, b Binder) (Requester, string) {
+func Resolve(ctx context.Context, pool httpcatalog.Pool, session string, claims Claims, v Verifier, b Binder) (Requester, string) {
+	pod, claimedRun := claims.Pod, claims.ClaimedRun
 	who := Requester{Kind: "none"}
 	requester := pool.Profile().RequesterKind()
+	// An attested requester counts only on a profile that takes its person
+	// from one; on any other, a proxy fault must not lend a person to a pool,
+	// so it is refused rather than ignored.
+	if claims.AttestedRequester != "" && requester != httpcatalog.RequesterPodAnnotation {
+		return who, "requester_unexpected"
+	}
 	// Only a session sidecar relays a session. One arriving on any other
 	// profile is a misconfigured or forged channel, never ignored.
 	if session != "" && requester != httpcatalog.RequesterSessionJWT && requester != httpcatalog.RequesterCursorOIDC {
@@ -128,6 +151,23 @@ func Resolve(ctx context.Context, pool httpcatalog.Pool, session, pod, claimedRu
 			}
 		}
 		who.Kind, who.Subject = string(s.Kind), s.Subject
+	case httpcatalog.RequesterPodAnnotation:
+		// The proxy admits no Pod in such a namespace without a requester,
+		// so a missing one is a fault, never a pool-level session.
+		if claims.AttestedRequester == "" {
+			return who, "requester_missing"
+		}
+		persons, ok := v.(AttestedPersons)
+		if !ok {
+			return who, "requester_unverifiable"
+		}
+		person, err := persons.AttestedPerson(claims.AttestedRequester)
+		if err != nil {
+			return who, "requester_unverifiable"
+		}
+		if person != "" {
+			who.Kind, who.Subject = "person", person
+		}
 	default:
 		// A requester kind this broker cannot verify. The catalog refuses
 		// such a profile at load; this keeps the decision closed regardless.

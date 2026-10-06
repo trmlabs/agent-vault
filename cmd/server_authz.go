@@ -20,16 +20,17 @@ import (
 type authorization struct {
 	runner       *runnerid.Verifier
 	cursor       *runnerid.CursorVerifier
+	sandbox      []string // person domains for attested requesters
 	entitlements *entitlement.Cache
 }
 
 // verifier returns the session verifiers as the interface consumers take, nil
-// (not a typed nil) when neither is set.
+// (not a typed nil) when none is set.
 func (a authorization) verifier() authorize.Verifier {
-	if a.runner == nil && a.cursor == nil {
+	if a.runner == nil && a.cursor == nil && len(a.sandbox) == 0 {
 		return nil
 	}
-	return runnerid.Verifiers{Claude: a.runner, Cursor: a.cursor}
+	return runnerid.Verifiers{Claude: a.runner, Cursor: a.cursor, SandboxDomains: a.sandbox}
 }
 
 // attachAuthorization wires the authorization model into the HTTP adapter.
@@ -58,6 +59,10 @@ func attachAuthorization(adapter *mitm.HeaderAdapter, getenv func(string) string
 //     owner_email as AGENT_VAULT_RUNNER_PERSON_DOMAINS does for Claude.
 //     AGENT_VAULT_CURSOR_JWKS_URL and AGENT_VAULT_CURSOR_ISSUER default to
 //     Cursor's published ones;
+//   - AGENT_VAULT_SANDBOX_PERSON_DOMAINS lists the email domains whose logins,
+//     attested by a shared proxy from an agent Pod's requester annotation, name
+//     a person, as the Entra user principal name. Unset: no attested login
+//     names a person, and person-mode agent-sandbox pools are refused;
 //   - AGENT_VAULT_ENTITLEMENTS selects the entitlement source: "file:<path>"
 //     (fixtures and tests) or unset. Graph stays off until its Entra app
 //     registration exists; "graph" is refused here until it is wired;
@@ -83,6 +88,11 @@ func loadAuthorization(getenv func(string) string) (authorization, error) {
 		}
 		a.runner = &runnerid.Verifier{JWKSURL: url, Issuer: issuer, PersonDomains: domains, Client: client}
 	}
+	sandbox, err := personDomains("AGENT_VAULT_SANDBOX_PERSON_DOMAINS", getenv)
+	if err != nil {
+		return a, err
+	}
+	a.sandbox = sandbox
 	if audience := getenv("AGENT_VAULT_CURSOR_AUDIENCE"); audience != "" {
 		cursor, err := cursorVerifier(audience, getenv, client)
 		if err != nil {

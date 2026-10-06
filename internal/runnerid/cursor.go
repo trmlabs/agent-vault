@@ -164,6 +164,24 @@ var ErrUnverifiable = errors.New("runner session verifier not configured")
 type Verifiers struct {
 	Claude *Verifier
 	Cursor *CursorVerifier
+	// SandboxDomains are the lower-case email domains whose logins, attested
+	// by a shared proxy from an agent Pod's requester annotation, name a
+	// person. Nil: no attested login names a person.
+	SandboxDomains []string
+}
+
+// AttestedPerson names the person behind an attested login: the lower-cased
+// login as the Entra user principal name when its domain is configured, or ""
+// for no person. Without configured domains it is ErrUnverifiable.
+func (s Verifiers) AttestedPerson(login string) (string, error) {
+	if len(s.SandboxDomains) == 0 {
+		return "", ErrUnverifiable
+	}
+	email, ok := personEmail(login, s.SandboxDomains)
+	if !ok || !plainSubject(email) {
+		return "", nil
+	}
+	return email, nil
 }
 
 func (s Verifiers) Verify(ctx context.Context, token string) (Session, error) {

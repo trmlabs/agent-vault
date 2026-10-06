@@ -250,6 +250,7 @@ func (r *Resolver) attestProxied(ctx context.Context, binding *Binding, c claims
 		return nil, brokercore.Denied("deadline")
 	}
 	scope.WorkloadID, scope.NotAfter, scope.Pool, scope.IdentityKind = a.PodUID, notAfter, profile.Pool, brokercore.KindProxyAttested
+	scope.AttestedRequester = a.Requester
 	return scope, nil
 }
 

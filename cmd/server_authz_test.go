@@ -61,3 +61,29 @@ func TestCursorSettings(t *testing.T) {
 		}
 	}
 }
+
+// AGENT_VAULT_SANDBOX_PERSON_DOMAINS alone yields a verifier that names
+// attested persons; unset, there is none.
+func TestSandboxPersonDomains(t *testing.T) {
+	env := func(values map[string]string) func(string) string { return func(k string) string { return values[k] } }
+	a, err := loadAuthorization(env(nil))
+	if err != nil || a.verifier() != nil {
+		t.Fatalf("unset: %v", err)
+	}
+	a, err = loadAuthorization(env(map[string]string{"AGENT_VAULT_SANDBOX_PERSON_DOMAINS": "trmlabs.com"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	persons, ok := a.verifier().(interface {
+		AttestedPerson(string) (string, error)
+	})
+	if !ok {
+		t.Fatal("verifier names no attested persons")
+	}
+	if person, err := persons.AttestedPerson("alice.smith@trmlabs.com"); err != nil || person != "alice.smith@trmlabs.com" {
+		t.Fatalf("person %q %v", person, err)
+	}
+	if _, err := loadAuthorization(env(map[string]string{"AGENT_VAULT_SANDBOX_PERSON_DOMAINS": "*.trmlabs.com"})); err == nil {
+		t.Fatal("wildcard domain accepted")
+	}
+}
