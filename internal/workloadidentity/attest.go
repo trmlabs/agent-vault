@@ -173,10 +173,11 @@ func (r *Resolver) verifyLocally(ctx context.Context, token string, renewal bool
 
 type livePod struct {
 	Metadata struct {
-		UID               string  `json:"uid"`
-		Name              string  `json:"name"`
-		Namespace         string  `json:"namespace"`
-		DeletionTimestamp *string `json:"deletionTimestamp"`
+		UID               string            `json:"uid"`
+		Name              string            `json:"name"`
+		Namespace         string            `json:"namespace"`
+		DeletionTimestamp *string           `json:"deletionTimestamp"`
+		Annotations       map[string]string `json:"annotations"`
 		OwnerReferences   []struct {
 			Kind               string `json:"kind"`
 			UID                string `json:"uid"`
@@ -395,6 +396,7 @@ func (r *Resolver) attest(ctx context.Context, token string, peer netip.Addr, re
 		return nil, brokercore.Denied("deadline")
 	}
 	scope.WorkloadID, scope.NotAfter, scope.Pool, scope.IdentityKind = k.Pod.UID, notAfter, binding.Pool, brokercore.KindPodToken
+	scope.ClaimedRun = pod.Metadata.Annotations[brokercore.CursorRunAnnotation]
 	return scope, nil
 }
 

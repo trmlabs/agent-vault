@@ -395,6 +395,7 @@ func TestSharedConfigValidation(t *testing.T) {
 		},
 		"browser":              func(c *FixedConfig) { c.Browser = &BrowserConfig{Listen: "0.0.0.0:9443", Upstream: c.Connect.Upstream} },
 		"session file":         func(c *FixedConfig) { c.Connect.Upstream.SessionFile = "/var/run/session" },
+		"Cursor socket":        func(c *FixedConfig) { c.Connect.Upstream.SessionSocketDir = "/var/run/cursor-identity" },
 		"no TLS":               func(c *FixedConfig) { c.TLSCertFile = "" },
 		"no Kubernetes access": func(c *FixedConfig) { c.Kubernetes.ReviewerTokenFile = "" },
 		"no profiles":          func(c *FixedConfig) { c.Shared.Profiles = nil },

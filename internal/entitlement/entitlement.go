@@ -226,7 +226,7 @@ func Tier(t string) (int, error) {
 
 // Pool is what the decision needs from a catalog pool.
 type Pool struct {
-	Identity     string // "none" (default), "claude-session" or "workload"
+	Identity     string // "none" (default), "claude-session", "cursor-session" or "workload"
 	Ceiling      string // highest tier the pool may reach
 	Entitlements []string
 }
@@ -300,7 +300,7 @@ func Decide(ctx context.Context, cache *Cache, pool Pool, entry Entry, who Reque
 		}
 		d.Allowed, d.Outcome = true, "workload_entitled"
 		return d
-	case "claude-session":
+	case "claude-session", "cursor-session":
 	default:
 		d.Outcome = "no_identity"
 		return d

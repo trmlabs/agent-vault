@@ -35,7 +35,7 @@ func (p *Proxy) authorize(ctx context.Context, scope *brokercore.ProxyScope, ent
 	if a.Runner != nil {
 		verifier = a.Runner
 	}
-	who, refusal := authorize.Resolve(ctx, pool, sessionToken(ctx), scope.WorkloadID, verifier, a.Sessions)
+	who, refusal := authorize.Resolve(ctx, pool, sessionToken(ctx), scope.WorkloadID, scope.ClaimedRun, verifier, a.Sessions)
 	event.TokenSHA256, event.RequesterKind = who.TokenSHA256, who.Kind
 	if refusal != "" {
 		return refusal

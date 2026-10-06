@@ -27,6 +27,7 @@ type AgentScope struct {
 	NotAfter   time.Time // zero, or when the session must end (a pool Pod's deadline)
 	// IdentityKind is how the workload proved itself; see brokercore.KindPodToken.
 	IdentityKind string
+	ClaimedRun   string // see brokercore.ProxyScope.ClaimedRun
 }
 
 // AgentAuthenticator validates the agent's Agent Vault token (presented in the
