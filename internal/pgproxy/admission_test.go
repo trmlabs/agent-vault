@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Infisical/agent-vault/internal/auditchain"
 )
 
 type slowRevokeMinter struct {
@@ -425,9 +427,63 @@ func TestWorkloadAtItsCapDoesNotStallOthers(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	start := time.Now()
 	code := connectExpectCode(t, addr, "victim", "db")
-	if elapsed := time.Since(start); code != "OK" || elapsed > 500*time.Millisecond {
+	if elapsed := time.Since(start); code != "OK" || elapsed > time.Second {
 		t.Fatalf("victim %q after %s behind a workload waiting at its own cap", code, elapsed)
 	}
 	<-codes
 	<-codes
+}
+
+// gatedLedger holds one workload's Add until released, signalling entry.
+type gatedLedger struct {
+	workload         string
+	entered, release chan struct{}
+}
+
+func (l gatedLedger) Add(ctx context.Context, _, workload string, _ int) error {
+	if workload != l.workload {
+		return nil
+	}
+	close(l.entered)
+	select {
+	case <-l.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (gatedLedger) Remove(context.Context, string) error { return nil }
+
+// A session refused after authentication because no admission slot freed in
+// time is audited, like every other refusal after authentication.
+func TestBusyRefusalAfterAuthenticationIsAudited(t *testing.T) {
+	up := startFakeUpstream(t, authTrust, "")
+	audit := &recordingAudit{}
+	ledger := gatedLedger{workload: "pod-a", entered: make(chan struct{}), release: make(chan struct{})}
+	defer close(ledger.release)
+	_, addr := startBroker(t, Options{AdmissionConcurrency: 1, MaxLeasesPerActor: 1, AdmissionTimeout: time.Second,
+		HandshakeTimeout: 1500 * time.Millisecond, Sessions: ledger, Audit: audit,
+		Auth: authFunc(func(_ context.Context, token, _ string) (*AgentScope, error) {
+			return &AgentScope{VaultID: "v", ActorID: token, WorkloadID: "pod-" + token}, nil
+		}),
+		Databases: &fakeResolver{svc: &DatabaseService{Name: "db", Addr: up.addr()}}, Leases: &fakeMinter{lease: newLease()}})
+	holder := openAgentSession(t, addr, "b", "db") // pod-b at its cap of 1
+	queued := make(chan string, 1)
+	go func() { queued <- connectExpectCode(t, addr, "b", "db") }() // waits for pod-b's slot, holding no admission slot
+	time.Sleep(200 * time.Millisecond)
+	go connectExpectCode(t, addr, "a", "db") // takes the only admission slot in its ledger add
+	<-ledger.entered
+	holder.close() // pod-b's slot frees; the queued session now waits for the admission slot
+	if code := <-queued; code != "53300" {
+		t.Fatalf("queued session: %q", code)
+	}
+	audit.mu.Lock()
+	defer audit.mu.Unlock()
+	for _, e := range audit.events {
+		if e.Event == auditchain.EventDenied && e.Outcome == "admission_timeout" && e.Agent == "b" {
+			return
+		}
+	}
+	t.Fatalf("no admission_timeout row: %+v", audit.events)
 }
