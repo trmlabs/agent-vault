@@ -170,7 +170,8 @@ var dnsHostLabel = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 // under broker routing: a lower-case DNS name of two or more labels, its last
 // label not all digits (so no IPv4 literal; an IPv6 literal fails the
 // labels), and port 443 only. Whether the host is reachable is the broker's
-// catalog's decision.
+// catalog's decision. Port 443 only is a deliberate limit: a catalog entry on
+// any other port is not reachable through broker routing.
 func brokerRouteTarget(target string) bool {
 	host, port, e := net.SplitHostPort(target)
 	if e != nil || port != "443" || len(host) > 253 {

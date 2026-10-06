@@ -41,8 +41,8 @@ func (s *syncBuffer) lines(t *testing.T, msg string) []map[string]any {
 func captureLog(t *testing.T) *syncBuffer {
 	t.Helper()
 	sink := &syncBuffer{}
-	logOutput = sink
-	t.Cleanup(func() { logOutput = io.Discard })
+	logOutput, sessionSummaryWindow = sink, 300*time.Millisecond
+	t.Cleanup(func() { logOutput, sessionSummaryWindow = io.Discard, time.Minute })
 	return sink
 }
 
@@ -70,10 +70,14 @@ func TestTunnelEndsAreLoggedWithTheirReason(t *testing.T) {
 		t.Fatalf("connect: %d", status)
 	}
 	c.Close()
-	waitUntil(t, "the agent's close", func() bool { return len(sink.lines(t, "session_closed")) == 1 })
-	first := sink.lines(t, "session_closed")[0]
-	if first["reason"] != endClientClosed || first["level"] != "INFO" || first["protocol"] != "connect" || first["target"] != "approved.test:443" {
-		t.Fatalf("agent close: %v", first)
+	// A normal end is counted, not logged alone: one summary per window.
+	waitUntil(t, "the close summary", func() bool { return len(sink.lines(t, "sessions_closed")) == 1 })
+	summary := sink.lines(t, "sessions_closed")[0]
+	if counts, _ := summary["counts"].(map[string]any); counts["connect:"+endClientClosed] != float64(1) || summary["level"] != "INFO" {
+		t.Fatalf("agent close summary: %v", summary)
+	}
+	if n := len(sink.lines(t, "session_closed")); n != 0 {
+		t.Fatalf("a normal end logged on its own line (%d)", n)
 	}
 	// Six tunnels open, then the broker's side drops them all at once.
 	for i := 0; i < 6; i++ {
@@ -82,8 +86,8 @@ func TestTunnelEndsAreLoggedWithTheirReason(t *testing.T) {
 		}
 	}
 	broker.dropTunnels()
-	waitUntil(t, "every broker-side end", func() bool { return len(sink.lines(t, "session_closed")) == 7 })
-	for _, line := range sink.lines(t, "session_closed")[1:] {
+	waitUntil(t, "every broker-side end", func() bool { return len(sink.lines(t, "session_closed")) == 6 })
+	for _, line := range sink.lines(t, "session_closed") {
 		if line["reason"] != endUpstreamReset || line["level"] != "WARN" {
 			t.Fatalf("a reset tunnel logged as %v", line)
 		}
@@ -172,9 +176,9 @@ func TestPostgresSessionEndIsLogged(t *testing.T) {
 	c, _ := openRouted(t, sf, sslRequestCode, "appdb")
 	<-backend.databases
 	c.Close()
-	waitUntil(t, "the session's end", func() bool { return len(sink.lines(t, "session_closed")) == 1 })
-	if line := sink.lines(t, "session_closed")[0]; line["protocol"] != "postgres" || line["reason"] != endClientClosed || line["target"] != "appdb" {
-		t.Fatalf("postgres end: %v", line)
+	waitUntil(t, "the session's end", func() bool { return len(sink.lines(t, "sessions_closed")) == 1 })
+	if counts, _ := sink.lines(t, "sessions_closed")[0]["counts"].(map[string]any); counts["postgres:"+endClientClosed] != float64(1) {
+		t.Fatalf("postgres end: %v", sink.lines(t, "sessions_closed")[0])
 	}
 }
 
