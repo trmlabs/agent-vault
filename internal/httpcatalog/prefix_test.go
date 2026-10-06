@@ -20,6 +20,7 @@ type prefixVault struct {
 	head        map[string]interface{}
 	headVersion int
 	entries     map[string]string
+	deleted     map[string]bool
 	reads       atomic.Int64
 }
 
@@ -32,6 +33,9 @@ func (v *prefixVault) ReadWithDataWithContext(_ context.Context, path string, _ 
 	switch {
 	case path == base+"head":
 		data = v.head
+	case v.deleted[strings.TrimPrefix(path, base+"entries/")]:
+		return &vaultapi.Secret{Data: map[string]interface{}{"data": nil,
+			"metadata": map[string]interface{}{"version": float64(2), "deletion_time": "2026-10-06T00:00:00Z", "destroyed": false}}}, nil
 	case strings.HasPrefix(path, base+"entries/"):
 		if entry, ok := v.entries[strings.TrimPrefix(path, base+"entries/")]; ok {
 			data = map[string]interface{}{"entry": entry}
@@ -51,6 +55,9 @@ func (v *prefixVault) ListWithContext(_ context.Context, path string) (*vaultapi
 	}
 	keys := make([]interface{}, 0, len(v.entries))
 	for name := range v.entries {
+		keys = append(keys, name)
+	}
+	for name := range v.deleted {
 		keys = append(keys, name)
 	}
 	return &vaultapi.Secret{Data: map[string]interface{}{"keys": keys}}, nil
@@ -158,5 +165,20 @@ func TestPrefixLoaderSkipsEntryReadsWhileTheHeadIsUnchanged(t *testing.T) {
 	v.headVersion = 2
 	if _, version, err := load(context.Background()); err != nil || version != 2 || v.reads.Load() != 52+51 {
 		t.Fatalf("new head: %d reads, %v", v.reads.Load(), err)
+	}
+}
+
+func TestPrefixLoaderSkipsDeletedEntries(t *testing.T) {
+	v := newPrefixVault(3)
+	delete(v.entries, "e00001")
+	v.deleted = map[string]bool{"e00001": true}
+	v.head["entries_sha256"] = entriesDigest(v.entries)
+	raw, _, err := VaultPrefixLoader(v, "gatehouse", "catalog")(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := Parse(raw)
+	if err != nil || len(c.Entries()) != 2 || c.HasHost("e00001.example.com", 443) {
+		t.Fatalf("deleted entry kept: %v", err)
 	}
 }

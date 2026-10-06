@@ -74,9 +74,16 @@ func VaultPrefixLoader(vault ListLogical, mount, prefix string) Loader {
 			names = append(names, name)
 		}
 		sort.Strings(names)
-		entries, err := readEntries(ctx, vault, mount+"/data/"+prefix+"/entries/", names)
+		stored, err := readEntries(ctx, vault, mount+"/data/"+prefix+"/entries/", names)
 		if err != nil {
 			return nil, version, err
+		}
+		listed := names
+		names, entries := names[:0:0], make([]string, 0, len(stored))
+		for i, entry := range stored {
+			if entry != "" {
+				names, entries = append(names, listed[i]), append(entries, entry)
+			}
 		}
 		digest := sha256.New()
 		for i, name := range names {
@@ -94,6 +101,10 @@ func VaultPrefixLoader(vault ListLogical, mount, prefix string) Loader {
 	}
 }
 
+// errDeleted is a KV secret whose current version is deleted or destroyed.
+// Vault still lists its key until its metadata is removed.
+var errDeleted = errors.New("catalog secret deleted")
+
 func readKV(ctx context.Context, vault Logical, path string) (map[string]interface{}, int, error) {
 	resp, err := vault.ReadWithDataWithContext(ctx, path, nil)
 	if err != nil || resp == nil || resp.Data == nil {
@@ -108,6 +119,9 @@ func readKV(ctx context.Context, vault Logical, path string) (map[string]interfa
 	case float64:
 		version = int(n)
 	}
+	if deleted, _ := metadata["deletion_time"].(string); data == nil && (deleted != "" || metadata["destroyed"] == true) {
+		return nil, 0, errDeleted
+	}
 	if data == nil || version < 1 {
 		return nil, 0, errors.New("catalog response incomplete")
 	}
@@ -115,6 +129,7 @@ func readKV(ctx context.Context, vault Logical, path string) (map[string]interfa
 }
 
 // readEntries reads every entry's stored JSON, concurrently, in names order.
+// A deleted entry reads as "": it is no longer in the catalog.
 func readEntries(ctx context.Context, vault Logical, base string, names []string) ([]string, error) {
 	out := make([]string, len(names))
 	ctx, cancel := context.WithCancel(ctx)
@@ -129,6 +144,9 @@ func readEntries(ctx context.Context, vault Logical, base string, names []string
 			defer wg.Done()
 			for i := range next {
 				data, _, err := readKV(ctx, vault, base+names[i])
+				if errors.Is(err, errDeleted) {
+					continue
+				}
 				entry, _ := data["entry"].(string)
 				if err == nil && entry == "" {
 					err = errors.New("catalog entry incomplete")
