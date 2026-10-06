@@ -28,6 +28,10 @@ type Client struct {
 	logger *slog.Logger
 	now    func() time.Time
 
+	// Token and AppRole modes: when their single login lapses, or zero when it
+	// does not expire. Neither renews it.
+	loginExpiry time.Time
+
 	// JWT mode only: held logins and their refresh loop.
 	jwt        jwtConfig
 	logins     *loginSet
@@ -80,7 +84,9 @@ func NewClient(ctx context.Context, logger *slog.Logger) (*Client, error) {
 		logger.Info("hashicorp vault client ready", slog.String("addr", addr), slog.String("auth_method", string(method)))
 		return c, nil
 	}
-	if err := login(ctx, api, method); err != nil {
+	started := time.Now()
+	ttl, err := login(ctx, api, method)
+	if err != nil {
 		return nil, fmt.Errorf("hashicorp login (%s): %w", method, err)
 	}
 
@@ -88,7 +94,11 @@ func NewClient(ctx context.Context, logger *slog.Logger) (*Client, error) {
 		slog.String("addr", addr),
 		slog.String("auth_method", string(method)))
 
-	return &Client{api: api, method: method, logger: logger}, nil
+	c := &Client{api: api, method: method, logger: logger}
+	if ttl > 0 {
+		c.loginExpiry = started.Add(ttl)
+	}
+	return c, nil
 }
 
 // newJWTClient performs the first login and starts the refresh loop, which
@@ -190,8 +200,10 @@ func stringValue(v interface{}) string {
 
 // login authenticates the API client per the detected method. Token sets the
 // token and probes it; AppRole writes the login endpoint and adopts the
-// returned client token. Both leave api ready for KV reads.
-func login(ctx context.Context, api *vaultapi.Client, method AuthMethod) error {
+// returned client token. Both leave api ready for KV reads. It returns the
+// login's remaining lifetime, or 0 for one that does not expire. Neither mode
+// renews its login, so readiness ends when it lapses.
+func login(ctx context.Context, api *vaultapi.Client, method AuthMethod) (time.Duration, error) {
 	switch method {
 	case AuthToken:
 		api.SetToken(os.Getenv("VAULT_TOKEN"))
@@ -199,10 +211,18 @@ func login(ctx context.Context, api *vaultapi.Client, method AuthMethod) error {
 		// would otherwise stay silent until the first sync tick. Probe
 		// lookup-self once to fail fast at startup (AppRole already fails fast
 		// via its login call).
-		if _, err := api.Auth().Token().LookupSelfWithContext(ctx); err != nil {
-			return fmt.Errorf("token lookup-self: %w", err)
+		secret, err := api.Auth().Token().LookupSelfWithContext(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("token lookup-self: %w", err)
 		}
-		return nil
+		if secret == nil {
+			return 0, fmt.Errorf("token lookup-self returned nothing")
+		}
+		ttl, err := secret.TokenTTL()
+		if err != nil {
+			return 0, fmt.Errorf("token lookup-self: unreadable TTL")
+		}
+		return ttl, nil
 	case AuthAppRole:
 		// AppRole is commonly mounted at a non-default path on Enterprise/HCP
 		// (e.g. auth/prod-approle). VAULT_APPROLE_MOUNT overrides the default.
@@ -215,14 +235,14 @@ func login(ctx context.Context, api *vaultapi.Client, method AuthMethod) error {
 			"secret_id": os.Getenv("VAULT_SECRET_ID"),
 		})
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if secret == nil || secret.Auth == nil || secret.Auth.ClientToken == "" {
-			return fmt.Errorf("approle login returned no client token")
+			return 0, fmt.Errorf("approle login returned no client token")
 		}
 		api.SetToken(secret.Auth.ClientToken)
-		return nil
+		return time.Duration(secret.Auth.LeaseDuration) * time.Second, nil
 	default:
-		return fmt.Errorf("hashicorp: unsupported auth method %q", method)
+		return 0, fmt.Errorf("hashicorp: unsupported auth method %q", method)
 	}
 }

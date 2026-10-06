@@ -455,13 +455,14 @@ func (c *Client) clock() time.Time {
 }
 
 // Ready reports whether a new database session could be minted now. Token and
-// AppRole modes have no refresh window and report ready.
+// AppRole modes keep one login, which they never renew: they are ready until
+// it expires, and always for a login that does not expire.
 func (c *Client) Ready() bool {
 	if c == nil {
 		return false
 	}
 	if c.logins == nil {
-		return true
+		return c.loginExpiry.IsZero() || c.clock().Before(c.loginExpiry)
 	}
 	c.logins.mu.Lock()
 	defer c.logins.mu.Unlock()

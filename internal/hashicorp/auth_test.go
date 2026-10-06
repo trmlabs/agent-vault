@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	vaultapi "github.com/hashicorp/vault/api"
 )
@@ -63,7 +64,7 @@ func TestLogin_AppRole(t *testing.T) {
 	if err != nil {
 		t.Fatalf("vault api client: %v", err)
 	}
-	if err := login(context.Background(), api, AuthAppRole); err != nil {
+	if _, err := login(context.Background(), api, AuthAppRole); err != nil {
 		t.Fatalf("login(AppRole): %v", err)
 	}
 	if gotPath != "/v1/auth/approle/login" {
@@ -90,7 +91,7 @@ func TestLogin_AppRoleNoToken(t *testing.T) {
 	cfg := vaultapi.DefaultConfig()
 	cfg.Address = srv.URL
 	api, _ := vaultapi.NewClient(cfg)
-	if err := login(context.Background(), api, AuthAppRole); err == nil {
+	if _, err := login(context.Background(), api, AuthAppRole); err == nil {
 		t.Fatal("expected an error when login returns no client token")
 	}
 }
@@ -113,7 +114,7 @@ func TestLogin_AppRoleCustomMount(t *testing.T) {
 	cfg := vaultapi.DefaultConfig()
 	cfg.Address = srv.URL
 	api, _ := vaultapi.NewClient(cfg)
-	if err := login(context.Background(), api, AuthAppRole); err != nil {
+	if _, err := login(context.Background(), api, AuthAppRole); err != nil {
 		t.Fatalf("login(AppRole, custom mount): %v", err)
 	}
 	if gotPath != "/v1/auth/prod-approle/login" {
@@ -139,7 +140,7 @@ func TestLogin_Token(t *testing.T) {
 	cfg := vaultapi.DefaultConfig()
 	cfg.Address = srv.URL
 	api, _ := vaultapi.NewClient(cfg)
-	if err := login(context.Background(), api, AuthToken); err != nil {
+	if _, err := login(context.Background(), api, AuthToken); err != nil {
 		t.Fatalf("login(Token): %v", err)
 	}
 	if !lookedUp {
@@ -162,7 +163,58 @@ func TestLogin_TokenInvalid(t *testing.T) {
 	cfg := vaultapi.DefaultConfig()
 	cfg.Address = srv.URL
 	api, _ := vaultapi.NewClient(cfg)
-	if err := login(context.Background(), api, AuthToken); err == nil {
+	if _, err := login(context.Background(), api, AuthToken); err == nil {
 		t.Fatal("expected login to fail fast for an invalid token")
+	}
+}
+
+// Token and AppRole logins report their lifetime, so readiness ends when the
+// login lapses: neither mode renews it.
+func TestLoginReportsItsLifetime(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/approle/login":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"auth": map[string]interface{}{"client_token": "hcv-approle-token", "lease_duration": 1800},
+			})
+		case "/v1/auth/token/lookup-self":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"data": map[string]interface{}{"ttl": 600}})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	t.Setenv("VAULT_ROLE_ID", "role-123")
+	t.Setenv("VAULT_SECRET_ID", "secret-456")
+	t.Setenv("VAULT_TOKEN", "hcv-static")
+	cfg := vaultapi.DefaultConfig()
+	cfg.Address = srv.URL
+	api, err := vaultapi.NewClient(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for method, want := range map[AuthMethod]time.Duration{AuthAppRole: 30 * time.Minute, AuthToken: 10 * time.Minute} {
+		if ttl, err := login(context.Background(), api, method); err != nil || ttl != want {
+			t.Errorf("login(%s) = %v, %v; want %v", method, ttl, err, want)
+		}
+	}
+}
+
+func TestReadyEndsWhenAStaticLoginExpires(t *testing.T) {
+	now := time.Date(2026, 10, 6, 0, 0, 0, 0, time.UTC)
+	for name, tc := range map[string]struct {
+		expiry time.Time
+		ready  bool
+	}{
+		"no expiry":    {time.Time{}, true},
+		"still valid":  {now.Add(time.Minute), true},
+		"expired":      {now.Add(-time.Second), false},
+		"expiring now": {now, false},
+	} {
+		c := &Client{method: AuthAppRole, loginExpiry: tc.expiry, now: func() time.Time { return now }}
+		if got := c.Ready(); got != tc.ready {
+			t.Errorf("%s: Ready() = %v, want %v", name, got, tc.ready)
+		}
 	}
 }
