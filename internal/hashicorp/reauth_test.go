@@ -311,13 +311,17 @@ func TestJWTOlderLoginsHaveNoCeiling(t *testing.T) {
 		t.Fatal("minting stopped with older logins in custody")
 	}
 	// Past the first login's four-hour maximum it is dropped, not revoked.
+	// Every login still held is inside its lifetime and holds a session.
 	h.advance(80 * time.Minute)
-	if retired, _ := h.c.logins.counts(); retired >= 12 {
-		t.Fatalf("retired=%d; logins past their maximum lifetime must leave custody", retired)
+	h.c.reauthTick(context.Background()) // a login retired on the last tick is released on the next
+	now := h.clock.Now()
+	h.c.logins.mu.Lock()
+	for _, l := range h.c.logins.retired {
+		if !now.Before(l.hardExpiry) || len(l.children) == 0 || l.token == "parent-1" {
+			t.Errorf("held %s: expiry %v, sessions %d", l.token, l.hardExpiry, len(l.children))
+		}
 	}
-	if h.c.logins.retired[0].token == "parent-1" {
-		t.Fatal("a login past its maximum lifetime is still held")
-	}
+	h.c.logins.mu.Unlock()
 }
 
 // Production's broker login has no revoke-self. An idle older login is then
