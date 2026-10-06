@@ -49,6 +49,7 @@ type relay struct {
 	log       *slog.Logger
 	upstreams upstreamWatch
 	atLimit   refusalWatch
+	closes    closeCounts
 }
 
 // Run serves native TLS only. Failure of any listener, pairing, deadline or

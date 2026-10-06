@@ -178,11 +178,11 @@ func newJanitor(t *testing.T, replicas map[string]*httptest.Server) *janitorFixt
 		client:  &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{TLSClientConfig: t2, MaxIdleConnsPerHost: 256}},
 		admin:   &http.Client{Timeout: 5 * time.Second},
 		backoff: func(int, string) time.Duration { return time.Millisecond }}
-	j.replicaURL = func(ip string) string {
+	j.replicaURL = func(ip, path string) string {
 		if s, ok := replicas[ip]; ok {
-			return s.URL + ActivityPath
+			return s.URL + path
 		}
-		return "http://127.0.0.1:1" + ActivityPath
+		return "http://127.0.0.1:1" + path
 	}
 	return &janitorFixture{j: j, api: api, out: out}
 }
@@ -424,54 +424,12 @@ func TestJanitorTrustsDurableReports(t *testing.T) {
 	if e := jf.j.pass(context.Background()); e != nil || len(jf.api.deleted) != 1 || !jf.api.deleted["sb-00001"] {
 		t.Fatalf("durable pass: deleted %v, error %v", jf.api.deleted, e)
 	}
-	// The replica that merges the durable view (the first by address) could
-	// not read it: the pass is not durable and the holds come back.
-	jf = newJanitor(t, map[string]*httptest.Server{"10.0.0.1": activityServer(t, time.Now().Add(-time.Minute)), "10.0.0.2": durable(time.Now().Add(-2 * time.Hour))})
+	// When the replica asked for the durable view cannot give it, the holds
+	// come back.
+	jf = newJanitor(t, map[string]*httptest.Server{"10.0.0.1": activityServer(t, time.Now().Add(-2*time.Hour)), "10.0.0.2": durable(time.Now().Add(-time.Minute))})
 	jf.api.sandboxes = []map[string]any{janitorSandbox(1, 3*time.Hour)}
 	if e := jf.j.pass(context.Background()); e != nil || len(jf.api.deleted) != 0 || jf.events(t, "janitor_pass")[0]["held"] != "proxy_replica_young" {
-		t.Fatalf("no durable view: deleted %v, error %v", jf.api.deleted, e)
-	}
-}
-
-// One replica merges the durable view a pass; the rest report their own
-// memory, which still counts. 120 replicas cost one durable read.
-func TestJanitorReadsTheDurableViewOnce(t *testing.T) {
-	var durableReads, localReads atomic.Int32
-	replica := func(owner string) *httptest.Server {
-		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			report := ActivityReport{ReplicaStarted: time.Now().Add(-2 * time.Hour), RetentionSeconds: 86400}
-			switch r.URL.Path {
-			case ActivityPath:
-				durableReads.Add(1)
-				report.Durable, report.HistoryStarted = true, time.Now().Add(-5*time.Hour)
-			case ActivityLocalPath:
-				localReads.Add(1)
-				report.Sandboxes = []SandboxActivity{{Namespace: tenantNS, OwnerUID: owner, LastSeen: time.Now().Add(-time.Minute)}}
-			default:
-				w.WriteHeader(404)
-				return
-			}
-			json.NewEncoder(w).Encode(report)
-		}))
-		t.Cleanup(s.Close)
-		return s
-	}
-	replicas := map[string]*httptest.Server{}
-	for i := range 120 {
-		owner := "uid-unused"
-		if i == 119 {
-			owner = "uid-sb-00002" // only one replica's memory saw Sandbox 2
-		}
-		replicas[fmt.Sprintf("10.0.%d.%d", i/250, i%250+1)] = replica(owner)
-	}
-	jf := newJanitor(t, replicas)
-	jf.api.scaleStatus = 403
-	jf.api.sandboxes = []map[string]any{janitorSandbox(1, 3*time.Hour), janitorSandbox(2, 3*time.Hour)}
-	if e := jf.j.pass(context.Background()); e != nil || len(jf.api.deleted) != 1 || !jf.api.deleted["sb-00001"] {
-		t.Fatalf("deleted %v, error %v", jf.api.deleted, e)
-	}
-	if durableReads.Load() != 1 || localReads.Load() != 119 {
-		t.Fatalf("durable reads %d, local reads %d", durableReads.Load(), localReads.Load())
+		t.Fatalf("mixed reports: deleted %v, error %v", jf.api.deleted, e)
 	}
 }
 
@@ -507,5 +465,47 @@ func TestJanitorHoldsOnAYoungDurableHistory(t *testing.T) {
 	jf.api.sandboxes = []map[string]any{janitorSandbox(1, 3*time.Hour)}
 	if e := jf.j.pass(context.Background()); e != nil || len(jf.api.deleted) != 1 {
 		t.Fatalf("an old history: deleted %v, error %v", jf.api.deleted, e)
+	}
+}
+
+// The durable view is read from one replica, the first by name; every other
+// replica is asked only for its own activity, and the replicas are read at
+// most ReplicaConcurrency at a time, all of them.
+func TestJanitorReadsTheDurableViewOnce(t *testing.T) {
+	var mu sync.Mutex
+	full, local, inFlight, maxFlight := 0, 0, 0, 0
+	server := func() *httptest.Server {
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			if r.URL.Path == ActivityPath {
+				full++
+			} else {
+				local++
+			}
+			inFlight++
+			maxFlight = max(maxFlight, inFlight)
+			mu.Unlock()
+			time.Sleep(20 * time.Millisecond)
+			mu.Lock()
+			inFlight--
+			mu.Unlock()
+			json.NewEncoder(w).Encode(ActivityReport{ReplicaStarted: time.Now().Add(-2 * time.Hour), RetentionSeconds: 86400,
+				Durable: r.URL.Path == ActivityPath, HistoryStarted: time.Now().Add(-5 * time.Hour)})
+		}))
+		t.Cleanup(s.Close)
+		return s
+	}
+	replicas := map[string]*httptest.Server{}
+	for i := 1; i <= 40; i++ {
+		replicas[fmt.Sprintf("10.0.%d.%d", i/250, i%250+1)] = server()
+	}
+	jf := newJanitor(t, replicas)
+	jf.j.config.ReplicaConcurrency = 8
+	jf.api.sandboxes = []map[string]any{janitorSandbox(1, 3*time.Hour)}
+	if e := jf.j.pass(context.Background()); e != nil || len(jf.api.deleted) != 1 {
+		t.Fatalf("pass: deleted %v, error %v", jf.api.deleted, e)
+	}
+	if full != 1 || local != 39 || maxFlight > 8 || maxFlight < 2 {
+		t.Fatalf("full reads %d, local reads %d, most at once %d", full, local, maxFlight)
 	}
 }

@@ -187,6 +187,17 @@ func TestDurableActivityOutlivesTheReplica(t *testing.T) {
 	if seen, _ := sandboxSeen(report, "sandbox-pod-a"); time.Since(seen) > 5*time.Second {
 		t.Fatalf("the later time did not win: %v", seen)
 	}
+	// The local path never reads the broker: this replica's own activity only.
+	resp, err := http.Get("http://" + admin + ActivityLocalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var own ActivityReport
+	json.NewDecoder(resp.Body).Decode(&own)
+	resp.Body.Close()
+	if own.Durable || len(own.Sandboxes) != 1 || own.Sandboxes[0].OwnerUID != "sandbox-pod-a" {
+		t.Fatalf("local report: %+v", own)
+	}
 	broker.failRead.Store(true)
 	if local := readActivity(t, admin); local.Durable || len(local.Sandboxes) != 1 || local.RetentionSeconds != 86400 || !local.HistoryStarted.IsZero() {
 		t.Fatalf("unreadable broker view: %+v", local)
@@ -256,5 +267,30 @@ func TestDurableActivityValidation(t *testing.T) {
 		if m.Validate(time.Now()) == nil {
 			t.Errorf("%s: accepted", name)
 		}
+	}
+}
+
+// Entries the broker took but no longer holds (a restored or emptied table)
+// are reported again; ones it holds are not.
+func TestDurableActivityRepushesWhatTheBrokerLost(t *testing.T) {
+	now := time.Now().UTC()
+	a := newActivity(now, time.Hour)
+	a.record("ns", "kept", now.Add(-time.Minute))
+	a.record("ns", "lost", now.Add(-time.Minute))
+	a.record("ns", "older", now.Add(-time.Minute))
+	a.accepted(a.pending())
+	if len(a.pending()) != 0 {
+		t.Fatal("accepted rows still pending")
+	}
+	// The broker holds milliseconds: a held time truncated so is still held.
+	a.repushMissing([]SandboxActivity{{OwnerUID: "kept", LastSeen: now.Add(-time.Minute).Truncate(time.Millisecond)},
+		{OwnerUID: "older", LastSeen: now.Add(-time.Hour)}})
+	var owners []string
+	for _, r := range a.pending() {
+		owners = append(owners, r.OwnerUID)
+	}
+	sort.Strings(owners)
+	if strings.Join(owners, ",") != "lost,older" {
+		t.Fatalf("pending again: %v", owners)
 	}
 }

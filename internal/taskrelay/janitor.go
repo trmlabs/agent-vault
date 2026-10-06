@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -34,6 +35,9 @@ type JanitorConfig struct {
 	DeleteConcurrency int `json:"deleteConcurrency"`
 	// ListPageSize is the page size for every list (the API's continue tokens).
 	ListPageSize int `json:"listPageSize"`
+	// ReplicaConcurrency is how many proxy replicas are read at once (default
+	// 32), so a large fleet is read well inside the Job's deadline.
+	ReplicaConcurrency int `json:"replicaConcurrency,omitempty"`
 	// ProxyNamespace and ProxyLabels find every proxy replica; AdminPort is
 	// each replica's activity listener.
 	ProxyNamespace    string            `json:"proxyNamespace"`
@@ -74,6 +78,7 @@ func (c JanitorConfig) validate() error {
 	// Bounds are sanity checks, not capacity limits: concurrency up to the API
 	// server's own scale, and pages up to what one response should carry.
 	if len(c.Namespaces) == 0 || c.IdleSeconds < 60 || c.DeleteConcurrency < 1 || c.DeleteConcurrency > 10000 ||
+		c.ReplicaConcurrency < 0 || c.ReplicaConcurrency > 10000 ||
 		c.ListPageSize < 1 || c.ListPageSize > 10000 || !dnsLabel.MatchString(c.ProxyNamespace) || len(c.ProxyLabels) == 0 ||
 		c.AdminPort < 1 || c.AdminPort > 65535 || !apiVersionPattern.MatchString(c.SandboxAPIVersion) || !strings.Contains(c.SandboxAPIVersion, "/") ||
 		c.Kubernetes.CAFile == "" || c.Kubernetes.ReviewerTokenFile == "" {
@@ -103,6 +108,13 @@ func (c JanitorConfig) validate() error {
 	return nil
 }
 
+func (j *janitor) replicaConcurrency() int {
+	if j.config.ReplicaConcurrency == 0 {
+		return 32
+	}
+	return j.config.ReplicaConcurrency
+}
+
 // errJanitorDoubt means the pass deleted nothing because a proxy replica did
 // not answer: a fault, so the run fails.
 var errJanitorDoubt = errors.New("janitor: a proxy replica did not report its activity; nothing deleted")
@@ -119,8 +131,9 @@ type janitor struct {
 	admin  *http.Client
 	out    io.Writer
 	now    func() time.Time
-	// replicaURL builds a replica's activity URL; tests point it at fakes.
-	replicaURL func(podIP string) string
+	// replicaURL builds a replica's URL for an activity path; tests point it
+	// at fakes.
+	replicaURL func(podIP, path string) string
 	// backoff is the wait before retrying a throttled request.
 	backoff func(attempt int, retryAfter string) time.Duration
 }
@@ -141,8 +154,8 @@ func RunJanitor(ctx context.Context, c JanitorConfig, out io.Writer) error {
 		admin: &http.Client{Timeout: 2 * brokerRequestTimeout, Transport: &http.Transport{Proxy: nil, MaxResponseHeaderBytes: 8192},
 			CheckRedirect: func(*http.Request, []*http.Request) error { return errDenied }},
 		backoff: defaultBackoff}
-	j.replicaURL = func(ip string) string {
-		return "http://" + net.JoinHostPort(ip, strconv.Itoa(c.AdminPort)) + ActivityPath
+	j.replicaURL = func(ip, path string) string {
+		return "http://" + net.JoinHostPort(ip, strconv.Itoa(c.AdminPort)) + path
 	}
 	return j.pass(ctx)
 }
@@ -293,54 +306,60 @@ func (j *janitor) activity(ctx context.Context, cutoff time.Time) (map[string]ti
 	}); e != nil {
 		return nil, false, false, fmt.Errorf("list proxy replicas: %w", e)
 	}
-	var ips []string
+	var live []replicaPod
 	for _, r := range replicas {
-		if r.Status.Phase == "Succeeded" || r.Status.Phase == "Failed" {
-			continue
+		if r.Status.Phase != "Succeeded" && r.Status.Phase != "Failed" {
+			live = append(live, r)
 		}
+	}
+	if len(live) == 0 {
+		return nil, false, false, errJanitorDoubt
+	}
+	// One replica, the first by name, answers with the broker's durable view
+	// merged in; the rest answer with their own activity only, which the
+	// durable view does not yet hold. Reads run ReplicaConcurrency at a time;
+	// any failure is doubt and stops the rest.
+	sort.Slice(live, func(a, b int) bool { return live[a].Metadata.Name < live[b].Metadata.Name })
+	reports := make([]ActivityReport, len(live))
+	readCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	limit := make(chan struct{}, j.replicaConcurrency())
+	var wg sync.WaitGroup
+	var failed atomic.Bool
+	for i, r := range live {
 		ip, e := netipString(r.Status.PodIP)
 		if e != nil {
 			return nil, false, false, errJanitorDoubt
 		}
-		ips = append(ips, ip)
+		path := ActivityLocalPath
+		if i == 0 {
+			path = ActivityPath
+		}
+		wg.Add(1)
+		limit <- struct{}{}
+		go func(i int, ip, path string) {
+			defer func() { <-limit; wg.Done() }()
+			report, e := j.replica(readCtx, ip, path)
+			if e != nil || report.ReplicaStarted.IsZero() || report.RetentionSeconds < j.config.IdleSeconds {
+				failed.Store(true)
+				cancel()
+				return
+			}
+			reports[i] = report
+		}(i, ip, path)
 	}
-	if len(ips) == 0 {
+	wg.Wait()
+	if failed.Load() {
 		return nil, false, false, errJanitorDoubt
 	}
-	sort.Strings(ips) // a stable choice of the replica that merges the durable view
-	// Every replica's durable view is the broker's same view of the binding,
-	// so one replica merges it and the rest report their own memory: one
-	// broker read a pass, not one per replica. Replicas are read in
-	// parallel, replicaReadConcurrency at a time (read speed, not a cap).
-	reports := make([]ActivityReport, len(ips))
-	failed := make([]bool, len(ips))
-	next := make(chan int)
-	var wg sync.WaitGroup
-	for range min(replicaReadConcurrency, len(ips)) {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := range next {
-				url := j.replicaURL(ips[i])
-				if i > 0 {
-					url = strings.TrimSuffix(url, ActivityPath) + ActivityLocalPath
-				}
-				report, e := j.replica(ctx, url)
-				reports[i], failed[i] = report, e != nil
-			}
-		}()
-	}
-	for i := range ips {
-		next <- i
-	}
-	close(next)
-	wg.Wait()
 	seen := map[string]time.Time{}
 	young := false
-	for i, report := range reports {
-		if failed[i] || report.ReplicaStarted.IsZero() || report.RetentionSeconds < j.config.IdleSeconds {
-			return nil, false, false, errJanitorDoubt
-		}
+	full := reports[0]
+	durable := full.Durable
+	// A durable report vouches only for as long as the broker's history for
+	// its binding: a new, recreated or emptied history is young.
+	historyYoung := durable && (full.HistoryStarted.IsZero() || full.HistoryStarted.After(cutoff))
+	for _, report := range reports {
 		if report.ReplicaStarted.After(cutoff) {
 			young = true
 		}
@@ -350,20 +369,11 @@ func (j *janitor) activity(ctx context.Context, cutoff time.Time) (map[string]ti
 			}
 		}
 	}
-	// The pass is durable when the merged report is: the broker's view then
-	// covers every replica, including one removed by a scale-down. A durable
-	// report vouches only for as long as the broker's history for its
-	// binding: a new, recreated or emptied history is young.
-	durable := reports[0].Durable
-	historyYoung := durable && (reports[0].HistoryStarted.IsZero() || reports[0].HistoryStarted.After(cutoff))
 	if historyYoung {
 		return nil, false, false, janitorHold{"activity_history_young"}
 	}
 	return seen, durable, young, nil
 }
-
-// replicaReadConcurrency is how many proxy replicas a pass reads at once.
-const replicaReadConcurrency = 64
 
 func netipString(s string) (string, error) {
 	ip := net.ParseIP(s)
@@ -373,9 +383,9 @@ func netipString(s string) (string, error) {
 	return ip.String(), nil
 }
 
-func (j *janitor) replica(ctx context.Context, url string) (ActivityReport, error) {
+func (j *janitor) replica(ctx context.Context, ip, path string) (ActivityReport, error) {
 	var report ActivityReport
-	req, e := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, e := http.NewRequestWithContext(ctx, http.MethodGet, j.replicaURL(ip, path), nil)
 	if e != nil {
 		return report, e
 	}

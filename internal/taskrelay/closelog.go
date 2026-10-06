@@ -104,11 +104,27 @@ func stopCause(ctx context.Context) string {
 	return endRelayStopping
 }
 
-// logClose writes one line per ended session: INFO for a normal end, WARN
-// when the broker side failed. The upstream watch also counts broker-side
-// ends, so a front that disappears is named once.
+// normalEnds are the ends counted rather than logged one by one: at fleet
+// churn of 100,000 sessions a line each would be noise. Every other end
+// (a reset on either side, a withdrawn agent) is logged on its own line.
+var normalEnds = map[string]bool{endClientClosed: true, endUpstreamClosed: true, endDeadline: true, endRelayStopping: true, "closed": true}
+
+// sessionSummaryWindow spaces the counts of normal ends.
+var sessionSummaryWindow = time.Minute
+
+// logClose logs an abnormal end on its own line (WARN for a broker-side
+// reset, INFO otherwise) and counts a normal one into a periodic
+// sessions_closed summary. The upstream watch also counts broker-side ends,
+// so a front that disappears is named once.
 func (r *relay) logClose(protocol, peer string, agent agentIdentity, upstream, target string, started time.Time, end *ending) {
 	reason := end.get()
+	if reason == endUpstreamReset || reason == endUpstreamClosed {
+		r.upstreams.ended(r.log, upstream, reason)
+	}
+	if normalEnds[reason] {
+		r.closes.count(r.log, protocol, reason)
+		return
+	}
 	level := slog.LevelInfo
 	if reason == endUpstreamReset {
 		level = slog.LevelWarn
@@ -116,9 +132,35 @@ func (r *relay) logClose(protocol, peer string, agent agentIdentity, upstream, t
 	r.log.LogAttrs(context.Background(), level, "session_closed", slog.String("protocol", protocol), slog.String("reason", reason),
 		slog.String("peer", peer), slog.String("pod", agent.pod), slog.String("target", target), slog.String("upstream", upstream),
 		slog.Int64("durationMs", time.Since(started).Milliseconds()))
-	if reason == endUpstreamReset || reason == endUpstreamClosed {
-		r.upstreams.ended(r.log, upstream, reason)
+}
+
+// closeCounts counts normal session ends by protocol and reason and logs
+// them once per window.
+type closeCounts struct {
+	mu      sync.Mutex
+	counts  map[string]int
+	pending bool
+}
+
+func (c *closeCounts) count(log *slog.Logger, protocol, reason string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.counts == nil {
+		c.counts = map[string]int{}
 	}
+	c.counts[protocol+":"+reason]++
+	if c.pending {
+		return
+	}
+	c.pending = true
+	window := sessionSummaryWindow
+	time.AfterFunc(window, func() {
+		c.mu.Lock()
+		counts := c.counts
+		c.counts, c.pending = nil, false
+		c.mu.Unlock()
+		log.Info("sessions_closed", "counts", counts, "windowMs", window.Milliseconds())
+	})
 }
 
 // massCloseWindow and massCloseMinimum: this many broker-side ends within the
