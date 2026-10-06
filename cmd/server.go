@@ -284,6 +284,8 @@ func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKe
 			MaxResponseBytes:      maxRespBytes,
 			MaxRequestBytes:       maxReqBytes,
 			DrainTunnels:          drainSeconds > 0,
+			// Pending or active credential-proxy tunnels per replica.
+			MaxCredentialProxyTunnels: intEnvValue("AGENT_VAULT_MITM_MAX_TUNNELS"),
 		},
 	))
 	return nil
