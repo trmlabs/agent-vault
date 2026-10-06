@@ -118,7 +118,7 @@ func newJWTClient(ctx context.Context, api *vaultapi.Client, logger *slog.Logger
 	}
 	api.SetToken(first.token)
 	logins := &loginSet{opts: opts}
-	_ = logins.rotate(first)
+	logins.rotate(first)
 	loopCtx, cancel := context.WithCancel(context.Background()) // #nosec G118 -- Close owns cancellation.
 	c := &Client{api: api, method: AuthJWT, logger: logger, now: now, jwt: cfg, logins: logins, stopReauth: cancel, reauthDone: make(chan struct{})}
 	go c.reauthLoop(loopCtx)

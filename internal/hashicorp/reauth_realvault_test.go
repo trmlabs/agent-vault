@@ -87,7 +87,7 @@ path "auth/token/lookup-accessor" { capabilities = ["update"] }`))
 	must(err)
 	api.ClearToken()
 	env := map[string]string{"VAULT_JWT_MOUNT": mount, "VAULT_JWT_ROLE": "broker", "VAULT_JWT_TOKEN_FILE": jwtFile}
-	opts := reauthOptions{interval: 3 * time.Second, minSessionLifetime: 4 * time.Second, mintGrace: time.Second, maxRetired: 3, tick: time.Hour}
+	opts := reauthOptions{interval: 3 * time.Second, minSessionLifetime: 4 * time.Second, mintGrace: time.Second, tick: time.Hour}
 	c, err := newJWTClient(ctx, api, slog.New(slog.DiscardHandler), func(k string) string { return env[k] }, opts, time.Now)
 	must(err)
 	defer c.Close()
