@@ -21,13 +21,14 @@ import (
 // like the HTTP proxy, and the two proxy activity routes over a map, two rows
 // to a page.
 type activityBroker struct {
-	srv        *httptest.Server
-	caFile     string
-	mu         sync.Mutex
-	rows       map[string]SandboxActivity
-	records    atomic.Int32
-	failRead   atomic.Bool
-	failRecord atomic.Bool
+	srv         *httptest.Server
+	caFile      string
+	mu          sync.Mutex
+	rows        map[string]SandboxActivity
+	records     atomic.Int32
+	refuseHosts atomic.Bool // answer every CONNECT 403, as for a host outside the catalog
+	failRead    atomic.Bool
+	failRecord  atomic.Bool
 	// history is when the binding's history began; zero until a report.
 	history time.Time
 }
@@ -37,6 +38,8 @@ func newActivityBroker(t *testing.T) *activityBroker {
 	b := &activityBroker{rows: map[string]SandboxActivity{}}
 	b.srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodConnect && b.refuseHosts.Load():
+			http.Error(w, "Agent Vault: host not in the catalog", http.StatusForbidden)
 		case r.Method == http.MethodConnect:
 			c, buf, e := w.(http.Hijacker).Hijack()
 			if e != nil {

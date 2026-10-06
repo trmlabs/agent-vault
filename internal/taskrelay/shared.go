@@ -153,7 +153,11 @@ func (c FixedConfig) validateShared(now time.Time) error {
 		return nil
 	}
 	if c.Connect != nil {
-		if check(c.Connect.Listen, c.Connect.Upstream) != nil || len(c.Connect.AllowedTargets) == 0 || len(c.Connect.AllowedTargets) > 32 {
+		// Exactly one of a target list and broker routing; with neither the
+		// config is refused, so a dropped list never opens the listener.
+		targets := len(c.Connect.AllowedTargets)
+		if check(c.Connect.Listen, c.Connect.Upstream) != nil || (c.Connect.Routes != "" && c.Connect.Routes != routesBroker) ||
+			(c.Connect.Routes == routesBroker) == (targets != 0) || targets > 32 {
 			return errConfig
 		}
 		for _, target := range c.Connect.AllowedTargets {
@@ -176,7 +180,8 @@ func (c FixedConfig) validateShared(now time.Time) error {
 		return errConfig
 	}
 	if l := c.PostgresListener; l != nil {
-		if check(l.Listen, l.Upstream) != nil || len(l.Databases) == 0 || !safeName.MatchString(l.User) || !safeName.MatchString(l.Placeholder) {
+		if check(l.Listen, l.Upstream) != nil || (l.Routes != "" && l.Routes != routesBroker) || (l.Routes == routesBroker) == (len(l.Databases) != 0) ||
+			!safeName.MatchString(l.User) || !safeName.MatchString(l.Placeholder) {
 			return errConfig
 		}
 		seen := make(map[string]bool, len(l.Databases))
