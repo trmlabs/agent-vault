@@ -245,6 +245,17 @@ func (p *agentPod) addresses() []netip.Addr {
 	return out
 }
 
+// controller is the UID of the Pod's controller when it is of the agent
+// kind, or "".
+func (p *agentPod) controller(s *SharedConfig) string {
+	for _, o := range p.Metadata.OwnerReferences {
+		if o.Controller != nil && *o.Controller && o.Kind == s.OwnerKind && o.APIVersion == s.OwnerAPIVersion {
+			return o.UID
+		}
+	}
+	return ""
+}
+
 // attest returns the Pod's attestation if it is an admissible agent right now.
 func (p *agentPod) attest(s *SharedConfig, now time.Time) (workloadidentity.Attestation, bool) {
 	var a workloadidentity.Attestation
@@ -309,8 +320,8 @@ type podCache struct {
 	byIP   map[netip.Addr]map[string]struct{} // address to namespace/name
 	inSync map[string]bool                    // namespace to whether its watch is open
 	lostAt map[string]time.Time               // namespace to when its watch last went down
-	// activity is each agent Pod's last use of this replica; a Pod that
-	// leaves the cache is forgotten.
+	// activity is each agent Sandbox's last use through this replica; a
+	// Pod's start counts as use.
 	activity *activity
 }
 
@@ -325,7 +336,7 @@ func newPodCache(c FixedConfig) (*podCache, error) {
 		CheckRedirect: func(*http.Request, []*http.Request) error { return errDenied }}
 	return &podCache{config: c.Shared, k8s: c.Kubernetes, client: client, now: time.Now,
 		pods: map[string]*agentPod{}, byIP: map[netip.Addr]map[string]struct{}{}, inSync: map[string]bool{}, lostAt: map[string]time.Time{},
-		activity: newActivity(time.Now())}, nil
+		activity: newActivity(time.Now(), c.activityRetention())}, nil
 }
 
 // lookup returns the attestation of the one admissible agent Pod at peer.
@@ -352,6 +363,11 @@ func (c *podCache) lookup(peer netip.Addr) (workloadidentity.Attestation, bool) 
 func (c *podCache) put(key string, p *agentPod) {
 	c.remove(key)
 	c.pods[key] = p
+	// A Pod's start is use of its Sandbox, so a replaced or fresh Pod that
+	// has made no request yet is not idle.
+	if owner := p.controller(c.config); owner != "" && p.Status.StartTime != nil {
+		c.activity.record(p.Metadata.Namespace, owner, *p.Status.StartTime)
+	}
 	for _, a := range p.addresses() {
 		if c.byIP[a] == nil {
 			c.byIP[a] = map[string]struct{}{}
@@ -372,7 +388,6 @@ func (c *podCache) remove(key string) {
 		}
 	}
 	delete(c.pods, key)
-	c.activity.forget(old.Metadata.UID)
 }
 
 // replace swaps one namespace's Pods for a fresh list.

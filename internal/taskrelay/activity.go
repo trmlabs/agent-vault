@@ -10,68 +10,80 @@ import (
 	"github.com/Infisical/agent-vault/internal/workloadidentity"
 )
 
-// activity records, for the idle janitor, when each agent Pod last used this
-// proxy replica: when it was admitted, and every second while one of its
+// activity records, for the idle janitor, when each agent Sandbox (the
+// Pods' controller) was last in use through this replica: when one of its
+// Pods started, when one was admitted, and every second while one of its
 // connections stays open, so a long-lived tunnel or database session counts
-// as use. It holds last-seen times only: no target, no bytes, no profile.
+// as use. It is keyed by the controller, so a replaced Pod keeps its
+// Sandbox's history, and an entry is kept for the retention time after its
+// last use whether or not the Pod is still running. It holds last-seen times
+// only: no target, no bytes, no profile.
 type activity struct {
-	mu      sync.Mutex
-	started time.Time
-	pods    map[string]activityEntry // by Pod UID
+	mu        sync.Mutex
+	started   time.Time
+	retention time.Duration
+	owners    map[string]activityEntry // by controller UID
 }
 
 type activityEntry struct {
-	namespace, owner string
-	lastSeen         time.Time
+	namespace string
+	lastSeen  time.Time
 }
 
-func newActivity(now time.Time) *activity {
-	return &activity{started: now, pods: map[string]activityEntry{}}
+// defaultActivityRetention keeps a day of history, well past any idle time.
+const defaultActivityRetention = 24 * time.Hour
+
+func newActivity(now time.Time, retention time.Duration) *activity {
+	return &activity{started: now, retention: retention, owners: map[string]activityEntry{}}
 }
 
-func (a *activity) seen(att workloadidentity.Attestation, now time.Time) {
-	if a == nil || att.PodUID == "" {
+// seen records use by the agent att names at when; an earlier time than the
+// one held changes nothing.
+func (a *activity) seen(att workloadidentity.Attestation, when time.Time) {
+	a.record(att.Namespace, att.OwnerUID, when)
+}
+
+func (a *activity) record(namespace, owner string, when time.Time) {
+	if a == nil || owner == "" {
 		return
 	}
 	a.mu.Lock()
-	a.pods[att.PodUID] = activityEntry{namespace: att.Namespace, owner: att.OwnerUID, lastSeen: now}
-	a.mu.Unlock()
-}
-
-// forget drops a Pod that left the cache: its controller no longer runs it.
-func (a *activity) forget(podUID string) {
-	if a == nil {
-		return
+	if e, ok := a.owners[owner]; !ok || when.After(e.lastSeen) {
+		a.owners[owner] = activityEntry{namespace: namespace, lastSeen: when}
 	}
-	a.mu.Lock()
-	delete(a.pods, podUID)
 	a.mu.Unlock()
 }
 
 // ActivityReport is the admin listener's one response.
 type ActivityReport struct {
-	// ReplicaStarted is when this replica began recording. A Pod absent from
-	// Pods has not used this replica since then.
-	ReplicaStarted time.Time     `json:"replicaStarted"`
-	Pods           []PodActivity `json:"pods"`
+	// ReplicaStarted is when this replica began recording. A Sandbox absent
+	// from Sandboxes has not been used through this replica since then, or
+	// not within RetentionSeconds.
+	ReplicaStarted   time.Time         `json:"replicaStarted"`
+	RetentionSeconds int64             `json:"retentionSeconds"`
+	Sandboxes        []SandboxActivity `json:"sandboxes"`
 }
 
-// PodActivity is one agent Pod's last use of this replica.
-type PodActivity struct {
+// SandboxActivity is one Sandbox's last use through this replica.
+type SandboxActivity struct {
 	Namespace string    `json:"namespace"`
-	PodUID    string    `json:"podUID"`
 	OwnerUID  string    `json:"ownerUID"`
 	LastSeen  time.Time `json:"lastSeen"`
 }
 
-func (a *activity) report() ActivityReport {
+// report drops entries past the retention time and returns the rest.
+func (a *activity) report(now time.Time) ActivityReport {
 	a.mu.Lock()
-	out := ActivityReport{ReplicaStarted: a.started.UTC(), Pods: make([]PodActivity, 0, len(a.pods))}
-	for uid, e := range a.pods {
-		out.Pods = append(out.Pods, PodActivity{Namespace: e.namespace, PodUID: uid, OwnerUID: e.owner, LastSeen: e.lastSeen.UTC()})
+	out := ActivityReport{ReplicaStarted: a.started.UTC(), RetentionSeconds: int64(a.retention / time.Second), Sandboxes: make([]SandboxActivity, 0, len(a.owners))}
+	for owner, e := range a.owners {
+		if now.Sub(e.lastSeen) > a.retention {
+			delete(a.owners, owner)
+			continue
+		}
+		out.Sandboxes = append(out.Sandboxes, SandboxActivity{Namespace: e.namespace, OwnerUID: owner, LastSeen: e.lastSeen.UTC()})
 	}
 	a.mu.Unlock()
-	sort.Slice(out.Pods, func(i, j int) bool { return out.Pods[i].PodUID < out.Pods[j].PodUID })
+	sort.Slice(out.Sandboxes, func(i, j int) bool { return out.Sandboxes[i].OwnerUID < out.Sandboxes[j].OwnerUID })
 	return out
 }
 
@@ -88,6 +100,6 @@ func (a *activity) handler() http.Handler {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
-		_ = json.NewEncoder(w).Encode(a.report())
+		_ = json.NewEncoder(w).Encode(a.report(time.Now()))
 	})
 }
