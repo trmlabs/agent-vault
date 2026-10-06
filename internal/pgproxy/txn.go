@@ -1059,7 +1059,9 @@ func (s *pooledSession) killWith(n *closeNotice) {
 	}
 	if n != nil {
 		notified := false
-		if s.writeMu.TryLock() {
+		// Another write may be finishing a message; the notice waits for that
+		// boundary, but never longer than a notice write may take.
+		if lockWithin(&s.writeMu, noticeWriteTimeout) {
 			_ = s.client.SetWriteDeadline(time.Now().Add(noticeWriteTimeout))
 			s.backend.Send(brokerError("FATAL", n.code, n.reason, n.message))
 			notified = s.backend.Flush() == nil

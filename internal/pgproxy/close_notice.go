@@ -2,6 +2,7 @@ package pgproxy
 
 import (
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -77,6 +78,20 @@ func (b *Broker) registerCloser(conn net.Conn, end func(closeNotice)) func() {
 	}
 }
 
+// lockWithin takes mu if it frees within d, so a close notice can wait for a
+// write in progress to finish its message without waiting on a client that
+// has stopped reading.
+func lockWithin(mu *sync.Mutex, d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for !mu.TryLock() {
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return true
+}
+
 // endConnLocked ends one connection the broker is closing for its own reason:
 // a pooled or unpooled session gets its notice first (between transactions,
 // restart becomes restartCut when one is open), anything still in its
@@ -88,7 +103,7 @@ func (b *Broker) endConnLocked(conn net.Conn, n closeNotice) {
 		return
 	}
 	if end := b.closers[conn]; end != nil {
-		go end(n)
+		end(n) // records the notice now and ends the session off the lock
 		return
 	}
 	b.logger.Info("pgproxy: connection closed during its handshake without a notice", "reason", n.reason)
