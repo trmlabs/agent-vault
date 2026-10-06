@@ -792,6 +792,25 @@ func (c Catalog) HasHost(host string, port int) bool {
 	return false
 }
 
+// HasHostForPool reports whether an entry granted to pool names host and
+// port. A tunnel is refused before it opens unless this holds, so a caller
+// learns nothing about hosts other pools may reach.
+func (c Catalog) HasHostForPool(host string, port int, pool string) bool {
+	host = strings.ToLower(host)
+	for _, e := range c.entries {
+		if !contains(e.Pools, pool) {
+			continue
+		}
+		if e.Kind != "postgres" && e.Host == host && e.Port == port {
+			return true
+		}
+		if e.BrowserSession != nil && e.BrowserSession.AppHost == host && e.Port == port {
+			return true
+		}
+	}
+	return false
+}
+
 // HasAuth0Domain reports whether host is the Auth0 domain of a
 // browser-session entry: the only hosts the broker's own logins may reach.
 func (c Catalog) HasAuth0Domain(host string) bool {
