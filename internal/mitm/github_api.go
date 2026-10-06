@@ -74,9 +74,15 @@ func (p *Proxy) forwardGitHubAPI(w http.ResponseWriter, r *http.Request, target 
 		deny(http.StatusBadRequest, "request_shape")
 		return
 	}
-	if api.OpensPullRequest && !pullRequestFromPoolBranch(body, api.Repo.Repo, api.HeadPrefixes) {
-		deny(http.StatusForbidden, "head")
-		return
+	if api.OpensPullRequest {
+		// GitHub receives the request rebuilt from the checked fields, never the
+		// worker's bytes, so the two cannot read it differently.
+		rebuilt, ok := pullRequestFromPoolBranch(body, api.HeadPrefixes)
+		if !ok {
+			deny(http.StatusForbidden, "head")
+			return
+		}
+		body = rebuilt
 	}
 	enf := p.rateLimit.EnforceProxy(r.Context(), scope.AgentID+"/"+scope.WorkloadID, entry.Name)
 	if !enf.Allowed {
@@ -127,35 +133,80 @@ func (p *Proxy) forwardGitHubAPI(w http.ResponseWriter, r *http.Request, target 
 	}, nil)
 }
 
-// pullRequestFromPoolBranch reports whether a create-pull-request body opens
-// one from a branch of this repository under one of the pool's push prefixes.
-// A head naming another owner ("owner:branch") or another repository, or a
-// pull request made from an issue, is refused, as is any body that is not one
-// JSON object.
-func pullRequestFromPoolBranch(body []byte, repo string, prefixes []string) bool {
-	var req map[string]json.RawMessage
-	if json.Unmarshal(body, &req) != nil {
-		return false
+// pullRequestFields are the only fields a pull request may be opened with.
+var pullRequestFields = map[string]bool{"title": true, "body": true, "head": true, "base": true, "draft": true}
+
+// pullRequestFromPoolBranch checks a create-pull-request body and returns it
+// rebuilt from the checked values alone. The body must be one JSON object with
+// only title, body, head and base (strings) and draft (a boolean), each at
+// most once, in exactly that case; the head must be a branch of this
+// repository under one of the pool's push prefixes. Anything else (an
+// owner:branch head, head_repo, issue, a duplicate or unknown key, trailing
+// data) is refused.
+func pullRequestFromPoolBranch(body []byte, prefixes []string) ([]byte, bool) {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
+		return nil, false
 	}
-	if _, ok := req["issue"]; ok {
-		return false
+	fields := map[string]json.RawMessage{}
+	seen := map[string]bool{}
+	for dec.More() {
+		t, err := dec.Token()
+		key, isKey := t.(string)
+		if err != nil || !isKey || !pullRequestFields[key] || seen[strings.ToLower(key)] {
+			return nil, false
+		}
+		seen[strings.ToLower(key)] = true
+		var raw json.RawMessage
+		if dec.Decode(&raw) != nil {
+			return nil, false
+		}
+		fields[key] = raw
 	}
-	if raw, ok := req["head_repo"]; ok {
-		var headRepo string
-		if json.Unmarshal(raw, &headRepo) != nil || !strings.EqualFold(headRepo, repo) {
-			return false
+	if t, err := dec.Token(); err != nil || t != json.Delim('}') {
+		return nil, false
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, false // trailing data
+	}
+	var req struct {
+		Title, Body, Head, Base string
+		Draft                   bool
+	}
+	out := map[string]any{}
+	for key, raw := range fields {
+		var err error
+		switch key {
+		case "title":
+			err = json.Unmarshal(raw, &req.Title)
+			out[key] = req.Title
+		case "body":
+			err = json.Unmarshal(raw, &req.Body)
+			out[key] = req.Body
+		case "head":
+			err = json.Unmarshal(raw, &req.Head)
+			out[key] = req.Head
+		case "base":
+			err = json.Unmarshal(raw, &req.Base)
+			out[key] = req.Base
+		case "draft":
+			err = json.Unmarshal(raw, &req.Draft)
+			out[key] = req.Draft
+		}
+		if err != nil || string(raw) == "null" {
+			return nil, false
 		}
 	}
-	var head string
-	if json.Unmarshal(req["head"], &head) != nil || strings.Contains(head, ":") || unsafeBranch(head) {
-		return false
+	if strings.Contains(req.Head, ":") || unsafeBranch(req.Head) {
+		return nil, false
 	}
 	for _, prefix := range prefixes {
-		if strings.HasPrefix(head, prefix) && len(head) > len(prefix) {
-			return true
+		if strings.HasPrefix(req.Head, prefix) && len(req.Head) > len(prefix) {
+			rebuilt, err := json.Marshal(out)
+			return rebuilt, err == nil
 		}
 	}
-	return false
+	return nil, false
 }
 
 // unsafeBranch refuses a branch name with a path step that could leave the

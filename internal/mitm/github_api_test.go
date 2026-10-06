@@ -34,6 +34,7 @@ type apiFixture struct {
 	created int
 	reads   int
 	echo    bool
+	last    string // the last body GitHub received
 }
 
 func newAPIFixture(t *testing.T) *apiFixture {
@@ -68,6 +69,7 @@ func newAPIFixture(t *testing.T) *apiFixture {
 		}
 		body, _ := io.ReadAll(r.Body)
 		f.mu.Lock()
+		f.last = string(body)
 		f.created++
 		echo := f.echo
 		f.mu.Unlock()
@@ -159,6 +161,16 @@ func TestGitHubAPIOpensPullRequestsAndComments(t *testing.T) {
 	if e := f.audit.last(); e.Binding != "github-api/trmlabs/trm-b2b" || e.Outcome != "completed" || e.Status != 201 {
 		t.Fatalf("audit: %+v", e)
 	}
+	// GitHub receives the request rebuilt from the checked fields, not the worker's bytes.
+	if code, _ := f.post(t, "POST", "/repos/trmlabs/trm-b2b/pulls", "", "{ \"head\" : \"cursor/pool-agent/y\", \"base\":\"main\", \"draft\":true, \"title\":\"t\", \"body\":\"b\" }"); code != 201 {
+		t.Fatalf("create: %d", code)
+	}
+	f.mu.Lock()
+	last := f.last
+	f.mu.Unlock()
+	if last != `{"base":"main","body":"b","draft":true,"head":"cursor/pool-agent/y","title":"t"}` {
+		t.Fatalf("GitHub received %s", last)
+	}
 	// Reading one pull request, for its state, is a GET with no body.
 	r, _ := http.NewRequest(http.MethodGet, "https://example.com:"+strconv.Itoa(f.port)+"/repos/trmlabs/trm-b2b/pulls/12", nil)
 	resp, err := f.client.Do(r)
@@ -193,6 +205,12 @@ func TestGitHubAPIRefusesEverythingElse(t *testing.T) {
 		{"head from another repository", "POST", "/repos/trmlabs/trm-b2b/pulls", "", `{"head":"cursor/pool-agent/x","head_repo":"trmlabs/other","base":"main"}`, "head"},
 		{"pull request from an issue", "POST", "/repos/trmlabs/trm-b2b/pulls", "", `{"issue":7,"head":"cursor/pool-agent/x","base":"main"}`, "head"},
 		{"no head", "POST", "/repos/trmlabs/trm-b2b/pulls", "", `{"base":"main"}`, "head"},
+		{"duplicate head", "POST", "/repos/trmlabs/trm-b2b/pulls", "", `{"head":"cursor/pool-agent/x","head":"main","base":"main"}`, "head"},
+		{"case-variant head", "POST", "/repos/trmlabs/trm-b2b/pulls", "", `{"head":"cursor/pool-agent/x","Head":"main","base":"main"}`, "head"},
+		{"unknown field", "POST", "/repos/trmlabs/trm-b2b/pulls", "", `{"head":"cursor/pool-agent/x","base":"main","maintainer_can_modify":true}`, "head"},
+		{"null head", "POST", "/repos/trmlabs/trm-b2b/pulls", "", `{"head":null,"base":"main"}`, "head"},
+		{"head not a string", "POST", "/repos/trmlabs/trm-b2b/pulls", "", `{"head":["cursor/pool-agent/x"],"base":"main"}`, "head"},
+		{"trailing data", "POST", "/repos/trmlabs/trm-b2b/pulls", "", `{"head":"cursor/pool-agent/x","base":"main"}{"head":"main"}`, "head"},
 		{"worker token", "POST", "/repos/trmlabs/trm-b2b/pulls", "token ghp_workersupplied", `{}`, "credential_header"},
 		{"placeholder in body", "POST", "/repos/trmlabs/trm-b2b/pulls", "", `{"body":"__vault_GITHUB_TOKEN__"}`, "placeholder_misplaced"},
 	} {
