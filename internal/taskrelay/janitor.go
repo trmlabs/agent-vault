@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -40,8 +41,17 @@ type JanitorConfig struct {
 	AdminPort         int               `json:"adminPort"`
 	SandboxAPIVersion string            `json:"sandboxAPIVersion"`
 	Kubernetes        KubernetesConfig  `json:"kubernetes"`
+	// ProxyAutoscaler and ProxyDeployment, in ProxyNamespace, name the
+	// proxy's HorizontalPodAutoscaler and Deployment. A replica removed by a
+	// scale-down takes its history with it, so a pass holds while either
+	// changed the replica set within IdleSeconds: the autoscaler's
+	// status.lastScaleTime, or the Deployment's Progressing condition's
+	// lastUpdateTime (a direct edit of its replicas). Either may be empty.
+	ProxyAutoscaler string `json:"proxyAutoscaler,omitempty"`
+	ProxyDeployment string `json:"proxyDeployment,omitempty"`
 }
 
+var dnsSubdomain = regexp.MustCompile(`^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$`)
 var labelValue = regexp.MustCompile(`^([A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?)?$`)
 var labelKey = regexp.MustCompile(`^([a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?/)?[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$`)
 
@@ -76,6 +86,11 @@ func (c JanitorConfig) validate() error {
 		}
 		seen[ns] = true
 	}
+	for _, name := range []string{c.ProxyAutoscaler, c.ProxyDeployment} {
+		if name != "" && !dnsSubdomain.MatchString(name) {
+			return errConfig
+		}
+	}
 	for k, v := range c.ProxyLabels {
 		if !labelKey.MatchString(k) || !labelValue.MatchString(v) {
 			return errConfig
@@ -88,8 +103,15 @@ func (c JanitorConfig) validate() error {
 	return nil
 }
 
-// errJanitorDoubt means the pass deleted nothing because it could not be sure.
-var errJanitorDoubt = errors.New("janitor: not every proxy replica answered for long enough; nothing deleted")
+// errJanitorDoubt means the pass deleted nothing because a proxy replica did
+// not answer: a fault, so the run fails.
+var errJanitorDoubt = errors.New("janitor: a proxy replica did not report its activity; nothing deleted")
+
+// janitorHold is an expected pause: the pass deletes nothing, logs why and
+// succeeds, so a failed run always means a fault.
+type janitorHold struct{ reason string }
+
+func (h janitorHold) Error() string { return "janitor: holding: " + h.reason }
 
 type janitor struct {
 	config JanitorConfig
@@ -125,12 +147,15 @@ func RunJanitor(ctx context.Context, c JanitorConfig, out io.Writer) error {
 	return j.pass(ctx)
 }
 
+// defaultBackoff waits at least the server's Retry-After plus up to as much
+// again, or else a full-jitter exponential delay, so many throttled workers
+// do not retry in step.
 func defaultBackoff(attempt int, retryAfter string) time.Duration {
 	if s, e := strconv.Atoi(retryAfter); e == nil && s > 0 && s <= 60 {
-		return time.Duration(s) * time.Second
+		d := time.Duration(s) * time.Second
+		return d + rand.N(d) // #nosec G404 -- retry jitter, not a secret
 	}
-	d := time.Duration(1<<min(attempt, 6)) * 250 * time.Millisecond
-	return d
+	return rand.N(time.Duration(1<<min(attempt, 6)) * 250 * time.Millisecond) // #nosec G404 -- retry jitter, not a secret
 }
 
 func (j *janitor) log(event string, fields map[string]any) {
@@ -140,10 +165,19 @@ func (j *janitor) log(event string, fields map[string]any) {
 	_, _ = j.out.Write(append(b, '\n'))
 }
 
+// pass returns nil when it held on purpose; the held reason is logged.
 func (j *janitor) pass(ctx context.Context) error {
 	now := j.now()
 	cutoff := now.Add(-time.Duration(j.config.IdleSeconds) * time.Second)
-	lastSeen, e := j.activity(ctx, cutoff)
+	e := j.scaledSince(ctx, cutoff)
+	var lastSeen map[string]time.Time
+	if e == nil {
+		lastSeen, e = j.activity(ctx, cutoff)
+	}
+	if hold, ok := e.(janitorHold); ok {
+		j.log("janitor_pass", map[string]any{"deleted": 0, "dryRun": j.config.DryRun, "held": hold.reason})
+		return nil
+	}
 	if e != nil {
 		j.log("janitor_pass", map[string]any{"deleted": 0, "dryRun": j.config.DryRun, "error": e.Error()})
 		return e
@@ -174,10 +208,61 @@ func (j *janitor) pass(ctx context.Context) error {
 	return e
 }
 
+// scaledSince holds the pass while the proxy's replica set changed after the
+// cutoff: a removed replica's history is gone. A failed read is a fault.
+func (j *janitor) scaledSince(ctx context.Context, cutoff time.Time) error {
+	ns := "/namespaces/" + url.PathEscape(j.config.ProxyNamespace)
+	if name := j.config.ProxyAutoscaler; name != "" {
+		var hpa struct {
+			Status struct {
+				LastScaleTime *time.Time `json:"lastScaleTime"`
+			} `json:"status"`
+		}
+		if e := j.get(ctx, "/apis/autoscaling/v2"+ns+"/horizontalpodautoscalers/"+url.PathEscape(name), &hpa); e != nil {
+			return fmt.Errorf("read proxy autoscaler: %w", e)
+		}
+		if t := hpa.Status.LastScaleTime; t != nil && t.After(cutoff) {
+			return janitorHold{"proxy_autoscaled"}
+		}
+	}
+	if name := j.config.ProxyDeployment; name != "" {
+		var deployment struct {
+			Status struct {
+				Conditions []struct {
+					Type           string    `json:"type"`
+					LastUpdateTime time.Time `json:"lastUpdateTime"`
+				} `json:"conditions"`
+			} `json:"status"`
+		}
+		if e := j.get(ctx, "/apis/apps/v1"+ns+"/deployments/"+url.PathEscape(name), &deployment); e != nil {
+			return fmt.Errorf("read proxy deployment: %w", e)
+		}
+		for _, c := range deployment.Status.Conditions {
+			if c.Type == "Progressing" && c.LastUpdateTime.After(cutoff) {
+				return janitorHold{"proxy_deployment_changed"}
+			}
+		}
+	}
+	return nil
+}
+
+// get reads one object; anything but 200 is an error.
+func (j *janitor) get(ctx context.Context, path string, into any) error {
+	status, body, e := j.request(ctx, http.MethodGet, path, nil)
+	if e != nil {
+		return e
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("status %d", status)
+	}
+	return json.Unmarshal(body, into)
+}
+
 // activity reads every proxy replica's report and returns, per Sandbox UID,
 // the latest use any replica saw. It is all or nothing: a replica that does
-// not answer, or one started after the cutoff (it cannot vouch for the whole
-// idle window), means doubt, and nothing is deleted.
+// not answer, or reports a retention shorter than the idle time, is a fault;
+// one started after the cutoff cannot vouch for the whole idle window, so the
+// pass holds. Either way nothing is deleted.
 func (j *janitor) activity(ctx context.Context, cutoff time.Time) (map[string]time.Time, error) {
 	selector := make([]string, 0, len(j.config.ProxyLabels))
 	for k, v := range j.config.ProxyLabels {
@@ -205,7 +290,7 @@ func (j *janitor) activity(ctx context.Context, cutoff time.Time) (map[string]ti
 		return nil, fmt.Errorf("list proxy replicas: %w", e)
 	}
 	seen := map[string]time.Time{}
-	answered := 0
+	answered, young := 0, false
 	for _, r := range replicas {
 		if r.Status.Phase == "Succeeded" || r.Status.Phase == "Failed" {
 			continue
@@ -215,18 +300,24 @@ func (j *janitor) activity(ctx context.Context, cutoff time.Time) (map[string]ti
 			return nil, errJanitorDoubt
 		}
 		report, e := j.replica(ctx, ip)
-		if e != nil || report.ReplicaStarted.IsZero() || report.ReplicaStarted.After(cutoff) {
+		if e != nil || report.ReplicaStarted.IsZero() || report.RetentionSeconds < j.config.IdleSeconds {
 			return nil, errJanitorDoubt
 		}
+		if report.ReplicaStarted.After(cutoff) {
+			young = true
+		}
 		answered++
-		for _, p := range report.Pods {
-			if p.OwnerUID != "" && p.LastSeen.After(seen[p.OwnerUID]) {
-				seen[p.OwnerUID] = p.LastSeen
+		for _, a := range report.Sandboxes {
+			if a.OwnerUID != "" && a.LastSeen.After(seen[a.OwnerUID]) {
+				seen[a.OwnerUID] = a.LastSeen
 			}
 		}
 	}
 	if answered == 0 {
 		return nil, errJanitorDoubt
+	}
+	if young {
+		return nil, janitorHold{"proxy_replica_young"}
 	}
 	return seen, nil
 }

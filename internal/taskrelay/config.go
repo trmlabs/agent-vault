@@ -47,6 +47,10 @@ type FixedConfig struct {
 	// when each agent Pod last used this replica, for the idle janitor. A
 	// network policy must admit only the janitor to it.
 	AdminListen string `json:"adminListen,omitempty"`
+	// ActivityRetentionSeconds is how long the activity report keeps a
+	// Sandbox after its last use (default a day). The janitor refuses a
+	// retention shorter than its idle time.
+	ActivityRetentionSeconds int64 `json:"activityRetentionSeconds,omitempty"`
 }
 type SandboxConfig struct {
 	Namespace     string `json:"namespace"`
@@ -144,6 +148,10 @@ func LoadConfig(path string) (FixedConfig, error) {
 
 func (c FixedConfig) Validate(now time.Time) error {
 	if (c.AdminListen != "" || c.PostgresListener != nil || c.TLS != nil) && c.Shared == nil {
+		return errConfig
+	}
+	// Up to a year: retention costs one small entry per Sandbox used.
+	if c.ActivityRetentionSeconds != 0 && (c.AdminListen == "" || c.ActivityRetentionSeconds < 60 || c.ActivityRetentionSeconds > 366*24*3600) {
 		return errConfig
 	}
 	if c.Shared != nil {
@@ -262,6 +270,13 @@ func (c FixedConfig) validateSelf(now time.Time) error {
 }
 
 // postgresBindings preserves the legacy single binding without mixing authority.
+func (c FixedConfig) activityRetention() time.Duration {
+	if c.ActivityRetentionSeconds == 0 {
+		return defaultActivityRetention
+	}
+	return time.Duration(c.ActivityRetentionSeconds) * time.Second
+}
+
 func (c FixedConfig) postgresBindings() []PostgresConfig {
 	if c.Postgres != nil {
 		return []PostgresConfig{*c.Postgres}
