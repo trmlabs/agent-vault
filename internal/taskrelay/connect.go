@@ -54,7 +54,9 @@ func (r *relay) connect(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	up, e := dialUpstream(req.Context(), c.Upstream)
+	dialCtx, cancelDial := context.WithTimeout(req.Context(), r.handshake())
+	up, e := dialUpstream(dialCtx, c.Upstream)
+	cancelDial()
 	if e != nil {
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 		return
@@ -62,7 +64,7 @@ func (r *relay) connect(w http.ResponseWriter, req *http.Request) {
 	defer func() { _ = up.Close() }()
 	stop := context.AfterFunc(r.ctx, func() { _ = up.Close() })
 	defer stop()
-	_ = up.SetDeadline(minTime(expiry, time.Now().Add(handshakeTimeout)))
+	_ = up.SetDeadline(minTime(expiry, time.Now().Add(r.handshake())))
 	if !time.Now().Before(expiry) || r.pair.check(req.Context(), req.RemoteAddr) != nil {
 		http.Error(w, "denied", http.StatusForbidden)
 		return

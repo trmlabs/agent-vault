@@ -50,7 +50,7 @@ type cancelTarget struct {
 // picks the binding: a name route accepts fixes Database to it, and any other
 // name is refused with the no_database words before admission.
 func (r *relay) postgres(conn net.Conn, binding PostgresConfig, route func(database string) bool) {
-	_ = conn.SetDeadline(minTime(r.config.Deadline, time.Now().Add(handshakeTimeout)))
+	_ = conn.SetDeadline(minTime(r.config.Deadline, time.Now().Add(r.handshake())))
 	peer := conn.RemoteAddr().String()
 	// The listener hands over the connection before the TLS handshake, so a
 	// foreign address is refused before the relay reads a byte from it. Only
@@ -190,7 +190,9 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig, route func(datab
 	if r.pair.check(r.ctx, peer) != nil {
 		return
 	}
-	up, e := dialUpstream(r.ctx, c.Upstream)
+	dialCtx, cancelDial := context.WithTimeout(r.ctx, r.handshake())
+	up, e := dialUpstream(dialCtx, c.Upstream)
+	cancelDial()
 	if e != nil {
 		tell(errorFrame("08001", unreachableMessage))
 		return
@@ -198,7 +200,7 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig, route func(datab
 	defer func() { _ = up.Close() }()
 	stop := context.AfterFunc(r.ctx, func() { _ = up.Close() })
 	defer stop()
-	_ = up.SetDeadline(minTime(expiry, time.Now().Add(handshakeTimeout)))
+	_ = up.SetDeadline(minTime(expiry, time.Now().Add(r.handshake())))
 	// A shared proxy states which agent Pod is behind this connection, first
 	// on the broker-side stream, and drops it when that Pod stops qualifying.
 	attestation, agent, e := r.attest(peer)
@@ -434,7 +436,7 @@ func (r *relay) cancelPostgres(peer string, packet []byte, binding PostgresConfi
 	// Pin to the established broker socket, not a newly selected service replica.
 	c := binding.Upstream
 	c.Address = target.address
-	ctx, cancel := context.WithDeadline(r.ctx, minTime(target.expiry, time.Now().Add(handshakeTimeout)))
+	ctx, cancel := context.WithDeadline(r.ctx, minTime(target.expiry, time.Now().Add(r.handshake())))
 	defer cancel()
 	up, e := dialUpstream(ctx, c)
 	if e != nil {
