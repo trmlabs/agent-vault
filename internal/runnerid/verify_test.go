@@ -56,7 +56,7 @@ func sign(t *testing.T, key *ecdsa.PrivateKey, kid string, claims map[string]any
 func personClaims(now time.Time) map[string]any {
 	return map[string]any{"iss": "ccr", "aud": []string{"ccpool_abc", "other"}, "iat": now.Unix(), "nbf": now.Unix(),
 		"exp": now.Add(4 * time.Hour).Unix(), "ccr:role": "session_worker",
-		"act": map[string]any{"sub": "user_1", "attested_by": map[string]any{"sub": "sso|alice"}}}
+		"ccr:account_id": "user_1", "act": map[string]any{"sub": "user:user_1", "email": "Alice@Example.com"}}
 }
 
 func setup(t *testing.T) (*issuer, *Verifier, *ecdsa.PrivateKey, *time.Time) {
@@ -65,22 +65,75 @@ func setup(t *testing.T) (*issuer, *Verifier, *ecdsa.PrivateKey, *time.Time) {
 	srv := httptest.NewServer(iss)
 	t.Cleanup(srv.Close)
 	now := time.Now()
-	v := &Verifier{JWKSURL: srv.URL, Issuer: "ccr", Client: srv.Client(), Now: func() time.Time { return now }}
+	v := &Verifier{JWKSURL: srv.URL, Issuer: "ccr", PersonDomains: []string{"example.com"}, Client: srv.Client(),
+		Now: func() time.Time { return now }}
 	return iss, v, key, &now
 }
 
 func TestPersonSession(t *testing.T) {
 	_, v, key, now := setup(t)
 	s, err := v.Verify(context.Background(), sign(t, key, "k1", personClaims(*now)))
-	if err != nil || s.Kind != KindPerson || s.Subject != "sso|alice" || !s.InPool("ccpool_abc") || s.InPool("other") || len(s.TokenSHA256) != 64 {
+	if err != nil || s.Kind != KindPerson || s.Subject != "alice@example.com" || !s.InPool("ccpool_abc") || s.InPool("other") || len(s.TokenSHA256) != 64 {
 		t.Fatalf("session %+v err %v", s, err)
 	}
+}
+
+// The runner's value carries the sk-ant-cc- prefix; a hosted session's sk-ant-si- token is refused.
+func TestRunnerTokenPrefix(t *testing.T) {
+	_, v, key, now := setup(t)
+	jwt := sign(t, key, "k1", personClaims(*now))
+	s, err := v.Verify(context.Background(), "sk-ant-cc-"+jwt)
+	if err != nil || s.Kind != KindPerson || s.Subject != "alice@example.com" {
+		t.Fatalf("prefixed token: session %+v err %v", s, err)
+	}
+	bare, _ := v.Verify(context.Background(), jwt)
+	if bare.TokenSHA256 == s.TokenSHA256 {
+		t.Fatal("the hash must name the value the worker holds, prefix included")
+	}
+	for _, prefix := range []string{"sk-ant-si-", "sk-ant-"} {
+		if _, err := v.Verify(context.Background(), prefix+jwt); err == nil {
+			t.Fatalf("%s token accepted", prefix)
+		}
+	}
+}
+
+// A user session names a person only by a recorded email in a configured domain.
+// attested_by is reserved and never read. Anything else: a valid session with no person.
+func TestUserSessionWithoutAMappablePerson(t *testing.T) {
+	for name, act := range map[string]map[string]any{
+		"no email":           {"sub": "user:user_1"},
+		"email off the list": {"sub": "user:user_1", "email": "alice@elsewhere.com"},
+		"subdomain":          {"sub": "user:user_1", "email": "alice@mail.example.com"},
+		"two at signs":       {"sub": "user:user_1", "email": "alice@evil.com@example.com"},
+		"attested_by only":   {"sub": "user:user_1", "attested_by": map[string]any{"sub": "alice@example.com"}},
+		"bare user id":       {"sub": "user_1", "email": "alice@example.com"},
+		"empty user":         {"sub": "user:", "email": "alice@example.com"},
+		"no subject at all":  {"email": "alice@example.com"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, v, key, now := setup(t)
+			c := personClaims(*now)
+			c["act"] = act
+			s, err := v.Verify(context.Background(), sign(t, key, "k1", c))
+			if err != nil || s.Kind != KindNone || s.Subject != "" {
+				t.Fatalf("session %+v err %v", s, err)
+			}
+		})
+	}
+	t.Run("no domains configured", func(t *testing.T) {
+		_, v, key, now := setup(t)
+		v.PersonDomains = nil
+		s, err := v.Verify(context.Background(), sign(t, key, "k1", personClaims(*now)))
+		if err != nil || s.Kind != KindNone {
+			t.Fatalf("session %+v err %v", s, err)
+		}
+	})
 }
 
 func TestAgentSessionHasNoPerson(t *testing.T) {
 	_, v, key, now := setup(t)
 	c := personClaims(*now)
-	c["act"] = map[string]any{"sub": "agent:slack-123", "attested_by": map[string]any{"sub": "sso|alice"}}
+	c["act"] = map[string]any{"sub": "agent:slack-123", "email": "alice@example.com"}
 	s, err := v.Verify(context.Background(), sign(t, key, "k1", c))
 	if err != nil || s.Kind != KindAgent || s.Subject != "agent:slack-123" {
 		t.Fatalf("session %+v err %v", s, err)

@@ -67,8 +67,10 @@ type GraphSource struct {
 	Endpoint string // https://graph.microsoft.com/v1.0
 	Token    func(context.Context) (string, error)
 	Client   *http.Client
-	// SubjectIsObjectID: the SSO subject is the Entra object ID. Otherwise it
-	// is looked up as a user principal name. Email alone is never used.
+	// SubjectIsObjectID: the subject is the Entra object ID. Otherwise it is
+	// looked up as a user principal name: a Claude runner session names its
+	// person by act.email in a configured domain, which /users/{id} matches
+	// against the UPN only, never a mail alias.
 	SubjectIsObjectID bool
 }
 
