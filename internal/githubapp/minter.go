@@ -94,10 +94,17 @@ type Minter struct {
 	// ScopeMode decides what an installation beyond the catalog does: empty
 	// or ScopeRefuse stops its tokens, ScopeWarn reports and serves.
 	ScopeMode ScopeMode
-	Log       *slog.Logger
+	// ScopeTimeout bounds one installation check, every repository page
+	// included. Default 5 minutes.
+	ScopeTimeout time.Duration
+	Log          *slog.Logger
 
-	scopeMu sync.Mutex
-	scopes  map[int64]scopeVerdict
+	// scopeMu guards the verdicts only; checks run outside it, one per
+	// installation at a time.
+	scopeMu       sync.Mutex
+	scopes        map[int64]scopeVerdict
+	scopeChecking map[int64]chan struct{}
+	scopeGen      uint64
 
 	mu          sync.Mutex
 	cache       map[tokenKey]Token

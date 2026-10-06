@@ -85,6 +85,7 @@ func sortedKeys(m map[string]string) []string {
 func (m *Minter) ForgetScope() {
 	m.scopeMu.Lock()
 	m.scopes = nil
+	m.scopeGen++ // a check already running answers its caller but is not kept
 	m.scopeMu.Unlock()
 }
 
@@ -95,27 +96,56 @@ func (m *Minter) checkScope(ctx context.Context, app App) error {
 	if m.Scope == nil {
 		return nil
 	}
+	// The lock guards the verdicts only. One check per installation runs at
+	// a time, outside it, and its callers wait for that check alone, so a
+	// slow installation never holds up another's tokens.
 	m.scopeMu.Lock()
-	defer m.scopeMu.Unlock()
-	if v, ok := m.scopes[app.InstallationID]; ok {
-		ttl := scopeTTL
-		if v.err != nil {
-			ttl = scopeRetry
+	for {
+		if v, ok := m.scopes[app.InstallationID]; ok {
+			ttl := scopeTTL
+			if v.err != nil {
+				ttl = scopeRetry
+			}
+			if m.now().Sub(v.checked) < ttl {
+				m.scopeMu.Unlock()
+				return v.err
+			}
 		}
-		if m.now().Sub(v.checked) < ttl {
-			return v.err
+		running, ok := m.scopeChecking[app.InstallationID]
+		if !ok {
+			break
 		}
+		m.scopeMu.Unlock()
+		select {
+		case <-running:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		m.scopeMu.Lock()
 	}
+	if m.scopeChecking == nil {
+		m.scopeChecking = map[int64]chan struct{}{}
+	}
+	done := make(chan struct{})
+	m.scopeChecking[app.InstallationID] = done
+	gen := m.scopeGen
+	m.scopeMu.Unlock()
 	found := m.verifyScope(ctx, app, m.Scope(app.InstallationID))
 	var err error
 	outcome := "serve"
 	if len(found.reach) > 0 && m.ScopeMode != ScopeWarn {
 		err, outcome = fmt.Errorf("%w: %s", errScope, strings.Join(found.reach, "; ")), "refuse"
 	}
-	if m.scopes == nil {
-		m.scopes = map[int64]scopeVerdict{}
+	m.scopeMu.Lock()
+	if gen == m.scopeGen {
+		if m.scopes == nil {
+			m.scopes = map[int64]scopeVerdict{}
+		}
+		m.scopes[app.InstallationID] = scopeVerdict{err: err, checked: m.now()}
 	}
-	m.scopes[app.InstallationID] = scopeVerdict{err: err, checked: m.now()}
+	delete(m.scopeChecking, app.InstallationID)
+	close(done)
+	m.scopeMu.Unlock()
 	if m.Log != nil && (len(found.reach) > 0 || len(found.settings) > 0) {
 		mode := m.ScopeMode
 		if mode == "" {
@@ -144,7 +174,11 @@ func (m *Minter) verifyScope(ctx context.Context, app App, want Scope) findings 
 		f.reach = append(f.reach, "repositories unreadable")
 		return f
 	}
-	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	timeout := m.ScopeTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	jwt, err := m.jwt(ctx, app.AppID)
 	if err != nil {
@@ -184,6 +218,11 @@ func (m *Minter) verifyScope(ctx context.Context, app App, want Scope) findings 
 		}
 	}
 
+	if settings.RepositorySelection == "all" {
+		// Already wider than any catalog: listing every repository would add
+		// nothing.
+		return f
+	}
 	// A metadata-only token for the whole installation lists its repositories,
 	// and is revoked straight after.
 	var listing struct {

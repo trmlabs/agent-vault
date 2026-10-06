@@ -330,3 +330,65 @@ func TestScopeModeDefaultsToRefuse(t *testing.T) {
 		}
 	}
 }
+
+// Concurrent callers share one check per installation, and the check runs
+// outside the lock: a slow GitHub never holds the verdicts.
+func TestScopeChecksOncePerInstallationOutsideTheLock(t *testing.T) {
+	g, m := newScopeGitHub(t)
+	release, reached := make(chan struct{}), make(chan struct{}, 1)
+	slow := m.Client.Transport
+	m.Client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/app/installations/42" {
+			select {
+			case reached <- struct{}{}:
+			default:
+			}
+			<-release
+		}
+		return slow.RoundTrip(r)
+	})}
+	app := App{AppID: 7, InstallationID: 42}
+	var wg sync.WaitGroup
+	for range 50 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := m.checkScope(context.Background(), app); err != nil {
+				t.Errorf("check: %v", err)
+			}
+		}()
+	}
+	<-reached // the first check is talking to GitHub
+	forgot := make(chan struct{})
+	go func() { m.ForgetScope(); close(forgot) }()
+	select {
+	case <-forgot:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the verdict lock was held across a GitHub call")
+	}
+	close(release)
+	wg.Wait()
+	// The catalog changed mid-check, so that verdict is not kept: the
+	// waiting callers share exactly one fresh check.
+	if settings, _, _, _ := g.counts(); settings != 2 {
+		t.Fatalf("%d checks for 50 callers and one catalog change", settings)
+	}
+}
+
+// An installation on all repositories is refused without listing them.
+func TestScopeAllRepositoriesSkipsTheListing(t *testing.T) {
+	g, m := newScopeGitHub(t)
+	g.mu.Lock()
+	g.selection = "all"
+	g.mu.Unlock()
+	if err := m.checkScope(context.Background(), App{AppID: 7, InstallationID: 42}); err == nil || !strings.Contains(err.Error(), "all repositories") {
+		t.Fatalf("err %v", err)
+	}
+	if _, listMints, _, _ := g.counts(); listMints != 0 {
+		t.Fatalf("%d listing tokens minted", listMints)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
