@@ -544,11 +544,14 @@ func refusalReason(body []byte) string {
 	if reason := errorField(body, brokercore.RefusalReasonField); brokerReason.MatchString(reason) {
 		return reason
 	}
-	if code := sqlState(body); code != "" {
+	if code := sqlState(body); sqlStateShape.MatchString(code) {
 		return "sqlstate_" + code
 	}
 	return "unknown"
 }
+
+// sqlStateShape is a SQLSTATE: five digits or capital letters.
+var sqlStateShape = regexp.MustCompile(`^[0-9A-Z]{5}$`)
 
 // refusalsByCode covers a broker refusal whose reason has no entry of its own:
 // every authorization decision is a 42501, whatever its reason.
