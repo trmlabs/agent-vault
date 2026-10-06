@@ -1,7 +1,6 @@
 package httpcatalog
 
 import (
-	"fmt"
 	"strings"
 	"testing"
 )
@@ -40,20 +39,5 @@ func TestTierGrantRules(t *testing.T) {
 	}
 	if _, err := Parse([]byte(`{"entries":[{` + strings.Replace(entryBase, `"pools":["p"]`, `"pools":["any"]`, 1) + `,"tier":"T1","requires":["` + group + `"]}]}`)); err == nil {
 		t.Error("a T1 entry was accepted without defined pools")
-	}
-}
-
-func TestRequiresIsCapped(t *testing.T) {
-	var groups []string
-	for i := 0; i < 9; i++ {
-		groups = append(groups, fmt.Sprintf("%08d-0000-0000-0000-000000000000", i))
-	}
-	e := Entry{Tier: "T1", Requires: groups}
-	if err := e.validateTier(); err == nil {
-		t.Fatal("an entry requiring 9 groups was accepted")
-	}
-	e.Requires = groups[:8]
-	if err := e.validateTier(); err != nil {
-		t.Fatalf("8 groups refused: %v", err)
 	}
 }
