@@ -22,26 +22,55 @@ type Scope struct {
 	PullRequests bool
 }
 
-// The installation's repositories on GitHub must stay inside the catalog, so
-// an App widened in GitHub's settings stops minting instead of quietly
-// reaching more than Gatehouse grants. Its other settings (permissions,
-// suspension) are reported, not enforced: the broker requests only what each
-// token needs, so a wider permission is a recorded risk rather than a breach.
-// Checked before tokens are handed out, at most every scopeTTL per
-// installation, and again after a catalog change.
+// ScopeMode is what the broker does when an installation reaches beyond the
+// catalog: ScopeRefuse (the default) stops every token for it, ScopeWarn
+// reports and keeps serving. Either way each token is still minted for one
+// repository and the minimum permissions, and a wider token is revoked.
+type ScopeMode string
+
 const (
-	scopeTTL      = 5 * time.Minute
-	scopeRetry    = 30 * time.Second
-	scopeMaxPages = 10
+	ScopeRefuse ScopeMode = "refuse"
+	ScopeWarn   ScopeMode = "warn"
+)
+
+// ParseScopeMode reads AGENT_VAULT_GITHUB_APP_SCOPE; empty is ScopeRefuse,
+// so a deployment gets warn only by asking for it.
+func ParseScopeMode(s string) (ScopeMode, error) {
+	switch ScopeMode(s) {
+	case "", ScopeRefuse:
+		return ScopeRefuse, nil
+	case ScopeWarn:
+		return ScopeWarn, nil
+	}
+	return "", fmt.Errorf("AGENT_VAULT_GITHUB_APP_SCOPE must be refuse or warn")
+}
+
+// The installation's repositories on GitHub should stay inside the catalog,
+// so an App widened in GitHub's settings is caught instead of quietly
+// reaching more than Gatehouse grants. Reach (all repositories, an unlisted
+// repository, or a list that cannot be read) is what ScopeMode governs. Other
+// settings (permissions, suspension, another App) are only reported: the
+// broker requests only what each token needs. Checked before tokens are
+// handed out, at most every scopeTTL per installation, and again after a
+// catalog change. Every check that finds anything logs one
+// "github app installation scope" event, which monitors count.
+const (
+	scopeTTL   = 5 * time.Minute
+	scopeRetry = 30 * time.Second
 )
 
 type scopeVerdict struct {
-	err      error
-	warnings string
-	checked  time.Time
+	err     error
+	checked time.Time
 }
 
 var errScope = errors.New("github app installation is wider than the catalog")
+
+// findings are what one check found: reach decides the verdict in refuse
+// mode; settings never do.
+type findings struct {
+	reach, settings []string
+}
 
 func sortedKeys(m map[string]string) []string {
 	keys := make([]string, 0, len(m))
@@ -59,8 +88,8 @@ func (m *Minter) ForgetScope() {
 	m.scopeMu.Unlock()
 }
 
-// checkScope reports whether the installation is inside the catalog, from a
-// recent verdict when there is one. Without a Scope function it passes; the
+// checkScope reports whether tokens may be minted for the installation, from
+// a recent verdict when there is one. Without a Scope function it passes; the
 // broker always sets one.
 func (m *Minter) checkScope(ctx context.Context, app App) error {
 	if m.Scope == nil {
@@ -77,40 +106,50 @@ func (m *Minter) checkScope(ctx context.Context, app App) error {
 			return v.err
 		}
 	}
-	warnings, err := m.verifyScope(ctx, app, m.Scope(app.InstallationID))
+	found := m.verifyScope(ctx, app, m.Scope(app.InstallationID))
+	var err error
+	outcome := "serve"
+	if len(found.reach) > 0 && m.ScopeMode != ScopeWarn {
+		err, outcome = fmt.Errorf("%w: %s", errScope, strings.Join(found.reach, "; ")), "refuse"
+	}
 	if m.scopes == nil {
 		m.scopes = map[int64]scopeVerdict{}
 	}
-	previous := m.scopes[app.InstallationID].warnings
-	joined := strings.Join(warnings, "; ")
-	m.scopes[app.InstallationID] = scopeVerdict{err: err, warnings: joined, checked: m.now()}
-	if m.Log != nil {
-		if err != nil {
-			m.Log.Warn("github app installation refused", slog.Int64("installation", app.InstallationID), slog.String("reason", err.Error()))
+	m.scopes[app.InstallationID] = scopeVerdict{err: err, checked: m.now()}
+	if m.Log != nil && (len(found.reach) > 0 || len(found.settings) > 0) {
+		mode := m.ScopeMode
+		if mode == "" {
+			mode = ScopeRefuse
 		}
-		if joined != "" && joined != previous {
-			m.Log.Warn("github app installation wider than needed", slog.Int64("installation", app.InstallationID), slog.String("settings", joined))
-		}
+		m.Log.Warn("github app installation scope",
+			slog.Int64("installation", app.InstallationID),
+			slog.String("mode", string(mode)),
+			slog.String("outcome", outcome),
+			slog.String("reach", strings.Join(found.reach, "; ")),
+			slog.String("settings", strings.Join(found.settings, "; ")))
 	}
 	return err
 }
 
-// verifyScope refuses an installation on all repositories, or on any
-// repository the catalog does not list, and when the repositories cannot be
-// read. A catalog repository the installation lacks needs no check here: its
-// mint already fails. Settings beyond what the catalog needs (a permission
-// other than metadata read, contents and, only with a github-api entry, pull
-// requests write; a suspension; another App's installation) come back as
-// warnings.
-func (m *Minter) verifyScope(ctx context.Context, app App, want Scope) ([]string, error) {
+// verifyScope finds reach beyond the catalog (an installation on all
+// repositories, any repository the catalog does not list, or a repository list
+// that cannot be read) and settings wider than the catalog needs (a
+// permission other than metadata read, contents and, only with a github-api
+// entry, pull requests write; a suspension; another App's installation). A
+// catalog repository the installation lacks needs no check here: its mint
+// already fails.
+func (m *Minter) verifyScope(ctx context.Context, app App, want Scope) findings {
+	var f findings
 	if m.Signer == nil || app.AppID <= 0 || app.InstallationID <= 0 {
-		return nil, ErrUnavailable
+		f.reach = append(f.reach, "repositories unreadable")
+		return f
 	}
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	jwt, err := m.jwt(ctx, app.AppID)
 	if err != nil {
-		return nil, err
+		f.reach = append(f.reach, "repositories unreadable")
+		return f
 	}
 	api, client := m.api(), m.client()
 	installation := api + "/app/installations/" + strconv.FormatInt(app.InstallationID, 10)
@@ -121,18 +160,17 @@ func (m *Minter) verifyScope(ctx context.Context, app App, want Scope) ([]string
 		Permissions         map[string]string `json:"permissions"`
 		SuspendedAt         *time.Time        `json:"suspended_at"`
 	}
-	var warnings []string
 	if err := m.githubJSON(ctx, client, http.MethodGet, installation, jwt, nil, http.StatusOK, &settings); err != nil {
-		warnings = append(warnings, "settings unreadable")
+		f.settings = append(f.settings, "settings unreadable")
 	} else {
 		if settings.RepositorySelection == "all" {
-			return nil, fmt.Errorf("%w: installed on all repositories", errScope)
+			f.reach = append(f.reach, "installed on all repositories")
 		}
 		if settings.AppID != app.AppID {
-			warnings = append(warnings, "belongs to another app")
+			f.settings = append(f.settings, "belongs to another app")
 		}
 		if settings.SuspendedAt != nil {
-			warnings = append(warnings, "suspended")
+			f.settings = append(f.settings, "suspended")
 		}
 		for _, name := range sortedKeys(settings.Permissions) {
 			level := settings.Permissions[name]
@@ -141,7 +179,7 @@ func (m *Minter) verifyScope(ctx context.Context, app App, want Scope) ([]string
 				name == "contents" && (level == "read" || level == "write"),
 				name == "pull_requests" && want.PullRequests && level == "write":
 			default:
-				warnings = append(warnings, "holds "+name+" "+level)
+				f.settings = append(f.settings, "holds "+name+" "+level)
 			}
 		}
 	}
@@ -153,11 +191,9 @@ func (m *Minter) verifyScope(ctx context.Context, app App, want Scope) ([]string
 		ExpiresAt time.Time `json:"expires_at"`
 	}
 	body, _ := json.Marshal(map[string]any{"permissions": map[string]string{"metadata": "read"}})
-	if err := m.githubJSON(ctx, client, http.MethodPost, installation+"/access_tokens", jwt, body, http.StatusCreated, &listing); err != nil {
-		return warnings, err
-	}
-	if !tokenShape(listing.Token) {
-		return warnings, ErrUnavailable
+	if err := m.githubJSON(ctx, client, http.MethodPost, installation+"/access_tokens", jwt, body, http.StatusCreated, &listing); err != nil || !tokenShape(listing.Token) {
+		f.reach = append(f.reach, "repositories unreadable")
+		return f
 	}
 	defer m.revoke(api, client, listing.Token)
 
@@ -165,10 +201,12 @@ func (m *Minter) verifyScope(ctx context.Context, app App, want Scope) ([]string
 	for _, r := range want.Repos {
 		allowed[strings.ToLower(r)] = true
 	}
+	// Every page, however many repositories the installation holds; only the
+	// names outside the catalog are kept, and only a few of those are named.
+	const named = 5
+	var extra []string
+	extraCount := 0
 	for page := 1; ; page++ {
-		if page > scopeMaxPages {
-			return warnings, fmt.Errorf("%w: more than %d repositories", errScope, scopeMaxPages*100)
-		}
 		var repos struct {
 			TotalCount   int `json:"total_count"`
 			Repositories []struct {
@@ -177,17 +215,29 @@ func (m *Minter) verifyScope(ctx context.Context, app App, want Scope) ([]string
 		}
 		url := api + "/installation/repositories?per_page=100&page=" + strconv.Itoa(page)
 		if err := m.githubJSON(ctx, client, http.MethodGet, url, listing.Token, nil, http.StatusOK, &repos); err != nil {
-			return warnings, err
+			f.reach = append(f.reach, "repositories unreadable")
+			return f
 		}
 		for _, r := range repos.Repositories {
 			if !allowed[strings.ToLower(r.FullName)] {
-				return warnings, fmt.Errorf("%w: installed on %s", errScope, r.FullName)
+				extraCount++
+				if len(extra) < named {
+					extra = append(extra, r.FullName)
+				}
 			}
 		}
 		if len(repos.Repositories) < 100 || page*100 >= repos.TotalCount {
-			return warnings, nil
+			break
 		}
 	}
+	if extraCount > 0 {
+		reason := "installed on " + strings.Join(extra, ", ")
+		if extraCount > len(extra) {
+			reason += fmt.Sprintf(" and %d more", extraCount-len(extra))
+		}
+		f.reach = append(f.reach, reason)
+	}
+	return f
 }
 
 // githubJSON makes one GitHub API call and decodes the reply. Any other status

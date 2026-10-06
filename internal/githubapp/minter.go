@@ -91,7 +91,10 @@ type Minter struct {
 	// Scope returns what the catalog grants an installation; tokens are
 	// refused while the installation on GitHub is wider (see scope.go).
 	Scope func(installation int64) Scope
-	Log   *slog.Logger
+	// ScopeMode decides what an installation beyond the catalog does: empty
+	// or ScopeRefuse stops its tokens, ScopeWarn reports and serves.
+	ScopeMode ScopeMode
+	Log       *slog.Logger
 
 	scopeMu sync.Mutex
 	scopes  map[int64]scopeVerdict

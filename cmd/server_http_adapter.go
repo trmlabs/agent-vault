@@ -137,7 +137,11 @@ func httpHeaderAdapter(ctx context.Context, srv *server.Server, getenv func(stri
 		if api != "" && !strings.HasPrefix(api, "https://") {
 			return nil, fmt.Errorf("AGENT_VAULT_GITHUB_API_URL must be https")
 		}
-		minter := &githubapp.Minter{Signer: signer, API: api, Log: srv.Logger(), Scope: func(installation int64) githubapp.Scope {
+		scopeMode, err := githubapp.ParseScopeMode(getenv("AGENT_VAULT_GITHUB_APP_SCOPE"))
+		if err != nil {
+			return nil, err
+		}
+		minter := &githubapp.Minter{Signer: signer, API: api, Log: srv.Logger(), ScopeMode: scopeMode, Scope: func(installation int64) githubapp.Scope {
 			repos, pullRequests := source.Current().GitScope(installation)
 			return githubapp.Scope{Repos: repos, PullRequests: pullRequests}
 		}}
