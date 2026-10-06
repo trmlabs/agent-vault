@@ -46,7 +46,7 @@ func readStartup(backend *pgproto3.Backend, conn net.Conn) (*pgproto3.StartupMes
 // admit, when set, runs after the token has arrived and before the store is
 // asked about it, so a client slow to send its token holds no admission slot.
 func authenticateAgent(ctx context.Context, backend *pgproto3.Backend, auth AgentAuthenticator, startup *pgproto3.StartupMessage,
-	admit func() (context.Context, error)) (*AgentScope, string, error) {
+	admit func() (context.Context, context.CancelFunc, error)) (*AgentScope, string, error) {
 	backend.Send(&pgproto3.AuthenticationCleartextPassword{})
 	if err := backend.Flush(); err != nil {
 		return nil, "", fmt.Errorf("request agent token: %w", err)
@@ -68,10 +68,11 @@ func authenticateAgent(ctx context.Context, backend *pgproto3.Backend, auth Agen
 	}
 
 	if admit != nil {
-		admitted, err := admit()
+		admitted, cancel, err := admit()
 		if err != nil {
 			return nil, "", err
 		}
+		defer cancel()
 		ctx = admitted
 	}
 	// An optional startup parameter lets an instance-scoped token name its vault,

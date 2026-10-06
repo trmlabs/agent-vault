@@ -611,20 +611,18 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	// together. Authentication then has its own startup budget.
 	releaseAdmission := func() {}
 	defer func() { releaseAdmission() }()
-	authCtx, authCancel := startupCtx, startupCancel
-	admit := func() (context.Context, error) {
+	admit := func() (context.Context, context.CancelFunc, error) {
 		release, ok := b.acquireAdmission(baseCtx)
 		if !ok {
-			return nil, errAdmissionQueue
+			return nil, nil, errAdmissionQueue
 		}
 		releaseAdmission = release
-		startupCancel()
-		authCtx, authCancel = context.WithTimeout(baseCtx, b.opts.StartupTimeout)
 		_ = conn.SetDeadline(time.Now().Add(b.opts.StartupTimeout))
-		return authCtx, nil
+		ctx, cancel := context.WithTimeout(baseCtx, b.opts.StartupTimeout) // #nosec G118 -- authenticateAgent defers the returned cancel.
+		return ctx, cancel, nil
 	}
 	scope, token, err := authenticateAgent(startupCtx, backend, b.authenticator(peer), startup, admit)
-	authCancel()
+	startupCancel()
 	if errors.Is(err, errAdmissionQueue) {
 		b.logger.Warn("pgproxy: admission queue wait exceeded; refusing session",
 			slog.String("stage", "admission_queue"), slog.Int("concurrency", b.opts.AdmissionConcurrency))
