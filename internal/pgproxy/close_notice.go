@@ -1,6 +1,9 @@
 package pgproxy
 
 import (
+	"context"
+	"errors"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -108,4 +111,26 @@ func (b *Broker) endConnLocked(conn net.Conn, n closeNotice) {
 	}
 	b.logger.Info("pgproxy: connection closed during its handshake without a notice", "reason", n.reason)
 	_ = conn.Close()
+}
+
+// errorClass names an error's kind for a log line without its text, which
+// can carry addresses or database messages.
+func errorClass(err error) string {
+	var netErr net.Error
+	switch {
+	case err == nil:
+		return "none"
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return "eof"
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return "context"
+	case errors.As(err, &netErr) && netErr.Timeout():
+		return "timeout"
+	case errors.As(err, &netErr):
+		return "network"
+	case errors.Is(err, errPoolBudget):
+		return "budget"
+	default:
+		return "other"
+	}
 }
