@@ -154,6 +154,21 @@ func TestAttestAdmitsPoolPodWithItsDeadline(t *testing.T) {
 	}
 }
 
+// The run Cursor's spawn hook recorded on the live Pod rides on the scope, read
+// fresh at each admission; a Pod without one carries none.
+func TestAttestCarriesTheClaimedRun(t *testing.T) {
+	f := setupPool(t)
+	scope, err := f.r.Attest(context.Background(), f.token(f.c), workerIP)
+	if err != nil || scope.ClaimedRun != "" {
+		t.Fatalf("no annotation: %+v %v", scope, err)
+	}
+	f.pod["metadata"].(map[string]any)["annotations"] = map[string]any{brokercore.CursorRunAnnotation: "bc-1", "other": "x"}
+	scope, err = f.r.Attest(context.Background(), f.token(f.c), workerIP)
+	if err != nil || scope.ClaimedRun != "bc-1" {
+		t.Fatalf("annotated: %+v %v", scope, err)
+	}
+}
+
 func TestAttestRefusals(t *testing.T) {
 	cases := map[string]func(f *poolFixture) (string, netip.Addr){
 		"stolen token from another address": func(f *poolFixture) (string, netip.Addr) {

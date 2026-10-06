@@ -56,10 +56,13 @@ type Requester struct {
 // (session_pod_mismatch), and without a binder or a Pod the session is
 // refused (session_unbindable).
 //
-// A Cursor worker Pod can serve several runs in its life and they share its
-// workspace, so a cursor-session Pod is also pinned to the first run owner it
-// presents: a run by anyone else on that Pod is refused (session_pod_owner).
-func Resolve(ctx context.Context, pool httpcatalog.Pool, session, pod string, v Verifier, b Binder) (Requester, string) {
+// A Cursor token is a bearer credential any process on a worker can mint for
+// that worker's run, so it counts only on the Pod the spawn hook created for
+// that run: its run must equal claimedRun, the run the controller recorded on
+// the live Pod (session_run). And since runs on one Pod share its workspace, a
+// cursor-session Pod is also pinned to the first run owner it presents: a run
+// by anyone else on that Pod is refused (session_pod_owner).
+func Resolve(ctx context.Context, pool httpcatalog.Pool, session, pod, claimedRun string, v Verifier, b Binder) (Requester, string) {
 	who := Requester{Kind: "none"}
 	requester := pool.Profile().RequesterKind()
 	// Only a session sidecar relays a session. One arriving on any other
@@ -94,9 +97,13 @@ func Resolve(ctx context.Context, pool httpcatalog.Pool, session, pod string, v 
 			return who, "session_token"
 		}
 		who.TokenSHA256 = s.TokenSHA256
-		// A Cursor token is bound to the broker's teams and audience instead.
+		// A Cursor token is bound to the broker's teams and audience instead,
+		// and to the run the controller started this Pod for.
 		if !cursor && !s.InPool(pool.CCPoolID) {
 			return who, "session_pool"
+		}
+		if cursor && (claimedRun == "" || s.Run != claimedRun) {
+			return who, "session_run"
 		}
 		if b == nil || pod == "" {
 			return who, "session_unbindable"

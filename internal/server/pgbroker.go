@@ -69,7 +69,7 @@ func (a agentAuthAdapter) AuthenticatePeer(ctx context.Context, token, vaultHint
 
 func agentScope(scope *brokercore.ProxyScope) *pgproxy.AgentScope {
 	return &pgproxy.AgentScope{VaultID: scope.VaultID, VaultName: scope.VaultName, ActorID: scope.ActorID(), WorkloadID: scope.WorkloadID, NotAfter: scope.NotAfter, Pool: scope.Pool,
-		IdentityKind: scope.IdentityKind}
+		IdentityKind: scope.IdentityKind, ClaimedRun: scope.ClaimedRun}
 }
 
 // DatabaseServiceConfig is one configured upstream database within a vault, as
