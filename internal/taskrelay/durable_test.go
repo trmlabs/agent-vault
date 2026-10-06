@@ -91,8 +91,8 @@ func newActivityBroker(t *testing.T) *activityBroker {
 				}
 			}
 			b.mu.Unlock()
-			b.records.Add(1)
-			w.WriteHeader(http.StatusNoContent)
+			n := b.records.Add(1)
+			json.NewEncoder(w).Encode(map[string]any{"seq": n, "lost": false})
 		case r.Method == http.MethodPost && r.URL.Path == activityReadPath && !b.failRead.Load():
 			var body struct{ After string }
 			json.NewDecoder(r.Body).Decode(&body)
@@ -104,7 +104,7 @@ func newActivityBroker(t *testing.T) *activityBroker {
 				}
 			}
 			sort.Strings(owners)
-			page := map[string]any{"retentionSeconds": 7200, "next": ""}
+			page := map[string]any{"retentionSeconds": 7200, "next": "", "seq": b.records.Load()}
 			if !b.history.IsZero() {
 				page["historyStarted"] = b.history
 			}
@@ -204,24 +204,27 @@ func TestDurableActivityOutlivesTheReplica(t *testing.T) {
 	}
 }
 
-// Only newer times are reported, a failed report is retried, and the last
-// one goes out when the relay stops.
+// Nothing is sent while nothing is new; only newer times are reported, each
+// accepted report's sequence is remembered, a failed report is retried, and
+// the last one goes out when the relay stops.
 func TestDurableActivityReportsNewerTimesAndOnStop(t *testing.T) {
 	broker := newActivityBroker(t)
 	f := newRelayFixture(t)
 	a := newActivity(time.Now(), time.Hour)
 	d := &durable{activity: a, upstream: broker.upstream(f.upstream(t, "")), interval: time.Hour}
-	// With nothing to report, the first report still starts the history.
-	if e := d.push(context.Background()); e != nil || broker.records.Load() != 1 || broker.history.IsZero() {
-		t.Fatalf("empty first report: %v", e)
+	if e := d.push(context.Background()); e != nil || broker.records.Load() != 0 {
+		t.Fatalf("an idle replica reported: %v", e)
 	}
-	if e := d.push(context.Background()); e != nil || broker.records.Load() != 1 {
-		t.Fatal("an empty report was repeated")
+	if acked, first := d.verification(); acked != 0 || !first.IsZero() {
+		t.Fatalf("acknowledged before any report: %d %v", acked, first)
 	}
 	now := time.Now().UTC()
 	a.record("ns", "sb-1", now.Add(-time.Minute))
-	if e := d.push(context.Background()); e != nil || broker.records.Load() != 2 {
+	if e := d.push(context.Background()); e != nil || broker.records.Load() != 1 {
 		t.Fatalf("first report: %v", e)
+	}
+	if acked, first := d.verification(); acked != 1 || time.Since(first) > time.Minute {
+		t.Fatalf("first acknowledgment: %d %v", acked, first)
 	}
 	if rows := a.pending(); len(rows) != 0 {
 		t.Fatalf("accepted rows still pending: %v", rows)

@@ -147,6 +147,8 @@ func Run(parent context.Context, c FixedConfig) (result error) {
 			_ = l.Close()
 		}
 		r.wg.Wait()
+		// Every session has ended: log the counts the next window would have.
+		r.closes.flush(r.log)
 		if audit.record("relay", "terminal") != nil {
 			result = errDenied
 		}
