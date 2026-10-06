@@ -178,7 +178,9 @@ func ValidMount(mount string) bool { return len(mount) <= 127 && vaultMount.Matc
 
 // Environment, when set (AGENT_VAULT_CATALOG_ENVIRONMENT, such as staging),
 // requires every database role to be that environment's named role:
-// <env>.<region>.<cluster>.<name>-readonly or -readwrite.
+// <env>.<region>.<cluster>.<name>-readonly or -readwrite, or the
+// Gatehouse-only role for the same connection, the same name prefixed with
+// "gatehouse-".
 var Environment atomic.Value // string
 
 func environment() string {
@@ -197,7 +199,7 @@ func validRole(role string) bool {
 	if env == "" {
 		return rolesWithoutEnvironment && vaultSegment.MatchString(role)
 	}
-	pattern := `^` + regexp.QuoteMeta(env) + `\.[a-z]+\.[a-z0-9]+\.[a-z0-9-]+-(readonly|readwrite)$`
+	pattern := `^(gatehouse-)?` + regexp.QuoteMeta(env) + `\.[a-z]+\.[a-z0-9]+\.[a-z0-9-]+-(readonly|readwrite)$`
 	return regexp.MustCompile(pattern).MatchString(role)
 }
 
