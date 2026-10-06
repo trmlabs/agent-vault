@@ -30,13 +30,17 @@ type fakeJanitorAPI struct {
 	throttle atomic.Int32
 	failName string
 	lists    atomic.Int32
+	// scaled and progressed are the proxy autoscaler's lastScaleTime and the
+	// Deployment's Progressing lastUpdateTime; scaleStatus answers both reads.
+	scaled, progressed time.Time
+	scaleStatus        int
 }
 
 const tenantNS = "developers-sandboxes"
 
 func newFakeJanitorAPI(t *testing.T, f *relayFixture) *fakeJanitorAPI {
 	t.Helper()
-	api := &fakeJanitorAPI{deleted: map[string]bool{}}
+	api := &fakeJanitorAPI{deleted: map[string]bool{}, scaled: time.Now().Add(-3 * time.Hour), progressed: time.Now().Add(-3 * time.Hour)}
 	api.srv = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer synthetic-reviewer" {
 			w.WriteHeader(403)
@@ -52,6 +56,20 @@ func newFakeJanitorAPI(t *testing.T, f *relayFixture) *fakeJanitorAPI {
 			items := append([]map[string]any(nil), api.replicas...)
 			api.mu.Unlock()
 			json.NewEncoder(w).Encode(map[string]any{"metadata": map[string]any{}, "items": items})
+		case r.Method == "GET" && r.URL.Path == "/apis/autoscaling/v2/namespaces/gatehouse-proxy/horizontalpodautoscalers/gatehouse-proxy":
+			if api.scaleStatus != 0 {
+				w.WriteHeader(api.scaleStatus)
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]any{"status": map[string]any{"lastScaleTime": api.scaled.UTC().Format(time.RFC3339)}})
+		case r.Method == "GET" && r.URL.Path == "/apis/apps/v1/namespaces/gatehouse-proxy/deployments/gatehouse-proxy":
+			if api.scaleStatus != 0 {
+				w.WriteHeader(api.scaleStatus)
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]any{"status": map[string]any{"conditions": []any{
+				map[string]any{"type": "Available", "lastUpdateTime": time.Now().UTC().Format(time.RFC3339)},
+				map[string]any{"type": "Progressing", "lastUpdateTime": api.progressed.UTC().Format(time.RFC3339)}}}})
 		case r.Method == "GET" && r.URL.Path == "/apis/agents.x-k8s.io/v1beta1/namespaces/"+tenantNS+"/sandboxes":
 			api.lists.Add(1)
 			limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
@@ -119,14 +137,14 @@ func replicaPod(name, ip string) map[string]any {
 }
 
 // activityServer is one proxy replica's admin listener.
-func activityServer(t *testing.T, started time.Time, pods ...PodActivity) *httptest.Server {
+func activityServer(t *testing.T, started time.Time, sandboxes ...SandboxActivity) *httptest.Server {
 	t.Helper()
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != ActivityPath {
 			w.WriteHeader(404)
 			return
 		}
-		json.NewEncoder(w).Encode(ActivityReport{ReplicaStarted: started, Pods: pods})
+		json.NewEncoder(w).Encode(ActivityReport{ReplicaStarted: started, RetentionSeconds: 86400, Sandboxes: sandboxes})
 	}))
 	t.Cleanup(s.Close)
 	return s
@@ -149,8 +167,8 @@ func newJanitor(t *testing.T, replicas map[string]*httptest.Server) *janitorFixt
 	}
 	c := JanitorConfig{Namespaces: []string{tenantNS}, IdleSeconds: 3600, DeleteConcurrency: 64, ListPageSize: 500,
 		ProxyNamespace: "gatehouse-proxy", ProxyLabels: map[string]string{"app": "gatehouse-proxy"}, AdminPort: 8081,
-		SandboxAPIVersion: "agents.x-k8s.io/v1beta1",
-		Kubernetes:        KubernetesConfig{APIURL: api.srv.URL, CAFile: f.c.Kubernetes.CAFile, ReviewerTokenFile: f.c.Kubernetes.ReviewerTokenFile}}
+		SandboxAPIVersion: "agents.x-k8s.io/v1beta1", ProxyAutoscaler: "gatehouse-proxy", ProxyDeployment: "gatehouse-proxy",
+		Kubernetes: KubernetesConfig{APIURL: api.srv.URL, CAFile: f.c.Kubernetes.CAFile, ReviewerTokenFile: f.c.Kubernetes.ReviewerTokenFile}}
 	if e := c.validate(); e != nil {
 		t.Fatal(e)
 	}
@@ -186,9 +204,9 @@ func (jf *janitorFixture) events(t *testing.T, name string) []map[string]any {
 // leaving ones are kept.
 func TestJanitorClearsTwelveThousandInOnePass(t *testing.T) {
 	old := time.Now().Add(-2 * time.Hour)
-	var recent []PodActivity
+	var recent []SandboxActivity
 	for i := 0; i < 12000; i += 4 { // every fourth Sandbox was used 5 minutes ago, on one replica or the other
-		recent = append(recent, PodActivity{Namespace: tenantNS, PodUID: fmt.Sprintf("pod-%d", i), OwnerUID: fmt.Sprintf("uid-sb-%05d", i),
+		recent = append(recent, SandboxActivity{Namespace: tenantNS, OwnerUID: fmt.Sprintf("uid-sb-%05d", i),
 			LastSeen: time.Now().Add(-5 * time.Minute)})
 	}
 	jf := newJanitor(t, map[string]*httptest.Server{
@@ -229,14 +247,20 @@ func TestJanitorClearsTwelveThousandInOnePass(t *testing.T) {
 	}
 }
 
-// Any doubt deletes nothing: a replica that does not answer, a replica
-// younger than the idle time, or no replica at all.
-func TestJanitorDeletesNothingInDoubt(t *testing.T) {
+// A fault deletes nothing and fails the run: a replica that does not answer,
+// one whose retention is shorter than the idle time, no replica at all, or a
+// scale record that cannot be read.
+func TestJanitorDeletesNothingOnAFault(t *testing.T) {
 	old := time.Now().Add(-2 * time.Hour)
+	short := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(ActivityReport{ReplicaStarted: old, RetentionSeconds: 600})
+	}))
+	t.Cleanup(short.Close)
 	for name, replicas := range map[string]map[string]*httptest.Server{
-		"silent replica": {"10.0.0.1": activityServer(t, old), "10.0.0.9": nil},
-		"young replica":  {"10.0.0.1": activityServer(t, old), "10.0.0.2": activityServer(t, time.Now().Add(-10*time.Minute))},
-		"no replica":     {},
+		"silent replica":          {"10.0.0.1": activityServer(t, old), "10.0.0.9": nil},
+		"short retention":         {"10.0.0.1": activityServer(t, old), "10.0.0.2": short},
+		"no replica":              {},
+		"unreadable scale record": {"10.0.0.1": activityServer(t, old)},
 	} {
 		t.Run(name, func(t *testing.T) {
 			live := map[string]*httptest.Server{}
@@ -251,11 +275,69 @@ func TestJanitorDeletesNothingInDoubt(t *testing.T) {
 					jf.api.replicas = append(jf.api.replicas, replicaPod("proxy-"+ip, ip))
 				}
 			}
+			if name == "unreadable scale record" {
+				jf.api.scaleStatus = 403
+			}
 			jf.api.sandboxes = []map[string]any{janitorSandbox(1, 3*time.Hour)}
 			if e := jf.j.pass(context.Background()); e == nil || len(jf.api.deleted) != 0 {
 				t.Fatalf("deleted %d, error %v", len(jf.api.deleted), e)
 			}
 		})
+	}
+}
+
+// An expected pause deletes nothing, logs why and succeeds: a replica
+// younger than the idle time, or a proxy autoscale or Deployment change
+// within it.
+func TestJanitorHoldsAfterAProxyChange(t *testing.T) {
+	old := time.Now().Add(-2 * time.Hour)
+	for reason, setup := range map[string]func(jf *janitorFixture){
+		"proxy_replica_young":      func(*janitorFixture) {},
+		"proxy_autoscaled":         func(jf *janitorFixture) { jf.api.scaled = time.Now().Add(-10 * time.Minute) },
+		"proxy_deployment_changed": func(jf *janitorFixture) { jf.api.progressed = time.Now().Add(-10 * time.Minute) },
+	} {
+		t.Run(reason, func(t *testing.T) {
+			started := old
+			if reason == "proxy_replica_young" {
+				started = time.Now().Add(-10 * time.Minute)
+			}
+			jf := newJanitor(t, map[string]*httptest.Server{"10.0.0.1": activityServer(t, old), "10.0.0.2": activityServer(t, started)})
+			setup(jf)
+			jf.api.sandboxes = []map[string]any{janitorSandbox(1, 3*time.Hour)}
+			if e := jf.j.pass(context.Background()); e != nil || len(jf.api.deleted) != 0 {
+				t.Fatalf("deleted %d, error %v", len(jf.api.deleted), e)
+			}
+			if pass := jf.events(t, "janitor_pass"); len(pass) != 1 || pass[0]["held"] != reason {
+				t.Fatalf("pass line %v", pass)
+			}
+		})
+	}
+	// Without the two names configured, neither record is read.
+	jf := newJanitor(t, map[string]*httptest.Server{"10.0.0.1": activityServer(t, old)})
+	jf.j.config.ProxyAutoscaler, jf.j.config.ProxyDeployment = "", ""
+	jf.api.scaleStatus = 403
+	jf.api.sandboxes = []map[string]any{janitorSandbox(1, 3*time.Hour)}
+	if e := jf.j.pass(context.Background()); e != nil || len(jf.api.deleted) != 1 {
+		t.Fatalf("unconfigured scale records: deleted %d, error %v", len(jf.api.deleted), e)
+	}
+}
+
+// Throttled retries are spread: never before Retry-After, at most twice it,
+// and with no Retry-After anywhere from zero up to the exponential bound.
+func TestJanitorBackoffJitters(t *testing.T) {
+	seen := map[time.Duration]bool{}
+	for range 200 {
+		d := defaultBackoff(0, "2")
+		if d < 2*time.Second || d >= 4*time.Second {
+			t.Fatalf("Retry-After 2: waited %v", d)
+		}
+		seen[d] = true
+		if e := defaultBackoff(3, ""); e < 0 || e >= 2*time.Second {
+			t.Fatalf("attempt 3: waited %v", e)
+		}
+	}
+	if len(seen) < 100 {
+		t.Fatalf("only %d distinct waits in 200: no jitter", len(seen))
 	}
 }
 
@@ -297,6 +379,8 @@ func TestJanitorConfigValidation(t *testing.T) {
 		"plain API":           func(c *JanitorConfig) { c.Kubernetes.APIURL = "http://x" },
 		"core API version":    func(c *JanitorConfig) { c.SandboxAPIVersion = "v1" },
 		"bad admin port":      func(c *JanitorConfig) { c.AdminPort = 0 },
+		"bad autoscaler name": func(c *JanitorConfig) { c.ProxyAutoscaler = "Gatehouse_Proxy" },
+		"bad deployment name": func(c *JanitorConfig) { c.ProxyDeployment = "gatehouse/proxy" },
 	} {
 		c := good
 		c.Namespaces = append([]string(nil), good.Namespaces...)
@@ -304,5 +388,20 @@ func TestJanitorConfigValidation(t *testing.T) {
 		if c.validate() == nil {
 			t.Errorf("%s: accepted", name)
 		}
+	}
+}
+
+// The rendered config, with the proxy's autoscaler and Deployment named,
+// loads.
+func TestJanitorConfigLoadsTheScaleRecords(t *testing.T) {
+	jf := newJanitor(t, nil)
+	b, _ := json.Marshal(jf.j.config)
+	if !bytes.Contains(b, []byte(`"proxyAutoscaler":"gatehouse-proxy"`)) || !bytes.Contains(b, []byte(`"proxyDeployment":"gatehouse-proxy"`)) {
+		t.Fatalf("field names: %s", b)
+	}
+	path := t.TempDir() + "/janitor.json"
+	writeTestFile(t, path, b)
+	if c, e := LoadJanitorConfig(path); e != nil || c.ProxyAutoscaler != "gatehouse-proxy" || c.ProxyDeployment != "gatehouse-proxy" {
+		t.Fatalf("load: %v %+v", e, c)
 	}
 }
