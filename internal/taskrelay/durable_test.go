@@ -36,6 +36,8 @@ type activityBroker struct {
 	history time.Time
 	// streams is each replica's report sequence.
 	streams map[string]int64
+	// onRead, if set, runs after a read takes its view.
+	onRead func()
 	// tunnels are the open CONNECT tunnels, for dropTunnels.
 	tunnels []net.Conn
 }
@@ -124,7 +126,11 @@ func newActivityBroker(t *testing.T) *activityBroker {
 				}
 				rows = append(rows, b.rows[owner])
 			}
+			onRead := b.onRead
 			b.mu.Unlock()
+			if onRead != nil {
+				onRead()
+			}
 			page["sandboxes"] = rows
 			json.NewEncoder(w).Encode(page)
 		default:
@@ -370,5 +376,37 @@ func TestDurableActivityForgetsAnOldAcknowledgment(t *testing.T) {
 				t.Fatalf("verification: %d %v, want %d", acked, first, tc.acked)
 			}
 		})
+	}
+}
+
+// A report acknowledged while the full report reads the broker's view is not
+// a loss: the acknowledgment is read before the view.
+func TestDurableActivityReportDuringTheReadIsNoLoss(t *testing.T) {
+	broker := newActivityBroker(t)
+	f := newRelayFixture(t)
+	a := newActivity(time.Now(), time.Hour)
+	used := time.Now().Add(-time.Minute).UTC().Truncate(time.Millisecond)
+	a.record("ns", "sb-1", used)
+	a.accepted(a.pending())
+	d := &durable{activity: a, upstream: broker.upstream(f.upstream(t, "")), interval: time.Hour, replica: "aaaa0001", acked: 5, lastAcked: time.Now(), keep: 2 * time.Hour}
+	a.durable = d
+	broker.mu.Lock()
+	broker.rows["sb-1"] = SandboxActivity{Namespace: "ns", OwnerUID: "sb-1", LastSeen: used}
+	broker.streams["aaaa0001"] = 5
+	// This replica's next report lands just after the view was taken.
+	broker.onRead = func() {
+		d.mu.Lock()
+		d.acked = 6
+		d.mu.Unlock()
+	}
+	broker.mu.Unlock()
+	if r := a.withDurable(context.Background(), a.report(time.Now())); !r.Durable {
+		t.Fatalf("view not read: %+v", r)
+	}
+	d.mu.Lock()
+	owed := d.lossOwed
+	d.mu.Unlock()
+	if owed || len(a.pending()) != 0 {
+		t.Fatalf("a report during the read read as a loss: owed %v, pending %v", owed, a.pending())
 	}
 }
