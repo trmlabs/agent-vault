@@ -62,7 +62,35 @@ type UpstreamConfig struct {
 	// broker can verify the person behind the session. A missing or empty
 	// file sends nothing.
 	SessionFile string `json:"sessionFile,omitempty"`
+	// SessionSocketDir, in self mode and instead of SessionFile, is the
+	// Cursor worker's identity socket directory (<data dir>/identity). The
+	// relay mints the claimed run's identity token for SessionAudience from
+	// the one socket there and sends it as SessionFile's token is sent. No
+	// claim, or more than one socket, sends nothing.
+	SessionSocketDir string `json:"sessionSocketDir,omitempty"`
+	SessionAudience  string `json:"sessionAudience,omitempty"`
 }
+
+// hasSession reports whether the upstream relays a session in any form.
+func (u UpstreamConfig) hasSession() bool {
+	return u.SessionFile != "" || u.SessionSocketDir != "" || u.SessionAudience != ""
+}
+
+// validSession checks a self-mode session source: one absolute source, and an
+// audience exactly when the source is a Cursor socket directory.
+func (u UpstreamConfig) validSession() bool {
+	if u.SessionFile != "" && u.SessionSocketDir != "" {
+		return false
+	}
+	if u.SessionFile != "" && !strings.HasPrefix(u.SessionFile, "/") {
+		return false
+	}
+	if u.SessionSocketDir == "" {
+		return u.SessionAudience == ""
+	}
+	return strings.HasPrefix(u.SessionSocketDir, "/") && sessionAudience.MatchString(u.SessionAudience)
+}
+
 type ConnectConfig struct {
 	Listen         string         `json:"listen"`
 	Upstream       UpstreamConfig `json:"upstream"`
@@ -82,6 +110,9 @@ type BrowserConfig struct {
 
 var safeName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,252}$`)
 var containerName = regexp.MustCompile(`^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$`)
+
+// sessionAudience matches the broker's AGENT_VAULT_CURSOR_AUDIENCE pattern.
+var sessionAudience = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,252}$`)
 var errConfig = errors.New("invalid fixed task relay configuration")
 
 // LoadConfig rejects unknown fields, trailing data and oversized configuration.
@@ -116,11 +147,11 @@ func (c FixedConfig) Validate(now time.Time) error {
 	if c.Self {
 		return c.validateSelf(now)
 	}
-	if (c.Connect != nil && c.Connect.Upstream.SessionFile != "") || c.Browser != nil && c.Browser.Upstream.SessionFile != "" {
+	if (c.Connect != nil && c.Connect.Upstream.hasSession()) || c.Browser != nil && c.Browser.Upstream.hasSession() {
 		return errConfig // only a sidecar in the session's own Pod forwards its token
 	}
 	for _, p := range c.postgresBindings() {
-		if p.Upstream.SessionFile != "" {
+		if p.Upstream.hasSession() {
 			return errConfig
 		}
 	}
@@ -179,11 +210,11 @@ func (c FixedConfig) Validate(now time.Time) error {
 
 // validateSelf allows only loopback listeners, no browser and no pairing input.
 func (c FixedConfig) validateSelf(now time.Time) error {
-	if c.Connect != nil && c.Connect.Upstream.SessionFile != "" && !strings.HasPrefix(c.Connect.Upstream.SessionFile, "/") {
+	if c.Connect != nil && !c.Connect.Upstream.validSession() {
 		return errConfig
 	}
 	for _, p := range c.postgresBindings() {
-		if p.Upstream.SessionFile != "" && !strings.HasPrefix(p.Upstream.SessionFile, "/") {
+		if !p.Upstream.validSession() {
 			return errConfig
 		}
 	}

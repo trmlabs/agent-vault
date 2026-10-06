@@ -104,9 +104,10 @@ type Pool struct {
 	Name           string `json:"name"`
 	Namespace      string `json:"namespace"`
 	ServiceAccount string `json:"serviceAccount"`
-	// Identity says who can stand behind a request: "none" (Cursor; the
-	// default), "claude-session" (a runner session token naming the person)
-	// or "workload" (CI and automation: Entitlements, never a person).
+	// Identity says who can stand behind a request: "none" (the default),
+	// "claude-session" (a runner session token naming the person),
+	// "cursor-session" (a Cursor run's identity token naming the person) or
+	// "workload" (CI and automation: Entitlements, never a person).
 	Identity string `json:"identity,omitempty"`
 	// Ceiling is the highest tier the pool may reach (default T0). "external"
 	// is below T0: the pool's workers may reach nothing, and no entry may
@@ -869,6 +870,12 @@ func (p Pool) validate() error {
 		if !ccpoolID.MatchString(p.CCPoolID) || len(p.Entitlements) != 0 {
 			return fmt.Errorf("a claude-session pool needs its ccpool_ ID and takes no fixed entitlements")
 		}
+	case "cursor-session":
+		// The broker's Cursor teams and audience bind the token; no session
+		// start gate exists for Cursor, so a base group would promise nothing.
+		if p.CCPoolID != "" || p.BaseGroup != "" || len(p.Entitlements) != 0 {
+			return fmt.Errorf("a cursor-session pool takes no ccpool_ ID, base group or fixed entitlements")
+		}
 	case "workload":
 		if p.CCPoolID != "" || p.BaseGroup != "" || tierRank[p.Ceiling] > 1 {
 			return fmt.Errorf("a workload pool takes fixed entitlements only and never reaches T2")
@@ -922,7 +929,7 @@ func grantable(e Entry, p Pool, defined bool) error {
 		return fmt.Errorf("%s exceeds the pool's ceiling", e.Tier)
 	}
 	switch p.Identity {
-	case "claude-session":
+	case "claude-session", "cursor-session":
 		return nil
 	case "workload":
 		if rank >= 2 {

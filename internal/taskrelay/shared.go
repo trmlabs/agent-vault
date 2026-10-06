@@ -135,7 +135,7 @@ func (c FixedConfig) validateShared(now time.Time) error {
 	}
 	used := map[string]bool{}
 	check := func(listen string, upstream UpstreamConfig) error {
-		if !validAddress(listen) || used[listen] || upstream.SessionFile != "" || !validAddress(upstream.Address) || upstream.ServerName == "" || upstream.CAFile == "" || upstream.ProofFile == "" || upstream.Audience == "" {
+		if !validAddress(listen) || used[listen] || upstream.hasSession() || !validAddress(upstream.Address) || upstream.ServerName == "" || upstream.CAFile == "" || upstream.ProofFile == "" || upstream.Audience == "" {
 			return errConfig
 		}
 		used[listen] = true

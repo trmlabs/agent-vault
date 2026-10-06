@@ -5,6 +5,7 @@ package authorize
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/Infisical/agent-vault/internal/entitlement"
@@ -16,6 +17,17 @@ import (
 type Verifier interface {
 	Verify(context.Context, string) (runnerid.Session, error)
 }
+
+// CursorVerifier checks a Cursor run's identity token. A Verifier that also
+// implements it (runnerid.Verifiers) serves cursor-session pools.
+type CursorVerifier interface {
+	VerifyCursor(context.Context, string) (runnerid.Session, error)
+}
+
+// podOwnerPin is how long a Pod stays pinned to the first Cursor run owner it
+// presents. Pod UIDs never repeat, so the pin only has to outlive the Pod;
+// a day is far past any worker's lifetime and costs one row.
+const podOwnerPin = 24 * time.Hour
 
 // Binder pins a runner session to the first Pod that presents it, across
 // every broker replica, and returns the Pod it is pinned to. The pin lasts
@@ -43,12 +55,16 @@ type Requester struct {
 // that presents it: the same token from another Pod is refused
 // (session_pod_mismatch), and without a binder or a Pod the session is
 // refused (session_unbindable).
+//
+// A Cursor worker Pod can serve several runs in its life and they share its
+// workspace, so a cursor-session Pod is also pinned to the first run owner it
+// presents: a run by anyone else on that Pod is refused (session_pod_owner).
 func Resolve(ctx context.Context, pool httpcatalog.Pool, session, pod string, v Verifier, b Binder) (Requester, string) {
 	who := Requester{Kind: "none"}
 	requester := pool.Profile().RequesterKind()
-	// Only a session-jwt sidecar relays a session. One arriving on any other
+	// Only a session sidecar relays a session. One arriving on any other
 	// profile is a misconfigured or forged channel, never ignored.
-	if session != "" && requester != httpcatalog.RequesterSessionJWT {
+	if session != "" && requester != httpcatalog.RequesterSessionJWT && requester != httpcatalog.RequesterCursorOIDC {
 		return who, "session_unexpected"
 	}
 	switch requester {
@@ -57,19 +73,29 @@ func Resolve(ctx context.Context, pool httpcatalog.Pool, session, pod string, v 
 		if pool.Identity == "workload" {
 			who.Kind = "workload"
 		}
-	case httpcatalog.RequesterSessionJWT:
+	case httpcatalog.RequesterSessionJWT, httpcatalog.RequesterCursorOIDC:
 		if session == "" {
 			return who, ""
 		}
-		if v == nil {
+		var s runnerid.Session
+		var err error
+		cursor := requester == httpcatalog.RequesterCursorOIDC
+		if cv, ok := v.(CursorVerifier); cursor && ok {
+			s, err = cv.VerifyCursor(ctx, session)
+		} else if v != nil && !cursor {
+			s, err = v.Verify(ctx, session)
+		} else {
 			return who, "session_unverifiable"
 		}
-		s, err := v.Verify(ctx, session)
+		if errors.Is(err, runnerid.ErrUnverifiable) {
+			return who, "session_unverifiable"
+		}
 		if err != nil {
 			return who, "session_token"
 		}
 		who.TokenSHA256 = s.TokenSHA256
-		if !s.InPool(pool.CCPoolID) {
+		// A Cursor token is bound to the broker's teams and audience instead.
+		if !cursor && !s.InPool(pool.CCPoolID) {
 			return who, "session_pool"
 		}
 		if b == nil || pod == "" {
@@ -81,6 +107,18 @@ func Resolve(ctx context.Context, pool httpcatalog.Pool, session, pod string, v 
 		}
 		if bound != pod {
 			return who, "session_pod_mismatch"
+		}
+		if cursor {
+			if s.Owner == "" {
+				return who, "session_token"
+			}
+			owner, err := b.BindRunnerSession(ctx, "cursor-pod:"+pod, s.Owner, time.Now().Add(podOwnerPin))
+			if err != nil {
+				return who, "session_unbindable"
+			}
+			if owner != s.Owner {
+				return who, "session_pod_owner"
+			}
 		}
 		who.Kind, who.Subject = string(s.Kind), s.Subject
 	default:

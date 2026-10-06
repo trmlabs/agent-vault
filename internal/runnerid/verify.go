@@ -6,32 +6,28 @@
 // address when the creating surface recorded one. act.attested_by is reserved
 // and not read. A person is named by that email, as an Entra user principal
 // name, only in a configured domain; without one the session has no person.
+// CursorVerifier does the same for a Cursor run's identity token (cursor.go).
 // The token is never stored or logged; callers keep only its SHA-256.
 package runnerid
 
 import (
 	"context"
 	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"io"
 	"math/big"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 )
 
 const (
-	keysMaxAge     = time.Hour
-	refetchBackoff = 30 * time.Second
-	maxLifetime    = 12 * time.Hour
-	clockSkew      = 60 * time.Second
-	sessionRole    = "session_worker"
+	maxLifetime = 12 * time.Hour
+	clockSkew   = 60 * time.Second
+	sessionRole = "session_worker"
 	// tokenPrefix marks a self-hosted runner session token. Hosted sessions carry
 	// another sk-ant- prefix and other keys; those are refused outright.
 	tokenPrefix = "sk-ant-cc-"
@@ -51,8 +47,10 @@ const (
 // Session is a verified runner session.
 type Session struct {
 	Kind        Kind
-	Subject     string   // the lower-cased act.email for a person; act.sub for an agent
-	Pools       []string // ccpool_ IDs in the audience
+	Subject     string   // the lower-cased email for a person; the owner for an agent
+	Owner       string   // the vendor's stable owner (user:, agent: or service_account:), or ""
+	Run         string   // the Cursor run (cloud_agent_id); "" for Claude
+	Pools       []string // ccpool_ IDs in the audience (Claude)
 	Expires     time.Time
 	TokenSHA256 string
 }
@@ -77,11 +75,7 @@ type Verifier struct {
 	Client        *http.Client
 	Now           func() time.Time
 
-	mu        sync.Mutex
-	keys      map[string]*ecdsa.PublicKey
-	loaded    time.Time     // last successful fetch
-	attempted time.Time     // last fetch attempt
-	inflight  chan struct{} // closed when the fetch in progress ends
+	cache jwks
 }
 
 func (v *Verifier) now() time.Time {
@@ -158,6 +152,9 @@ func (v *Verifier) Verify(ctx context.Context, token string) (Session, error) {
 	}
 	sum := sha256.Sum256([]byte(raw))
 	session := Session{Kind: KindNone, Pools: pools, Expires: expires, TokenSHA256: hex.EncodeToString(sum[:])}
+	if strings.HasPrefix(c.Act.Sub, "agent:") || strings.HasPrefix(c.Act.Sub, "user:") {
+		session.Owner = c.Act.Sub
+	}
 	switch {
 	case strings.HasPrefix(c.Act.Sub, "agent:"):
 		// No person behind it, whatever else the token says.
@@ -165,26 +162,31 @@ func (v *Verifier) Verify(ctx context.Context, token string) (Session, error) {
 	case strings.HasPrefix(c.Act.Sub, "user:") && len(c.Act.Sub) > len("user:"):
 		// A person only with a recorded email in a configured domain; otherwise
 		// the session has no person and gets T0 at most.
-		if email, ok := v.personEmail(c.Act.Email); ok {
+		if email, ok := personEmail(c.Act.Email, v.PersonDomains); ok {
 			session.Kind, session.Subject = KindPerson, email
 		}
 	}
-	if len(session.Subject) > 256 || strings.ContainsAny(session.Subject, " \"\\") || strings.ContainsFunc(session.Subject, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
+	if !plainSubject(session.Subject) || !plainSubject(session.Owner) {
 		return Session{}, ErrInvalid
 	}
 	return session, nil
 }
 
+// plainSubject reports whether a value is short and safe to log and key on.
+func plainSubject(s string) bool {
+	return len(s) <= 256 && !strings.ContainsAny(s, " \"\\") && !strings.ContainsFunc(s, func(r rune) bool { return r < 0x20 || r == 0x7f })
+}
+
 // personEmail is the lower-cased email when it is a single plain address in one
 // of the configured domains.
-func (v *Verifier) personEmail(email string) (string, bool) {
+func personEmail(email string, domains []string) (string, bool) {
 	email = strings.ToLower(email)
 	at := strings.LastIndexByte(email, '@')
 	if at < 1 || at != strings.IndexByte(email, '@') || len(email) > 254 {
 		return "", false
 	}
 	domain := email[at+1:]
-	for _, d := range v.PersonDomains {
+	for _, d := range domains {
 		if d != "" && domain == d {
 			return email, true
 		}
@@ -211,110 +213,6 @@ func audience(raw json.RawMessage) []string {
 }
 
 func (v *Verifier) key(ctx context.Context, kid string) *ecdsa.PublicKey {
-	v.mu.Lock()
-	now := v.now()
-	fresh := !v.loaded.IsZero() && now.Sub(v.loaded) < keysMaxAge
-	if k := v.keys[kid]; k != nil && fresh {
-		v.mu.Unlock()
-		return k
-	}
-	// One fetch at a time, outside the lock: concurrent verifies wait for it
-	// instead of each holding the lock across a network call.
-	if wait := v.inflight; wait != nil {
-		v.mu.Unlock()
-		select {
-		case <-wait:
-		case <-ctx.Done():
-			return nil
-		}
-		return v.current(kid)
-	}
-	// An unknown kid or stale keys refetch, at most every 30 seconds.
-	if !v.attempted.IsZero() && now.Sub(v.attempted) < refetchBackoff {
-		defer v.mu.Unlock()
-		if fresh {
-			return v.keys[kid]
-		}
-		return nil
-	}
-	v.attempted = now
-	done := make(chan struct{})
-	v.inflight = done
-	v.mu.Unlock()
-	// The caller's cancellation must not fail the refresh for everyone else.
-	keys, err := v.fetch(context.WithoutCancel(ctx))
-	v.mu.Lock()
-	if err == nil {
-		v.keys, v.loaded = keys, now
-	}
-	v.inflight = nil
-	close(done)
-	v.mu.Unlock()
-	// On failure the last good keys keep serving within their hour.
-	return v.current(kid)
-}
-
-// current returns a key from the last good set while it is within its hour.
-func (v *Verifier) current(kid string) *ecdsa.PublicKey {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if v.loaded.IsZero() || v.now().Sub(v.loaded) >= keysMaxAge {
-		return nil
-	}
-	return v.keys[kid]
-}
-
-// RefuseRedirects is an http.Client CheckRedirect that follows no redirect:
-// the signing keys come only from the configured https URL.
-func RefuseRedirects(*http.Request, []*http.Request) error {
-	return errors.New("runner JWKS redirect refused")
-}
-
-func (v *Verifier) fetch(ctx context.Context) (map[string]*ecdsa.PublicKey, error) {
-	client := v.Client
-	if client == nil {
-		client = &http.Client{Timeout: 5 * time.Second, CheckRedirect: RefuseRedirects}
-	}
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, v.JWKSURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return nil, errors.New("runner JWKS unavailable")
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, err
-	}
-	var set struct {
-		Keys []struct{ Kty, Crv, Kid, Alg, Use, X, Y string } `json:"keys"`
-	}
-	if json.Unmarshal(body, &set) != nil {
-		return nil, errors.New("invalid runner JWKS")
-	}
-	keys := map[string]*ecdsa.PublicKey{}
-	for _, k := range set.Keys {
-		if k.Kty != "EC" || k.Crv != "P-256" || k.Kid == "" || (k.Alg != "" && k.Alg != "ES256") || (k.Use != "" && k.Use != "sig") {
-			continue
-		}
-		x, ex := base64.RawURLEncoding.DecodeString(k.X)
-		y, ey := base64.RawURLEncoding.DecodeString(k.Y)
-		if ex != nil || ey != nil || len(x) != 32 || len(y) != 32 {
-			continue
-		}
-		// Parsing the uncompressed point also rejects coordinates off the curve.
-		pub, err := ecdsa.ParseUncompressedPublicKey(elliptic.P256(), append(append([]byte{4}, x...), y...))
-		if err != nil {
-			continue
-		}
-		keys[k.Kid] = pub
-	}
-	return keys, nil
+	k, _ := v.cache.key(ctx, kid, v.JWKSURL, v.Client, v.now).(*ecdsa.PublicKey)
+	return k
 }
