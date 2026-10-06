@@ -69,8 +69,10 @@ func newAPIFixture(t *testing.T) *apiFixture {
 		}
 		body, _ := io.ReadAll(r.Body)
 		f.mu.Lock()
-		f.last = string(body)
-		f.created++
+		if r.Method != http.MethodGet {
+			f.last = string(body)
+			f.created++ // writes only; reads are counted below
+		}
 		echo := f.echo
 		f.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
@@ -78,7 +80,18 @@ func newAPIFixture(t *testing.T) *apiFixture {
 			f.mu.Lock()
 			f.reads++
 			f.mu.Unlock()
-			fmt.Fprintf(w, `{"number":12,"state":"open","received":%d}`, len(body))
+			// 12 is the pool's own pull request; 13 comes from another pool's branch,
+			// 14 from a fork; 20 is an issue, not a pull request.
+			switch r.URL.Path {
+			case "/repos/trmlabs/trm-b2b/pulls/12":
+				fmt.Fprintf(w, `{"number":12,"state":"open","received":%d,"head":{"ref":"cursor/pool-agent/x","repo":{"full_name":"trmlabs/trm-b2b"}}}`, len(body))
+			case "/repos/trmlabs/trm-b2b/pulls/13":
+				fmt.Fprint(w, `{"number":13,"head":{"ref":"cursor/other-pool/x","repo":{"full_name":"trmlabs/trm-b2b"}}}`)
+			case "/repos/trmlabs/trm-b2b/pulls/14":
+				fmt.Fprint(w, `{"number":14,"head":{"ref":"cursor/pool-agent/x","repo":{"full_name":"someone/trm-b2b"}}}`)
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
 			return
 		}
 		w.WriteHeader(http.StatusCreated)
@@ -172,6 +185,9 @@ func TestGitHubAPIOpensPullRequestsAndComments(t *testing.T) {
 		t.Fatalf("GitHub received %s", last)
 	}
 	// Reading one pull request, for its state, is a GET with no body.
+	f.mu.Lock()
+	before := f.reads
+	f.mu.Unlock()
 	r, _ := http.NewRequest(http.MethodGet, "https://example.com:"+strconv.Itoa(f.port)+"/repos/trmlabs/trm-b2b/pulls/12", nil)
 	resp, err := f.client.Do(r)
 	if err != nil {
@@ -180,10 +196,35 @@ func TestGitHubAPIOpensPullRequestsAndComments(t *testing.T) {
 	data, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	f.mu.Lock()
-	reads := f.reads
+	reads := f.reads - before
 	f.mu.Unlock()
 	if resp.StatusCode != 200 || !strings.Contains(string(data), `"state":"open"`) || reads != 1 {
 		t.Fatalf("read: %d %s, reads=%d", resp.StatusCode, data, reads)
+	}
+}
+
+// A comment goes only to the pool's own pull request: never to another pool's,
+// a fork's, or an issue (people's work).
+func TestGitHubAPICommentsOnlyOnThePoolsPullRequests(t *testing.T) {
+	f := newAPIFixture(t)
+	for _, path := range []string{
+		"/repos/trmlabs/trm-b2b/issues/13/comments",
+		"/repos/trmlabs/trm-b2b/pulls/14/comments",
+		"/repos/trmlabs/trm-b2b/issues/20/comments",
+		"/repos/trmlabs/trm-b2b/pulls/13/comments/99/replies",
+	} {
+		if code, _ := f.post(t, "POST", path, "", `{"body":"note"}`); code != 403 || f.audit.last().Outcome != "comment_target" {
+			t.Fatalf("%s: code=%d outcome=%q", path, code, f.audit.last().Outcome)
+		}
+	}
+	f.mu.Lock()
+	created := f.created
+	f.mu.Unlock()
+	if created != 0 {
+		t.Fatalf("GitHub received %d refused comments", created)
+	}
+	if code, _ := f.post(t, "POST", "/repos/trmlabs/trm-b2b/issues/12/comments", "", `{"body":"note"}`); code != 201 {
+		t.Fatalf("comment on the pool's own pull request: %d", code)
 	}
 }
 

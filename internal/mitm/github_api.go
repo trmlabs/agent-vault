@@ -2,12 +2,15 @@ package mitm
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Infisical/agent-vault/internal/auditchain"
 	"github.com/Infisical/agent-vault/internal/brokercore"
@@ -96,6 +99,10 @@ func (p *Proxy) forwardGitHubAPI(w http.ResponseWriter, r *http.Request, target 
 		deny(http.StatusServiceUnavailable, "token_unavailable")
 		return
 	}
+	if api.CommentsOn > 0 && !p.commentsOnPoolPullRequest(r, target, expected, api, token.Value()) {
+		deny(http.StatusForbidden, "comment_target")
+		return
+	}
 	outURL := &url.URL{Scheme: "https", Host: target, Path: r.URL.Path}
 	method, outBody := http.MethodPost, io.Reader(bytes.NewReader(body))
 	if !api.Write {
@@ -131,6 +138,51 @@ func (p *Proxy) forwardGitHubAPI(w http.ResponseWriter, r *http.Request, target 
 	p.relayScreened(w, out, needles, entry.MaxResponseBytes, finish, func(*http.Response) {
 		a.GitTokens.Invalidate(app, api.Repo.Repo, githubapp.PullRequestsWrite)
 	}, nil)
+}
+
+// commentsOnPoolPullRequest reads the pull request a comment targets, with
+// the same one-repository token, and reports whether its head is a branch of
+// this repository under one of the pool's push prefixes. An issue that is not
+// a pull request, a pull request from a fork or another pool's branch, or any
+// failed read refuses the comment, so an agent comments only on its own pool's
+// pull requests, never on people's.
+func (p *Proxy) commentsOnPoolPullRequest(r *http.Request, target, host string, api httpcatalog.GitRequest, token string) bool {
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	u := &url.URL{Scheme: "https", Host: target, Path: "/repos/" + api.Repo.Repo + "/pulls/" + strconv.FormatInt(api.CommentsOn, 10)}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return false
+	}
+	req.Host = host
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Accept-Encoding", "identity")
+	resp, err := p.upstream.RoundTrip(req)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var pr struct {
+		Head struct {
+			Ref  string `json:"ref"`
+			Repo *struct {
+				FullName string `json:"full_name"`
+			} `json:"repo"`
+		} `json:"head"`
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil || resp.StatusCode != http.StatusOK || json.Unmarshal(data, &pr) != nil ||
+		pr.Head.Repo == nil || !strings.EqualFold(pr.Head.Repo.FullName, api.Repo.Repo) ||
+		strings.Contains(pr.Head.Ref, ":") || unsafeBranch(pr.Head.Ref) {
+		return false
+	}
+	for _, prefix := range api.HeadPrefixes {
+		if strings.HasPrefix(pr.Head.Ref, prefix) && len(pr.Head.Ref) > len(prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // pullRequestFields are the only fields a pull request may be opened with.
