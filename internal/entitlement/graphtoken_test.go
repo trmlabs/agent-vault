@@ -26,6 +26,7 @@ func entra(t *testing.T, status int, body func(n int64) any) (*httptest.Server, 
 	var lastAssertion atomic.Value
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n := calls.Add(1)
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		if r.Method != http.MethodPost || r.URL.Path != "/"+testTenant+"/oauth2/v2.0/token" || r.ParseForm() != nil {
 			w.WriteHeader(400)
 			return
