@@ -148,4 +148,9 @@ func TestEveryBrokerReasonHasWords(t *testing.T) {
 	if got := refusalReason(errorBody("XX000", "x")); got != "sqlstate_XX000" {
 		t.Fatalf("log reason without a code %q", got)
 	}
+	for _, code := range []string{"xx000", "XX00", "XX0000", "XX 00", "XX\n00"} {
+		if got := refusalReason(errorBody(code, "x")); got != "unknown" {
+			t.Errorf("malformed SQLSTATE %q logged as %q", code, got)
+		}
+	}
 }
