@@ -26,8 +26,9 @@ import (
 
 // Store is the shared store's part this service uses.
 type Store interface {
-	RecordProxyActivity(ctx context.Context, scope string, rows []store.ProxyActivity) error
+	RecordProxyActivity(ctx context.Context, scope string, rows []store.ProxyActivity, maxRows int) error
 	ReadProxyActivity(ctx context.Context, scope, after string, since time.Time, limit int) ([]store.ProxyActivity, error)
+	ProxyActivityHistory(ctx context.Context, scope string) (time.Time, bool, error)
 	PruneProxyActivity(ctx context.Context, cutoff time.Time) error
 }
 
@@ -45,7 +46,8 @@ type Identifier interface {
 }
 
 const (
-	// RecordPath takes {"sandboxes": [{namespace, ownerUID, lastSeen}]}.
+	// RecordPath takes {"sandboxes": [{namespace, ownerUID, lastSeen}]}; an
+	// empty list starts the binding's history.
 	RecordPath = "/v1/proxy/activity"
 	// ReadPath takes {"after": cursor} and returns {"retentionSeconds",
 	// "sandboxes", "next"}; an empty next is the last page.
@@ -75,11 +77,14 @@ type ReadRequest struct {
 	After string `json:"after"`
 }
 
-// ReadResponse is one page of a binding's view.
+// ReadResponse is one page of a binding's view. HistoryStarted is when the
+// binding's history began (its first report), absent if it has none: the
+// janitor deletes nothing until that is older than its idle window.
 type ReadResponse struct {
-	RetentionSeconds int64  `json:"retentionSeconds"`
-	Sandboxes        []Row  `json:"sandboxes"`
-	Next             string `json:"next"`
+	RetentionSeconds int64      `json:"retentionSeconds"`
+	HistoryStarted   *time.Time `json:"historyStarted,omitempty"`
+	Sandboxes        []Row      `json:"sandboxes"`
+	Next             string     `json:"next"`
 }
 
 // Service serves both routes.
@@ -88,7 +93,11 @@ type Service struct {
 	Identifier Identifier
 	// Retention is how long a row is kept after its last use.
 	Retention time.Duration
-	Logger    *slog.Logger
+	// MaxRows is the most rows one binding may hold (default
+	// DefaultMaxRows), so a compromised proxy cannot grow the shared store
+	// without bound. A report that would pass it is refused.
+	MaxRows int
+	Logger  *slog.Logger
 
 	mu         sync.Mutex
 	lastPruned time.Time
@@ -103,6 +112,9 @@ func (s *Service) Validate() error {
 	}
 	if s.Retention < time.Hour || s.Retention > 366*24*time.Hour {
 		return errors.New("proxy activity retention must be between one hour and a year")
+	}
+	if s.MaxRows < 0 || s.MaxRows > 100_000_000 {
+		return errors.New("proxy activity maximum rows must be between 1 and 100,000,000")
 	}
 	return nil
 }
@@ -153,7 +165,10 @@ func (s *Service) record(w http.ResponseWriter, r *http.Request) {
 		}
 		rows = append(rows, store.ProxyActivity{Namespace: row.Namespace, OwnerUID: row.OwnerUID, LastSeen: row.LastSeen})
 	}
-	if err := s.Store.RecordProxyActivity(r.Context(), id.Scope, rows); err != nil {
+	if err := s.Store.RecordProxyActivity(r.Context(), id.Scope, rows, s.maxRows()); errors.Is(err, store.ErrProxyActivityFull) {
+		s.refuse(w, http.StatusInsufficientStorage, "row_ceiling")
+		return
+	} else if err != nil {
 		s.refuse(w, http.StatusServiceUnavailable, "store")
 		return
 	}
@@ -173,12 +188,20 @@ func (s *Service) read(w http.ResponseWriter, r *http.Request) {
 		s.refuse(w, http.StatusBadRequest, "body")
 		return
 	}
+	started, known, err := s.Store.ProxyActivityHistory(r.Context(), id.Scope)
+	if err != nil {
+		s.refuse(w, http.StatusServiceUnavailable, "store")
+		return
+	}
 	rows, err := s.Store.ReadProxyActivity(r.Context(), id.Scope, body.After, time.Now().Add(-s.Retention), ReadPageRows)
 	if err != nil {
 		s.refuse(w, http.StatusServiceUnavailable, "store")
 		return
 	}
 	out := ReadResponse{RetentionSeconds: int64(s.Retention / time.Second), Sandboxes: make([]Row, 0, len(rows))}
+	if known {
+		out.HistoryStarted = &started
+	}
 	for _, row := range rows {
 		out.Sandboxes = append(out.Sandboxes, Row{Namespace: row.Namespace, OwnerUID: row.OwnerUID, LastSeen: row.LastSeen})
 	}
@@ -188,6 +211,17 @@ func (s *Service) read(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	_ = json.NewEncoder(w).Encode(out)
+}
+
+// DefaultMaxRows sizes a binding's ceiling for a fleet of 10,000+ sandboxes
+// with churn: ten times that many used within a day's retention.
+const DefaultMaxRows = 100_000
+
+func (s *Service) maxRows() int {
+	if s.MaxRows == 0 {
+		return DefaultMaxRows
+	}
+	return s.MaxRows
 }
 
 // prune drops expired rows at most once a minute per broker replica.

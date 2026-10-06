@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"sync/atomic"
 	"time"
 )
 
@@ -38,6 +39,9 @@ type durable struct {
 	activity *activity
 	upstream UpstreamConfig
 	interval time.Duration
+	// started is set once the broker has taken a report, which starts the
+	// binding's history even when there is nothing to report.
+	started atomic.Bool
 }
 
 // run reports every interval until ctx ends, then once more.
@@ -61,6 +65,17 @@ func (d *durable) run(ctx context.Context) {
 // last accepted from this replica. A failed report is retried next time.
 func (d *durable) push(ctx context.Context) error {
 	rows := d.activity.pending()
+	if len(rows) == 0 && !d.started.Load() {
+		status, _, e := brokerPost(ctx, d.upstream, activityRecordPath, []byte(`{"sandboxes":[]}`), 4096)
+		if e != nil {
+			return e
+		}
+		if status != http.StatusNoContent {
+			return errDenied
+		}
+		d.started.Store(true)
+		return nil
+	}
 	for start := 0; start < len(rows); start += activityRecordRows {
 		chunk := rows[start:min(start+activityRecordRows, len(rows))]
 		body, e := json.Marshal(map[string]any{"sandboxes": chunk})
@@ -75,32 +90,43 @@ func (d *durable) push(ctx context.Context) error {
 			return errDenied
 		}
 		d.activity.accepted(chunk)
+		d.started.Store(true)
 	}
 	return nil
 }
 
-// read returns the broker's whole view for this proxy's binding, and its
-// retention.
-func (d *durable) read(ctx context.Context) ([]SandboxActivity, int64, error) {
-	var out []SandboxActivity
-	var retention int64
+// durableView is the broker's whole view for this proxy's binding.
+type durableView struct {
+	sandboxes []SandboxActivity
+	retention int64
+	// historyStarted is when the binding's history began; zero if none.
+	historyStarted time.Time
+}
+
+// read returns the broker's whole view for this proxy's binding.
+func (d *durable) read(ctx context.Context) (durableView, error) {
+	var view durableView
 	for after := ""; ; {
 		body, _ := json.Marshal(map[string]string{"after": after})
 		status, b, e := brokerPost(ctx, d.upstream, activityReadPath, body, 64<<20)
 		if e != nil {
-			return nil, 0, e
+			return view, e
 		}
 		var page struct {
 			RetentionSeconds int64             `json:"retentionSeconds"`
+			HistoryStarted   *time.Time        `json:"historyStarted"`
 			Sandboxes        []SandboxActivity `json:"sandboxes"`
 			Next             string            `json:"next"`
 		}
 		if status != http.StatusOK || json.Unmarshal(b, &page) != nil || page.RetentionSeconds <= 0 || (page.Next != "" && page.Next <= after) {
-			return nil, 0, errDenied
+			return view, errDenied
 		}
-		out, retention = append(out, page.Sandboxes...), page.RetentionSeconds
+		if after == "" && page.HistoryStarted != nil {
+			view.historyStarted = page.HistoryStarted.UTC()
+		}
+		view.sandboxes, view.retention = append(view.sandboxes, page.Sandboxes...), page.RetentionSeconds
 		if after = page.Next; after == "" {
-			return out, retention, nil
+			return view, nil
 		}
 	}
 }

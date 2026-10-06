@@ -412,7 +412,7 @@ func TestJanitorConfigLoadsTheScaleRecords(t *testing.T) {
 func TestJanitorTrustsDurableReports(t *testing.T) {
 	durable := func(started time.Time) *httptest.Server {
 		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			json.NewEncoder(w).Encode(ActivityReport{ReplicaStarted: started, RetentionSeconds: 86400, Durable: true,
+			json.NewEncoder(w).Encode(ActivityReport{ReplicaStarted: started, RetentionSeconds: 86400, Durable: true, HistoryStarted: time.Now().Add(-5 * time.Hour),
 				Sandboxes: []SandboxActivity{{Namespace: tenantNS, OwnerUID: "uid-sb-00002", LastSeen: time.Now().Add(-time.Minute)}}})
 		}))
 		t.Cleanup(s.Close)
@@ -429,5 +429,40 @@ func TestJanitorTrustsDurableReports(t *testing.T) {
 	jf.api.sandboxes = []map[string]any{janitorSandbox(1, 3*time.Hour)}
 	if e := jf.j.pass(context.Background()); e != nil || len(jf.api.deleted) != 0 || jf.events(t, "janitor_pass")[0]["held"] != "proxy_replica_young" {
 		t.Fatalf("mixed reports: deleted %v, error %v", jf.api.deleted, e)
+	}
+}
+
+// A durable history vouches only for as long as it has existed. At first
+// switch-on, or after a recreated proxy account or a lost table, the broker's
+// history for the binding is new or absent, and every Sandbox past the idle
+// window would read as unused: the pass holds and deletes nothing until the
+// history is older than the idle window.
+func TestJanitorHoldsOnAYoungDurableHistory(t *testing.T) {
+	durable := func(history time.Time) *httptest.Server {
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			json.NewEncoder(w).Encode(ActivityReport{ReplicaStarted: time.Now().Add(-time.Minute), RetentionSeconds: 86400, Durable: true, HistoryStarted: history})
+		}))
+		t.Cleanup(s.Close)
+		return s
+	}
+	for name, history := range map[string]time.Time{"no history": {}, "history a minute old": time.Now().Add(-time.Minute)} {
+		t.Run(name, func(t *testing.T) {
+			// The reported reproduction: two durable replicas started a minute ago with empty
+			// reports, and two Sandboxes created three hours ago.
+			jf := newJanitor(t, map[string]*httptest.Server{"10.0.0.1": durable(history), "10.0.0.2": durable(history)})
+			jf.api.sandboxes = []map[string]any{janitorSandbox(1, 3*time.Hour), janitorSandbox(2, 3*time.Hour)}
+			if e := jf.j.pass(context.Background()); e != nil || len(jf.api.deleted) != 0 {
+				t.Fatalf("deleted %v, error %v", jf.api.deleted, e)
+			}
+			if pass := jf.events(t, "janitor_pass"); len(pass) != 1 || pass[0]["held"] != "activity_history_young" {
+				t.Fatalf("pass line %v", pass)
+			}
+		})
+	}
+	// Once the history is older than the idle window, the same reports delete.
+	jf := newJanitor(t, map[string]*httptest.Server{"10.0.0.1": durable(time.Now().Add(-2 * time.Hour))})
+	jf.api.sandboxes = []map[string]any{janitorSandbox(1, 3*time.Hour)}
+	if e := jf.j.pass(context.Background()); e != nil || len(jf.api.deleted) != 1 {
+		t.Fatalf("an old history: deleted %v, error %v", jf.api.deleted, e)
 	}
 }

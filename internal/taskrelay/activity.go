@@ -95,6 +95,10 @@ type ActivityReport struct {
 	// read in full for this report, so no replica's going or coming loses
 	// history beyond its last report to the broker.
 	Durable bool `json:"durable"`
+	// HistoryStarted, on a durable report, is when the broker's history for
+	// this proxy's binding began. Zero means none yet: a new, recreated or
+	// emptied history, which vouches for nothing.
+	HistoryStarted time.Time `json:"historyStarted,omitzero"`
 }
 
 // SandboxActivity is one Sandbox's last use through this replica.
@@ -145,10 +149,11 @@ func (a *activity) handler() http.Handler {
 // per Sandbox and the shorter retention. If the view cannot be read in full,
 // the report is this replica's alone and not durable.
 func (a *activity) withDurable(ctx context.Context, report ActivityReport) ActivityReport {
-	rows, retention, e := a.durable.read(ctx)
+	view, e := a.durable.read(ctx)
 	if e != nil {
 		return report
 	}
+	rows, retention := view.sandboxes, view.retention
 	byOwner := make(map[string]int, len(report.Sandboxes))
 	for i, s := range report.Sandboxes {
 		byOwner[s.OwnerUID] = i
@@ -165,6 +170,6 @@ func (a *activity) withDurable(ctx context.Context, report ActivityReport) Activ
 	}
 	sort.Slice(report.Sandboxes, func(i, j int) bool { return report.Sandboxes[i].OwnerUID < report.Sandboxes[j].OwnerUID })
 	report.RetentionSeconds = min(report.RetentionSeconds, retention)
-	report.Durable = true
+	report.Durable, report.HistoryStarted = true, view.historyStarted
 	return report
 }
