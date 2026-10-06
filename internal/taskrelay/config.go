@@ -16,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Infisical/agent-vault/internal/workloadidentity"
 )
 
 // FixedConfig is operator-owned. None of these fields may come from requests.
@@ -139,7 +141,7 @@ func LoadConfig(path string) (FixedConfig, error) {
 	// A sidecar's config is static in the Pod template, so its relay lifetime
 	// starts with the container; the broker enforces the Pod's real deadline.
 	if c.Self && c.Deadline.IsZero() {
-		c.Deadline = time.Now().Add(8 * time.Hour).Add(-time.Minute)
+		c.Deadline = time.Now().Add(workloadidentity.DefaultSessionCeiling).Add(-time.Minute)
 	}
 	// A shared proxy serves many agents for as long as it runs; each agent's
 	// own deadline comes from its Pod.
@@ -178,7 +180,7 @@ func (c FixedConfig) Validate(now time.Time) error {
 	if !containerName.MatchString(c.Sandbox.ContainerName) {
 		return errConfig
 	}
-	if !safeName.MatchString(c.TaskID) || !c.Deadline.After(now) || c.Deadline.After(now.Add(8*time.Hour)) {
+	if !safeName.MatchString(c.TaskID) || !c.Deadline.After(now) || c.Deadline.After(now.Add(workloadidentity.DefaultSessionCeiling)) {
 		return errConfig
 	}
 	for _, v := range []string{c.Sandbox.Namespace, c.Sandbox.Name, c.Sandbox.UID} {
@@ -238,7 +240,7 @@ func (c FixedConfig) validateSelf(now time.Time) error {
 			return errConfig
 		}
 	}
-	if !safeName.MatchString(c.TaskID) || !c.Deadline.After(now) || c.Deadline.After(now.Add(8*time.Hour)) || c.AuditFile == "" || c.Browser != nil ||
+	if !safeName.MatchString(c.TaskID) || !c.Deadline.After(now) || c.Deadline.After(now.Add(workloadidentity.DefaultSessionCeiling)) || c.AuditFile == "" || c.Browser != nil ||
 		c.Sandbox != (SandboxConfig{}) || c.Kubernetes != (KubernetesConfig{}) || c.TLSCertFile != "" || c.TLSKeyFile != "" {
 		return errConfig
 	}

@@ -290,7 +290,7 @@ func TestPoolBindingValidation(t *testing.T) {
 		"tag instead of a digest":       func(b *Binding) { b.ImageDigests = []string{"worker:latest"} },
 		"digests on a non-pool binding": func(b *Binding) { b.OwnerUIDs, b.MaxPodSeconds = nil, 0 },
 		"Pod UID pinned":                func(b *Binding) { b.PodUID = "p" },
-		"lifetime too long":             func(b *Binding) { b.MaxPodSeconds = 9 * 3600 },
+		"lifetime over the ceiling":     func(b *Binding) { b.MaxPodSeconds = 24*3600 + 1 },
 		"lifetime missing":              func(b *Binding) { b.MaxPodSeconds = 0 },
 		"empty owner":                   func(b *Binding) { b.OwnerUIDs = []string{""} },
 		"bad container":                 func(b *Binding) { b.ContainerName = "Bad Name" },

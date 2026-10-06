@@ -262,7 +262,7 @@ func TestConfigAndProofFailClosed(t *testing.T) {
 			t.Fatal("accepted invalid proof")
 		}
 	}
-	f.c.Deadline = time.Now().Add(9 * time.Hour)
+	f.c.Deadline = time.Now().Add(25 * time.Hour)
 	if f.c.Validate(time.Now()) == nil {
 		t.Fatal("accepted excessive deadline")
 	}
