@@ -159,6 +159,11 @@ func (c FixedConfig) validateShared(now time.Time) error {
 			return errConfig
 		}
 	}
+	// A broker-issued certificate replaces the files, and is requested over
+	// the CONNECT listener's upstream: the broker's cross-cluster listener.
+	if c.TLS != nil && (c.TLS.validate() != nil || c.TLSCertFile != "" || c.Connect == nil) {
+		return errConfig
+	}
 	if l := c.PostgresListener; l != nil {
 		if check(l.Listen, l.Upstream) != nil || len(l.Databases) == 0 || !safeName.MatchString(l.User) || !safeName.MatchString(l.Placeholder) {
 			return errConfig

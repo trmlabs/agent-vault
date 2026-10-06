@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -69,10 +70,44 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig, catalog map[stri
 		}
 		return
 	}
+	// With a broker-issued certificate the listener is TCP: GSS encryption is
+	// declined, an SSLRequest is answered 'S' and the session continues in
+	// TLS, and anything else in plaintext, a cancellation included, is
+	// refused. The next packet inside TLS must be the startup or a
+	// cancellation.
+	if r.pgTLS != nil {
+		if len(packet) == 8 && binary.BigEndian.Uint32(packet[4:8]) == gssRequestCode {
+			if _, e = conn.Write([]byte{'N'}); e != nil {
+				return
+			}
+			if packet, e = readStartupPacket(conn); e != nil {
+				_ = r.record("postgres", "denied:bad-startup")
+				return
+			}
+		}
+		if len(packet) != 8 || binary.BigEndian.Uint32(packet[4:8]) != sslRequestCode {
+			_ = r.record("postgres", "denied:plaintext")
+			_, _ = conn.Write(errorFrame("28000", plaintextRefusedMessage))
+			return
+		}
+		if _, e = conn.Write([]byte{'S'}); e != nil {
+			return
+		}
+		secure := tls.Server(conn, r.pgTLS)
+		if secure.HandshakeContext(r.ctx) != nil {
+			_ = r.record("postgres", "denied:tls")
+			return
+		}
+		conn = secure
+		if packet, e = readStartupPacket(conn); e != nil || len(packet) == 8 {
+			_ = r.record("postgres", "denied:bad-startup")
+			return
+		}
+	}
 	// A shared proxy's plaintext listener declines TLS and GSS encryption, so
 	// a client set to sslmode=prefer goes on in plaintext; one that requires
 	// TLS stops. The next packet must be the startup.
-	if code := binary.BigEndian.Uint32(packet[4:8]); r.config.Shared != nil && r.config.TLSCertFile == "" && len(packet) == 8 && (code == sslRequestCode || code == gssRequestCode) {
+	if code := binary.BigEndian.Uint32(packet[4:8]); r.pgTLS == nil && r.config.Shared != nil && r.config.TLSCertFile == "" && len(packet) == 8 && (code == sslRequestCode || code == gssRequestCode) {
 		if _, e = conn.Write([]byte{'N'}); e != nil {
 			return
 		}
@@ -442,6 +477,9 @@ const (
 	workerCapMessage      = "this worker reached its session cap"
 	databaseBudgetMessage = "the database's Gatehouse connection budget is full; retry shortly"
 	genericRefusalMessage = "Gatehouse: the broker refused this connection"
+	// A PostgreSQL error field is plain text, so this is readable even to a
+	// client that sent no SSLRequest.
+	plaintextRefusedMessage = "Gatehouse requires TLS on this port: connect with sslmode=require or stricter"
 )
 
 type refusal struct{ code, message string }
