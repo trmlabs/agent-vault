@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	vaultapi "github.com/hashicorp/vault/api"
@@ -35,6 +36,7 @@ type Client struct {
 	// JWT mode only: held logins and their refresh loop.
 	jwt        jwtConfig
 	logins     *loginSet
+	loginMu    sync.Mutex // one new login at a time: scheduled or after a denied mint
 	stopReauth context.CancelFunc
 	reauthDone chan struct{}
 }
