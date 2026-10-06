@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -87,6 +88,13 @@ type Minter struct {
 	API    string // default https://api.github.com
 	Client *http.Client
 	Now    func() time.Time
+	// Scope returns what the catalog grants an installation; tokens are
+	// refused while the installation on GitHub is wider (see scope.go).
+	Scope func(installation int64) Scope
+	Log   *slog.Logger
+
+	scopeMu sync.Mutex
+	scopes  map[int64]scopeVerdict
 
 	mu          sync.Mutex
 	cache       map[tokenKey]Token
@@ -117,7 +125,7 @@ func (m *Minter) now() time.Time {
 // Token returns a token for repo ("owner/name") with exactly permissions plus
 // metadata read. Nothing else is ever requested.
 func (m *Minter) Token(ctx context.Context, app App, repo string, permissions Permissions) (Token, error) {
-	if !permissions.valid() {
+	if !permissions.valid() || m.checkScope(ctx, app) != nil {
 		return Token{}, ErrUnavailable
 	}
 	key := tokenKey{app.InstallationID, strings.ToLower(repo), permissions}

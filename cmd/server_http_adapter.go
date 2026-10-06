@@ -137,11 +137,16 @@ func httpHeaderAdapter(ctx context.Context, srv *server.Server, getenv func(stri
 		if api != "" && !strings.HasPrefix(api, "https://") {
 			return nil, fmt.Errorf("AGENT_VAULT_GITHUB_API_URL must be https")
 		}
-		minter := &githubapp.Minter{Signer: signer, API: api}
+		minter := &githubapp.Minter{Signer: signer, API: api, Log: srv.Logger(), Scope: func(installation int64) githubapp.Scope {
+			repos, pullRequests := source.Current().GitScope(installation)
+			return githubapp.Scope{Repos: repos, PullRequests: pullRequests}
+		}}
 		adapter.GitTokens = minter
 		// A catalog change that removes or narrows a repository revokes the
-		// tokens it no longer grants instead of letting them run out.
+		// tokens it no longer grants instead of letting them run out, and
+		// checks each installation against the new catalog before its next token.
 		source.OnChange(func(c httpcatalog.Catalog) {
+			minter.ForgetScope()
 			minter.Prune(func(installation int64, repo string, p githubapp.Permissions) bool {
 				return c.GitGranted(installation, repo, gitScope(p))
 			})

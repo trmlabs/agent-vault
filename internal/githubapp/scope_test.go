@@ -1,0 +1,271 @@
+package githubapp
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// scopeGitHub is a fake GitHub for the installation scope check: the
+// installation's settings, metadata-only listing tokens and its repositories.
+type scopeGitHub struct {
+	mu          sync.Mutex
+	appID       int64
+	selection   string
+	permissions map[string]string
+	suspended   bool
+	repos       []string
+	settingsErr int
+	listErr     int
+	settings    int // GET /app/installations/42 calls
+	listMints   int // metadata-only tokens
+	repoMints   int // one-repository tokens
+	revoked     []string
+	pages       []string
+}
+
+func newScopeGitHub(t *testing.T) (*scopeGitHub, *Minter) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := &scopeGitHub{appID: 7, selection: "selected", permissions: map[string]string{"contents": "write", "metadata": "read"},
+		repos: []string{"trmlabs/trm-b2b"}}
+	jwtCheck := &fakeGitHub{t: t, key: key}
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		bearer := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		switch {
+		case r.Method == http.MethodDelete && r.URL.Path == "/installation/token":
+			g.revoked = append(g.revoked, bearer)
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet && r.URL.Path == "/app/installations/42" && jwtCheck.validJWT(bearer):
+			g.settings++
+			if g.settingsErr != 0 {
+				w.WriteHeader(g.settingsErr)
+				return
+			}
+			reply := map[string]any{"id": 42, "app_id": g.appID, "repository_selection": g.selection, "permissions": g.permissions, "suspended_at": nil}
+			if g.suspended {
+				reply["suspended_at"] = time.Now().Format(time.RFC3339)
+			}
+			_ = json.NewEncoder(w).Encode(reply)
+		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/42/access_tokens" && jwtCheck.validJWT(bearer):
+			var body struct {
+				Repositories []string          `json:"repositories"`
+				Permissions  map[string]string `json:"permissions"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			expires := time.Now().Add(time.Hour).Format(time.RFC3339)
+			if len(body.Repositories) == 0 && g.listErr != 0 {
+				w.WriteHeader(g.listErr)
+				return
+			}
+			w.WriteHeader(http.StatusCreated)
+			if len(body.Repositories) == 0 {
+				if fmt.Sprint(body.Permissions) != "map[metadata:read]" {
+					t.Errorf("listing token asked for %v", body.Permissions)
+				}
+				g.listMints++
+				_ = json.NewEncoder(w).Encode(map[string]any{"token": fmt.Sprintf("ghs_listingtoken%04d", g.listMints), "expires_at": expires, "permissions": body.Permissions})
+				return
+			}
+			g.repoMints++
+			_ = json.NewEncoder(w).Encode(map[string]any{"token": fmt.Sprintf("ghs_repositorytoken%04d", g.repoMints), "expires_at": expires,
+				"permissions": body.Permissions, "repositories": []map[string]string{{"full_name": "trmlabs/" + body.Repositories[0]}}})
+		case r.Method == http.MethodGet && r.URL.Path == "/installation/repositories" && strings.HasPrefix(bearer, "ghs_listingtoken"):
+			page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+			g.pages = append(g.pages, r.URL.Query().Get("page"))
+			var out []map[string]string
+			for i := (page - 1) * 100; i < len(g.repos) && i < page*100; i++ {
+				out = append(out, map[string]string{"full_name": g.repos[i]})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": len(g.repos), "repositories": out})
+		default:
+			w.WriteHeader(http.StatusUnauthorized)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	m := &Minter{Signer: localSigner{key}, API: srv.URL, Client: srv.Client(),
+		Scope: func(installation int64) Scope {
+			if installation != 42 {
+				t.Errorf("scope asked for installation %d", installation)
+			}
+			return Scope{Repos: []string{"trmlabs/trm-b2b", "trmlabs/docs"}}
+		}}
+	return g, m
+}
+
+func (g *scopeGitHub) counts() (settings, listMints, repoMints, revoked int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.settings, g.listMints, g.repoMints, len(g.revoked)
+}
+
+func TestScopeInsideCatalogMintsAndRevokesListingToken(t *testing.T) {
+	g, m := newScopeGitHub(t)
+	for range 3 {
+		if _, err := m.Token(context.Background(), app, "trmlabs/trm-b2b", ContentsWrite); err != nil {
+			t.Fatal(err)
+		}
+	}
+	settings, listMints, repoMints, revoked := g.counts()
+	if settings != 1 || listMints != 1 || repoMints != 1 || revoked != 1 {
+		t.Fatalf("settings=%d listMints=%d repoMints=%d revoked=%d", settings, listMints, repoMints, revoked)
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.revoked[0] != "ghs_listingtoken0001" {
+		t.Fatalf("revoked %q, not the listing token", g.revoked[0])
+	}
+}
+
+func TestScopeRefusesRepositoriesBeyondTheCatalog(t *testing.T) {
+	for name, widen := range map[string]func(*scopeGitHub){
+		"all repositories":    func(g *scopeGitHub) { g.selection = "all" },
+		"unlisted repository": func(g *scopeGitHub) { g.repos = append(g.repos, "trmlabs/secret") },
+		"listing unavailable": func(g *scopeGitHub) { g.listErr = http.StatusForbidden },
+	} {
+		t.Run(name, func(t *testing.T) {
+			g, m := newScopeGitHub(t)
+			var logs bytes.Buffer
+			m.Log = slog.New(slog.NewJSONHandler(&logs, nil))
+			widen(g)
+			if _, err := m.Token(context.Background(), app, "trmlabs/trm-b2b", ContentsRead); err != ErrUnavailable {
+				t.Fatalf("token minted for a wider installation: %v", err)
+			}
+			if _, _, repoMints, _ := g.counts(); repoMints != 0 {
+				t.Fatal("a repository token was minted")
+			}
+			if !strings.Contains(logs.String(), "github app installation refused") || strings.Contains(logs.String(), "ghs_") {
+				t.Fatalf("log: %s", logs.String())
+			}
+			g.mu.Lock()
+			defer g.mu.Unlock()
+			if g.listMints != len(g.revoked) {
+				t.Fatalf("listing tokens %d, revoked %d", g.listMints, len(g.revoked))
+			}
+		})
+	}
+}
+
+// Settings wider than the catalog needs are reported once, and git keeps
+// working: the broker requests only what each token needs.
+func TestScopeWarnsOnWiderSettings(t *testing.T) {
+	for name, widen := range map[string]func(*scopeGitHub){
+		"pull requests":        func(g *scopeGitHub) { g.permissions["pull_requests"] = "write" },
+		"workflows":            func(g *scopeGitHub) { g.permissions["workflows"] = "write" },
+		"administration read":  func(g *scopeGitHub) { g.permissions["administration"] = "read" },
+		"metadata write":       func(g *scopeGitHub) { g.permissions["metadata"] = "write" },
+		"suspended":            func(g *scopeGitHub) { g.suspended = true },
+		"another app":          func(g *scopeGitHub) { g.appID = 8 },
+		"settings unavailable": func(g *scopeGitHub) { g.settingsErr = http.StatusInternalServerError },
+	} {
+		t.Run(name, func(t *testing.T) {
+			g, m := newScopeGitHub(t)
+			now := time.Now()
+			m.Now = func() time.Time { return now }
+			var logs bytes.Buffer
+			m.Log = slog.New(slog.NewJSONHandler(&logs, nil))
+			widen(g)
+			for range 2 {
+				if _, err := m.Token(context.Background(), app, "trmlabs/trm-b2b", ContentsRead); err != nil {
+					t.Fatalf("a settings warning refused the token: %v", err)
+				}
+				now = now.Add(scopeTTL + time.Second)
+			}
+			if settings, _, _, _ := g.counts(); settings != 2 {
+				t.Fatalf("settings checked %d times, want 2", settings)
+			}
+			if n := strings.Count(logs.String(), "github app installation wider than needed"); n != 1 || strings.Contains(logs.String(), "refused") {
+				t.Fatalf("want one warning and no refusal, log: %s", logs.String())
+			}
+		})
+	}
+}
+
+func TestScopeAllowsPullRequestsOnlyWithAGitHubAPIEntry(t *testing.T) {
+	g, m := newScopeGitHub(t)
+	g.permissions["pull_requests"] = "write"
+	m.Scope = func(int64) Scope { return Scope{Repos: []string{"trmlabs/trm-b2b"}, PullRequests: true} }
+	if _, err := m.Token(context.Background(), app, "trmlabs/trm-b2b", PullRequestsWrite); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestScopeRechecksAfterTTLRetryAndCatalogChange(t *testing.T) {
+	g, m := newScopeGitHub(t)
+	now := time.Now()
+	m.Now = func() time.Time { return now }
+	token := func() error {
+		_, err := m.Token(context.Background(), app, "trmlabs/trm-b2b", ContentsRead)
+		return err
+	}
+	if err := token(); err != nil {
+		t.Fatal(err)
+	}
+	g.mu.Lock()
+	g.selection = "all"
+	g.mu.Unlock()
+	now = now.Add(scopeTTL - time.Second)
+	if err := token(); err != nil {
+		t.Fatal("rechecked before the verdict expired")
+	}
+	now = now.Add(2 * time.Second)
+	if err := token(); err == nil {
+		t.Fatal("a widened installation still mints after the verdict expired")
+	}
+	g.mu.Lock()
+	g.selection = "selected"
+	g.mu.Unlock()
+	now = now.Add(scopeRetry - time.Second)
+	if err := token(); err == nil {
+		t.Fatal("a refusal was retried before scopeRetry")
+	}
+	m.ForgetScope()
+	if err := token(); err != nil {
+		t.Fatalf("a catalog change did not recheck: %v", err)
+	}
+	if settings, _, _, _ := g.counts(); settings != 3 {
+		t.Fatalf("settings checked %d times, want 3", settings)
+	}
+}
+
+func TestScopeReadsEveryPage(t *testing.T) {
+	g, m := newScopeGitHub(t)
+	var want []string
+	for i := range 150 {
+		want = append(want, fmt.Sprintf("trmlabs/repo-%03d", i))
+	}
+	g.repos = want
+	m.Scope = func(int64) Scope { return Scope{Repos: append(want, "trmlabs/trm-b2b")} }
+	if _, err := m.Token(context.Background(), app, "trmlabs/trm-b2b", ContentsRead); err != nil {
+		t.Fatal(err)
+	}
+	g.mu.Lock()
+	pages := fmt.Sprint(g.pages)
+	g.mu.Unlock()
+	if pages != "[1 2]" {
+		t.Fatalf("pages %s", pages)
+	}
+
+	// An unlisted repository on the last page is still found.
+	g2, m2 := newScopeGitHub(t)
+	g2.repos = append(append([]string(nil), want...), "trmlabs/secret")
+	m2.Scope = func(int64) Scope { return Scope{Repos: append(want, "trmlabs/trm-b2b")} }
+	if _, err := m2.Token(context.Background(), app, "trmlabs/trm-b2b", ContentsRead); err == nil {
+		t.Fatal("an unlisted repository on page two was missed")
+	}
+}

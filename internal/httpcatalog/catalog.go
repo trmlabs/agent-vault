@@ -800,6 +800,21 @@ func (c Catalog) GitGranted(installation int64, repo, scope string) bool {
 	return false
 }
 
+// GitScope returns every repository the catalog lists for an installation,
+// and whether any github-api entry on it opens pull requests.
+func (c Catalog) GitScope(installation int64) (repos []string, pullRequests bool) {
+	for _, e := range c.entries {
+		if e.Git == nil || e.Git.InstallationID != installation {
+			continue
+		}
+		pullRequests = pullRequests || e.Kind == "github-api"
+		for _, r := range e.Git.Repos {
+			repos = append(repos, r.Repo)
+		}
+	}
+	return repos, pullRequests
+}
+
 // clusterLocal reports whether host is a Kubernetes Service name, the only
 // kind of host a plaintext database entry may name.
 func clusterLocal(host string) bool {
