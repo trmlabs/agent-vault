@@ -25,7 +25,6 @@ import (
 	"time"
 
 	"github.com/Infisical/agent-vault/internal/auditchain"
-	"github.com/Infisical/agent-vault/internal/workloadidentity"
 )
 
 var proxyNames = []string{"gatehouse-proxy.gatehouse-proxy.svc.cluster.local", "gatehouse-proxy.gatehouse-proxy.svc"}
@@ -226,12 +225,12 @@ type fakeVerifier struct {
 	err  error
 }
 
-func (f *fakeVerifier) IdentifyProxy(_ context.Context, token string, peer netip.Addr) (workloadidentity.ProxyIdentity, error) {
+func (f *fakeVerifier) ProxyBinding(_ context.Context, token string, peer netip.Addr) (string, error) {
 	f.peer = peer
 	if token != "proxy-token" {
-		return workloadidentity.ProxyIdentity{}, errors.New("not a proxy")
+		return "", errors.New("not a proxy")
 	}
-	return workloadidentity.ProxyIdentity{Scope: "sandbox-cluster/gatehouse-proxy/0f0e-uid"}, f.err
+	return "sandbox-cluster/gatehouse-proxy/0f0e-uid", f.err
 }
 
 func TestHandlerIssuesOnlyToTheProxy(t *testing.T) {

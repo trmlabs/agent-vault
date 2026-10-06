@@ -27,7 +27,6 @@ import (
 	"time"
 
 	"github.com/Infisical/agent-vault/internal/auditchain"
-	"github.com/Infisical/agent-vault/internal/workloadidentity"
 )
 
 // Signer signs a request for exactly names; Vault's PKI engine in production.
@@ -36,9 +35,10 @@ type Signer interface {
 }
 
 // ProxyVerifier admits only a shared proxy's own identity, from its token and
-// the connection's source address, and names its binding.
+// the connection's source address, and names its binding (trust domain,
+// namespace and service account UID).
 type ProxyVerifier interface {
-	IdentifyProxy(ctx context.Context, token string, peer netip.Addr) (workloadidentity.ProxyIdentity, error)
+	ProxyBinding(ctx context.Context, token string, peer netip.Addr) (string, error)
 }
 
 // Audit is the signed audit trail: Admit refuses while it cannot record, and
@@ -293,12 +293,12 @@ func (i *Issuer) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	peer = peer.Unmap()
-	proxy, err := i.Verifier.IdentifyProxy(r.Context(), token, peer)
+	binding, err := i.Verifier.ProxyBinding(r.Context(), token, peer)
 	if err != nil {
 		refuse(http.StatusForbidden, "not_proxy")
 		return
 	}
-	if !i.allow(proxy.Scope, time.Now()) {
+	if !i.allow(binding, time.Now()) {
 		refuse(http.StatusTooManyRequests, "rate_limited")
 		return
 	}
@@ -329,12 +329,12 @@ func (i *Issuer) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The certificate goes out only once its row is in the signed trail.
-	if i.Audit.Record(auditchain.Event{Event: auditchain.EventCertificate, Outcome: "issued", Peer: peer.String(), Binding: proxy.Scope,
+	if i.Audit.Record(auditchain.Event{Event: auditchain.EventCertificate, Outcome: "issued", Peer: peer.String(), Binding: binding,
 		Serial: serial, NotAfter: notAfter, DNSNames: strings.Join(names, ",")}) != nil {
 		refuse(http.StatusServiceUnavailable, "audit_unavailable")
 		return
 	}
-	i.log().Info("proxycert: certificate issued", "proxy", proxy.Scope, "names", strings.Join(names, ","), "serial", serial, "not_after", notAfter)
+	i.log().Info("proxycert: certificate issued", "proxy", binding, "names", strings.Join(names, ","), "serial", serial, "not_after", notAfter)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(response{Certificate: certificate, Chain: chain})
 }

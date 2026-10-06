@@ -266,6 +266,13 @@ func (r *Resolver) VerifyProxy(ctx context.Context, token string, peer netip.Add
 	return err
 }
 
+// ProxyBinding names the proxy binding a shared proxy's token and source
+// address belong to, for the certificate endpoint's audit row and limit.
+func (r *Resolver) ProxyBinding(ctx context.Context, token string, peer netip.Addr) (string, error) {
+	id, err := r.IdentifyProxy(ctx, token, peer)
+	return id.Scope, err
+}
+
 // ProxyIdentity is the shared proxy VerifyProxy admitted: Scope names its
 // binding (trust domain, namespace and service account UID), and Namespaces
 // are the agent namespaces it serves.
