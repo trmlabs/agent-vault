@@ -18,8 +18,9 @@ import (
 )
 
 // maxSeedLife bounds the placeholder session a seed describes, for a worker
-// without a deadline. A pool worker's seed ends at its Pod's deadline.
-const maxSeedLife = 8 * time.Hour
+// without a deadline: the workload identity's default session ceiling. A pool
+// worker's seed ends at its Pod's deadline.
+const maxSeedLife = 24 * time.Hour
 
 // forwardBrowser serves a browser-session entry: the app's own host with no
 // credential, the login seed, and the API with the placeholder access token

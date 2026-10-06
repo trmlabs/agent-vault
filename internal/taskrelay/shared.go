@@ -42,7 +42,8 @@ type SharedConfig struct {
 	// the image the node pulled, never the Pod spec.
 	ImagePrefixes map[string]string `json:"imagePrefixes,omitempty"`
 	ImageDigests  []string          `json:"imageDigests,omitempty"`
-	// MaxPodSeconds bounds an agent Pod's admission from its start (60 s to 8 h).
+	// MaxPodSeconds bounds an agent Pod's admission from its start (60 s up to
+	// the broker's default session ceiling, a day).
 	MaxPodSeconds int64 `json:"maxPodSeconds"`
 	// RequesterNamespaces are the namespaces whose attestations carry the
 	// requester: the Pod's gatehouse.trmlabs.com/requester annotation, which
@@ -84,7 +85,7 @@ func (s *SharedConfig) namespaces() []string {
 
 func (s *SharedConfig) validate() error {
 	if len(s.Profiles) == 0 || len(s.Profiles) > 64 || !kindPattern.MatchString(s.OwnerKind) || !apiVersionPattern.MatchString(s.OwnerAPIVersion) ||
-		len(s.ImageDigests) > 16 || s.MaxPodSeconds < 60 || s.MaxPodSeconds > 8*3600 || s.MaxConnections < 0 || s.MaxConnections > 65536 {
+		len(s.ImageDigests) > 16 || s.MaxPodSeconds < 60 || s.MaxPodSeconds > int64(workloadidentity.DefaultSessionCeiling/time.Second) || s.MaxConnections < 0 || s.MaxConnections > 65536 {
 		return errConfig
 	}
 	for ns, profile := range s.Profiles {

@@ -69,6 +69,22 @@ type Config struct {
 	Bindings                []Binding `json:"bindings"`
 	// TrustDomains are other clusters, each verified by its published keys.
 	TrustDomains []TrustDomain `json:"trustDomains,omitempty"`
+	// MaxSessionSeconds is the ceiling on every pool binding's Pod lifetime
+	// and every proxy binding's session (default a day, at most 30 days).
+	// Lifetimes follow the platform's own ceilings, so it is set here once.
+	MaxSessionSeconds int64 `json:"maxSessionSeconds,omitempty"`
+}
+
+// DefaultSessionCeiling is MaxSessionSeconds when unset.
+const DefaultSessionCeiling = 24 * time.Hour
+
+const maxSessionCeiling = 30 * 24 * time.Hour
+
+func (c *Config) sessionCeiling() int64 {
+	if c.MaxSessionSeconds == 0 {
+		return int64(DefaultSessionCeiling / time.Second)
+	}
+	return c.MaxSessionSeconds
 }
 
 // Store supplies current broker identity and grant state for every decision.
@@ -162,6 +178,10 @@ func newResolver(c Config, s Store, observer bool) (*Resolver, error) {
 	if c.MaxTokenLifetimeSeconds == 0 {
 		c.MaxTokenLifetimeSeconds = 3600
 	}
+	if c.MaxSessionSeconds != 0 && (c.MaxSessionSeconds < 60 || c.MaxSessionSeconds > int64(maxSessionCeiling/time.Second)) {
+		return nil, errors.New("workload identity maxSessionSeconds must be between 60 s and 30 days")
+	}
+	ceiling := c.sessionCeiling()
 	if c.MaxTokenLifetimeSeconds < 600 || c.MaxTokenLifetimeSeconds > 3600 {
 		return nil, errors.New("workload identity maxTokenLifetimeSeconds must be between 600 and 3600")
 	}
@@ -178,8 +198,8 @@ func newResolver(c Config, s Store, observer bool) (*Resolver, error) {
 			if b.Pool != "" && !pathSegment(b.Pool) {
 				return nil, errors.New("pool binding name must be a lowercase DNS-style name")
 			}
-			if observer || len(b.OwnerUIDs) == 0 || len(b.OwnerUIDs) > 16 || b.PodUID != "" || b.MaxPodSeconds < 60 || b.MaxPodSeconds > 8*3600 || (b.ContainerName != "" && !pathSegment(b.ContainerName)) {
-				return nil, errors.New("pool binding requires 1 to 16 owner UIDs, no Pod UID and a 60 s to 8 h Pod lifetime")
+			if observer || len(b.OwnerUIDs) == 0 || len(b.OwnerUIDs) > 16 || b.PodUID != "" || b.MaxPodSeconds < 60 || b.MaxPodSeconds > ceiling || (b.ContainerName != "" && !pathSegment(b.ContainerName)) {
+				return nil, errors.New("pool binding requires 1 to 16 owner UIDs, no Pod UID and a Pod lifetime from 60 s to maxSessionSeconds")
 			}
 			for _, owner := range b.OwnerUIDs {
 				if owner == "" {
@@ -205,7 +225,7 @@ func newResolver(c Config, s Store, observer bool) (*Resolver, error) {
 			if observer || b.PodUID != "" || len(b.OwnerUIDs) != 0 || b.ContainerName != "" || b.MaxPodSeconds != 0 || len(b.ImageDigests) != 0 || b.Pool != "" {
 				return nil, errors.New("a proxy binding takes its pools from its profiles and no Pod, owner or image settings of its own")
 			}
-			if err := b.Proxy.validate(); err != nil {
+			if err := b.Proxy.validate(ceiling); err != nil {
 				return nil, err
 			}
 			// Within one trust domain, a namespace names one profile.

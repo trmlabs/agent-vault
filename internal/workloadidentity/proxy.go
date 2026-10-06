@@ -36,9 +36,11 @@ type ProxyBinding struct {
 	// address range. A connection from anywhere else is refused.
 	SourceCIDRs []string `json:"sourceCIDRs"`
 	// MaxSessionSeconds caps a session from the proxy token's issue time (60
-	// to 1800 s). A remote proxy token cannot be revoked by a live Pod read,
-	// so this bounds how long an open session outlives it.
-	MaxSessionSeconds int64 `json:"maxSessionSeconds"`
+	// s up to the policy's maxSessionSeconds, which is also the default). A
+	// remote proxy token cannot be revoked by a live Pod read, so this bounds
+	// how long an open session outlives it; the proxy itself ends a session
+	// within a second of its Pod no longer qualifying.
+	MaxSessionSeconds int64 `json:"maxSessionSeconds,omitempty"`
 }
 
 // ProxyProfile is one namespace a proxy serves: the harness profile its
@@ -142,7 +144,7 @@ func decodeAttestation(s string) (Attestation, error) {
 }
 
 // validate checks a proxy binding at load.
-func (p *ProxyBinding) validate() error {
+func (p *ProxyBinding) validate(ceiling int64) error {
 	if len(p.Profiles) == 0 || len(p.Profiles) > 64 {
 		return errors.New("proxy binding needs 1 to 64 namespace profiles")
 	}
@@ -187,8 +189,11 @@ func (p *ProxyBinding) validate() error {
 			return errors.New("proxy binding source range must be a non-default CIDR")
 		}
 	}
-	if p.MaxSessionSeconds < 60 || p.MaxSessionSeconds > 1800 {
-		return errors.New("proxy binding maxSessionSeconds must be between 60 and 1800")
+	if p.MaxSessionSeconds == 0 {
+		p.MaxSessionSeconds = ceiling
+	}
+	if p.MaxSessionSeconds < 60 || p.MaxSessionSeconds > ceiling {
+		return errors.New("proxy binding maxSessionSeconds must be from 60 s to the policy's maxSessionSeconds")
 	}
 	return nil
 }
