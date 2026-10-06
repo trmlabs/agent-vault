@@ -119,14 +119,19 @@ func New(addr string, opts Options) *Broker {
 	if opts.MinRenewInterval <= 0 {
 		opts.MinRenewInterval = defaultMinRenewInterval
 	}
+	maxConns, perActor := defaultMaxConns, defaultMaxLeasesPerActor
+	if opts.Pool != nil {
+		maxConns, perActor = defaultPooledMaxConns, defaultPooledMaxLeasesPerActor
+	}
 	if opts.MaxConns <= 0 {
-		opts.MaxConns = defaultMaxConns
+		opts.MaxConns = maxConns
 	}
 	if opts.MaxPendingConns <= 0 {
-		opts.MaxPendingConns = defaultMaxPendingConns
+		// Handshakes in progress scale with the serving cap they feed.
+		opts.MaxPendingConns = max(defaultMaxPendingConns, opts.MaxConns)
 	}
 	if opts.MaxLeasesPerActor <= 0 {
-		opts.MaxLeasesPerActor = defaultMaxLeasesPerActor
+		opts.MaxLeasesPerActor = perActor
 	}
 	if opts.MaxLeasesPerActor > opts.MaxConns {
 		// A per-actor limit above the global ceiling has no effect.
