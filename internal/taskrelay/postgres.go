@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -229,6 +230,7 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig, route func(datab
 	}
 	typ, body, e := readPGFrame(up, 8192)
 	if e == nil && typ == 'E' {
+		_ = r.record("postgres", "refused:"+refusalReason(body))
 		tell(refusalFrame(body))
 		return
 	}
@@ -298,6 +300,7 @@ func (r *relay) postgres(conn net.Conn, binding PostgresConfig, route func(datab
 				return
 			}
 		case 'E':
+			_ = r.record("postgres", "refused:"+refusalReason(body))
 			tell(refusalFrame(body))
 			return
 		default:
@@ -509,6 +512,42 @@ var refusalsByReason = map[string]refusal{
 	"encoding_change":     {"42501", "Gatehouse refuses changing standard_conforming_strings or client_encoding mid-session; only on and UTF8 at connect"},
 	"pipelined_escape":    {"0A000", "Gatehouse refuses a statement with a backslash after an Execute in the same batch; send Sync first"},
 	"statement_limit":     {"54000", "this session holds too many prepared statements; deallocate some"},
+	"audit_unavailable":   {"08004", "Gatehouse could not write its audit record, so it refused the connection; retry shortly"},
+	"ledger_unavailable":  {"08004", "Gatehouse could not record the session in its accounting, so it refused the connection; retry shortly"},
+	// Authorization decisions (42501): which check refused.
+	"pool_external":            {"42501", "Gatehouse: this pool may reach only external destinations, not this database"},
+	"pool_ceiling":             {"42501", "Gatehouse: this database is above your pool's tier ceiling"},
+	"entitlement_config":       {"42501", "Gatehouse: this database's entitlement settings are incomplete; tell the Gatehouse owners"},
+	"workload_not_entitled":    {"42501", "Gatehouse: this workload is not entitled to this database"},
+	"no_identity":              {"42501", "Gatehouse: this pool has no identity that can be authorized for this database"},
+	"no_person":                {"42501", "Gatehouse: no person could be named for this session"},
+	"entitlement_rate_limited": {"42501", "Gatehouse could not check entitlements just now (rate limited); retry shortly"},
+	"entitlement_unavailable":  {"42501", "Gatehouse could not check entitlements just now; retry shortly"},
+	"account_disabled":         {"42501", "Gatehouse: this person's account is disabled"},
+	"not_entitled":             {"42501", "Gatehouse: this person is not entitled to this database"},
+	"session_unexpected":       {"42501", "Gatehouse: this pool takes no runner session, but one was sent"},
+	"session_unverifiable":     {"42501", "Gatehouse could not verify this runner session"},
+	"session_token":            {"42501", "Gatehouse: this runner session's token was refused"},
+	"session_pool":             {"42501", "Gatehouse: this runner session belongs to another pool"},
+	"session_unbindable":       {"42501", "Gatehouse could not bind this runner session to its Pod; retry shortly"},
+	"session_pod_mismatch":     {"42501", "Gatehouse: this runner session is already bound to another Pod"},
+	"requester_unverifiable":   {"42501", "Gatehouse could not verify the person behind this session"},
+}
+
+// brokerReason is the broker's reason code on a refusal, if it has the shape
+// of one: a fixed identifier, safe to log and to name to the client.
+var brokerReason = regexp.MustCompile(`^[a-z][a-z_]{0,47}$`)
+
+// refusalReason is a refusal's reason for the relay log: the broker's code,
+// or its SQLSTATE when it gave none.
+func refusalReason(body []byte) string {
+	if reason := errorField(body, brokercore.RefusalReasonField); brokerReason.MatchString(reason) {
+		return reason
+	}
+	if code := sqlState(body); code != "" {
+		return "sqlstate_" + code
+	}
+	return "unknown"
 }
 
 // refusalsByCode covers a broker refusal whose reason has no entry of its own:
@@ -531,11 +570,17 @@ func brokerRefusal(severity string, body []byte) []byte {
 	if r, ok := refusalsByReason[errorField(body, brokercore.RefusalReasonField)]; ok {
 		return severityFrame(severity, r.code, r.message)
 	}
+	// A reason this relay has no words for still reaches the client by name,
+	// so one failure under load can be told from another.
+	named := ""
+	if reason := errorField(body, brokercore.RefusalReasonField); brokerReason.MatchString(reason) {
+		named = " (" + reason + ")"
+	}
 	code := sqlState(body)
 	if message, ok := refusalsByCode[code]; ok {
-		return severityFrame(severity, code, message)
+		return severityFrame(severity, code, message+named)
 	}
-	return severityFrame(severity, "08004", genericRefusalMessage)
+	return severityFrame(severity, "08004", genericRefusalMessage+named)
 }
 
 // refusalFrame is the relay-authored FATAL error for a broker startup refusal.

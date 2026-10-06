@@ -91,6 +91,12 @@ func (r *relay) connect(w http.ResponseWriter, req *http.Request) {
 	limited := &io.LimitedReader{R: up, N: 8193}
 	reader := bufio.NewReader(limited)
 	status, e := reader.ReadString('\n')
+	if e == nil && !strings.HasPrefix(status, "HTTP/1.1 200 ") {
+		// The broker's status (not its text) names the refusal in the relay log.
+		if code := strings.TrimPrefix(status, "HTTP/1.1 "); len(code) >= 3 && strings.Trim(code[:3], "0123456789") == "" {
+			_ = r.record("connect", "refused:"+code[:3])
+		}
+	}
 	if e == nil && strings.HasPrefix(status, "HTTP/1.1 403 ") {
 		// The broker refused the target (not in the catalog, or not this
 		// pool's): a refusal, not an outage. Only the status passes.
