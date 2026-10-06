@@ -592,3 +592,23 @@ func TestVerifyProxyAdmitsOnlyTheProxy(t *testing.T) {
 		}
 	}
 }
+
+// A requester, when present, must be a lower-case login; the broker refuses
+// any other value before it looks at the rest of the attestation.
+func TestAttestationRequester(t *testing.T) {
+	a := setupProxy(t).a
+	for _, requester := range []string{"", "alice.smith@trmlabs.com", "a+b@sub.trmlabs.com"} {
+		a.Requester = requester
+		encoded, _ := EncodeAttestation(a)
+		if got, err := decodeAttestation(encoded); err != nil || got.Requester != requester {
+			t.Errorf("%q refused: %v", requester, err)
+		}
+	}
+	for _, requester := range []string{"Alice@trmlabs.com", "alice", "alice@trmlabs", "@trmlabs.com", "alice@-trmlabs.com", "alice@trmlabs.com ", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@trmlabs.com"} {
+		a.Requester = requester
+		encoded, _ := EncodeAttestation(a)
+		if _, err := decodeAttestation(encoded); err == nil {
+			t.Errorf("%q accepted", requester)
+		}
+	}
+}

@@ -86,9 +86,10 @@ func (a *relayAudit) recordAgent(protocol, outcome string, agent *workloadidenti
 		PodUID     string    `json:"podUID,omitempty"`
 		Namespace  string    `json:"namespace,omitempty"`
 		Images     []string  `json:"images,omitempty"`
+		Requester  string    `json:"requester,omitempty"`
 	}{Time: time.Now().UTC(), TaskID: a.config.TaskID, SandboxUID: a.config.Sandbox.UID, Protocol: protocol, Outcome: outcome}
 	if agent != nil {
-		row.SandboxUID, row.PodUID, row.Namespace, row.Images = agent.OwnerUID, agent.PodUID, agent.Namespace, agent.Images
+		row.SandboxUID, row.PodUID, row.Namespace, row.Images, row.Requester = agent.OwnerUID, agent.PodUID, agent.Namespace, agent.Images, agent.Requester
 	}
 	if json.NewEncoder(a.file).Encode(row) != nil || (!a.stdout && a.file.Sync() != nil) {
 		return errDenied
