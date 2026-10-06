@@ -77,6 +77,7 @@ type Event struct {
 	// Proxy certificate issuance: see Row.
 	Serial   string
 	NotAfter string
+	DNSNames string // comma-separated lower-case DNS names the certificate holds
 	Method   string
 	Status   int
 	Duration int64 // milliseconds
@@ -186,6 +187,9 @@ func (e Event) Validate() error {
 	if !groupList(e.Groups) {
 		return ErrInvalidEvent
 	}
+	if !dnsNameList(e.DNSNames) {
+		return ErrInvalidEvent
+	}
 	if e.Serial != "" && !serialHex.MatchString(e.Serial) {
 		return ErrInvalidEvent
 	}
@@ -200,6 +204,22 @@ func (e Event) Validate() error {
 // serialHex is a certificate serial number: at most 20 octets (RFC 5280), in
 // lower-case hex with no leading zeros.
 var serialHex = regexp.MustCompile(`^(0|[1-9a-f][0-9a-f]{0,39})$`)
+
+var dnsName = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$`)
+
+// dnsNameList admits comma-separated lower-case DNS names, any number, so no
+// free text can enter the row.
+func dnsNameList(s string) bool {
+	if s == "" {
+		return true
+	}
+	for _, n := range strings.Split(s, ",") {
+		if len(n) > 253 || !dnsName.MatchString(n) {
+			return false
+		}
+	}
+	return true
+}
 
 var groupID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
@@ -229,7 +249,7 @@ func (c *Chain) Record(e Event) error {
 	defer c.mu.Unlock()
 	_, err := c.appendLocked(Row{Event: e.Event, Pool: e.Pool, Agent: e.Agent, PodUID: e.PodUID, Binding: e.Binding, Session: e.Session, Outcome: e.Outcome, Requester: e.Requester,
 		RequesterKind: e.RequesterKind, RequesterOID: e.RequesterOID, TokenSHA256: e.TokenSHA256, Tier: e.Tier, Decision: e.Decision, Groups: e.Groups, CacheAgeSec: e.CacheAgeSec,
-		Kid: e.Kid, KidSHA256: e.KidSHA256, Peer: e.Peer, Serial: e.Serial, NotAfter: e.NotAfter,
+		Kid: e.Kid, KidSHA256: e.KidSHA256, Peer: e.Peer, Serial: e.Serial, NotAfter: e.NotAfter, DNSNames: e.DNSNames,
 		Method: e.Method, Status: e.Status, Duration: e.Duration})
 	return err
 }

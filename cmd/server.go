@@ -360,8 +360,11 @@ func attachProxyCertificates(srv *server.Server, resolver *workloadidentity.Reso
 	if chain == nil {
 		return fmt.Errorf("proxy certificates need the signed audit trail (AGENT_VAULT_AUDIT_CHAIN)")
 	}
+	// Issuance per proxy binding: AGENT_VAULT_PROXY_CERT_PER_HOUR and
+	// AGENT_VAULT_PROXY_CERT_BURST (default 1,000 each).
 	return srv.EnableProxyCertificates(&proxycert.Issuer{Mount: mount, Role: role, Names: list, TTL: ttl,
-		Signer: srv.HashicorpClient(), Verifier: resolver, Audit: chain, Logger: logger})
+		Signer: srv.HashicorpClient(), Verifier: resolver, Audit: chain, Logger: logger,
+		PerHour: intEnvValue("AGENT_VAULT_PROXY_CERT_PER_HOUR"), Burst: intEnvValue("AGENT_VAULT_PROXY_CERT_BURST")})
 }
 
 // attachProxyActivity keeps shared proxies' Sandbox activity in the shared

@@ -12,7 +12,6 @@ import (
 	"crypto/elliptic"
 	"crypto/x509"
 	"encoding/asn1"
-	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -24,9 +23,11 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Infisical/agent-vault/internal/auditchain"
+	"github.com/Infisical/agent-vault/internal/workloadidentity"
 )
 
 // Signer signs a request for exactly names; Vault's PKI engine in production.
@@ -35,9 +36,9 @@ type Signer interface {
 }
 
 // ProxyVerifier admits only a shared proxy's own identity, from its token and
-// the connection's source address.
+// the connection's source address, and names its binding.
 type ProxyVerifier interface {
-	VerifyProxy(ctx context.Context, token string, peer netip.Addr) error
+	IdentifyProxy(ctx context.Context, token string, peer netip.Addr) (workloadidentity.ProxyIdentity, error)
 }
 
 // Audit is the signed audit trail: Admit refuses while it cannot record, and
@@ -56,6 +57,47 @@ type Issuer struct {
 	Verifier    ProxyVerifier
 	Audit       Audit
 	Logger      *slog.Logger
+	// PerHour and Burst bound issuance per proxy binding (token bucket), so a
+	// looping proxy cannot flood Vault PKI or the audit trail. Defaults: 1,000
+	// an hour, burst 1,000, room for a fleet of replicas all starting at once
+	// and each renewing at two thirds of its lifetime with retries.
+	PerHour, Burst int
+
+	limitMu sync.Mutex
+	buckets map[string]*certBucket
+}
+
+type certBucket struct {
+	tokens float64
+	at     time.Time
+}
+
+// allow takes one issuance from binding's bucket.
+func (i *Issuer) allow(binding string, now time.Time) bool {
+	perHour, burst := i.PerHour, i.Burst
+	if perHour <= 0 {
+		perHour = 1000
+	}
+	if burst <= 0 {
+		burst = 1000
+	}
+	i.limitMu.Lock()
+	defer i.limitMu.Unlock()
+	if i.buckets == nil {
+		i.buckets = map[string]*certBucket{}
+	}
+	b, ok := i.buckets[binding]
+	if !ok {
+		b = &certBucket{tokens: float64(burst), at: now}
+		i.buckets[binding] = b
+	}
+	b.tokens = min(float64(burst), b.tokens+now.Sub(b.at).Hours()*float64(perHour))
+	b.at = now
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
 }
 
 const (
@@ -208,7 +250,9 @@ func checkIssued(certificatePEM string, csrPEM string, names []string) (string, 
 		!slices.Equal(slices.Sorted(slices.Values(leaf.DNSNames)), slices.Sorted(slices.Values(names))) || leaf.SerialNumber == nil || leaf.SerialNumber.Sign() < 0 {
 		return "", "", errIssued
 	}
-	return hex.EncodeToString(leaf.SerialNumber.Bytes()), leaf.NotAfter.UTC().Format(time.RFC3339), nil
+	// Text(16) is lower-case hex with no leading zeros ("0" for zero), the
+	// form the audit row takes; hex of the bytes keeps a leading zero nibble.
+	return leaf.SerialNumber.Text(16), leaf.NotAfter.UTC().Format(time.RFC3339), nil
 }
 
 type request struct {
@@ -249,8 +293,13 @@ func (i *Issuer) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	peer = peer.Unmap()
-	if err := i.Verifier.VerifyProxy(r.Context(), token, peer); err != nil {
+	proxy, err := i.Verifier.IdentifyProxy(r.Context(), token, peer)
+	if err != nil {
 		refuse(http.StatusForbidden, "not_proxy")
+		return
+	}
+	if !i.allow(proxy.Scope, time.Now()) {
+		refuse(http.StatusTooManyRequests, "rate_limited")
 		return
 	}
 	if i.Audit.Admit() != nil {
@@ -280,11 +329,12 @@ func (i *Issuer) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The certificate goes out only once its row is in the signed trail.
-	if i.Audit.Record(auditchain.Event{Event: auditchain.EventCertificate, Outcome: "issued", Peer: peer.String(), Serial: serial, NotAfter: notAfter}) != nil {
+	if i.Audit.Record(auditchain.Event{Event: auditchain.EventCertificate, Outcome: "issued", Peer: peer.String(), Binding: proxy.Scope,
+		Serial: serial, NotAfter: notAfter, DNSNames: strings.Join(names, ",")}) != nil {
 		refuse(http.StatusServiceUnavailable, "audit_unavailable")
 		return
 	}
-	i.log().Info("proxycert: certificate issued", "names", strings.Join(names, ","), "serial", serial, "not_after", notAfter)
+	i.log().Info("proxycert: certificate issued", "proxy", proxy.Scope, "names", strings.Join(names, ","), "serial", serial, "not_after", notAfter)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(response{Certificate: certificate, Chain: chain})
 }

@@ -65,6 +65,7 @@ type Row struct {
 	// lower-case hex and its notAfter in RFC 3339 UTC.
 	Serial    string `json:"serial,omitempty"`
 	NotAfter  string `json:"notAfter,omitempty"`
+	DNSNames  string `json:"dnsNames,omitempty"`
 	Method    string `json:"method,omitempty"`     // HTTP rows only
 	Status    int    `json:"status,omitempty"`     // HTTP response rows: upstream or broker status
 	Duration  int64  `json:"durationMs,omitempty"` // transaction rows: milliseconds from first message to completion
@@ -117,7 +118,7 @@ func (r Row) macInput() []byte {
 	if r.MACVersion < 4 {
 		return lengthPrefixed("gatehouse-audit-v3", fields...)
 	}
-	fields = append(fields, r.Serial, r.NotAfter)
+	fields = append(fields, r.Serial, r.NotAfter, r.DNSNames)
 	return lengthPrefixed("gatehouse-audit-v4", fields...)
 }
 
@@ -131,7 +132,7 @@ func (r Row) v2Only() bool {
 func (r Row) v3Only() bool { return r.Kid != "" || r.KidSHA256 != "" || r.Peer != "" }
 
 // v4Only reports whether a row sets a field that only the v4 MAC covers.
-func (r Row) v4Only() bool { return r.Serial != "" || r.NotAfter != "" }
+func (r Row) v4Only() bool { return r.Serial != "" || r.NotAfter != "" || r.DNSNames != "" }
 
 func (r Row) computeMAC(key []byte) string {
 	h := hmac.New(sha256.New, key)
