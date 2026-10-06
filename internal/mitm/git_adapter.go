@@ -80,7 +80,7 @@ func (p *Proxy) forwardGit(w http.ResponseWriter, r *http.Request, target string
 		}
 		outBody = io.MultiReader(bytes.NewReader(consumed), body)
 	}
-	enf := p.rateLimit.EnforceProxy(r.Context(), scope.AgentID+"/"+scope.WorkloadID, entry.Name)
+	enf := p.rateLimit.EnforceProxy(r.Context(), proxyLimitActor(scope), entry.Name)
 	if !enf.Allowed {
 		deny(http.StatusTooManyRequests, "rate_limited")
 		return
