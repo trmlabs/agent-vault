@@ -112,6 +112,17 @@ func (rig *restoreRig) replica(t *testing.T) (*sharedFixture, string) {
 	pod := sandboxPod("sandbox-a", "pod-a", "127.0.0.1")
 	pod["metadata"].(map[string]any)["ownerReferences"].([]any)[0].(map[string]any)["uid"] = "uid-sb-00007"
 	sf.api.send(t, "MODIFIED", pod)
+	// The watch applies the change on its own goroutine: until it has, a
+	// tunnel is attributed to the Pod's old owner. The Pod's start, recorded
+	// for its new owner, shows it has.
+	waitUntil(t, "the replica to see sb-00007's Pod", func() bool {
+		for _, s := range local(t, admin).Sandboxes {
+			if s.OwnerUID == "uid-sb-00007" {
+				return true
+			}
+		}
+		return false
+	})
 	return sf, admin
 }
 
