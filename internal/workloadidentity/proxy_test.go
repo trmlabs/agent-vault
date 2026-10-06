@@ -566,3 +566,29 @@ func TestProxyBindingListsAreFleetSized(t *testing.T) {
 		t.Fatal("a list past its bound was accepted")
 	}
 }
+
+// A shared proxy asking for its serving certificate is admitted as itself:
+// its own current token, from its link's range. Nothing else qualifies.
+func TestVerifyProxyAdmitsOnlyTheProxy(t *testing.T) {
+	p := setupProxy(t)
+	if err := p.r.VerifyProxy(context.Background(), p.rc.token(p.rc.claims()), linkIP); err != nil {
+		t.Fatalf("the proxy was refused: %v", err)
+	}
+	expired := p.rc.claims()
+	expired.Issued = time.Now().Unix() - 700
+	expired.Expires = expired.Issued + 600
+	for name, tc := range map[string]struct {
+		token string
+		peer  netip.Addr
+	}{
+		"outside the link's range": {p.rc.token(p.rc.claims()), netip.MustParseAddr("10.9.9.9")},
+		"expired proxy token":      {p.rc.token(expired), linkIP},
+		"a pool worker":            {p.pool.token(p.pool.c), linkIP},
+		"loopback":                 {p.rc.token(p.rc.claims()), netip.MustParseAddr("127.0.0.1")},
+		"no token":                 {"", linkIP},
+	} {
+		if err := p.r.VerifyProxy(context.Background(), tc.token, tc.peer); err == nil {
+			t.Errorf("%s: admitted", name)
+		}
+	}
+}
