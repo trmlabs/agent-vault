@@ -260,28 +260,47 @@ func (r *Resolver) attestProxied(ctx context.Context, binding *Binding, c claims
 // token from a proxy binding's own account, from the binding's source ranges.
 // It is how a proxy asks the broker for its serving certificate.
 func (r *Resolver) VerifyProxy(ctx context.Context, token string, peer netip.Addr) error {
+	_, err := r.IdentifyProxy(ctx, token, peer)
+	return err
+}
+
+// ProxyIdentity is the shared proxy VerifyProxy admitted: Scope names its
+// binding (trust domain, namespace and service account UID), and Namespaces
+// are the agent namespaces it serves.
+type ProxyIdentity struct {
+	Scope      string
+	Namespaces []string
+}
+
+// IdentifyProxy is VerifyProxy, returning which proxy binding was admitted.
+func (r *Resolver) IdentifyProxy(ctx context.Context, token string, peer netip.Addr) (ProxyIdentity, error) {
+	var id ProxyIdentity
 	if !peer.IsValid() || peer.IsLoopback() || peer.IsUnspecified() {
-		return brokercore.Denied("peer")
+		return id, brokercore.Denied("peer")
 	}
 	peer = peer.Unmap()
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(r.config.TimeoutSeconds)*time.Second)
 	defer cancel()
 	c, d, err := r.verifyLocally(ctx, token, false)
 	if err != nil {
-		return err
+		return id, err
 	}
 	k := c.Kubernetes
 	for i := range r.config.Bindings {
 		b := &r.config.Bindings[i]
 		if b.TrustDomain == d.name && b.Namespace == k.Namespace && b.ServiceAccount == k.ServiceAccount.Name && b.ServiceAccountUID == k.ServiceAccount.UID {
 			if b.Proxy == nil {
-				return brokercore.Denied("not_proxy")
+				return id, brokercore.Denied("not_proxy")
 			}
 			if !b.Proxy.fromSource(peer) {
-				return brokercore.Denied("proxy_source")
+				return id, brokercore.Denied("proxy_source")
 			}
-			return nil
+			id.Scope = b.TrustDomain + "/" + b.Namespace + "/" + b.ServiceAccountUID
+			for _, pp := range b.Proxy.Profiles {
+				id.Namespaces = append(id.Namespaces, pp.Namespace)
+			}
+			return id, nil
 		}
 	}
-	return brokercore.Denied("no_binding")
+	return id, brokercore.Denied("no_binding")
 }

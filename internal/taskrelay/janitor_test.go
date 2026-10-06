@@ -405,3 +405,29 @@ func TestJanitorConfigLoadsTheScaleRecords(t *testing.T) {
 		t.Fatalf("load: %v %+v", e, c)
 	}
 }
+
+// When every replica's report is durable, a replica's coming or going loses
+// nothing: a young replica and a recent scale do not hold the pass, and the
+// scale records are not read.
+func TestJanitorTrustsDurableReports(t *testing.T) {
+	durable := func(started time.Time) *httptest.Server {
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			json.NewEncoder(w).Encode(ActivityReport{ReplicaStarted: started, RetentionSeconds: 86400, Durable: true,
+				Sandboxes: []SandboxActivity{{Namespace: tenantNS, OwnerUID: "uid-sb-00002", LastSeen: time.Now().Add(-time.Minute)}}})
+		}))
+		t.Cleanup(s.Close)
+		return s
+	}
+	jf := newJanitor(t, map[string]*httptest.Server{"10.0.0.1": durable(time.Now().Add(-2 * time.Hour)), "10.0.0.2": durable(time.Now().Add(-time.Minute))})
+	jf.api.scaleStatus = 403
+	jf.api.sandboxes = []map[string]any{janitorSandbox(1, 3*time.Hour), janitorSandbox(2, 3*time.Hour)}
+	if e := jf.j.pass(context.Background()); e != nil || len(jf.api.deleted) != 1 || !jf.api.deleted["sb-00001"] {
+		t.Fatalf("durable pass: deleted %v, error %v", jf.api.deleted, e)
+	}
+	// One replica-local report brings the holds back.
+	jf = newJanitor(t, map[string]*httptest.Server{"10.0.0.1": durable(time.Now().Add(-2 * time.Hour)), "10.0.0.2": activityServer(t, time.Now().Add(-time.Minute))})
+	jf.api.sandboxes = []map[string]any{janitorSandbox(1, 3*time.Hour)}
+	if e := jf.j.pass(context.Background()); e != nil || len(jf.api.deleted) != 0 || jf.events(t, "janitor_pass")[0]["held"] != "proxy_replica_young" {
+		t.Fatalf("mixed reports: deleted %v, error %v", jf.api.deleted, e)
+	}
+}

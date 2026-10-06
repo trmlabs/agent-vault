@@ -29,6 +29,7 @@ import (
 	"github.com/Infisical/agent-vault/internal/oauth"
 	"github.com/Infisical/agent-vault/internal/pgproxy"
 	"github.com/Infisical/agent-vault/internal/pidfile"
+	"github.com/Infisical/agent-vault/internal/proxyactivity"
 	"github.com/Infisical/agent-vault/internal/proxycert"
 	"github.com/Infisical/agent-vault/internal/ratelimit"
 	"github.com/Infisical/agent-vault/internal/requestlog"
@@ -101,8 +102,9 @@ type Server struct {
 	// pgBroker is the PostgreSQL credential-brokering TCP listener; nil when
 	// --postgres-port is 0 or no database services are configured.
 	cleanupObserverServer *http.Server
-	crossClusterAddr      string            // loopback address of the cross-cluster listener, or ""
-	proxyCerts            *proxycert.Issuer // signs shared proxies' serving certificates on that listener, or nil
+	crossClusterAddr      string                 // loopback address of the cross-cluster listener, or ""
+	proxyCerts            *proxycert.Issuer      // signs shared proxies' serving certificates on that listener, or nil
+	proxyActivity         *proxyactivity.Service // keeps shared proxies' Sandbox activity on that listener, or nil
 	pgBroker              *pgproxy.Broker
 	readiness             []readinessCheck
 	pgLeaseCloser         interface{ Close(context.Context) error }
@@ -154,6 +156,16 @@ func (s *Server) EnableProxyCertificates(i *proxycert.Issuer) error {
 		return err
 	}
 	s.proxyCerts = i
+	return nil
+}
+
+// EnableProxyActivity serves shared proxies' activity reports and reads on
+// the cross-cluster listener, which must also be enabled.
+func (s *Server) EnableProxyActivity(a *proxyactivity.Service) error {
+	if err := a.Validate(); err != nil {
+		return err
+	}
+	s.proxyActivity = a
 	return nil
 }
 
@@ -1158,9 +1170,18 @@ func (s *Server) Start() error {
 			pgLn = pgMerged
 		}
 		var certLn *injectedListener
-		if s.proxyCerts != nil {
+		if s.proxyCerts != nil || s.proxyActivity != nil {
+			// A shared proxy's own requests: its serving certificate and its
+			// Sandboxes' activity.
+			mux := http.NewServeMux()
+			if s.proxyCerts != nil {
+				s.proxyCerts.Register(mux)
+			}
+			if s.proxyActivity != nil {
+				s.proxyActivity.Register(mux)
+			}
 			certLn = newInjectedListener(crossLn.Addr())
-			certServer := &http.Server{Handler: s.proxyCerts.Handler(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second,
+			certServer := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second,
 				WriteTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 			defer func() { _ = certServer.Close() }()
 			go func() { _ = certServer.Serve(certLn) }()
