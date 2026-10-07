@@ -14,7 +14,7 @@ Not all of this is live yet:
 |---|---|
 | Gatehouse support for all six destination kinds | On main, through #30; there is no tagged release. Staging runs broker images built from main commits |
 | Adding an entry with one trm-infra pull request | The catalog is trm-infra `vault/terraform/environments/prod/gatehouse-catalog.yaml`, written to Vault by the `gatehouse-catalog` module. A broker reads it only when `AGENT_VAULT_CATALOG_VAULT_PATH` or `AGENT_VAULT_CATALOG_VAULT_PREFIX` is set, and the staging render sets neither yet |
-| Entries limited to named people (tiers T1 and T2) | The broker names the person behind a Claude session, a Cursor run or an agent-sandbox Pod and can look up their Entra groups. Group entries are refused until a deployment switches that lookup on |
+| Entries limited to named people (tiers T1 and T2) | The broker names the person behind a Claude session, a Cursor run (the staging Cursor pool does not use this yet) or an agent-sandbox Pod and can look up their Entra groups. Group entries are refused until a deployment switches that lookup on |
 | Database entries above T0 | The database path carries the person's session, so T1 and T2 databases work once the Entra lookup is on, as for HTTP |
 | Repository and pull request entries | The staging GitHub App exists (the catalog's `github-git` entry). Git requests are refused until its private key is imported into Vault |
 
