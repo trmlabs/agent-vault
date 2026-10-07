@@ -518,7 +518,10 @@ func TestSessionRemovalFitsTheShutdownBudget(t *testing.T) {
 		s := openAgentSession(t, addr, "agent", "db")
 		s.close()
 		waitFor(t, 2*time.Second, func() bool { ledger.mu.Lock(); defer ledger.mu.Unlock(); return len(ledger.removed) == 1 }, "session not removed")
-		if got := ledger.removed[0]; got > tc.most || got < tc.most-time.Second {
+		ledger.mu.Lock()
+		got := ledger.removed[0]
+		ledger.mu.Unlock()
+		if got > tc.most || got < tc.most-time.Second {
 			t.Errorf("LedgerTimeout %s: removal deadline %s, want about %s", tc.setting, got, tc.most)
 		}
 	}

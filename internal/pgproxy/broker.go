@@ -501,8 +501,8 @@ func (b *Broker) releaseServeSlot() { <-b.serveSem }
 
 // removalTimeout bounds removing a session from the ledger. Removal runs as
 // sessions end, including at shutdown, so it never exceeds leaseRevokeTimeout,
-// which fits the server's default five-second shutdown budget; a smaller
-// LedgerTimeout still applies.
+// inside the server's 5s database-cleanup budget (see maxShutdownSeconds in
+// cmd/server.go); a smaller LedgerTimeout still applies.
 func (b *Broker) removalTimeout() time.Duration {
 	return min(b.opts.LedgerTimeout, leaseRevokeTimeout)
 }
