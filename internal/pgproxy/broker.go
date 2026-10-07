@@ -763,6 +763,9 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	if deadline, ok := admissionCtx.Deadline(); ok {
 		admissionLeft = time.Until(deadline)
 	}
+	// removeSession takes this session off the ledger once it ends; an
+	// unpooled session runs it alongside the credential revoke.
+	removeSession := func() {}
 	if b.opts.Sessions != nil && scope.WorkloadID != "" {
 		id := newSessionID()
 		sessionID := "ledger-" + id
@@ -792,14 +795,16 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 			refuse("ledger_unavailable", "08004", "Agent Vault: session accounting unavailable")
 			return
 		}
-		defer func() {
+		removeSession = sync.OnceFunc(func() {
 			ctx, cancel := context.WithTimeout(context.Background(), b.removalTimeout())
 			defer cancel()
 			if err := b.opts.Sessions.Remove(ctx, sessionID); err != nil {
 				// The row stops counting when this replica's owner row expires.
 				b.logger.Warn("pgproxy: session ledger removal failed", slog.String("error", err.Error()))
 			}
-		}()
+		})
+		// Waits for a removal already started beside the revoke.
+		defer removeSession()
 	}
 
 	// Global backstop: bound the total upstream connections across all databases,
@@ -917,6 +922,10 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		return
 	}
 	defer func() {
+		// Remove the ledger row while revoking, not after: run in turn, the
+		// two could take twice leaseRevokeTimeout and overrun the shutdown
+		// budget. Any upstream connection on this credential is closed by now.
+		go removeSession()
 		revokeCtx, revokeCancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
 		defer revokeCancel()
 		if err := b.opts.Leases.Revoke(revokeCtx, lease.ID); err != nil {

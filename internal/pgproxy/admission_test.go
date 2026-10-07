@@ -526,3 +526,33 @@ func TestSessionRemovalFitsTheShutdownBudget(t *testing.T) {
 		}
 	}
 }
+
+// signalLedger closes removed on the first Remove.
+type signalLedger struct {
+	removed chan struct{}
+	once    sync.Once
+}
+
+func (*signalLedger) Add(context.Context, string, string, int) error { return nil }
+
+func (l *signalLedger) Remove(context.Context, string) error {
+	l.once.Do(func() { close(l.removed) })
+	return nil
+}
+
+// A slow revoke does not delay removal: the two run together, so an
+// unpooled session's cleanup takes one leaseRevokeTimeout, not two.
+func TestSessionRemovalRunsAlongsideASlowRevoke(t *testing.T) {
+	up := startFakeUpstream(t, authTrust, "")
+	// The revoke finishes only once the session is off the ledger.
+	m := &slowRevokeMinter{fakeMinter: &fakeMinter{lease: newLease()}, entered: make(chan struct{}), release: make(chan struct{})}
+	_, addr := startBroker(t, Options{Sessions: &signalLedger{removed: m.release},
+		Auth: authFunc(func(_ context.Context, token, _ string) (*AgentScope, error) {
+			return &AgentScope{VaultID: "v", ActorID: token, WorkloadID: "pod-1"}, nil
+		}),
+		Databases: &fakeResolver{svc: &DatabaseService{Name: "db", Addr: up.addr()}}, Leases: m})
+	s := openAgentSession(t, addr, "agent", "db")
+	s.close()
+	waitFor(t, leaseRevokeTimeout/2, func() bool { return len(m.revokedLeases()) == 1 },
+		"revoke waited out its timeout: removal did not run beside it")
+}
