@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
@@ -335,6 +336,9 @@ type podCache struct {
 	// activity is each agent Sandbox's last use through this replica; a
 	// Pod's start counts as use.
 	activity *activity
+	// log and syncs name why a namespace's sync fails, by class only.
+	log   *slog.Logger
+	syncs syncWatch
 }
 
 func newPodCache(c FixedConfig) (*podCache, error) {
@@ -348,7 +352,7 @@ func newPodCache(c FixedConfig) (*podCache, error) {
 		CheckRedirect: func(*http.Request, []*http.Request) error { return errDenied }}
 	return &podCache{config: c.Shared, k8s: c.Kubernetes, client: client, now: time.Now,
 		pods: map[string]*agentPod{}, byIP: map[netip.Addr]map[string]struct{}{}, inSync: map[string]bool{}, lostAt: map[string]time.Time{},
-		activity: newActivity(time.Now(), c.activityRetention())}, nil
+		activity: newActivity(time.Now(), c.activityRetention()), log: newRelayLog()}, nil
 }
 
 // lookup returns the attestation of the one admissible agent Pod at peer.
@@ -454,7 +458,10 @@ func (c *podCache) run(ctx context.Context) {
 		go func() {
 			defer wg.Done()
 			for ctx.Err() == nil {
-				if c.sync(ctx, ns) != nil {
+				if e := c.sync(ctx, ns); e != nil {
+					if ctx.Err() == nil {
+						c.syncs.failed(c.log, ns, e, c.now())
+					}
 					select {
 					case <-ctx.Done():
 					case <-time.After(time.Second):
@@ -516,6 +523,7 @@ func (c *podCache) sync(ctx context.Context, ns string) error {
 		}
 	}
 	c.replace(ns, pods)
+	c.syncs.synced(c.log, ns, c.now())
 	version := list.Metadata.ResourceVersion
 	for ctx.Err() == nil {
 		query := url.Values{"watch": {"1"}, "resourceVersion": {version}, "allowWatchBookmarks": {"true"}, "timeoutSeconds": {"60"}}
@@ -579,24 +587,24 @@ func (c *podCache) sync(ctx context.Context, ns string) error {
 func (c *podCache) get(ctx context.Context, ns string, query url.Values, limit time.Duration, read func(io.Reader) error) error {
 	token, e := readBoundedFile(c.k8s.ReviewerTokenFile, 32<<10)
 	if e != nil || strings.TrimSpace(string(token)) == "" {
-		return errDenied
+		return &syncError{class: syncFailToken}
 	}
 	ctx, cancel := context.WithTimeout(ctx, limit)
 	defer cancel()
 	endpoint := strings.TrimRight(c.k8s.APIURL, "/") + "/api/v1/namespaces/" + url.PathEscape(ns) + "/pods?" + query.Encode()
 	req, e := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if e != nil {
-		return errDenied
+		return &syncError{class: syncFailOther}
 	}
 	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(token)))
 	req.Header.Set("Accept", "application/json")
 	resp, e := c.client.Do(req)
 	if e != nil {
-		return errDenied
+		return classifyTransport(e)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return errDenied
+		return &syncError{class: syncFailHTTP, status: resp.StatusCode}
 	}
 	idle := time.AfterFunc(watchIdle, cancel)
 	defer idle.Stop()
