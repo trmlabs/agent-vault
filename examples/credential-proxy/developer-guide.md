@@ -12,16 +12,16 @@ Not all of this is live yet:
 
 | Part | Status |
 |---|---|
-| Gatehouse support for all six destination kinds | Added by agent-vault #22 to #24; not in a release yet |
-| Adding an entry with one trm-infra pull request | The module is trm-infra #1041. Nothing calls it yet; a follow-up pull request adds the catalog file and connects it to Vault |
-| Entries limited to named people (tiers T1 and T2) | Refused today. The live Entra group lookup stays off until its app registration exists. |
+| Gatehouse support for all six destination kinds | On main, through #30; there is no tagged release. Staging runs broker images built from main commits |
+| Adding an entry with one trm-infra pull request | The catalog is trm-infra `vault/terraform/environments/prod/gatehouse-catalog.yaml`, written to Vault by the `gatehouse-catalog` module. A broker reads it only when `AGENT_VAULT_CATALOG_VAULT_PATH` or `AGENT_VAULT_CATALOG_VAULT_PREFIX` is set, and the staging render sets neither yet |
+| Entries limited to named people (tiers T1 and T2) | The broker names the person behind a Claude session, a Cursor run or an agent-sandbox Pod and can look up their Entra groups. Group entries are refused until a deployment switches that lookup on |
 | Database entries above T0 | The database path carries the person's session, so T1 and T2 databases work once the Entra lookup is on, as for HTTP |
-| Repository and pull request entries | Wait for the GitHub App, which is not created yet |
+| Repository and pull request entries | The staging GitHub App exists (the catalog's `github-git` entry). Git requests are refused until its private key is imported into Vault |
 
 ## Add a destination with one catalog entry
 
-Once the trm-infra module is wired in, the catalog is `gatehouse-catalog.yaml`,
-read by `vault/terraform/modules/gatehouse-catalog` in trm-infra. You add one
+The catalog is `vault/terraform/environments/prod/gatehouse-catalog.yaml` in
+trm-infra, read by the `vault/terraform/modules/gatehouse-catalog` module. You add one
 entry and open one pull request; Atlantis, the Terraform pull request bot,
 creates the Vault access the entry needs, and Gatehouse picks up the change
 within 30 seconds with no restart. Check an entry locally first, with an
@@ -29,7 +29,7 @@ within 30 seconds with no restart. Check an entry locally first, with an
 release yet):
 
 ```sh
-agent-vault broker-catalog validate --require-pools gatehouse-catalog.yaml
+agent-vault broker-catalog validate --require-pools --environment staging gatehouse-catalog.yaml
 ```
 
 | To reach | `kind` | You also need |
