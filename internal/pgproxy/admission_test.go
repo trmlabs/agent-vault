@@ -3,10 +3,13 @@ package pgproxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Infisical/agent-vault/internal/auditchain"
 )
 
 type slowRevokeMinter struct {
@@ -50,9 +53,7 @@ func TestAdmissionWaitsForCleanupWithoutMintingOrUnboundedPending(t *testing.T) 
 	if m.mintCallCount() != 1 {
 		t.Fatal("queued connection minted before cleanup released capacity")
 	}
-	if code := connectExpectCode(t, addr, "overflow", "db"); code != "" {
-		t.Fatalf("overflow should be closed before authentication: %s", code)
-	}
+	overflow := overflowWaits(t, b, addr)
 	select {
 	case <-done:
 		t.Fatal("admission failed instead of waiting for cleanup")
@@ -68,6 +69,11 @@ func TestAdmissionWaitsForCleanupWithoutMintingOrUnboundedPending(t *testing.T) 
 		t.Fatal("queued connection did not establish")
 	}
 	defer second.close()
+	// The overflow is accepted once the queued connection is served, and is
+	// refused at serving capacity without a mint.
+	if code := <-overflow; code != "53300" {
+		t.Fatalf("overflow ended with %q", code)
+	}
 	if m.mintCallCount() != 2 || len(b.acceptSem) != 0 {
 		t.Fatal("admission did not release pending slot or mint exactly once")
 	}
@@ -135,9 +141,7 @@ func TestActorAdmissionWaitsForCleanupWithoutMintingOrUnboundedPending(t *testin
 	if m.mintCallCount() != 1 {
 		t.Fatal("queued connection minted before cleanup released capacity")
 	}
-	if code := connectExpectCode(t, addr, "overflow", "db"); code != "" {
-		t.Fatalf("overflow should be closed before authentication: %s", code)
-	}
+	overflow := overflowWaits(t, b, addr)
 	select {
 	case <-done:
 		t.Fatal("admission failed instead of waiting for cleanup")
@@ -153,8 +157,13 @@ func TestActorAdmissionWaitsForCleanupWithoutMintingOrUnboundedPending(t *testin
 		t.Fatal("queued connection did not establish")
 	}
 	defer second.close()
-	if m.mintCallCount() != 2 || len(b.acceptSem) != 0 {
-		t.Fatal("admission did not release pending slot or mint exactly once")
+	// The overflow, another actor, is accepted and served once the queued
+	// connection is.
+	if code := <-overflow; code != "OK" {
+		t.Fatalf("overflow ended with %q", code)
+	}
+	if m.mintCallCount() != 3 || len(b.acceptSem) != 0 {
+		t.Fatal("admission did not release pending slot or mint once per session")
 	}
 }
 
@@ -253,4 +262,297 @@ func TestActorAdmissionRechecksRevocationAndScopeBeforeMint(t *testing.T) {
 			waitFor(t, time.Second, func() bool { b.mu.Lock(); defer b.mu.Unlock(); return len(b.leaseCounts) == 0 }, "actor slot leaked")
 		})
 	}
+}
+
+// overflowWaits starts a connection past the pending bound and checks that it
+// waits to be accepted: no answer and no pending slot while the bound holds.
+func overflowWaits(t *testing.T, b *Broker, addr string) <-chan string {
+	t.Helper()
+	overflow := make(chan string, 1)
+	go func() { overflow <- connectExpectCode(t, addr, "overflow", "db") }()
+	time.Sleep(200 * time.Millisecond)
+	select {
+	case code := <-overflow:
+		t.Fatalf("overflow answered while the pending slot was held: %q", code)
+	default:
+	}
+	if len(b.acceptSem) != 1 {
+		t.Fatal("overflow took a pending slot")
+	}
+	return overflow
+}
+
+// A burst far past the pending bound and the admission concurrency is
+// queued, not refused: with a store that answers one call at a time, every
+// connection of the burst is served.
+func TestBurstQueuesInsteadOfRefusing(t *testing.T) {
+	up := startFakeUpstream(t, authTrust, "")
+	var store sync.Mutex // one connection, like the SQLite store
+	_, addr := startBroker(t, Options{MaxPendingConns: 4, AdmissionConcurrency: 2,
+		Auth: authFunc(func(_ context.Context, token, _ string) (*AgentScope, error) {
+			store.Lock()
+			defer store.Unlock()
+			time.Sleep(2 * time.Millisecond)
+			return &AgentScope{VaultID: "v", ActorID: token}, nil
+		}),
+		Databases: &fakeResolver{svc: &DatabaseService{Name: "db", Addr: up.addr()}}, Leases: &fakeMinter{lease: newLease()}})
+	const burst = 100
+	codes := make(chan string, burst)
+	var wg sync.WaitGroup
+	for i := range burst {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			codes <- connectExpectCode(t, addr, fmt.Sprintf("agent-%d", i), "db")
+		}()
+	}
+	wg.Wait()
+	close(codes)
+	counts := map[string]int{}
+	for code := range codes {
+		counts[code]++
+	}
+	if counts["OK"] != burst {
+		t.Fatalf("burst of %d: %v", burst, counts)
+	}
+}
+
+// slowLedger answers each Add after delay, unless its deadline comes first.
+type slowLedger struct{ delay time.Duration }
+
+func (l slowLedger) Add(ctx context.Context, _, _ string, _ int) error {
+	select {
+	case <-time.After(l.delay):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (slowLedger) Remove(context.Context, string) error { return nil }
+
+// A slow session ledger has its own deadline and does not spend the wait for
+// serving capacity: an Add that outlasts AdmissionTimeout but not
+// LedgerTimeout still admits, and one past LedgerTimeout is refused as the
+// ledger, not as the serving cap.
+func TestSlowLedgerHasItsOwnDeadline(t *testing.T) {
+	up := startFakeUpstream(t, authTrust, "")
+	start := func(ledger time.Duration) string {
+		_, addr := startBroker(t, Options{AdmissionTimeout: 100 * time.Millisecond, LedgerTimeout: 400 * time.Millisecond,
+			Sessions: slowLedger{delay: ledger},
+			Auth: authFunc(func(_ context.Context, token, _ string) (*AgentScope, error) {
+				return &AgentScope{VaultID: "v", ActorID: token, WorkloadID: "pod-1"}, nil
+			}),
+			Databases: &fakeResolver{svc: &DatabaseService{Name: "db", Addr: up.addr()}}, Leases: &fakeMinter{lease: newLease()}})
+		return connectExpectCode(t, addr, "agent", "db")
+	}
+	if code := start(200 * time.Millisecond); code != "OK" {
+		t.Fatalf("ledger slower than the admission timeout: %q", code)
+	}
+	if code := start(time.Second); code != "08004" {
+		t.Fatalf("ledger past its own deadline: %q", code)
+	}
+}
+
+// Admission's store calls never run more than AdmissionConcurrency at once,
+// whatever the pending bound lets in.
+func TestAdmissionConcurrencyBoundsStoreCalls(t *testing.T) {
+	up := startFakeUpstream(t, authTrust, "")
+	var inFlight, peak atomic.Int32
+	_, addr := startBroker(t, Options{MaxPendingConns: 1000, AdmissionConcurrency: 2,
+		Auth: authFunc(func(_ context.Context, token, _ string) (*AgentScope, error) {
+			n := inFlight.Add(1)
+			defer inFlight.Add(-1)
+			for p := peak.Load(); n > p && !peak.CompareAndSwap(p, n); p = peak.Load() {
+			}
+			time.Sleep(5 * time.Millisecond)
+			return &AgentScope{VaultID: "v", ActorID: token}, nil
+		}),
+		Databases: &fakeResolver{svc: &DatabaseService{Name: "db", Addr: up.addr()}}, Leases: &fakeMinter{lease: newLease()}})
+	var wg sync.WaitGroup
+	var served atomic.Int32
+	for i := range 60 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if connectExpectCode(t, addr, fmt.Sprintf("agent-%d", i), "db") == "OK" {
+				served.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if served.Load() != 60 || peak.Load() > 2 {
+		t.Fatalf("served %d of 60, peak store calls %d", served.Load(), peak.Load())
+	}
+}
+
+// A connection that waited in the admission queue past its startup deadline
+// still receives its refusal, not a dropped connection.
+func TestQueuedRefusalReachesTheClient(t *testing.T) {
+	up := startFakeUpstream(t, authTrust, "")
+	held, release := make(chan struct{}), make(chan struct{})
+	defer close(release)
+	_, addr := startBroker(t, Options{AdmissionConcurrency: 1, StartupTimeout: 100 * time.Millisecond, HandshakeTimeout: 400 * time.Millisecond,
+		Auth: authFunc(func(_ context.Context, token, _ string) (*AgentScope, error) {
+			if token == "holder" {
+				close(held)
+				<-release
+			}
+			return &AgentScope{VaultID: "v", ActorID: token}, nil
+		}),
+		Databases: &fakeResolver{svc: &DatabaseService{Name: "db", Addr: up.addr()}}, Leases: &fakeMinter{lease: newLease()}})
+	go connectExpectCode(t, addr, "holder", "db")
+	<-held
+	if code := connectExpectCode(t, addr, "queued", "db"); code != "53300" {
+		t.Fatalf("queued refusal: %q", code)
+	}
+}
+
+// One workload at its own cap opens more connections. While they wait for its
+// per-workload slot they hold no admission slot, so another workload's
+// admission does not stall behind them.
+func TestWorkloadAtItsCapDoesNotStallOthers(t *testing.T) {
+	up := startFakeUpstream(t, authTrust, "")
+	_, addr := startBroker(t, Options{AdmissionConcurrency: 2, MaxLeasesPerActor: 1, AdmissionTimeout: 1500 * time.Millisecond,
+		Auth: authFunc(func(_ context.Context, token, _ string) (*AgentScope, error) {
+			return &AgentScope{VaultID: "v", ActorID: token, WorkloadID: "pod-" + token}, nil
+		}),
+		Databases: &fakeResolver{svc: &DatabaseService{Name: "db", Addr: up.addr()}}, Leases: &fakeMinter{lease: newLease()}})
+	held := openAgentSession(t, addr, "hog", "db")
+	defer held.close()
+	codes := make(chan string, 2)
+	for range 2 {
+		go func() { codes <- connectExpectCode(t, addr, "hog", "db") }()
+	}
+	time.Sleep(200 * time.Millisecond)
+	start := time.Now()
+	code := connectExpectCode(t, addr, "victim", "db")
+	if elapsed := time.Since(start); code != "OK" || elapsed > time.Second {
+		t.Fatalf("victim %q after %s behind a workload waiting at its own cap", code, elapsed)
+	}
+	<-codes
+	<-codes
+}
+
+// gatedLedger holds one workload's Add until released, signalling entry.
+type gatedLedger struct {
+	workload         string
+	entered, release chan struct{}
+}
+
+func (l gatedLedger) Add(ctx context.Context, _, workload string, _ int) error {
+	if workload != l.workload {
+		return nil
+	}
+	close(l.entered)
+	select {
+	case <-l.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (gatedLedger) Remove(context.Context, string) error { return nil }
+
+// A session refused after authentication because no admission slot freed in
+// time is audited, like every other refusal after authentication.
+func TestBusyRefusalAfterAuthenticationIsAudited(t *testing.T) {
+	up := startFakeUpstream(t, authTrust, "")
+	audit := &recordingAudit{}
+	ledger := gatedLedger{workload: "pod-a", entered: make(chan struct{}), release: make(chan struct{})}
+	defer close(ledger.release)
+	_, addr := startBroker(t, Options{AdmissionConcurrency: 1, MaxLeasesPerActor: 1, AdmissionTimeout: time.Second,
+		HandshakeTimeout: 1500 * time.Millisecond, Sessions: ledger, Audit: audit,
+		Auth: authFunc(func(_ context.Context, token, _ string) (*AgentScope, error) {
+			return &AgentScope{VaultID: "v", ActorID: token, WorkloadID: "pod-" + token}, nil
+		}),
+		Databases: &fakeResolver{svc: &DatabaseService{Name: "db", Addr: up.addr()}}, Leases: &fakeMinter{lease: newLease()}})
+	holder := openAgentSession(t, addr, "b", "db") // pod-b at its cap of 1
+	queued := make(chan string, 1)
+	go func() { queued <- connectExpectCode(t, addr, "b", "db") }() // waits for pod-b's slot, holding no admission slot
+	time.Sleep(200 * time.Millisecond)
+	go connectExpectCode(t, addr, "a", "db") // takes the only admission slot in its ledger add
+	<-ledger.entered
+	holder.close() // pod-b's slot frees; the queued session now waits for the admission slot
+	if code := <-queued; code != "53300" {
+		t.Fatalf("queued session: %q", code)
+	}
+	audit.mu.Lock()
+	defer audit.mu.Unlock()
+	for _, e := range audit.events {
+		if e.Event == auditchain.EventDenied && e.Outcome == "admission_timeout" && e.Agent == "b" {
+			return
+		}
+	}
+	t.Fatalf("no admission_timeout row: %+v", audit.events)
+}
+
+// deadlineLedger records the deadline each Remove was given.
+type deadlineLedger struct {
+	mu      sync.Mutex
+	removed []time.Duration
+}
+
+func (*deadlineLedger) Add(context.Context, string, string, int) error { return nil }
+
+func (l *deadlineLedger) Remove(ctx context.Context, _ string) error {
+	deadline, _ := ctx.Deadline()
+	l.mu.Lock()
+	l.removed = append(l.removed, time.Until(deadline))
+	l.mu.Unlock()
+	return nil
+}
+
+// Removing a session fits the shutdown budget whatever LedgerTimeout is: a
+// larger setting applies to adding a session only, and a smaller one is kept.
+func TestSessionRemovalFitsTheShutdownBudget(t *testing.T) {
+	up := startFakeUpstream(t, authTrust, "")
+	for _, tc := range []struct{ setting, most time.Duration }{{time.Minute, leaseRevokeTimeout}, {time.Second, time.Second}} {
+		ledger := &deadlineLedger{}
+		_, addr := startBroker(t, Options{LedgerTimeout: tc.setting, Sessions: ledger,
+			Auth: authFunc(func(_ context.Context, token, _ string) (*AgentScope, error) {
+				return &AgentScope{VaultID: "v", ActorID: token, WorkloadID: "pod-1"}, nil
+			}),
+			Databases: &fakeResolver{svc: &DatabaseService{Name: "db", Addr: up.addr()}}, Leases: &fakeMinter{lease: newLease()}})
+		s := openAgentSession(t, addr, "agent", "db")
+		s.close()
+		waitFor(t, 2*time.Second, func() bool { ledger.mu.Lock(); defer ledger.mu.Unlock(); return len(ledger.removed) == 1 }, "session not removed")
+		ledger.mu.Lock()
+		got := ledger.removed[0]
+		ledger.mu.Unlock()
+		if got > tc.most || got < tc.most-time.Second {
+			t.Errorf("LedgerTimeout %s: removal deadline %s, want about %s", tc.setting, got, tc.most)
+		}
+	}
+}
+
+// signalLedger closes removed on the first Remove.
+type signalLedger struct {
+	removed chan struct{}
+	once    sync.Once
+}
+
+func (*signalLedger) Add(context.Context, string, string, int) error { return nil }
+
+func (l *signalLedger) Remove(context.Context, string) error {
+	l.once.Do(func() { close(l.removed) })
+	return nil
+}
+
+// A slow revoke does not delay removal: the two run together, so an
+// unpooled session's cleanup takes one leaseRevokeTimeout, not two.
+func TestSessionRemovalRunsAlongsideASlowRevoke(t *testing.T) {
+	up := startFakeUpstream(t, authTrust, "")
+	// The revoke finishes only once the session is off the ledger.
+	m := &slowRevokeMinter{fakeMinter: &fakeMinter{lease: newLease()}, entered: make(chan struct{}), release: make(chan struct{})}
+	_, addr := startBroker(t, Options{Sessions: &signalLedger{removed: m.release},
+		Auth: authFunc(func(_ context.Context, token, _ string) (*AgentScope, error) {
+			return &AgentScope{VaultID: "v", ActorID: token, WorkloadID: "pod-1"}, nil
+		}),
+		Databases: &fakeResolver{svc: &DatabaseService{Name: "db", Addr: up.addr()}}, Leases: m})
+	s := openAgentSession(t, addr, "agent", "db")
+	s.close()
+	waitFor(t, leaseRevokeTimeout/2, func() bool { return len(m.revokedLeases()) == 1 },
+		"revoke waited out its timeout: removal did not run beside it")
 }

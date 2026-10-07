@@ -31,7 +31,17 @@ type Options struct {
 	Dialer    DialFunc // defaults to a plain net.Dialer; the server injects netguard's guarded dialer
 	Logger    *slog.Logger
 
-	AdmissionTimeout      time.Duration // bounded wait for global capacity (default 2s)
+	AdmissionTimeout time.Duration // bounded wait for per-actor and global capacity (default 2s)
+	// AdmissionConcurrency is how many connections run admission's store
+	// calls (agent authentication and the session ledger) at once; the rest
+	// queue for a slot within HandshakeTimeout instead of all reaching the
+	// store together (default 256). It shapes a burst, it does not cap
+	// sessions.
+	AdmissionConcurrency int
+	// LedgerTimeout bounds each session-ledger call (default 4s). Adding a
+	// session may take all of it; removing one never takes longer than
+	// leaseRevokeTimeout, so it fits the shutdown budget.
+	LedgerTimeout         time.Duration
 	AuthorizationInterval time.Duration // recheck identity and binding (default 30s)
 	AuthorizationTimeout  time.Duration // fail closed if recheck stalls (default 5s)
 	HandshakeTimeout      time.Duration
@@ -41,8 +51,12 @@ type Options struct {
 	// DefaultDatabaseConns is a database's ceiling when its catalog entry
 	// sets no maxConns (default 50).
 	DefaultDatabaseConns int
-	MaxPendingConns      int // cap on accepted-but-not-yet-serving connections (default 512)
-	MaxLeasesPerActor    int // cap on live credentials/connections per workload (Pod), or per agent when no workload is known (default 16; clamped to <= MaxConns)
+	// MaxPendingConns bounds accepted-but-not-yet-serving connections
+	// (default the larger of 512 and MaxConns). Past it the broker stops
+	// accepting, so further connections wait in the listen backlog instead
+	// of being refused.
+	MaxPendingConns   int
+	MaxLeasesPerActor int // cap on live credentials/connections per workload (Pod), or per agent when no workload is known (default 16; clamped to <= MaxConns)
 	// MaxLeasesPerAgent caps one agent's sessions across all its workloads on
 	// this replica, so a pool agent with many Pods cannot take the whole
 	// serving cap (default MaxConns minus MaxLeasesPerActor, at least
@@ -70,6 +84,9 @@ type Broker struct {
 	// reports it and the process restarts as a new owner.
 	authorityLost atomic.Bool
 	acceptSem     chan struct{} // bounds accepted (handshaking) connections
+	admitSem      chan struct{} // bounds connections running admission's store calls
+	acceptStop    chan struct{} // closed by Shutdown, so a blocked accept loop stops
+	pendingWarned time.Time     // the accept loop's last pending-bound warning
 	serveSem      chan struct{} // bounds TOTAL serving connections across all databases
 
 	cancellations  map[string]*cancelTarget
@@ -106,6 +123,12 @@ func New(addr string, opts Options) *Broker {
 	}
 	if opts.AdmissionTimeout <= 0 {
 		opts.AdmissionTimeout = 2 * time.Second
+	}
+	if opts.AdmissionConcurrency <= 0 {
+		opts.AdmissionConcurrency = defaultAdmissionConcurrency
+	}
+	if opts.LedgerTimeout <= 0 {
+		opts.LedgerTimeout = leaseRevokeTimeout
 	}
 	if opts.AuthorizationInterval <= 0 {
 		opts.AuthorizationInterval = 30 * time.Second
@@ -161,6 +184,8 @@ func New(addr string, opts Options) *Broker {
 		opts:           opts,
 		logger:         opts.Logger,
 		acceptSem:      make(chan struct{}, opts.MaxPendingConns),
+		admitSem:       make(chan struct{}, opts.AdmissionConcurrency),
+		acceptStop:     make(chan struct{}),
 		serveSem:       make(chan struct{}, opts.MaxConns),
 		upstreamCounts: make(map[string]int),
 		ctx:            ctx,
@@ -195,8 +220,9 @@ func (b *Broker) IsListening() bool { return b.isListening.Load() }
 
 // Serve accepts connections on l until Shutdown is called or Accept fails. It
 // takes ownership of l. Accepted connections are capped at MaxPendingConns;
-// connections beyond that are rejected immediately rather than queued. The
-// smaller serving cap (MaxConns) is applied later, after authentication.
+// at that bound Serve stops accepting, and further connections queue in the
+// listen backlog until a handshake finishes, rather than being refused. The
+// serving cap (MaxConns) is applied later, after authentication.
 func (b *Broker) Serve(l net.Listener) error {
 	// This listener exchanges bearer tokens without TLS. Enforce the transport
 	// boundary here as well as in CLI configuration.
@@ -237,6 +263,12 @@ func (b *Broker) Serve(l net.Listener) error {
 		}()
 	}
 
+	stopped := func() error {
+		if b.authorityLost.Load() {
+			return ErrAuthorityLost
+		}
+		return nil
+	}
 	for {
 		conn, err := l.Accept()
 		if err != nil {
@@ -244,20 +276,28 @@ func (b *Broker) Serve(l net.Listener) error {
 			closed := b.closed
 			b.mu.Unlock()
 			if closed {
-				if b.authorityLost.Load() {
-					return ErrAuthorityLost
-				}
-				return nil
+				return stopped()
 			}
 			return err
 		}
+		// At the pending bound, hold this connection and stop accepting until
+		// a handshake finishes: further connections wait in the listen
+		// backlog instead of being refused.
 		select {
 		case b.acceptSem <- struct{}{}:
 		default:
-			b.logger.Warn("pgproxy: max pending connections reached; rejecting connection",
-				slog.Int("max_pending", b.opts.MaxPendingConns))
-			_ = conn.Close()
-			continue
+			// One line per pendingWarnEvery, not one per blocked accept.
+			if now := time.Now(); now.Sub(b.pendingWarned) >= pendingWarnEvery {
+				b.pendingWarned = now
+				b.logger.Warn("pgproxy: max pending connections reached; new connections wait to be accepted",
+					slog.Int("max_pending", b.opts.MaxPendingConns))
+			}
+			select {
+			case b.acceptSem <- struct{}{}:
+			case <-b.acceptStop:
+				_ = conn.Close()
+				return stopped()
+			}
 		}
 		// Register and increment under the same lock used by Shutdown, before
 		// launching a handler. Shutdown cannot miss a just-accepted socket.
@@ -300,6 +340,7 @@ func (b *Broker) Shutdown(ctx context.Context) error {
 	b.mu.Lock()
 	if !b.closed {
 		b.closed = true
+		close(b.acceptStop)
 		drain := b.opts.Pool != nil && b.opts.Pool.DrainSessions && !b.authorityLost.Load()
 		if b.listener != nil {
 			_ = b.listener.Close()
@@ -458,6 +499,39 @@ func (b *Broker) acquireServeSlot(ctx context.Context) bool {
 
 func (b *Broker) releaseServeSlot() { <-b.serveSem }
 
+// removalTimeout bounds removing a session from the ledger. Removal runs as
+// sessions end, including at shutdown, so it never exceeds leaseRevokeTimeout,
+// inside the server's 5s database-cleanup budget (see maxShutdownSeconds in
+// cmd/server.go); a smaller LedgerTimeout still applies.
+func (b *Broker) removalTimeout() time.Duration {
+	return min(b.opts.LedgerTimeout, leaseRevokeTimeout)
+}
+
+// defaultAdmissionConcurrency is how many connections run admission's store
+// calls at once. It shapes a burst for the store, which serves one SQLite
+// connection or a PostgreSQL pool of tens; connections past it queue, so it
+// bounds throughput, not sessions (AGENT_VAULT_DB_ADMISSION_CONCURRENCY).
+const defaultAdmissionConcurrency = 256
+
+var errAdmissionQueue = errors.New("admission queue wait exceeded")
+
+// pendingWarnEvery spaces the accept loop's warnings while it waits at the
+// pending bound.
+const pendingWarnEvery = 10 * time.Second
+
+// acquireAdmission waits up to the handshake budget for a slot to run
+// admission's store calls. The release is safe to call more than once.
+func (b *Broker) acquireAdmission(ctx context.Context) (func(), bool) {
+	ctx, cancel := context.WithTimeout(ctx, b.opts.HandshakeTimeout)
+	defer cancel()
+	select {
+	case b.admitSem <- struct{}{}:
+		return sync.OnceFunc(func() { <-b.admitSem }), true
+	case <-ctx.Done():
+		return nil, false
+	}
+}
+
 // Budgets are read on each admission; a lower live limit prevents new
 // connections until occupancy falls below it. Counters disappear when drained.
 func (b *Broker) acquireUpstreamSlot(svc *DatabaseService) bool {
@@ -549,8 +623,44 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		requestedDB = startup.Parameters["user"]
 	}
 
-	scope, token, err := authenticateAgent(startupCtx, backend, b.authenticator(peer), startup)
+	// Admission's store calls (authentication here; the session ledger, the
+	// recheck and database resolution below) run a bounded number at a time.
+	// A slot is held only around those calls, never across a wait for
+	// capacity. Once its token has arrived, a connection waits for a slot for
+	// up to the handshake budget, so a burst queues instead of reaching the
+	// store all at once and timing out together. Authentication then has its
+	// own startup budget.
+	releaseAdmission := func() {}
+	defer func() { releaseAdmission() }()
+	admit := func() (context.Context, context.CancelFunc, error) {
+		release, ok := b.acquireAdmission(baseCtx)
+		if !ok {
+			return nil, nil, errAdmissionQueue
+		}
+		releaseAdmission = release
+		_ = conn.SetDeadline(time.Now().Add(b.opts.StartupTimeout))
+		ctx, cancel := context.WithTimeout(baseCtx, b.opts.StartupTimeout) // #nosec G118 -- authenticateAgent defers the returned cancel.
+		return ctx, cancel, nil
+	}
+	scope, token, err := authenticateAgent(startupCtx, backend, b.authenticator(peer), startup, admit)
 	startupCancel()
+	releaseAdmission()
+	// busy refuses a session whose wait for an admission slot ran out. The
+	// wait can outlast the connection's startup deadline, so the refusal
+	// gets a fresh write deadline of its own.
+	busy := func(stage string) {
+		if b.ctx.Err() != nil {
+			return // the broker is stopping, not busy
+		}
+		b.logger.Warn("pgproxy: admission queue wait exceeded; refusing session",
+			slog.String("stage", stage), slog.Int("concurrency", b.opts.AdmissionConcurrency))
+		_ = conn.SetWriteDeadline(time.Now().Add(noticeWriteTimeout))
+		writeClientError(backend, "53300", "admission_timeout", "Agent Vault: broker busy; retry")
+	}
+	if errors.Is(err, errAdmissionQueue) {
+		busy("admission_queue")
+		return
+	}
 	if err == nil && scope != nil && !brokercore.KindAdmitted(brokercore.ConnKinds(conn), scope.IdentityKind) {
 		// Each listener admits only the identity kinds it was opened for.
 		err, scope = fmt.Errorf("identity kind not admitted on this listener"), nil
@@ -583,6 +693,14 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	refuse := func(outcome, code, message string) {
 		b.auditDenied(event, outcome)
 		writeClientError(backend, code, outcome, message)
+	}
+	// refuseBusy is busy for a session past authentication: it is audited like
+	// every other refusal from here on.
+	refuseBusy := func(stage string) {
+		if b.ctx.Err() == nil {
+			b.auditDenied(event, "admission_timeout")
+		}
+		busy(stage)
 	}
 	if err := b.auditAdmit(); err != nil {
 		b.logger.Error("pgproxy: audit trail unavailable; refusing session", slog.String("error", err.Error()))
@@ -639,12 +757,31 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	}
 	// Across the fleet, the store holds the authoritative per-Pod count; the
 	// in-memory slot above only spares the store a call this replica can refuse.
+	// The session ledger runs on its own deadline; the admission budget left
+	// for serving capacity is what remained before it.
+	admissionLeft := time.Duration(0)
+	if deadline, ok := admissionCtx.Deadline(); ok {
+		admissionLeft = time.Until(deadline)
+	}
+	// removeSession takes this session off the ledger once it ends; an
+	// unpooled session runs it alongside the credential revoke.
+	removeSession := func() {}
 	if b.opts.Sessions != nil && scope.WorkloadID != "" {
 		id := newSessionID()
 		sessionID := "ledger-" + id
 		err := errors.New("session ID unavailable")
 		if id != "" {
-			err = b.opts.Sessions.Add(admissionCtx, sessionID, scope.WorkloadID, b.opts.MaxLeasesPerActor)
+			release, ok := b.acquireAdmission(hsCtx)
+			if !ok {
+				refuseBusy("ledger_queue")
+				return
+			}
+			// Its own deadline: a slow ledger must not spend the wait for
+			// serving capacity below.
+			ledgerCtx, ledgerCancel := context.WithTimeout(hsCtx, b.opts.LedgerTimeout)
+			err = b.opts.Sessions.Add(ledgerCtx, sessionID, scope.WorkloadID, b.opts.MaxLeasesPerActor)
+			ledgerCancel()
+			release()
 		}
 		if errors.Is(err, ErrSessionLimit) {
 			b.logger.Warn("pgproxy: per-workload live-credential limit reached across the fleet",
@@ -654,24 +791,37 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 			return
 		}
 		if err != nil {
-			b.logger.Error("pgproxy: session ledger unavailable; refusing session", slog.String("error", err.Error()))
+			b.logger.Error("pgproxy: session ledger unavailable; refusing session", slog.String("stage", "ledger_add"), slog.String("error", err.Error()))
 			refuse("ledger_unavailable", "08004", "Agent Vault: session accounting unavailable")
 			return
 		}
-		defer func() {
-			ctx, cancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
+		removeSession = sync.OnceFunc(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), b.removalTimeout())
 			defer cancel()
 			if err := b.opts.Sessions.Remove(ctx, sessionID); err != nil {
 				// The row stops counting when this replica's owner row expires.
 				b.logger.Warn("pgproxy: session ledger removal failed", slog.String("error", err.Error()))
 			}
-		}()
+		})
+		// Waits for a removal already started beside the revoke.
+		defer removeSession()
 	}
 
 	// Global backstop: bound the total upstream connections across all databases,
 	// applied only after auth so unauthenticated handshakes cannot consume it.
-	admitted := b.acquireServeSlot(admissionCtx)
+	expired := admissionLeft <= 0
+	serveCtx, serveCancel := context.WithTimeout(hsCtx, admissionLeft)
+	admitted := !expired && b.acquireServeSlot(serveCtx)
+	serveCancel()
 	admissionCancel()
+	if expired {
+		// The budget ran out on the per-actor waits above, not on serving
+		// capacity: say so instead of naming the cap.
+		b.logger.Warn("pgproxy: admission timed out before serving capacity was checked",
+			slog.String("stage", "actor_capacity"), slog.String("vault", scope.VaultID), slog.Duration("timeout", b.opts.AdmissionTimeout))
+		refuse("admission_timeout", "53300", "Agent Vault: broker busy; retry")
+		return
+	}
 	if !admitted {
 		b.logger.Warn("pgproxy: serving-connection limit reached",
 			slog.String("vault", scope.VaultID),
@@ -683,7 +833,14 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 	releasePending()
 
 	// Admission can wait for cleanup. Recheck the original proof before using
-	// its scope to resolve a destination or issue another credential.
+	// its scope to resolve a destination or issue another credential. The
+	// recheck and resolution are store calls, so they take an admission slot.
+	releaseStore, ok := b.acquireAdmission(hsCtx)
+	if !ok {
+		refuseBusy("resolve_queue")
+		return
+	}
+	defer releaseStore()
 	checkCtx, checkCancel := context.WithTimeout(hsCtx, b.opts.AuthorizationTimeout)
 	current, checkErr := b.authenticator(peer).Authenticate(checkCtx, token, startup.Parameters["agent_vault_vault"])
 	valid := checkErr == nil && checkCtx.Err() == nil && current != nil &&
@@ -696,6 +853,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 
 	var who Requester
 	svc, err := b.opts.Databases.ResolveDatabase(withRequesterRecord(hsCtx, &who), *scope, requestedDB)
+	releaseStore()
 	event.RequesterKind, event.TokenSHA256, event.RequesterOID = who.Kind, who.TokenSHA256, who.ObjectID
 	event.Tier, event.Decision, event.Groups, event.CacheAgeSec = who.Tier, who.Decision, who.Groups, who.CacheAgeSec
 	if who.Kind == "person" || who.Kind == "agent" {
@@ -764,6 +922,10 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 		return
 	}
 	defer func() {
+		// Remove the ledger row while revoking, not after: run in turn, the
+		// two could take twice leaseRevokeTimeout and overrun the shutdown
+		// budget. Any upstream connection on this credential is closed by now.
+		go removeSession()
 		revokeCtx, revokeCancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
 		defer revokeCancel()
 		if err := b.opts.Leases.Revoke(revokeCtx, lease.ID); err != nil {

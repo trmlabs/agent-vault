@@ -43,7 +43,10 @@ func readStartup(backend *pgproto3.Backend, conn net.Conn) (*pgproto3.StartupMes
 // vault scope; it is never a database credential. Returns the authorized scope
 // or an error (the caller maps errors to a generic client-facing message so no
 // internal detail leaks).
-func authenticateAgent(ctx context.Context, backend *pgproto3.Backend, auth AgentAuthenticator, startup *pgproto3.StartupMessage) (*AgentScope, string, error) {
+// admit, when set, runs after the token has arrived and before the store is
+// asked about it, so a client slow to send its token holds no admission slot.
+func authenticateAgent(ctx context.Context, backend *pgproto3.Backend, auth AgentAuthenticator, startup *pgproto3.StartupMessage,
+	admit func() (context.Context, context.CancelFunc, error)) (*AgentScope, string, error) {
 	backend.Send(&pgproto3.AuthenticationCleartextPassword{})
 	if err := backend.Flush(); err != nil {
 		return nil, "", fmt.Errorf("request agent token: %w", err)
@@ -64,6 +67,14 @@ func authenticateAgent(ctx context.Context, backend *pgproto3.Backend, auth Agen
 		return nil, "", errMissingToken
 	}
 
+	if admit != nil {
+		admitted, cancel, err := admit()
+		if err != nil {
+			return nil, "", err
+		}
+		defer cancel()
+		ctx = admitted
+	}
 	// An optional startup parameter lets an instance-scoped token name its vault,
 	// mirroring the HTTP path's vault hint. A vault-scoped session token needs no
 	// hint.
