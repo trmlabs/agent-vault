@@ -487,3 +487,39 @@ func TestBusyRefusalAfterAuthenticationIsAudited(t *testing.T) {
 	}
 	t.Fatalf("no admission_timeout row: %+v", audit.events)
 }
+
+// deadlineLedger records the deadline each Remove was given.
+type deadlineLedger struct {
+	mu      sync.Mutex
+	removed []time.Duration
+}
+
+func (*deadlineLedger) Add(context.Context, string, string, int) error { return nil }
+
+func (l *deadlineLedger) Remove(ctx context.Context, _ string) error {
+	deadline, _ := ctx.Deadline()
+	l.mu.Lock()
+	l.removed = append(l.removed, time.Until(deadline))
+	l.mu.Unlock()
+	return nil
+}
+
+// Removing a session fits the shutdown budget whatever LedgerTimeout is: a
+// larger setting applies to adding a session only, and a smaller one is kept.
+func TestSessionRemovalFitsTheShutdownBudget(t *testing.T) {
+	up := startFakeUpstream(t, authTrust, "")
+	for _, tc := range []struct{ setting, most time.Duration }{{time.Minute, leaseRevokeTimeout}, {time.Second, time.Second}} {
+		ledger := &deadlineLedger{}
+		_, addr := startBroker(t, Options{LedgerTimeout: tc.setting, Sessions: ledger,
+			Auth: authFunc(func(_ context.Context, token, _ string) (*AgentScope, error) {
+				return &AgentScope{VaultID: "v", ActorID: token, WorkloadID: "pod-1"}, nil
+			}),
+			Databases: &fakeResolver{svc: &DatabaseService{Name: "db", Addr: up.addr()}}, Leases: &fakeMinter{lease: newLease()}})
+		s := openAgentSession(t, addr, "agent", "db")
+		s.close()
+		waitFor(t, 2*time.Second, func() bool { ledger.mu.Lock(); defer ledger.mu.Unlock(); return len(ledger.removed) == 1 }, "session not removed")
+		if got := ledger.removed[0]; got > tc.most || got < tc.most-time.Second {
+			t.Errorf("LedgerTimeout %s: removal deadline %s, want about %s", tc.setting, got, tc.most)
+		}
+	}
+}

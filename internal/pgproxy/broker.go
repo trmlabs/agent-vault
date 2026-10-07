@@ -38,8 +38,9 @@ type Options struct {
 	// store together (default 256). It shapes a burst, it does not cap
 	// sessions.
 	AdmissionConcurrency int
-	// LedgerTimeout bounds each session-ledger call, adding or removing a
-	// session (default 4s).
+	// LedgerTimeout bounds each session-ledger call (default 4s). Adding a
+	// session may take all of it; removing one never takes longer than
+	// leaseRevokeTimeout, so it fits the shutdown budget.
 	LedgerTimeout         time.Duration
 	AuthorizationInterval time.Duration // recheck identity and binding (default 30s)
 	AuthorizationTimeout  time.Duration // fail closed if recheck stalls (default 5s)
@@ -219,8 +220,9 @@ func (b *Broker) IsListening() bool { return b.isListening.Load() }
 
 // Serve accepts connections on l until Shutdown is called or Accept fails. It
 // takes ownership of l. Accepted connections are capped at MaxPendingConns;
-// connections beyond that are rejected immediately rather than queued. The
-// smaller serving cap (MaxConns) is applied later, after authentication.
+// at that bound Serve stops accepting, and further connections queue in the
+// listen backlog until a handshake finishes, rather than being refused. The
+// serving cap (MaxConns) is applied later, after authentication.
 func (b *Broker) Serve(l net.Listener) error {
 	// This listener exchanges bearer tokens without TLS. Enforce the transport
 	// boundary here as well as in CLI configuration.
@@ -496,6 +498,14 @@ func (b *Broker) acquireServeSlot(ctx context.Context) bool {
 }
 
 func (b *Broker) releaseServeSlot() { <-b.serveSem }
+
+// removalTimeout bounds removing a session from the ledger. Removal runs as
+// sessions end, including at shutdown, so it never exceeds leaseRevokeTimeout,
+// which fits the server's default five-second shutdown budget; a smaller
+// LedgerTimeout still applies.
+func (b *Broker) removalTimeout() time.Duration {
+	return min(b.opts.LedgerTimeout, leaseRevokeTimeout)
+}
 
 // defaultAdmissionConcurrency is how many connections run admission's store
 // calls at once. It shapes a burst for the store, which serves one SQLite
@@ -783,7 +793,7 @@ func (b *Broker) handleConn(conn net.Conn, releasePending func()) {
 			return
 		}
 		defer func() {
-			ctx, cancel := context.WithTimeout(context.Background(), b.opts.LedgerTimeout)
+			ctx, cancel := context.WithTimeout(context.Background(), b.removalTimeout())
 			defer cancel()
 			if err := b.opts.Sessions.Remove(ctx, sessionID); err != nil {
 				// The row stops counting when this replica's owner row expires.
