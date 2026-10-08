@@ -23,9 +23,14 @@ func validPinnedCA(text string) error {
 	rest := []byte(text)
 	count := 0
 	for {
-		block, next := pem.Decode(rest)
-		if block == nil {
+		// pem.Decode skips text before a block; nothing may hide there.
+		rest = bytes.TrimLeft(rest, " \t\r\n")
+		if len(rest) == 0 {
 			break
+		}
+		block, next := pem.Decode(rest)
+		if block == nil || !bytes.HasPrefix(rest, []byte("-----BEGIN ")) {
+			return errors.New("postgres ca has text that is not a PEM certificate")
 		}
 		rest = next
 		if block.Type != "CERTIFICATE" {
@@ -40,9 +45,6 @@ func validPinnedCA(text string) error {
 			return fmt.Errorf("postgres ca certificate %d (%s) is neither a CA nor self-signed", count+1, cert.Subject)
 		}
 		count++
-	}
-	if len(bytes.TrimSpace(rest)) > 0 {
-		return errors.New("postgres ca has text that is not a PEM certificate")
 	}
 	if count == 0 {
 		return errors.New("postgres ca has no PEM certificate")

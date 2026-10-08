@@ -78,6 +78,8 @@ func TestCatalogDatabasePinnedCA(t *testing.T) {
 		"bad DER":         {"ca": "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"},
 		"no PEM":          {"ca": "not a certificate"},
 		"trailing text":   {"ca": caPEM + "extra"},
+		"leading text":    {"ca": "note\n" + caPEM},
+		"text between":    {"ca": caPEM + "note\n" + citusPEM},
 		"oversized":       {"ca": strings.Repeat(caPEM, maxPinnedCABytes/len(caPEM)+1)},
 		"uppercase name":  {"serverName": "DB.example.com"},
 		"bare label name": {"serverName": "db"},
