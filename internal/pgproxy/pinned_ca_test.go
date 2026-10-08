@@ -157,3 +157,21 @@ func TestPinnedCARefusesBadPEM(t *testing.T) {
 		}
 	}
 }
+
+// AlloyDB's direct port serves one self-signed certificate per instance:
+// CN unused, CA:TRUE, named only localhost. Pinned as itself it verifies
+// with no serverName, and another instance's certificate does not.
+func TestPinnedAlloyDBShapedCertificate(t *testing.T) {
+	alloydb := func() testCert {
+		return issue(t, &x509.Certificate{SerialNumber: big.NewInt(5), Subject: pkix.Name{CommonName: "unused"},
+			NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+			IsCA: true, BasicConstraintsValid: true, DNSNames: []string{"localhost"}}, nil)
+	}
+	instance := alloydb()
+	if err := connectPinned(t, instance.serverTLS(), DatabaseService{CA: instance.pem()}); err != nil {
+		t.Fatalf("pinned instance certificate: %v", err)
+	}
+	if err := connectPinned(t, alloydb().serverTLS(), DatabaseService{CA: instance.pem()}); !handshakeRefused(err) {
+		t.Fatalf("another instance's certificate: %v", err)
+	}
+}
