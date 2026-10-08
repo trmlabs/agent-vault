@@ -15,7 +15,7 @@ const databaseCatalog = `{"pools":[{"name":"cursor","namespace":"agents","servic
  {"name":"b2bcore","kind":"postgres","host":"p.abc.db.postgresbridge.com","pools":["cursor"],
   "postgres":{"database":"core","mount":"database","role":"staging.us.crunchy.core-readonly","maxConns":20}},
  {"name":"auditlog","kind":"postgres","host":"p.abc.db.postgresbridge.com","pools":["cursor","ci"],
-  "postgres":{"database":"auditlog","mount":"database","role":"staging.us.crunchy.auditlog-readonly","sslmode":"verify-full","maxConns":5}}]}`
+  "postgres":{"database":"auditlog","mount":"database","role":"staging.us.crunchy.auditlog-readonly","sslmode":"verify-full","maxConns":5,"serverName":"auditlog.example.com"}}]}`
 
 func TestCatalogDatabaseResolverFollowsTheLiveCatalog(t *testing.T) {
 	httpcatalog.Environment.Store("staging")
@@ -29,6 +29,9 @@ func TestCatalogDatabaseResolverFollowsTheLiveCatalog(t *testing.T) {
 	svc, err := r.ResolveDatabase(context.Background(), pgproxy.AgentScope{ActorID: "agent-uuid-1", Pool: "cursor"}, "b2bcore")
 	if err != nil || svc.Addr != "p.abc.db.postgresbridge.com:5432" || svc.Database != "core" || svc.SSLMode != "verify-full" || svc.MaxConns != 5 || !svc.ReadOnly {
 		t.Fatalf("resolved %+v %v", svc, err)
+	}
+	if svc, err := r.ResolveDatabase(context.Background(), pgproxy.AgentScope{ActorID: "agent-uuid-2", Pool: "ci"}, "auditlog"); err != nil || svc.ServerName != "auditlog.example.com" {
+		t.Fatalf("server name: %+v %v", svc, err)
 	}
 	if _, err := r.ResolveDatabase(context.Background(), pgproxy.AgentScope{ActorID: "agent-uuid-2", Pool: "ci"}, "b2bcore"); err == nil || !strings.Contains(err.Error(), "not granted") {
 		t.Fatalf("ungranted pool: %v", err)

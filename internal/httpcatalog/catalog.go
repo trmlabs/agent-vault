@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"os"
 	"regexp"
 	"sort"
@@ -146,6 +147,13 @@ type PostgresBinding struct {
 	// Access is "read" (the default) or "write", and must be "write" exactly
 	// when the role is a -readwrite role.
 	Access string `json:"access,omitempty"`
+	// CA, when set, is the only trust for this database's certificate: PEM
+	// certificates, public, in place of the broker's bundled roots. Each is a
+	// CA, or the server's own self-signed certificate (Citus makes one).
+	CA string `json:"ca,omitempty"`
+	// ServerName is the name the certificate must carry when it is not the
+	// host, as when the host is our own DNS name for a provider's endpoint.
+	ServerName string `json:"serverName,omitempty"`
 }
 
 // Current lets a fixed Catalog stand wherever a live, reloading one can.
@@ -484,6 +492,19 @@ func (e *Entry) normalizePostgres() error {
 	case p.SSLMode == "disable" && plaintextDatabases.Load() && clusterLocal(e.Host):
 	default:
 		return fmt.Errorf("sslmode %q: catalog databases use verify-full", p.SSLMode)
+	}
+	if (p.CA != "" || p.ServerName != "") && p.SSLMode != "verify-full" {
+		return errors.New("ca and serverName need sslmode verify-full")
+	}
+	if p.CA != "" {
+		if err := validPinnedCA(p.CA); err != nil {
+			return err
+		}
+	}
+	if p.ServerName != "" && !hostPattern.MatchString(p.ServerName) {
+		if _, err := netip.ParseAddr(p.ServerName); err != nil {
+			return fmt.Errorf("serverName %q: a lowercase DNS name or an IP address", p.ServerName)
+		}
 	}
 	if p.MaxConns < 0 || p.MaxConns > 1000 {
 		return errors.New("maxConns out of range")
