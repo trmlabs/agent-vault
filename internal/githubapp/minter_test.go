@@ -179,7 +179,7 @@ func TestMinterRequestsOnlyOneRepoAndMinimumPermissions(t *testing.T) {
 	for permissions, want := range map[Permissions]map[string]any{
 		ContentsRead:      {"contents": "read", "metadata": "read"},
 		ContentsWrite:     {"contents": "write", "metadata": "read"},
-		PullRequestsWrite: {"pull_requests": "write", "metadata": "read"},
+		PullRequestsWrite: {"contents": "read", "pull_requests": "write", "metadata": "read"},
 	} {
 		token, err := m.Token(context.Background(), app, "trmlabs/trm-b2b", permissions)
 		if err != nil || !strings.HasPrefix(token.Value(), "ghs_") {

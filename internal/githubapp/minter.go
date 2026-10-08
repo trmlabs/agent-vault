@@ -40,11 +40,13 @@ type Permissions struct {
 }
 
 // ContentsRead and ContentsWrite are the git fetch and push scopes;
-// PullRequestsWrite opens pull requests and comments on them.
+// PullRequestsWrite opens pull requests and comments on them. Opening one
+// also reads its head and base refs, which GitHub checks with contents read
+// ("not all refs are readable" without it), so that scope carries it.
 var (
 	ContentsRead      = Permissions{Contents: "read"}
 	ContentsWrite     = Permissions{Contents: "write"}
-	PullRequestsWrite = Permissions{PullRequests: "write"}
+	PullRequestsWrite = Permissions{Contents: "read", PullRequests: "write"}
 )
 
 func (p Permissions) valid() bool {
