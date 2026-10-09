@@ -52,9 +52,13 @@ func TestV1InputIsUnchanged(t *testing.T) {
 	if !bytes.HasPrefix(r.macInput(), []byte("gatehouse-audit-v3\x00")) {
 		t.Fatal("a v3 row does not use the v3 input")
 	}
-	r.MACVersion = MACVersionCurrent
+	r.MACVersion = 4
 	if !bytes.HasPrefix(r.macInput(), []byte("gatehouse-audit-v4\x00")) {
-		t.Fatal("a current row does not use the v4 input")
+		t.Fatal("a v4 row does not use the v4 input")
+	}
+	r.MACVersion = MACVersionCurrent
+	if !bytes.HasPrefix(r.macInput(), []byte("gatehouse-audit-v5\x00")) {
+		t.Fatal("a current row does not use the v5 input")
 	}
 }
 
@@ -83,7 +87,7 @@ func TestAuthorizationFieldEditsAreDetected(t *testing.T) {
 		"kid":       {`"kid":"invalid"`, `"kid":"k1"`},
 		"kid hash":  {`"kidSHA256":"0123456789ab"`, `"kidSHA256":"ba9876543210"`},
 		"peer":      {`"peer":"10.0.0.5"`, `"peer":"10.0.0.6"`},
-		"version":   {`"macVersion":4`, `"macVersion":3`},
+		"version":   {`"macVersion":5`, `"macVersion":4`},
 	} {
 		t.Run(name, func(t *testing.T) {
 			f, out := authzFixture(t)
@@ -112,6 +116,7 @@ func TestV1RowsCannotCarryAuthorizationOrDowngrade(t *testing.T) {
 		"v2 row with a kid":      func(r *Row) { r.MACVersion, r.Kid = 2, "k1" },
 		"v3 row with a serial":   func(r *Row) { r.MACVersion, r.Serial = 3, "1a" },
 		"v3 row with a notAfter": func(r *Row) { r.MACVersion, r.NotAfter = 3, "2026-10-07T00:00:00Z" },
+		"v4 row with a target":   func(r *Row) { r.MACVersion, r.Target = 4, "example.com:443" },
 		"plain downgrade":        func(*Row) {},
 		"unknown version":        func(r *Row) { r.MACVersion = 9 },
 	} {
@@ -141,7 +146,7 @@ func hasKind(r Report, kind string) bool {
 	return false
 }
 
-// A trail written by a v2 broker, then after upgrades by v3 and v4 ones,
+// A trail written by a v2 broker, then after upgrades by v3, v4 and v5 ones,
 // verifies; an older row after a newer one is a step down and does not.
 func TestUpgradeFromV2VerifiesAndNeverStepsDown(t *testing.T) {
 	writeMACVersion = 2
@@ -155,9 +160,15 @@ func TestUpgradeFromV2VerifiesAndNeverStepsDown(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.checkpoint(t)
-	writeMACVersion = MACVersionCurrent
+	writeMACVersion = 4
 	f.restart(t)
 	if err := f.chain.Record(Event{Event: EventCertificate, Outcome: "issued", Peer: "10.0.0.5", Serial: "1a2b", NotAfter: "2026-10-07T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	f.checkpoint(t)
+	writeMACVersion = MACVersionCurrent
+	f.restart(t)
+	if err := f.chain.Record(Event{Event: EventDenied, Outcome: "unlisted", Target: "example.com:443"}); err != nil {
 		t.Fatal(err)
 	}
 	f.session(t, 2)
@@ -167,8 +178,8 @@ func TestUpgradeFromV2VerifiesAndNeverStepsDown(t *testing.T) {
 	for _, r := range rows(t, out) {
 		versions[r.MACVersion]++
 	}
-	if versions[2] == 0 || versions[3] == 0 || versions[MACVersionCurrent] == 0 || len(versions) != 3 {
-		t.Fatalf("trail versions %v, want v2, v3 then v4", versions)
+	if versions[2] == 0 || versions[3] == 0 || versions[4] == 0 || versions[MACVersionCurrent] == 0 || len(versions) != 4 {
+		t.Fatalf("trail versions %v, want v2, v3, v4 then v5", versions)
 	}
 	if report := verify(t, f.verifier(), out); len(report.Findings) != 0 {
 		t.Fatalf("upgraded trail: %v", kinds(report))
@@ -176,13 +187,13 @@ func TestUpgradeFromV2VerifiesAndNeverStepsDown(t *testing.T) {
 	parsed := rows(t, out)
 	last := parsed[len(parsed)-1]
 	key, _ := f.keys.lookup(last.KeyVersion)
-	for _, older := range []int{2, 3} {
+	for _, older := range []int{2, 3, 4} {
 		forged := Row{Type: RowType, Replica: last.Replica, Boot: last.Boot, Seq: last.Seq + 1, Time: last.Time,
 			Event: EventSessionOpen, Pool: "claude", KeyVersion: last.KeyVersion, Prev: last.MAC, MACVersion: older}
 		forged.MAC = forged.computeMAC(key)
 		line, _ := json.Marshal(forged)
 		if report := verify(t, f.verifier(), out+string(line)+"\n"); !hasKind(report, FindingEdit) {
-			t.Fatalf("step down from v4 to v%d accepted: %v", older, kinds(report))
+			t.Fatalf("step down from v5 to v%d accepted: %v", older, kinds(report))
 		}
 	}
 }
@@ -233,6 +244,53 @@ func TestManyGroupsAreRecordedInFull(t *testing.T) {
 	for _, bad := range []string{"g1", many + ",", many + ",not a group", "11111111-2222-3333-4444-555555555555 "} {
 		if (Event{Event: EventDenied, Groups: bad}).Validate() == nil {
 			t.Errorf("group list %.40q accepted", bad)
+		}
+	}
+}
+
+// A refusal's target is covered by the MAC, and only the canonical form
+// TargetField returns is accepted, so no path, query or free text can enter.
+func TestRefusalTargetIsCoveredAndBounded(t *testing.T) {
+	f := newFixture(t)
+	if err := f.chain.Record(Event{Event: EventDenied, Outcome: "unlisted", Pool: "claude", Target: "api.example.com:443"}); err != nil {
+		t.Fatal(err)
+	}
+	f.checkpoint(t)
+	out := f.out.String()
+	edit := [2]string{`"target":"api.example.com:443"`, `"target":"api.example.org:443"`}
+	if !strings.Contains(out, edit[0]) {
+		t.Fatalf("row lacks %s", edit[0])
+	}
+	if report := verify(t, f.verifier(), strings.Replace(out, edit[0], edit[1], 1)); !hasKind(report, FindingEdit) {
+		t.Fatal("target edit not detected")
+	}
+	for in, want := range map[string]string{
+		"":                         "",
+		"API.Example.com:443":      "api.example.com:443",
+		"api.example.com":          "api.example.com",
+		"10.0.0.5:5432":            "10.0.0.5:5432",
+		"[2001:DB8::1]:443":        "[2001:db8::1]:443",
+		"[2001:db8::1]":            "2001:db8::1",
+		"api.example.com:0":        "invalid",
+		"api.example.com:070":      "invalid",
+		"api.example.com:99999":    "invalid",
+		"api.example.com/v1?key=x": "invalid",
+		"user@api.example.com:443": "invalid",
+		"api example.com:443":      "invalid",
+		strings.Repeat("a.", 200):  "invalid",
+		"invalid":                  "invalid",
+	} {
+		got := TargetField(in)
+		if got != want {
+			t.Errorf("TargetField(%q) = %q, want %q", in, got, want)
+		}
+		if (Event{Event: EventDenied, Target: got}).Validate() != nil {
+			t.Errorf("TargetField(%q) = %q is refused by Validate", in, got)
+		}
+	}
+	for _, bad := range []string{"API.example.com:443", "api.example.com/v1", "api.example.com:070"} {
+		if (Event{Event: EventDenied, Target: bad}).Validate() == nil {
+			t.Errorf("target %q accepted", bad)
 		}
 	}
 }

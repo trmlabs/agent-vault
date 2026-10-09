@@ -109,14 +109,15 @@ type adapterFixture struct {
 // scopeResolver lets a test change the admitted scope without touching the
 // running proxy.
 type scopeResolver struct {
-	mu    sync.Mutex
-	scope *brokercore.ProxyScope
+	mu      sync.Mutex
+	scope   *brokercore.ProxyScope
+	expired bool // every later resolution fails, as for an expired session
 }
 
 func (s *scopeResolver) ResolveForProxy(_ context.Context, token, _ string) (*brokercore.ProxyScope, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if token != "workload-token" {
+	if token != "workload-token" || s.expired {
 		return nil, brokercore.ErrInvalidSession
 	}
 	return s.scope, nil
@@ -159,6 +160,9 @@ func newAdapterFixtureWith(t *testing.T, basic bool, options ...func(*Options)) 
 			body, _ := io.ReadAll(r.Body)
 			w.Header().Set("Content-Type", "application/json")
 			fmt.Fprintf(w, `{"method":%q,"bytes":%d}`, r.Method, len(body)) // #nosec G705 -- test upstream; JSON response
+		case "/v1/chat/slow":
+			time.Sleep(30 * time.Millisecond)
+			fmt.Fprint(w, "ok")
 		case "/v1/stream":
 			w.Header().Set("Content-Type", "text/event-stream")
 			fmt.Fprint(w, "data: first\n\n")
@@ -264,6 +268,44 @@ func TestAdapterInjectsKeyForPlaceholderOrOmittedHeader(t *testing.T) {
 		if e.Pool != "pool-agent" || e.Agent != "agent-uuid-1" || e.PodUID != "pod-uid-1" || e.Binding != "llm" || e.Method != "POST" || e.Session == "" {
 			t.Fatalf("attribution: %+v", e)
 		}
+		if e.Target != "" {
+			t.Fatalf("an admitted call carries a target: %+v", e)
+		}
+	}
+}
+
+// A response row records how long the call took from admission, and the
+// admitted row carries no duration.
+func TestAdapterRecordsResponseDuration(t *testing.T) {
+	f := newAdapterFixture(t)
+	if code, body, err := f.do(t, "GET", "/v1/chat/slow", "", nil); err != nil || code != 200 || body != "ok" {
+		t.Fatalf("slow call: %d %q %v", code, body, err)
+	}
+	events := f.audit.all()
+	if len(events) != 2 || events[0].Event != auditchain.EventHTTPRequest || events[0].Duration != 0 {
+		t.Fatalf("admitted row: %+v", events)
+	}
+	if done := events[1]; done.Event != auditchain.EventHTTPResponse || done.Outcome != "completed" || done.Duration < 30 || done.Duration > 10_000 {
+		t.Fatalf("response row: %+v", done)
+	}
+}
+
+// A refusal inside an open tunnel records the tunnel's CONNECT target, the
+// host the broker checked, not the Host header the client sent.
+func TestTunnelRefusalRecordsConnectTarget(t *testing.T) {
+	f := newAdapterFixture(t)
+	if code, _, err := f.do(t, "GET", "/v1/chat/x", "", nil); err != nil || code != 200 {
+		t.Fatalf("open tunnel: %d %v", code, err)
+	}
+	f.sessions.mu.Lock()
+	f.sessions.expired = true
+	f.sessions.mu.Unlock()
+	code, _, err := f.do(t, "GET", "/v1/chat/x", "", func(r *http.Request) { r.Host = "other.example.net" })
+	if err != nil || code != http.StatusForbidden {
+		t.Fatalf("in-tunnel refusal: %d %v", code, err)
+	}
+	if e, want := f.audit.last(), "example.com:"+strconv.Itoa(f.port); e.Event != auditchain.EventDenied || e.Target != want {
+		t.Fatalf("refusal row %+v, want target %q", e, want)
 	}
 }
 
@@ -282,6 +324,9 @@ func TestAdapterRefusesOutsideTheCatalog(t *testing.T) {
 			if err != nil || code != tc.code || f.audit.last().Outcome != tc.outcome || f.calls.Load() != 0 {
 				t.Fatalf("code=%d outcome=%q calls=%d err=%v", code, f.audit.last().Outcome, f.calls.Load(), err)
 			}
+			if got, want := f.audit.last().Target, "example.com:"+strconv.Itoa(f.port); got != want {
+				t.Fatalf("refusal target %q, want %q", got, want)
+			}
 		})
 	}
 	// An unlisted host is refused before the tunnel opens.
@@ -292,6 +337,9 @@ func TestAdapterRefusesOutsideTheCatalog(t *testing.T) {
 	}
 	if err == nil || f.audit.last().Outcome != "unlisted" || f.calls.Load() != 0 {
 		t.Fatalf("unlisted host tunnelled: %v %+v", err, f.audit.last())
+	}
+	if got, want := f.audit.last().Target, "other.example.net:"+strconv.Itoa(f.port); got != want {
+		t.Fatalf("unlisted host target %q, want %q", got, want)
 	}
 	// A pool without the grant is still refused per request inside a tunnel
 	// that is already open (this client reuses its earlier tunnel); a new

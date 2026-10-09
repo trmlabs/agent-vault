@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -78,6 +80,7 @@ type Event struct {
 	Serial   string
 	NotAfter string
 	DNSNames string // comma-separated lower-case DNS names the certificate holds
+	Target   string // refusals: see Row; set it with TargetField
 	Method   string
 	Status   int
 	Duration int64 // milliseconds
@@ -190,6 +193,9 @@ func (e Event) Validate() error {
 	if !dnsNameList(e.DNSNames) {
 		return ErrInvalidEvent
 	}
+	if e.Target != "" && TargetField(e.Target) != e.Target {
+		return ErrInvalidEvent
+	}
 	if e.Serial != "" && !serialHex.MatchString(e.Serial) {
 		return ErrInvalidEvent
 	}
@@ -221,6 +227,33 @@ func dnsNameList(s string) bool {
 	return true
 }
 
+// TargetField returns the canonical form of a requested host or host:port
+// for a row's target: a lower-case DNS name or IP address, with the port when
+// one was given, or "invalid" when the input is anything else. Its result is
+// always a valid target, and canonical input comes back unchanged.
+func TargetField(hostport string) string {
+	if hostport == "" {
+		return ""
+	}
+	host, port, err := net.SplitHostPort(hostport)
+	if err != nil {
+		host, port = strings.TrimSuffix(strings.TrimPrefix(hostport, "["), "]"), ""
+	}
+	host = strings.ToLower(host)
+	if ip := net.ParseIP(host); ip != nil {
+		host = ip.String()
+	} else if len(host) > 253 || !dnsName.MatchString(host) {
+		return "invalid"
+	}
+	if port == "" {
+		return host
+	}
+	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 || strconv.Itoa(n) != port {
+		return "invalid"
+	}
+	return net.JoinHostPort(host, port)
+}
+
 var groupID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 // groupList admits the comma-separated Entra object IDs of the groups a
@@ -249,7 +282,7 @@ func (c *Chain) Record(e Event) error {
 	defer c.mu.Unlock()
 	_, err := c.appendLocked(Row{Event: e.Event, Pool: e.Pool, Agent: e.Agent, PodUID: e.PodUID, Binding: e.Binding, Session: e.Session, Outcome: e.Outcome, Requester: e.Requester,
 		RequesterKind: e.RequesterKind, RequesterOID: e.RequesterOID, TokenSHA256: e.TokenSHA256, Tier: e.Tier, Decision: e.Decision, Groups: e.Groups, CacheAgeSec: e.CacheAgeSec,
-		Kid: e.Kid, KidSHA256: e.KidSHA256, Peer: e.Peer, Serial: e.Serial, NotAfter: e.NotAfter, DNSNames: e.DNSNames,
+		Kid: e.Kid, KidSHA256: e.KidSHA256, Peer: e.Peer, Serial: e.Serial, NotAfter: e.NotAfter, DNSNames: e.DNSNames, Target: e.Target,
 		Method: e.Method, Status: e.Status, Duration: e.Duration})
 	return err
 }

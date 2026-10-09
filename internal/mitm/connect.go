@@ -163,7 +163,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 			if catalog.HasHost(host, port) {
 				outcome = "pool"
 			}
-			p.adapterDeny(w, auditchain.Event{Pool: connectScope.Pool, Agent: connectScope.AgentID, PodUID: connectScope.WorkloadID}, http.StatusForbidden, outcome)
+			p.adapterDeny(w, auditchain.Event{Pool: connectScope.Pool, Agent: connectScope.AgentID, PodUID: connectScope.WorkloadID}, target, http.StatusForbidden, outcome)
 			return
 		}
 	}
@@ -244,6 +244,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	kinds := connKinds(r.Context())
 	srv := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r = r.WithContext(withConnectTarget(r.Context(), target))
 			// A tunnel can outlive its token or grant. Recheck each request
 			// against the original proxy identity before injecting credentials.
 			scope, err := p.resolveScope(withKinds(brokercore.WithAttestation(r.Context(), brokercore.AttestationFrom(attested)), kinds), token, hint, peer, peerErr, true)

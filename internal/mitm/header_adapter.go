@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/Infisical/agent-vault/internal/auditchain"
 	"github.com/Infisical/agent-vault/internal/brokercore"
@@ -74,10 +75,12 @@ func (a *HeaderAdapter) valid() bool {
 
 const placeholderMarker = "__vault_"
 
-// adapterDeny records a refusal before answering. If the row cannot be
-// written the caller still learns nothing beyond "unavailable".
-func (p *Proxy) adapterDeny(w http.ResponseWriter, event auditchain.Event, status int, outcome string) {
+// adapterDeny records a refusal, with the target the caller asked for, before
+// answering. If the row cannot be written the caller still learns nothing
+// beyond "unavailable".
+func (p *Proxy) adapterDeny(w http.ResponseWriter, event auditchain.Event, target string, status int, outcome string) {
 	event.Event, event.Outcome, event.Status = auditchain.EventDenied, outcome, status
+	event.Target = auditchain.TargetField(target)
 	if p.adapter.Audit.Record(event) != nil {
 		status = http.StatusServiceUnavailable
 	}
@@ -98,7 +101,24 @@ func (p *Proxy) adapterIdentityDeny(w http.ResponseWriter, r *http.Request, a re
 	if key != nil {
 		event.Kid, event.KidSHA256, event.Peer = key.Kid, key.KidSHA256, key.Peer
 	}
-	p.adapterDeny(w, event, status, "refused")
+	p.adapterDeny(w, event, requestedTarget(r), status, "refused")
+}
+
+type connectTargetKey struct{}
+
+// withConnectTarget marks a request inside a tunnel with the tunnel's CONNECT
+// target, the host and port the broker checked.
+func withConnectTarget(ctx context.Context, target string) context.Context {
+	return context.WithValue(ctx, connectTargetKey{}, target)
+}
+
+// requestedTarget is the host a refusal records: inside a tunnel, its CONNECT
+// target rather than the Host header the client chose for this request.
+func requestedTarget(r *http.Request) string {
+	if target, ok := r.Context().Value(connectTargetKey{}).(string); ok {
+		return target
+	}
+	return r.Host
 }
 
 func auditMethod(m string) string {
@@ -122,7 +142,7 @@ func (p *Proxy) forwardCatalog(w http.ResponseWriter, r *http.Request, target, h
 		event.Pool, event.Agent, event.PodUID = scope.Pool, scope.AgentID, scope.WorkloadID
 	}
 	w.Header().Set("X-Request-Id", event.Session)
-	deny := func(status int, outcome string) { p.adapterDeny(w, event, status, outcome) }
+	deny := func(status int, outcome string) { p.adapterDeny(w, event, target, status, outcome) }
 	if scope == nil || scope.AgentID == "" || scope.UserID != "" {
 		deny(http.StatusForbidden, "authentication")
 		return
@@ -266,9 +286,11 @@ func (p *Proxy) forwardCatalog(w http.ResponseWriter, r *http.Request, target, h
 		http.Error(w, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
 		return
 	}
+	admittedAt := time.Now()
 	finish := func(status int, outcome string) {
 		done := event
 		done.Event, done.Outcome, done.Status = auditchain.EventHTTPResponse, outcome, status
+		done.Duration = time.Since(admittedAt).Milliseconds()
 		_ = a.Audit.Record(done)
 	}
 	values := map[string]string{"key": secret.Value(), "credential": credential}
