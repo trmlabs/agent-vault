@@ -58,6 +58,12 @@ type DatabaseService struct {
 	SSLMode  string // upstream TLS mode: "disable" | "prefer" (default) | "require" | "verify-full"
 	MaxConns int    // per-database connection budget (0 = the broker's default); bounds this upstream so a burst to one database cannot starve the others
 	ReadOnly bool   // a read-only login: statements that could create temporary objects are refused
+	// CA, with verify-full, is the only trust for the server certificate:
+	// PEM certificates, each a CA or the server's own self-signed one.
+	// Empty uses the system roots.
+	CA string
+	// ServerName is the name verify-full checks when it is not the host.
+	ServerName string
 }
 
 // DatabaseResolver selects the database service an authorized agent is asking
