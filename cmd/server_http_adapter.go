@@ -122,8 +122,9 @@ func httpHeaderAdapter(ctx context.Context, srv *server.Server, getenv func(stri
 	adapter.Sessions = sessionBinder(srv.CleanupStore())
 	dial := netguard.SafeDialContext(netguard.AllowPrivateFromEnv())
 	browserTokens := &httpcatalog.Auth0Tokens{Keys: keys, Client: auth0Client(source, dial), AutomatedAuth: automatedAuthClient(source, dial),
-		Revoked: func(binding, outcome string, status int) {
-			_ = chain.Record(auditchain.Event{Event: auditchain.EventHTTPResponse, Binding: binding + "/revoke", Outcome: outcome, Method: http.MethodPost, Status: status})
+		Revoked: func(binding, outcome string, status int, took time.Duration) {
+			_ = chain.Record(auditchain.Event{Event: auditchain.EventHTTPResponse, Binding: binding + "/revoke", Outcome: outcome, Method: http.MethodPost, Status: status,
+				Duration: took.Milliseconds()})
 		}}
 	adapter.BrowserTokens = browserTokens
 	source.OnChange(browserTokens.Prune)

@@ -72,7 +72,7 @@ type Row struct {
 	Target    string `json:"target,omitempty"`
 	Method    string `json:"method,omitempty"`     // HTTP rows only
 	Status    int    `json:"status,omitempty"`     // HTTP response rows: upstream or broker status
-	Duration  int64  `json:"durationMs,omitempty"` // transaction rows: milliseconds from first message to completion; HTTP response rows: from admission to the end of the response
+	Duration  int64  `json:"durationMs,omitempty"` // transaction rows: milliseconds from first message to completion; HTTP response rows: from admission to the end of the response, or the length of a refresh-token revocation
 	SignedSeq uint64 `json:"signedSeq,omitempty"`  // checkpoint: the chain head it signs
 	SignedMAC string `json:"signedMAC,omitempty"`
 	Signature string `json:"signature,omitempty"` // checkpoint: Transit "vault:vN:..." signature
