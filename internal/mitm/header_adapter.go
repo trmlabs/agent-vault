@@ -101,7 +101,24 @@ func (p *Proxy) adapterIdentityDeny(w http.ResponseWriter, r *http.Request, a re
 	if key != nil {
 		event.Kid, event.KidSHA256, event.Peer = key.Kid, key.KidSHA256, key.Peer
 	}
-	p.adapterDeny(w, event, r.Host, status, "refused")
+	p.adapterDeny(w, event, requestedTarget(r), status, "refused")
+}
+
+type connectTargetKey struct{}
+
+// withConnectTarget marks a request inside a tunnel with the tunnel's CONNECT
+// target, the host and port the broker checked.
+func withConnectTarget(ctx context.Context, target string) context.Context {
+	return context.WithValue(ctx, connectTargetKey{}, target)
+}
+
+// requestedTarget is the host a refusal records: inside a tunnel, its CONNECT
+// target rather than the Host header the client chose for this request.
+func requestedTarget(r *http.Request) string {
+	if target, ok := r.Context().Value(connectTargetKey{}).(string); ok {
+		return target
+	}
+	return r.Host
 }
 
 func auditMethod(m string) string {

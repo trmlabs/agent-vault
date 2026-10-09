@@ -109,14 +109,15 @@ type adapterFixture struct {
 // scopeResolver lets a test change the admitted scope without touching the
 // running proxy.
 type scopeResolver struct {
-	mu    sync.Mutex
-	scope *brokercore.ProxyScope
+	mu      sync.Mutex
+	scope   *brokercore.ProxyScope
+	expired bool // every later resolution fails, as for an expired session
 }
 
 func (s *scopeResolver) ResolveForProxy(_ context.Context, token, _ string) (*brokercore.ProxyScope, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if token != "workload-token" {
+	if token != "workload-token" || s.expired {
 		return nil, brokercore.ErrInvalidSession
 	}
 	return s.scope, nil
@@ -286,6 +287,25 @@ func TestAdapterRecordsResponseDuration(t *testing.T) {
 	}
 	if done := events[1]; done.Event != auditchain.EventHTTPResponse || done.Outcome != "completed" || done.Duration < 30 || done.Duration > 10_000 {
 		t.Fatalf("response row: %+v", done)
+	}
+}
+
+// A refusal inside an open tunnel records the tunnel's CONNECT target, the
+// host the broker checked, not the Host header the client sent.
+func TestTunnelRefusalRecordsConnectTarget(t *testing.T) {
+	f := newAdapterFixture(t)
+	if code, _, err := f.do(t, "GET", "/v1/chat/x", "", nil); err != nil || code != 200 {
+		t.Fatalf("open tunnel: %d %v", code, err)
+	}
+	f.sessions.mu.Lock()
+	f.sessions.expired = true
+	f.sessions.mu.Unlock()
+	code, _, err := f.do(t, "GET", "/v1/chat/x", "", func(r *http.Request) { r.Host = "other.example.net" })
+	if err != nil || code != http.StatusForbidden {
+		t.Fatalf("in-tunnel refusal: %d %v", code, err)
+	}
+	if e, want := f.audit.last(), "example.com:"+strconv.Itoa(f.port); e.Event != auditchain.EventDenied || e.Target != want {
+		t.Fatalf("refusal row %+v, want target %q", e, want)
 	}
 }
 
