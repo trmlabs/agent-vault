@@ -32,7 +32,7 @@ func (p *Proxy) forwardGitHubAPI(w http.ResponseWriter, r *http.Request, target 
 	if api.Entry != nil {
 		event.Binding = api.Entry.Name + "/" + api.Repo.Repo
 	}
-	deny := func(status int, outcome string) { p.adapterDeny(w, event, status, outcome) }
+	deny := func(status int, outcome string) { p.adapterDeny(w, event, target, status, outcome) }
 	switch {
 	case errors.Is(matchErr, httpcatalog.ErrUnlisted):
 		deny(http.StatusForbidden, "unlisted")
@@ -129,9 +129,11 @@ func (p *Proxy) forwardGitHubAPI(w http.ResponseWriter, r *http.Request, target 
 		http.Error(w, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
 		return
 	}
+	admittedAt := time.Now()
 	finish := func(status int, outcome string) {
 		done := event
 		done.Event, done.Outcome, done.Status = auditchain.EventHTTPResponse, outcome, status
+		done.Duration = time.Since(admittedAt).Milliseconds()
 		_ = a.Audit.Record(done)
 	}
 	needles := secretRepresentations(map[string]string{"token": token.Value(), "credential": credential})

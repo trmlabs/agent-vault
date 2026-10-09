@@ -163,7 +163,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 			if catalog.HasHost(host, port) {
 				outcome = "pool"
 			}
-			p.adapterDeny(w, auditchain.Event{Pool: connectScope.Pool, Agent: connectScope.AgentID, PodUID: connectScope.WorkloadID}, http.StatusForbidden, outcome)
+			p.adapterDeny(w, auditchain.Event{Pool: connectScope.Pool, Agent: connectScope.AgentID, PodUID: connectScope.WorkloadID}, target, http.StatusForbidden, outcome)
 			return
 		}
 	}

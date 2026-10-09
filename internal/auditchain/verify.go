@@ -296,6 +296,8 @@ func (v Verifier) verifyChain(k chainKey, rows []Row, keys map[int][]byte) ([]Fi
 			add(FindingEdit, row.Seq)
 		case row.MACVersion < 4 && row.v4Only():
 			add(FindingEdit, row.Seq)
+		case row.MACVersion < 5 && row.v5Only():
+			add(FindingEdit, row.Seq)
 		case prev != nil && row.MACVersion < prev.MACVersion:
 			// A chain never steps down to a weaker MAC.
 			add(FindingEdit, row.Seq)
