@@ -122,14 +122,21 @@ func serverStatementName(query string, types []uint32) string {
 	return "gatehouse_" + hex.EncodeToString(h.Sum(nil))[:24]
 }
 
+// pooledKey is the pool key a client session of scope on svc checks out from.
+func pooledKey(scope AgentScope, svc *DatabaseService) poolKey {
+	key := poolKey{pool: scope.Pool, binding: databaseBinding(scope.VaultID, svc), mount: svc.Mount, role: svc.Role, addr: svc.Addr, database: svc.Database,
+		trust: trustKey(svc)}
+	if key.pool == "" {
+		key.pool = "actor:" + scope.ActorID
+	}
+	return key
+}
+
 // servePooled runs a client session on the shared pool. It returns when the
 // client leaves, the session is terminated, or the pool fails it.
 func (b *Broker) servePooled(ctx context.Context, conn net.Conn, backend *pgproto3.Backend, scope AgentScope, svc *DatabaseService, token, hint, requested string, peer netip.Addr,
 	startupParams map[string]string, event auditchain.Event) {
-	key := poolKey{pool: scope.Pool, binding: databaseBinding(scope.VaultID, svc), mount: svc.Mount, role: svc.Role, addr: svc.Addr, database: svc.Database}
-	if key.pool == "" {
-		key.pool = "actor:" + scope.ActorID
-	}
+	key := pooledKey(scope, svc)
 	s := &pooledSession{b: b, key: key, vaultID: scope.VaultID, svc: *svc, client: conn, backend: backend, event: event,
 		params: map[string]string{}, txStatus: 'I', statements: map[string]clientStatement{}}
 	wanted := map[string]bool{}

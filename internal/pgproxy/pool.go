@@ -3,7 +3,9 @@ package pgproxy
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -104,6 +106,22 @@ type poolKey struct {
 	role     string
 	addr     string
 	database string
+	// trust is trustKey of the entry: a re-pin or unpin gets new server
+	// connections, so none verified under the old pin is reused.
+	trust string
+}
+
+// trustKey names the inputs verify-full checks a server against: a hash of
+// the pinned CA and the server name, or empty when the entry pins neither.
+func trustKey(svc *DatabaseService) string {
+	if svc.CA == "" && svc.ServerName == "" {
+		return ""
+	}
+	h := sha256.New()
+	h.Write(binary.BigEndian.AppendUint32(nil, uint32(len(svc.CA)))) //nolint:gosec // bounded by the catalog's CA size limit
+	h.Write([]byte(svc.CA))
+	h.Write([]byte(svc.ServerName))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // credential is one Vault-issued database login shared by a pool key's

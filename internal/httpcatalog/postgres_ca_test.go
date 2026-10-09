@@ -89,7 +89,9 @@ func TestCatalogDatabasePinnedCA(t *testing.T) {
 			t.Errorf("%s accepted", name)
 		}
 	}
-	if err := entry(map[string]any{"ca": "-----BEGIN PRIVATE KEY-----\nc2VjcmV0\n-----END PRIVATE KEY-----\n"}); err == nil || strings.Contains(err.Error(), "c2VjcmV0") {
+	// Neither the PEM text nor its decoded value ("secret") may be echoed.
+	if err := entry(map[string]any{"ca": "-----BEGIN PRIVATE KEY-----\nc2VjcmV0\n-----END PRIVATE KEY-----\n"}); err == nil ||
+		strings.Contains(err.Error(), "c2VjcmV0") || strings.Contains(err.Error(), "secret") {
 		t.Fatalf("a private key must be refused without echoing it: %v", err)
 	}
 	// The test harness's plaintext database may not carry a pin it never checks.

@@ -175,3 +175,67 @@ func TestPinnedAlloyDBShapedCertificate(t *testing.T) {
 		t.Fatalf("another instance's certificate: %v", err)
 	}
 }
+
+// A catalog reload that re-pins or unpins an entry gets new server
+// connections: an idle one verified under the old pin is never reused.
+func TestPooledConnectionsAreKeyedOnThePin(t *testing.T) {
+	lease := newLease()
+	upstream := startFakeUpstream(t, authTrust, lease.Password)
+	scope := AgentScope{VaultID: "vault-1", ActorID: "agent-uuid-1", WorkloadID: "pod-1", Pool: "cursor"}
+	base := DatabaseService{Name: "analytics", Addr: upstream.addr(), Mount: "database", Role: "readonly", SSLMode: "disable", MaxConns: 10}
+	b, _ := startBroker(t, Options{
+		Auth:      &fakeAuth{scope: &scope},
+		Databases: &fakeResolver{svc: &base},
+		Leases:    &fakeMinter{lease: lease},
+		Pool:      &PoolOptions{},
+	})
+	if got := pooledKey(scope, &base).trust; got != "" {
+		t.Fatalf("an unpinned entry's key carries trust %q", got)
+	}
+	withCA := func(ca, name string) *DatabaseService {
+		svc := base
+		svc.CA, svc.ServerName = ca, name
+		return &svc
+	}
+	variants := map[string]*DatabaseService{
+		"unpinned":   &base,
+		"CA one":     withCA("ca-one", ""),
+		"CA two":     withCA("ca-two", ""),
+		"CA and one": withCA("ca-one", "db.example.com"),
+		"CA and two": withCA("ca-one", "db2.example.com"),
+		"name alone": withCA("", "db.example.com"),
+		"shifted":    withCA("ca-onedb.example.com", ""),
+	}
+	keys := map[poolKey]string{}
+	conns := map[*serverConn]string{}
+	ctx := context.Background()
+	for name, svc := range variants {
+		key := pooledKey(scope, svc)
+		if other, dup := keys[key]; dup {
+			t.Fatalf("%s and %s share a pool key", name, other)
+		}
+		keys[key] = name
+		if same := pooledKey(scope, withCA(svc.CA, svc.ServerName)); same != key {
+			t.Fatalf("%s: the key is not stable", name)
+		}
+		conn, err := b.pools.acquire(ctx, key, scope.VaultID, svc, false)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if other, dup := conns[conn]; dup {
+			t.Fatalf("%s reused a connection opened for %s", name, other)
+		}
+		conns[conn] = name
+		b.pools.release(conn, true)
+	}
+	// The same pin still reuses its idle connection.
+	key := pooledKey(scope, variants["CA one"])
+	conn, err := b.pools.acquire(ctx, key, scope.VaultID, variants["CA one"], false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conns[conn] != "CA one" {
+		t.Fatalf("CA one got a connection opened for %q", conns[conn])
+	}
+	b.pools.release(conn, true)
+}
