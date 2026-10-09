@@ -15,7 +15,7 @@ const (
 // harnessCatalog is the three harnesses Gatehouse serves: Cursor workers, Claude
 // sessions and agent-sandbox, each with its pool and one entry granted to all.
 func harnessCatalog() map[string]any {
-	inCluster := map[string]any{"issuer": "https://container.googleapis.com/v1/projects/p/locations/l/clusters/us-saas", "keys": "in-cluster", "audience": "gatehouse"}
+	inCluster := map[string]any{"issuer": "https://container.googleapis.com/v1/projects/p/locations/l/clusters/example-cluster", "keys": "in-cluster", "audience": "gatehouse"}
 	return map[string]any{
 		"harnesses": []any{
 			map[string]any{"name": "cursor", "trustDomain": inCluster,

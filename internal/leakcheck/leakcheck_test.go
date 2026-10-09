@@ -53,7 +53,7 @@ const securityContact = "security@trmlabs.com"
 func TestNoInternalNames(t *testing.T) {
 	root, files := trackedFiles(t)
 	for _, name := range files {
-		if strings.HasPrefix(name, "internal/leakcheck/") || skipped(name) {
+		if name == "internal/leakcheck/leakcheck_test.go" || skipped(name) {
 			continue
 		}
 		data, err := os.ReadFile(filepath.Join(root, name))
@@ -73,7 +73,7 @@ func TestNoInternalNames(t *testing.T) {
 func problems(name, line string) []string {
 	var found []string
 	for _, loc := range internalHost.FindAllStringIndex(line, -1) {
-		if !strings.HasPrefix(line[loc[1]:], "/") {
+		if !strings.EqualFold(line[loc[0]:loc[1]], "gatehouse.trmlabs.com") || !strings.HasPrefix(line[loc[1]:], "/") {
 			found = append(found, "internal hostname")
 		}
 	}
@@ -111,6 +111,11 @@ func trackedFiles(t *testing.T) (string, []string) {
 	t.Helper()
 	out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
 	if err != nil {
+		// CI always runs from a checkout, so a skip there would pass with
+		// nothing scanned.
+		if os.Getenv("CI") != "" {
+			t.Fatalf("git rev-parse: %v", err)
+		}
 		t.Skip("not a git checkout")
 	}
 	root := strings.TrimSpace(string(out))
@@ -133,6 +138,7 @@ func TestProblems(t *testing.T) {
 	for line, want := range map[string]bool{
 		`"host": "api.staging.example.com"`:                  false,
 		`"host": "api.corp.trmlabs.com"`:                     true,
+		`"https://api.corp.trmlabs.com/v1/x"`:                true,
 		`annotation gatehouse.trmlabs.com/requester`:         false,
 		`"https://trmlabs.com/email"`:                        false,
 		`alice@example.com`:                                  false,
