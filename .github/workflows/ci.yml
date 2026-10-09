@@ -98,6 +98,9 @@ jobs:
       - name: Test upstream merge automation
         run: python3 scripts/upstream-update-test.py
 
+      - name: Test upstream tag copy
+        run: python3 scripts/upstream-tags-test.py
+
       - name: Run tests
         run: go test -race -count=1 ./...
 
