@@ -182,8 +182,8 @@ func newBrowserFixtureWith(t *testing.T, automated bool, logger *slog.Logger) *b
 	}
 	authClient := &http.Client{Transport: &http.Transport{DialContext: dial, TLSClientConfig: &tls.Config{RootCAs: upstreamRoots}}}
 	tokens := &httpcatalog.Auth0Tokens{Keys: &httpcatalog.Keys{Vault: browserVault{down: &f.vaultDown}}, Client: authClient, AutomatedAuth: authClient,
-		Revoked: func(binding, outcome string, status int) {
-			_ = f.audit.Record(auditchain.Event{Event: auditchain.EventHTTPResponse, Binding: binding + "/revoke", Outcome: outcome, Status: status})
+		Revoked: func(binding, outcome string, status int, took time.Duration) {
+			_ = f.audit.Record(auditchain.Event{Event: auditchain.EventHTTPResponse, Binding: binding + "/revoke", Outcome: outcome, Status: status, Duration: took.Milliseconds()})
 		},
 		Now: func() time.Time { return time.Now().Add(time.Duration(f.clock.Load())) }}
 	f.sessions = &scopeResolver{scope: &brokercore.ProxyScope{VaultID: "vault-1", AgentID: "pool-agent", Pool: "database-developers",

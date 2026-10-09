@@ -45,8 +45,9 @@ type Auth0Tokens struct {
 	AutomatedAuth *http.Client // must dial only the automated-auth services in the catalog
 	// Revoked reports each refresh-token revocation after an automated-auth
 	// sign-in, for the audit trail: outcome "refresh_revoked" or
-	// "revoke_failed", and Auth0's status (0 without an answer).
-	Revoked func(binding, outcome string, status int)
+	// "revoke_failed", Auth0's status (0 without an answer), and how long the
+	// revocation took, retries included.
+	Revoked func(binding, outcome string, status int, took time.Duration)
 	Now     func() time.Time
 
 	mu     sync.Mutex

@@ -170,10 +170,10 @@ func accessTokenClaims(token string) (accessClaims, error) {
 // failure is audited and does not fail the sign-in, since the broker keeps
 // the token nowhere.
 func (a *Auth0Tokens) revoke(ctx context.Context, e *Entry, token string) {
-	outcome, status := "revoke_failed", 0
+	outcome, status, started := "revoke_failed", 0, time.Now()
 	defer func() {
 		if a.Revoked != nil {
-			a.Revoked(e.Name, outcome, status)
+			a.Revoked(e.Name, outcome, status, time.Since(started))
 		}
 	}()
 	if a.Client == nil {

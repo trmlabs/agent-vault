@@ -30,8 +30,11 @@ func (s Secret) Format(f fmt.State, _ rune) { _, _ = f.Write([]byte(s.String()))
 
 // Keys caches each key for TTL, so the broker reads Vault about once a
 // minute per key instead of once per request. A new KV version is picked up
-// within TTL, or sooner after Invalidate. If Vault is unreachable, a cached
-// key is served for up to MaxStale past its TTL, then requests fail.
+// within TTL, or sooner after Invalidate. A key deleted in Vault is refused
+// from the first read after that, so within TTL: the cached copy is dropped
+// and the refusal is cached for TTL like a key. Only an unreachable or
+// failing Vault keeps a cached key in use, for up to MaxStale past its TTL,
+// then requests fail.
 type Keys struct {
 	Vault    Logical
 	TTL      time.Duration // default and maximum 1 minute
@@ -52,9 +55,15 @@ const invalidateInterval = 30 * time.Second
 type cachedKey struct {
 	secret  Secret
 	fetched time.Time
+	deleted bool // Vault answered that there is no usable key
 }
 
 var ErrKeyUnavailable = errors.New("destination key unavailable")
+
+// ErrKeyDeleted means Vault answered and has no usable key: the secret or its
+// current version is deleted or destroyed, or the field is missing, empty or
+// not header-safe. It is an ErrKeyUnavailable that no cached copy outlives.
+var ErrKeyDeleted = fmt.Errorf("%w: deleted in Vault", ErrKeyUnavailable)
 
 func (k *Keys) settings() (time.Duration, time.Duration, time.Time) {
 	ttl, stale, now := k.TTL, k.MaxStale, time.Now()
@@ -82,7 +91,7 @@ func (k *Keys) Get(ctx context.Context, ref KeyRef) (Secret, error) {
 	}
 	if c, ok := k.cache[ref]; ok && now.Sub(c.fetched) < ttl {
 		k.mu.Unlock()
-		return c.secret, nil
+		return c.result()
 	}
 	lock, ok := k.flight[ref]
 	if !ok {
@@ -97,11 +106,18 @@ func (k *Keys) Get(ctx context.Context, ref KeyRef) (Secret, error) {
 	cached, have := k.cache[ref]
 	k.mu.Unlock()
 	if have && now.Sub(cached.fetched) < ttl {
-		return cached.secret, nil // another request refreshed it while we waited
+		return cached.result() // another request refreshed it while we waited
 	}
 	secret, err := k.read(ctx, ref)
-	if err != nil {
-		if have && now.Sub(cached.fetched) < ttl+stale {
+	switch {
+	case errors.Is(err, ErrKeyDeleted):
+		// A revoke: drop the cached key now rather than serving it as stale.
+		k.mu.Lock()
+		k.cache[ref] = cachedKey{fetched: now, deleted: true}
+		k.mu.Unlock()
+		return Secret{}, ErrKeyDeleted
+	case err != nil:
+		if have && !cached.deleted && now.Sub(cached.fetched) < ttl+stale {
 			return cached.secret, nil
 		}
 		return Secret{}, ErrKeyUnavailable
@@ -110,6 +126,13 @@ func (k *Keys) Get(ctx context.Context, ref KeyRef) (Secret, error) {
 	k.cache[ref] = cachedKey{secret: secret, fetched: now}
 	k.mu.Unlock()
 	return secret, nil
+}
+
+func (c cachedKey) result() (Secret, error) {
+	if c.deleted {
+		return Secret{}, ErrKeyDeleted
+	}
+	return c.secret, nil
 }
 
 // Invalidate drops a cached key after the vendor rejects it, so the next
@@ -129,26 +152,35 @@ func (k *Keys) Invalidate(ref KeyRef) {
 	delete(k.cache, ref)
 }
 
-// read never puts Vault's response or the key into an error.
+// read never puts Vault's response or the key into an error. It returns
+// ErrKeyDeleted when Vault answered without a usable key, and
+// ErrKeyUnavailable when there was no answer: a network, permission or
+// server error, or a sealed Vault.
 func (k *Keys) read(ctx context.Context, ref KeyRef) (Secret, error) {
 	if k.Vault == nil {
 		return Secret{}, ErrKeyUnavailable
 	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
+	// The client turns a 404 into a nil secret, or into one whose data is
+	// null when the current version is deleted or destroyed; every other
+	// failure is an error.
 	resp, err := k.Vault.ReadWithDataWithContext(ctx, ref.Mount+"/data/"+ref.Path, nil)
-	if err != nil || resp == nil || resp.Data == nil {
+	if err != nil {
 		return Secret{}, ErrKeyUnavailable
+	}
+	if resp == nil || resp.Data == nil {
+		return Secret{}, ErrKeyDeleted
 	}
 	data, _ := resp.Data["data"].(map[string]interface{})
 	metadata, _ := resp.Data["metadata"].(map[string]interface{})
 	value, _ := data[ref.Field].(string)
 	if value == "" || len(value) > 8192 {
-		return Secret{}, ErrKeyUnavailable
+		return Secret{}, ErrKeyDeleted
 	}
 	for i := 0; i < len(value); i++ {
 		if value[i] < 0x21 || value[i] > 0x7e {
-			return Secret{}, ErrKeyUnavailable // header-safe printable ASCII only
+			return Secret{}, ErrKeyDeleted // header-safe printable ASCII only
 		}
 	}
 	version := 0

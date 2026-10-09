@@ -51,7 +51,7 @@ Set `AGENT_VAULT_HTTP_CATALOG_FILE` to a JSON file. One entry per binding:
 
 ## Keys and rotation
 
-The broker reads each key from Vault at most once a minute and shares that read across concurrent requests. A new KV version takes effect within a minute, or at once when the vendor answers 401 or 403, which drops the cached key. If Vault is unreachable, a cached key keeps working for five minutes past its minute, then calls are refused.
+The broker reads each key from Vault at most once a minute and shares that read across concurrent requests. A new KV version takes effect within a minute, or at once when the vendor answers 401 or 403, which drops the cached key. Deleting the key in Vault revokes it within a minute: deleting or destroying the current version, deleting the secret, or removing or emptying the field makes the next read refuse the destination and drop the cached key. Only when Vault does not answer (unreachable, sealed, a server error or permission denied) does a cached key keep working, for five minutes past its minute, then calls are refused.
 
 Grant the broker read on each key path, for example `gatehouse/data/vendors/*`. In TRM's Vault this is a trm-infra change.
 

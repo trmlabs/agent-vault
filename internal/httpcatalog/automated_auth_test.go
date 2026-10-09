@@ -342,12 +342,14 @@ func automatedEntry(t *testing.T) *Entry {
 type revocations struct {
 	mu   sync.Mutex
 	seen []string
+	took time.Duration
 }
 
-func (r *revocations) record(binding, outcome string, _ int) {
+func (r *revocations) record(binding, outcome string, _ int, took time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.seen = append(r.seen, binding+" "+outcome)
+	r.took = took
 }
 
 func (r *revocations) all() []string {
@@ -537,6 +539,11 @@ func TestAutomatedAuthRevokeRetriesThenReports(t *testing.T) {
 	}
 	if fake.revokes.Load() != 2 || !reflect.DeepEqual(revoked.all(), []string{"staging-app revoke_failed"}) {
 		t.Fatalf("revocation: %d %v", fake.revokes.Load(), revoked.all())
+	}
+	revoked.mu.Lock()
+	defer revoked.mu.Unlock()
+	if revoked.took < revokeBackoff { // the audit row's durationMs covers the retry
+		t.Fatalf("revocation took %v, under the backoff", revoked.took)
 	}
 }
 
