@@ -169,7 +169,7 @@ func newBrowserFixtureWith(t *testing.T, automated bool, logger *slog.Logger) *b
 	}
 	login := `,"realm":"Username-Password-Authentication","tokenClient":{"mount":"gatehouse","path":"browser/client"}},`
 	if automated {
-		login = `,"login":"automated-auth"},"automatedAuth":{"url":"https://automated-auth.example.com","profile":"trm-b2b-staging","orgID":"org_synthetic",
+		login = `,"login":"automated-auth"},"automatedAuth":{"url":"https://automated-auth.example.com","profile":"app-staging","orgID":"org_synthetic",
 			"key":{"mount":"gatehouse","path":"browser/automated-auth"}},`
 	}
 	catalog, err := httpcatalog.Parse([]byte(`{"entries":[{"name":"staging-app","kind":"browser-session","host":"api.example.com",

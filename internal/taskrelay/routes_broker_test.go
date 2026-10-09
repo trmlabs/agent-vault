@@ -31,7 +31,7 @@ func TestConnectRoutesBroker(t *testing.T) {
 		response.Body.Close()
 		return response.StatusCode
 	}
-	for _, target := range []string{"api.github.com:443", "litellm.internal.trmlabs.com:443", "a1.b2:443"} {
+	for _, target := range []string{"api.github.com:443", "llm.internal.example.com:443", "a1.b2:443"} {
 		if status := connect(target); status != 200 {
 			t.Fatalf("%s: %d", target, status)
 		}

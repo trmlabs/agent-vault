@@ -23,12 +23,12 @@ another, even with the token Gatehouse used.
 ```json
 {"name": "team-files", "kind": "gcp", "host": "storage.googleapis.com", "tier": "T1",
  "requires": ["<Entra group object ID>"], "placeholder": "__vault_GCP__", "pools": ["claude"],
- "gcp": {"bucket": "trm-agent-files", "prefix": "teams/analytics/", "role": "roles/storage.objectViewer"}}
+ "gcp": {"bucket": "example-agent-files", "prefix": "teams/analytics/", "role": "roles/storage.objectViewer"}}
 
 {"name": "bq-cases", "kind": "gcp", "host": "bigquery.googleapis.com", "tier": "T1",
  "requires": ["<Entra group object ID>"], "placeholder": "__vault_GCP__", "pools": ["claude"],
- "pathPrefixes": ["/bigquery/v2/projects/trm-analytics/"],
- "gcp": {"serviceAccount": "gh-bq-cases@trm-analytics.iam.gserviceaccount.com",
+ "pathPrefixes": ["/bigquery/v2/projects/example-analytics/"],
+ "gcp": {"serviceAccount": "bq-cases@example-analytics.iam.gserviceaccount.com",
          "scopes": ["https://www.googleapis.com/auth/bigquery"]}}
 ```
 
@@ -43,18 +43,15 @@ The service accounts and grants are GCP IAM, so they live in
 **trm-global-infrastructure**, not trm-infra. Each new entry is a PR there,
 then a catalog PR.
 
-**Where, for staging.** The Gatehouse staging broker runs on the GKE cluster
-`trm-us-saas-gke-staging-us-central1`, in project `tokendrop-b2b-app`. That
-project's Terraform sits under the production-named folder:
-`gcp/folders/trm-b2b/trm-b2b-production/trm-b2b-api/infrastructure/service-accounts/`.
-The `trm-b2b-staging` folder has no projects. Staging resources there carry a
-`-staging` suffix, as `daytona_staging` does. Name every Gatehouse staging
-account and binding `gatehouse-staging-*`.
+**Where, for staging.** Find the staging broker's cluster and its project with
+`gcloud container clusters list`. That project's Terraform can sit under a
+production-named folder, so search for the project ID rather than the folder
+name. Name every Gatehouse staging account and binding `gatehouse-staging-*`.
 
-**One identity pool for both clusters.** The staging and production clusters
-share `tokendrop-b2b-app`'s Workload Identity pool. A member is named only by
-namespace and service account, never by cluster:
-`serviceAccount:tokendrop-b2b-app.svc.id.goog[gatehouse/gatehouse]` (the staging chart's service account, from `fullnameOverride: gatehouse` in `broker.values.yaml`; confirm it with `kubectl -n gatehouse get serviceaccount` before writing the binding).
+**One identity pool for both clusters.** Clusters in the same project share
+its Workload Identity pool. A member is named only by namespace and service
+account, never by cluster:
+`serviceAccount:PROJECT_ID.svc.id.goog[gatehouse/gatehouse]` (the staging chart's service account, from `fullnameOverride: gatehouse` in `broker.values.yaml`; confirm it with `kubectl -n gatehouse get serviceaccount` before writing the binding).
 A production broker must use a different namespace (or project), or it would
 inherit the staging grants.
 

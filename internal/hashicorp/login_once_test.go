@@ -15,7 +15,7 @@ func TestLoginOnceLogsInAndRevokes(t *testing.T) {
 	var logins, revokes atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/v1/auth/gke-us-saas-staging-gatehouse/login":
+		case "/v1/auth/gke-staging-gatehouse/login":
 			var body map[string]string
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			if body["role"] != "gatehouse-litellm-keys" || body["jwt"] != "a.b.c" {
@@ -39,7 +39,7 @@ func TestLoginOnceLogsInAndRevokes(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("VAULT_ADDR", srv.URL)
-	env := map[string]string{"VAULT_ADDR": srv.URL, "VAULT_JWT_MOUNT": "gke-us-saas-staging-gatehouse",
+	env := map[string]string{"VAULT_ADDR": srv.URL, "VAULT_JWT_MOUNT": "gke-staging-gatehouse",
 		"VAULT_JWT_ROLE": "gatehouse-litellm-keys", "VAULT_JWT_TOKEN_FILE": tokenFile}
 	getenv := func(k string) string { return env[k] }
 

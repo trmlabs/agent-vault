@@ -99,7 +99,7 @@ func TestAutomatedAuthClientDialsOnlyCatalogServices(t *testing.T) {
 	catalog, err := httpcatalog.Parse([]byte(`{"entries":[{"name":"staging-app","kind":"browser-session","host":"api.example.com",
 		"placeholder":"__vault_STAGING_APP__","pools":["pool-a"],"pathPrefixes":["/v1"],"browserSession":{"appHost":"app.example.com",
 		"auth0":{"domain":"auth.example.com","clientID":"spaClient1","audience":"https://api.example.com","login":"automated-auth"},
-		"automatedAuth":{"url":"https://automated-auth.automated-auth.svc.cluster.local:8443","profile":"trm-b2b-staging","orgID":"org_synthetic",
+		"automatedAuth":{"url":"https://automated-auth.automated-auth.svc.cluster.local:8443","profile":"app-staging","orgID":"org_synthetic",
 		"key":{"mount":"gatehouse","path":"browser/automated-auth"}},"user":{"mount":"gatehouse","path":"browser/qa-user"}}}]}`))
 	if err != nil {
 		t.Fatal(err)

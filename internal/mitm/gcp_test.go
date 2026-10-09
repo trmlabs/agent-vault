@@ -89,7 +89,7 @@ func (f *gcpFake) handler(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"accessToken": token, "expireTime": time.Now().Add(15 * time.Minute).UTC().Format(time.RFC3339)})
 	case "storage.googleapis.com":
 		prefix, ok := f.boundary[bearer]
-		object := strings.TrimPrefix(r.URL.Path, "/storage/v1/b/trm-agent-files/o/")
+		object := strings.TrimPrefix(r.URL.Path, "/storage/v1/b/example-agent-files/o/")
 		if !ok || !strings.HasPrefix(object, prefix) {
 			http.Error(w, `{"error":{"code":403}}`, http.StatusForbidden)
 			return
@@ -138,11 +138,11 @@ func newGCPFixture(t *testing.T) *gcpFixture {
 	  {"name":"claude","namespace":"n","serviceAccount":"claude","identity":"claude-session","ccpoolID":"ccpool_abc","ceiling":"T1"}],
 	 "entries":[
 	  {"name":"team-files","kind":"gcp","host":"storage.googleapis.com","tier":"T1","requires":["` + authzGroup + `"],"placeholder":"__vault_GCP__","pools":["claude"],
-	   "gcp":{"bucket":"trm-agent-files","prefix":"teams/analytics/","role":"roles/storage.objectViewer"}},
+	   "gcp":{"bucket":"example-agent-files","prefix":"teams/analytics/","role":"roles/storage.objectViewer"}},
 	  {"name":"bq-cases","kind":"gcp","host":"bigquery.googleapis.com","tier":"T1","requires":["` + authzGroup + `"],"placeholder":"__vault_GCP__","pools":["claude"],
-	   "pathPrefixes":["/bigquery/v2/projects/trm-analytics/"],"gcp":{"serviceAccount":"gh-bq-cases@trm-analytics.iam.gserviceaccount.com"}},
+	   "pathPrefixes":["/bigquery/v2/projects/example-analytics/"],"gcp":{"serviceAccount":"bq-cases@example-analytics.iam.gserviceaccount.com"}},
 	  {"name":"bq-other","kind":"gcp","host":"bigquery.googleapis.com","tier":"T1","requires":["` + authzGroup + `"],"placeholder":"__vault_GCP__","pools":["claude"],
-	   "pathPrefixes":["/bigquery/v2/projects/trm-finance/"],"gcp":{"serviceAccount":"gh-bq-finance@trm-finance.iam.gserviceaccount.com"}}]}`))
+	   "pathPrefixes":["/bigquery/v2/projects/example-finance/"],"gcp":{"serviceAccount":"bq-finance@example-finance.iam.gserviceaccount.com"}}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,11 +191,11 @@ func (f *gcpFixture) get(t *testing.T, session, rawURL string) (int, string) {
 // Storage refuses the other prefix with the very token the broker minted.
 func TestGCPDownscopedTokenStaysInItsPrefix(t *testing.T) {
 	f := newGCPFixture(t)
-	code, body := f.get(t, "alice", "https://storage.googleapis.com/storage/v1/b/trm-agent-files/o/teams%2Fanalytics%2Fq3.csv")
+	code, body := f.get(t, "alice", "https://storage.googleapis.com/storage/v1/b/example-agent-files/o/teams%2Fanalytics%2Fq3.csv")
 	if code != 200 || !strings.Contains(body, "teams/analytics/q3.csv") {
 		t.Fatalf("own prefix: %d %s", code, body)
 	}
-	if code, _ := f.get(t, "alice", "https://storage.googleapis.com/storage/v1/b/trm-agent-files/o/teams%2Ffinance%2Fpayroll.csv"); code != 403 {
+	if code, _ := f.get(t, "alice", "https://storage.googleapis.com/storage/v1/b/example-agent-files/o/teams%2Ffinance%2Fpayroll.csv"); code != 403 {
 		t.Fatalf("another prefix: %d", code)
 	}
 	if f.fake.mints.Load() != 1 {
@@ -206,21 +206,21 @@ func TestGCPDownscopedTokenStaysInItsPrefix(t *testing.T) {
 // Each impersonating entry gets a token for its own service account only.
 func TestGCPImpersonationUsesOnlyTheEntrysAccount(t *testing.T) {
 	f := newGCPFixture(t)
-	code, body := f.get(t, "alice", "https://bigquery.googleapis.com/bigquery/v2/projects/trm-analytics/datasets")
-	if code != 200 || body != `{"principal":"gh-bq-cases@trm-analytics.iam.gserviceaccount.com"}` {
+	code, body := f.get(t, "alice", "https://bigquery.googleapis.com/bigquery/v2/projects/example-analytics/datasets")
+	if code != 200 || body != `{"principal":"bq-cases@example-analytics.iam.gserviceaccount.com"}` {
 		t.Fatalf("analytics: %d %s", code, body)
 	}
-	if code, body := f.get(t, "alice", "https://bigquery.googleapis.com/bigquery/v2/projects/trm-finance/datasets"); code != 200 ||
-		body != `{"principal":"gh-bq-finance@trm-finance.iam.gserviceaccount.com"}` {
+	if code, body := f.get(t, "alice", "https://bigquery.googleapis.com/bigquery/v2/projects/example-finance/datasets"); code != 200 ||
+		body != `{"principal":"bq-finance@example-finance.iam.gserviceaccount.com"}` {
 		t.Fatalf("finance: %d %s", code, body)
 	}
-	if code, _ := f.get(t, "alice", "https://bigquery.googleapis.com/bigquery/v2/projects/trm-hr/datasets"); code != 403 {
+	if code, _ := f.get(t, "alice", "https://bigquery.googleapis.com/bigquery/v2/projects/example-hr/datasets"); code != 403 {
 		t.Fatalf("unlisted project: %d", code)
 	}
 	f.fake.mu.Lock()
 	requested := strings.Join(f.fake.requested, ",")
 	f.fake.mu.Unlock()
-	if requested != "gh-bq-cases@trm-analytics.iam.gserviceaccount.com,gh-bq-finance@trm-finance.iam.gserviceaccount.com" {
+	if requested != "bq-cases@example-analytics.iam.gserviceaccount.com,bq-finance@example-finance.iam.gserviceaccount.com" {
 		t.Fatalf("service accounts requested: %s", requested)
 	}
 }
@@ -229,7 +229,7 @@ func TestGCPImpersonationUsesOnlyTheEntrysAccount(t *testing.T) {
 // are refused before any token is minted.
 func TestGCPRefusesCursorPoolAndUnentitledPeople(t *testing.T) {
 	f := newGCPFixture(t)
-	gcs := "https://storage.googleapis.com/storage/v1/b/trm-agent-files/o/teams%2Fanalytics%2Fq3.csv"
+	gcs := "https://storage.googleapis.com/storage/v1/b/example-agent-files/o/teams%2Fanalytics%2Fq3.csv"
 	if code, _ := f.get(t, "bob", gcs); code != 403 || f.audit.last().Outcome != "not_entitled" {
 		t.Fatalf("non-member: %d %q", code, f.audit.last().Outcome)
 	}

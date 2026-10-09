@@ -35,12 +35,12 @@ func attestedPools(t *testing.T) (person, pool httpcatalog.Pool) {
 func TestAttestedRequesterNamesThePerson(t *testing.T) {
 	person, pool := attestedPools(t)
 	ctx := context.Background()
-	persons := runnerid.Verifiers{SandboxDomains: []string{"trmlabs.com"}}
+	persons := runnerid.Verifiers{SandboxDomains: []string{"example.org"}}
 	b := &authorizetest.MemBinder{}
 	resolve := func(p httpcatalog.Pool, session, requester string, v Verifier) (Requester, string) {
 		return Resolve(ctx, p, session, Claims{Pod: "pod-a", AttestedRequester: requester}, v, b)
 	}
-	if who, refusal := resolve(person, "", "alice.smith@trmlabs.com", persons); refusal != "" || who.Kind != "person" || who.Subject != "alice.smith@trmlabs.com" {
+	if who, refusal := resolve(person, "", "alice.smith@example.org", persons); refusal != "" || who.Kind != "person" || who.Subject != "alice.smith@example.org" {
 		t.Fatalf("attested person: %+v %q", who, refusal)
 	}
 	// Another domain names nobody: T0 at most.
@@ -55,11 +55,11 @@ func TestAttestedRequesterNamesThePerson(t *testing.T) {
 		want      string
 	}{
 		"no requester on a person profile":    {person, "", "", persons, "requester_missing"},
-		"no domains configured":               {person, "", "alice.smith@trmlabs.com", runnerid.Verifiers{}, "requester_unverifiable"},
-		"no verifier at all":                  {person, "", "alice.smith@trmlabs.com", nil, "requester_unverifiable"},
-		"a verifier without attested persons": {person, "", "alice.smith@trmlabs.com", oneToken{}, "requester_unverifiable"},
-		"a requester on a pool profile":       {pool, "", "alice.smith@trmlabs.com", persons, "requester_unexpected"},
-		"a session token through the proxy":   {person, "alice", "alice.smith@trmlabs.com", persons, "session_unexpected"},
+		"no domains configured":               {person, "", "alice.smith@example.org", runnerid.Verifiers{}, "requester_unverifiable"},
+		"no verifier at all":                  {person, "", "alice.smith@example.org", nil, "requester_unverifiable"},
+		"a verifier without attested persons": {person, "", "alice.smith@example.org", oneToken{}, "requester_unverifiable"},
+		"a requester on a pool profile":       {pool, "", "alice.smith@example.org", persons, "requester_unexpected"},
+		"a session token through the proxy":   {person, "alice", "alice.smith@example.org", persons, "session_unexpected"},
 	} {
 		who, refusal := resolve(c.pool, c.session, c.requester, c.v)
 		if refusal != c.want || who.Kind != "none" || who.Subject != "" {
@@ -73,7 +73,7 @@ func TestAttestedRequesterNamesThePerson(t *testing.T) {
 	// A requester reaching a Claude pool is refused, not ignored.
 	_, explicit := profiledPools(t)
 	claude, _ := explicit.Pool("claude")
-	if _, refusal := resolve(claude, "alice", "alice.smith@trmlabs.com", oneToken{}); refusal != "requester_unexpected" {
+	if _, refusal := resolve(claude, "alice", "alice.smith@example.org", oneToken{}); refusal != "requester_unexpected" {
 		t.Fatalf("claude pool: %q", refusal)
 	}
 }

@@ -89,7 +89,7 @@ entries:
     requires: [00000000-0000-0000-0000-000000000000]   # the Entra group's object ID
     placeholder: __vault_GCP__
     pools: [claude-developers]
-    gcp: {bucket: trm-agent-files, prefix: teams/analytics/, role: roles/storage.objectViewer}
+    gcp: {bucket: example-agent-files, prefix: teams/analytics/, role: roles/storage.objectViewer}
 ```
 
 ## Tiers decide who may use an entry

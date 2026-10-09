@@ -634,26 +634,26 @@ func TestSharedProxyAttestsTheRequester(t *testing.T) {
 	if _, _, status := sf.connect(t, ""); status == 200 {
 		t.Fatal("a Pod with no requester was admitted")
 	}
-	sf.api.send(t, "MODIFIED", withRequester(sandboxPod("sandbox-a", "pod-a", "127.0.0.1"), "alice.smith@trmlabs.com"))
+	sf.api.send(t, "MODIFIED", withRequester(sandboxPod("sandbox-a", "pod-a", "127.0.0.1"), "alice.smith@example.com"))
 	c, b, status := sf.connectUntil(t, 200)
 	if status != 200 {
 		t.Fatalf("connect: %d", status)
 	}
 	raw, _ := base64.RawURLEncoding.DecodeString(<-sf.attested)
 	var a workloadidentity.Attestation
-	if json.Unmarshal(raw, &a) != nil || a.Requester != "alice.smith@trmlabs.com" || a.PodUID != "pod-a" {
+	if json.Unmarshal(raw, &a) != nil || a.Requester != "alice.smith@example.com" || a.PodUID != "pod-a" {
 		t.Fatalf("attestation %s", raw)
 	}
 	audit, _ := os.ReadFile(sf.f.c.AuditFile)
-	if !bytes.Contains(audit, []byte(`"requester":"alice.smith@trmlabs.com"`)) {
+	if !bytes.Contains(audit, []byte(`"requester":"alice.smith@example.com"`)) {
 		t.Fatalf("admission row lacks the requester: %s", audit)
 	}
-	sf.api.send(t, "MODIFIED", withRequester(sandboxPod("sandbox-a", "pod-a", "127.0.0.1"), "bob.jones@trmlabs.com"))
+	sf.api.send(t, "MODIFIED", withRequester(sandboxPod("sandbox-a", "pod-a", "127.0.0.1"), "bob.jones@example.com"))
 	if !tunnelCloses(t, c, b) {
 		t.Fatal("a connection stayed open after its requester changed")
 	}
-	for _, bad := range []string{"", "Alice.Smith@trmlabs.com", "alice", "alice@", "alice@trmlabs", "alice smith@trmlabs.com", "alice@trmlabs.com\n", strings.Repeat("a", 65) + "@trmlabs.com"} {
-		sf.api.send(t, "MODIFIED", withRequester(sandboxPod("sandbox-a", "pod-a", "127.0.0.1"), "carol@trmlabs.com"))
+	for _, bad := range []string{"", "Alice.Smith@example.com", "alice", "alice@", "alice@example", "alice smith@example.com", "alice@example.com\n", strings.Repeat("a", 65) + "@example.com"} {
+		sf.api.send(t, "MODIFIED", withRequester(sandboxPod("sandbox-a", "pod-a", "127.0.0.1"), "carol@example.com"))
 		if _, _, status := sf.connectUntil(t, 200); status != 200 {
 			t.Fatalf("valid requester refused: %d", status)
 		}
@@ -669,12 +669,12 @@ func TestSharedProxyAttestsTheRequester(t *testing.T) {
 // the annotation, and the namespace list must name configured namespaces.
 func TestSharedProxyRequesterIsOptIn(t *testing.T) {
 	s := sharedConfig()
-	pod := decodePods(t, []map[string]any{withRequester(sandboxPod("sandbox-a", "pod-a", "127.0.0.1"), "alice.smith@trmlabs.com")})[0]
+	pod := decodePods(t, []map[string]any{withRequester(sandboxPod("sandbox-a", "pod-a", "127.0.0.1"), "alice.smith@example.com")})[0]
 	if a, ok := pod.attest(s, time.Now()); !ok || a.Requester != "" {
 		t.Fatalf("requester attested without opt-in: %+v %v", a, ok)
 	}
 	s.RequesterNamespaces = []string{"agent-sandboxes"}
-	if a, ok := pod.attest(s, time.Now()); !ok || a.Requester != "alice.smith@trmlabs.com" {
+	if a, ok := pod.attest(s, time.Now()); !ok || a.Requester != "alice.smith@example.com" {
 		t.Fatalf("opted-in requester: %+v %v", a, ok)
 	}
 	for name, namespaces := range map[string][]string{
