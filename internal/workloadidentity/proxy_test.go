@@ -82,8 +82,8 @@ func TestProxyAttestedAdmitsTheAttestedPod(t *testing.T) {
 	// The attested requester reaches the scope as is; authorization decides
 	// whether the pool's profile takes one.
 	withRequester := p.a
-	withRequester.Requester = "alice.smith@trmlabs.com"
-	if scope, err := p.r.Attest(p.ctx(t, withRequester), p.rc.token(p.rc.claims()), linkIP); err != nil || scope.AttestedRequester != "alice.smith@trmlabs.com" {
+	withRequester.Requester = "alice.smith@example.com"
+	if scope, err := p.r.Attest(p.ctx(t, withRequester), p.rc.token(p.rc.claims()), linkIP); err != nil || scope.AttestedRequester != "alice.smith@example.com" {
 		t.Fatalf("requester not carried: %+v %v", scope, err)
 	}
 	// A recheck after the proxy token expired still holds, but only for one
@@ -607,14 +607,14 @@ func TestVerifyProxyAdmitsOnlyTheProxy(t *testing.T) {
 // any other value before it looks at the rest of the attestation.
 func TestAttestationRequester(t *testing.T) {
 	a := setupProxy(t).a
-	for _, requester := range []string{"", "alice.smith@trmlabs.com", "a+b@sub.trmlabs.com"} {
+	for _, requester := range []string{"", "alice.smith@example.com", "a+b@sub.example.com"} {
 		a.Requester = requester
 		encoded, _ := EncodeAttestation(a)
 		if got, err := decodeAttestation(encoded); err != nil || got.Requester != requester {
 			t.Errorf("%q refused: %v", requester, err)
 		}
 	}
-	for _, requester := range []string{"Alice@trmlabs.com", "alice", "alice@trmlabs", "@trmlabs.com", "alice@-trmlabs.com", "alice@trmlabs.com ", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@trmlabs.com"} {
+	for _, requester := range []string{"Alice@example.com", "alice", "alice@example", "@example.com", "alice@-example.com", "alice@example.com ", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@example.com"} {
 		a.Requester = requester
 		encoded, _ := EncodeAttestation(a)
 		if _, err := decodeAttestation(encoded); err == nil {

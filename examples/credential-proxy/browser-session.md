@@ -58,21 +58,21 @@ A browser-session entry acts as its test user, often an admin of its organizatio
 
 ## Catalog entry
 
-The TRM Enterprise staging app, all values public:
+An example staging app (placeholder values):
 
 ```json
-{"name": "enterprise-staging", "kind": "browser-session", "host": "api.trmlabs-staging.com",
+{"name": "enterprise-staging", "kind": "browser-session", "host": "api.staging.example.com",
  "placeholder": "__vault_ENTERPRISE_STAGING__", "pools": ["<one pool>"],
  "pathPrefixes": ["<the API paths the workers need>"],
  "readOnlyPaths": ["/users-organizations"],
  "deniedPaths": ["/v1/parent-organizations/*/users", "/v1/parent-organizations/*/invitations",
                  "/v1/parent-organizations/*/environments/*/groups/*/members", "/v1/users/*/email", "/v1/intel-vault"],
  "browserSession": {
-   "appHost": "my.trmlabs-staging.com",
-   "auth0": {"domain": "auth.trmlabs-staging.com", "clientID": "oXEx4sYBQfNWgRX64ZowzXGkNQ0sFgny",
-             "audience": "https://my.trmlabs-staging.com/", "login": "automated-auth"},
-   "automatedAuth": {"url": "https://automated-auth.staging.us-saas.clever-hertz.com", "profile": "trm-b2b-staging",
-                     "orgID": "org_M2CBUrwlctYqzmNG", "key": {"mount": "gatehouse", "path": "browser/automated-auth"}},
+   "appHost": "app.staging.example.com",
+   "auth0": {"domain": "auth.staging.example.com", "clientID": "<SPA client ID>",
+             "audience": "https://app.staging.example.com/", "login": "automated-auth"},
+   "automatedAuth": {"url": "https://automated-auth.staging.example.com", "profile": "app-staging",
+                     "orgID": "org_example", "key": {"mount": "gatehouse", "path": "browser/automated-auth"}},
    "user": {"mount": "gatehouse", "path": "browser/enterprise-staging/user"}}}
 ```
 

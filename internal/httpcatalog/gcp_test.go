@@ -23,10 +23,10 @@ const (
 	  {"name":"claude","namespace":"n","serviceAccount":"claude","identity":"claude-session","ccpoolID":"ccpool_abc","ceiling":"T1"}]`
 	gcsEntry = `{"name":"team-files","kind":"gcp","host":"storage.googleapis.com","tier":"T1","requires":["` + gcpGroup + `"],
 	  "placeholder":"__vault_GCP__","pools":["claude"],
-	  "gcp":{"bucket":"trm-agent-files","prefix":"teams/analytics/","role":"roles/storage.objectViewer"}}`
+	  "gcp":{"bucket":"example-agent-files","prefix":"teams/analytics/","role":"roles/storage.objectViewer"}}`
 	bqEntry = `{"name":"bq-cases","kind":"gcp","host":"bigquery.googleapis.com","tier":"T1","requires":["` + gcpGroup + `"],
-	  "placeholder":"__vault_GCP__","pools":["claude"],"pathPrefixes":["/bigquery/v2/projects/trm-analytics/"],
-	  "gcp":{"serviceAccount":"gh-bq-cases@trm-analytics.iam.gserviceaccount.com","scopes":["https://www.googleapis.com/auth/bigquery"]}}`
+	  "placeholder":"__vault_GCP__","pools":["claude"],"pathPrefixes":["/bigquery/v2/projects/example-analytics/"],
+	  "gcp":{"serviceAccount":"bq-cases@example-analytics.iam.gserviceaccount.com","scopes":["https://www.googleapis.com/auth/bigquery"]}}`
 )
 
 func gcpCatalog(t *testing.T, entries ...string) Catalog {
@@ -40,11 +40,11 @@ func gcpCatalog(t *testing.T, entries ...string) Catalog {
 
 func TestGCPEntries(t *testing.T) {
 	c := gcpCatalog(t, gcsEntry, bqEntry)
-	gcs, ok, err := c.GCPMatch("storage.googleapis.com", 443, "GET", "/storage/v1/b/trm-agent-files/o/teams%2Fanalytics%2Fa.csv", "claude")
+	gcs, ok, err := c.GCPMatch("storage.googleapis.com", 443, "GET", "/storage/v1/b/example-agent-files/o/teams%2Fanalytics%2Fa.csv", "claude")
 	if !ok || err != nil || gcs.Name != "team-files" || gcs.GCP.LifetimeSeconds != 900 || len(gcs.PathPrefixes) != 3 {
 		t.Fatalf("gcs: %+v %v %v", gcs, ok, err)
 	}
-	if bq, _, err := c.GCPMatch("bigquery.googleapis.com", 443, "POST", "/bigquery/v2/projects/trm-analytics/queries", "claude"); err != nil || bq.GCP.ServiceAccount == "" {
+	if bq, _, err := c.GCPMatch("bigquery.googleapis.com", 443, "POST", "/bigquery/v2/projects/example-analytics/queries", "claude"); err != nil || bq.GCP.ServiceAccount == "" {
 		t.Fatalf("bigquery: %v", err)
 	}
 	if _, _, err := c.GCPMatch("bigquery.googleapis.com", 443, "GET", "/bigquery/v2/projects/other/datasets", "claude"); !errors.Is(err, ErrUnlisted) {
@@ -53,7 +53,7 @@ func TestGCPEntries(t *testing.T) {
 	if _, _, err := c.GCPMatch("storage.googleapis.com", 443, "GET", "/storage/v1/b/other-bucket/o", "claude"); !errors.Is(err, ErrUnlisted) {
 		t.Fatalf("other bucket: %v", err)
 	}
-	if _, _, err := c.GCPMatch("storage.googleapis.com", 443, "GET", "/storage/v1/b/trm-agent-files/o", "cursor"); !errors.Is(err, ErrPool) {
+	if _, _, err := c.GCPMatch("storage.googleapis.com", 443, "GET", "/storage/v1/b/example-agent-files/o", "cursor"); !errors.Is(err, ErrPool) {
 		t.Fatalf("cursor pool matched: %v", err)
 	}
 	if _, ok, _ := c.GCPMatch("pubsub.googleapis.com", 443, "GET", "/", "claude"); ok {
@@ -74,9 +74,9 @@ func TestGCPEntryRejects(t *testing.T) {
 		"prefix breaking CEL":            sub(gcsEntry, `teams/analytics/`, `teams/a')||true||('/`),
 		"bucket admin role":              sub(gcsEntry, `roles/storage.objectViewer`, `roles/storage.admin`),
 		"downscope off storage":          sub(gcsEntry, `storage.googleapis.com`, `bigquery.googleapis.com`),
-		"both modes":                     sub(gcsEntry, `"role":"roles/storage.objectViewer"`, `"role":"roles/storage.objectViewer","serviceAccount":"gh-x@trm-analytics.iam.gserviceaccount.com"`),
-		"not a service account":          sub(bqEntry, `gh-bq-cases@trm-analytics.iam.gserviceaccount.com`, `someone@trmlabs.com`),
-		"impersonation without paths":    sub(bqEntry, `"pathPrefixes":["/bigquery/v2/projects/trm-analytics/"],`, ``),
+		"both modes":                     sub(gcsEntry, `"role":"roles/storage.objectViewer"`, `"role":"roles/storage.objectViewer","serviceAccount":"x@example-analytics.iam.gserviceaccount.com"`),
+		"not a service account":          sub(bqEntry, `bq-cases@example-analytics.iam.gserviceaccount.com`, `someone@example.com`),
+		"impersonation without paths":    sub(bqEntry, `"pathPrefixes":["/bigquery/v2/projects/example-analytics/"],`, ``),
 		"lifetime too long":              sub(bqEntry, `"scopes"`, `"lifetimeSeconds":7200,"scopes"`),
 		"gcp settings on a header entry": sub(gcsEntry, `"kind":"gcp",`, `"header":"Authorization","methods":["GET"],"pathPrefixes":["/x"],"key":{"mount":"m","path":"p","field":"f"},`),
 	} {
@@ -136,9 +136,9 @@ func TestGCPTokensDownscopeAndImpersonate(t *testing.T) {
 	}
 	rule := got["accessBoundary"].(map[string]any)["accessBoundaryRules"].([]any)[0].(map[string]any)
 	condition := rule["availabilityCondition"].(map[string]any)["expression"].(string)
-	if rule["availableResource"] != "//storage.googleapis.com/projects/_/buckets/trm-agent-files" ||
+	if rule["availableResource"] != "//storage.googleapis.com/projects/_/buckets/example-agent-files" ||
 		fmt.Sprint(rule["availablePermissions"]) != "[inRole:roles/storage.objectViewer]" ||
-		!strings.Contains(condition, "startsWith('projects/_/buckets/trm-agent-files/objects/teams/analytics/')") {
+		!strings.Contains(condition, "startsWith('projects/_/buckets/example-agent-files/objects/teams/analytics/')") {
 		t.Fatalf("boundary: %v", rule)
 	}
 	if again, _ := tokens.Token(context.Background(), &entries[0]); again.Value() != gcs.Value() || sts.Load() != 1 {
@@ -149,8 +149,8 @@ func TestGCPTokensDownscopeAndImpersonate(t *testing.T) {
 	}
 
 	bq, err := tokens.Token(context.Background(), &entries[1])
-	if err != nil || !strings.Contains(bq.Value(), "gh-bq-cases@trm-analytics.iam.gserviceaccount.com") ||
-		minted.Load() != "/v1/projects/-/serviceAccounts/gh-bq-cases@trm-analytics.iam.gserviceaccount.com:generateAccessToken 900s" {
+	if err != nil || !strings.Contains(bq.Value(), "bq-cases@example-analytics.iam.gserviceaccount.com") ||
+		minted.Load() != "/v1/projects/-/serviceAccounts/bq-cases@example-analytics.iam.gserviceaccount.com:generateAccessToken 900s" {
 		t.Fatalf("impersonate: %v %v %v", err, bq, minted.Load())
 	}
 	now = now.Add(12 * time.Minute) // a fifth of its use left: mint again

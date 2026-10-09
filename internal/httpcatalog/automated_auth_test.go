@@ -47,7 +47,7 @@ func automatedEntryJSON(automated string) string {
 		"automatedAuth":{` + automated + `},"user":{"mount":"gatehouse","path":"browser/qa-user"}}}`
 }
 
-const automatedSettings = `"url":"https://automated-auth.example.com","profile":"trm-b2b-staging","orgID":"org_synthetic",
+const automatedSettings = `"url":"https://automated-auth.example.com","profile":"app-staging","orgID":"org_synthetic",
 	"key":{"mount":"gatehouse","path":"browser/automated-auth"}`
 
 func parseOne(entry string) error {
@@ -68,7 +68,7 @@ func TestAutomatedAuthEntry(t *testing.T) {
 	for name, settings := range map[string]string{
 		"no org":        strings.Replace(automatedSettings, `"orgID":"org_synthetic",`, "", 1),
 		"empty org":     strings.Replace(automatedSettings, `"org_synthetic"`, `""`, 1),
-		"no profile":    strings.Replace(automatedSettings, `"profile":"trm-b2b-staging",`, "", 1),
+		"no profile":    strings.Replace(automatedSettings, `"profile":"app-staging",`, "", 1),
 		"no key":        strings.Replace(automatedSettings, ",\n\t\"key\":{\"mount\":\"gatehouse\",\"path\":\"browser/automated-auth\"}", "", 1),
 		"plain http":    strings.Replace(automatedSettings, "https://automated-auth.example.com", "http://automated-auth.automated-auth.svc.cluster.local:4319", 1),
 		"path":          strings.Replace(automatedSettings, "example.com", "example.com/v1/auth/login", 1),
@@ -285,7 +285,7 @@ func fakeAutomatedAuth(t *testing.T) (*automatedFake, *http.Client) {
 		}
 		var body map[string]string
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		want := map[string]string{"privateKey": automatedSecrets["private_key"], "profile": "trm-b2b-staging", "orgId": "org_synthetic",
+		want := map[string]string{"privateKey": automatedSecrets["private_key"], "profile": "app-staging", "orgId": "org_synthetic",
 			"email": automatedSecrets["email"], "password": automatedSecrets["password"]}
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/auth/login" || r.Header.Get("Content-Type") != "application/json" || !reflect.DeepEqual(body, want) {
 			w.WriteHeader(http.StatusBadRequest)
@@ -501,7 +501,7 @@ func TestAutomatedAuthRefusals(t *testing.T) {
 		"short life":      {func(f *automatedFake, _ *Entry, _ *Auth0Tokens) { f.lifetime.Store(60) }, 1, 1},
 		"refused sign-in": {func(f *automatedFake, _ *Entry, _ *Auth0Tokens) { f.status.Store(http.StatusBadGateway) }, 1, 0},
 		"other profile": {func(_ *automatedFake, e *Entry, _ *Auth0Tokens) {
-			e.BrowserSession.AutomatedAuth.Profile = "trm-b2b-prod"
+			e.BrowserSession.AutomatedAuth.Profile = "app-prod"
 		}, 1, 0},
 	} {
 		t.Run(name, func(t *testing.T) {

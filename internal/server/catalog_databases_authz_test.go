@@ -173,15 +173,15 @@ func TestCatalogDatabaseResolverAuthorizesTheAttestedPerson(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cache := &entitlement.Cache{Source: directory{"alice.smith@trmlabs.com": {t1Group}, "bob@trmlabs.com": {}}}
-	r := NewCatalogDatabaseResolver(httpcatalog.NewSource(catalog, 1), runnerid.Verifiers{SandboxDomains: []string{"trmlabs.com"}}, cache, &authorizetest.MemBinder{})
+	cache := &entitlement.Cache{Source: directory{"alice.smith@example.org": {t1Group}, "bob@example.org": {}}}
+	r := NewCatalogDatabaseResolver(httpcatalog.NewSource(catalog, 1), runnerid.Verifiers{SandboxDomains: []string{"example.org"}}, cache, &authorizetest.MemBinder{})
 	for _, c := range []struct{ name, pool, requester, database, want string }{
-		{"T1 member", "developers", "alice.smith@trmlabs.com", "t1db", ""},
-		{"T1 non-member", "developers", "bob@trmlabs.com", "t1db", "not_entitled"},
+		{"T1 member", "developers", "alice.smith@example.org", "t1db", ""},
+		{"T1 non-member", "developers", "bob@example.org", "t1db", "not_entitled"},
 		{"outside the person domains", "developers", "alice@example.com", "t1db", "no_person"},
 		{"no requester attested", "developers", "", "open", "requester_missing"},
 		{"pool mode, no requester", "shared", "", "open", ""},
-		{"pool mode with a requester", "shared", "alice.smith@trmlabs.com", "open", "requester_unexpected"},
+		{"pool mode with a requester", "shared", "alice.smith@example.org", "open", "requester_unexpected"},
 	} {
 		_, err := r.ResolveDatabase(context.Background(), pgproxy.AgentScope{ActorID: "a", Pool: c.pool, WorkloadID: "pod-a", AttestedRequester: c.requester}, c.database)
 		var refused *pgproxy.RefusedError

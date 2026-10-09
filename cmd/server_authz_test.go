@@ -10,15 +10,15 @@ func TestRunnerPersonDomains(t *testing.T) {
 	if err != nil || a.runner == nil || len(a.runner.PersonDomains) != 0 {
 		t.Fatalf("unset: %+v %v", a.runner, err)
 	}
-	with := map[string]string{"AGENT_VAULT_RUNNER_PERSON_DOMAINS": "trmlabs.com,example.com"}
+	with := map[string]string{"AGENT_VAULT_RUNNER_PERSON_DOMAINS": "example.org,example.com"}
 	for k, v := range base {
 		with[k] = v
 	}
 	a, err = loadAuthorization(env(with))
-	if err != nil || len(a.runner.PersonDomains) != 2 || a.runner.PersonDomains[0] != "trmlabs.com" {
+	if err != nil || len(a.runner.PersonDomains) != 2 || a.runner.PersonDomains[0] != "example.org" {
 		t.Fatalf("set: %+v %v", a.runner, err)
 	}
-	for _, bad := range []string{"TRMLABS.com", "trmlabs.com, example.com", "*.trmlabs.com", "trmlabs", ",", "trmlabs.com,"} {
+	for _, bad := range []string{"EXAMPLE.org", "example.org, example.com", "*.example.org", "example", ",", "example.org,"} {
 		with["AGENT_VAULT_RUNNER_PERSON_DOMAINS"] = bad
 		if _, err := loadAuthorization(env(with)); err == nil {
 			t.Errorf("%q accepted", bad)
@@ -29,9 +29,9 @@ func TestRunnerPersonDomains(t *testing.T) {
 func TestCursorSettings(t *testing.T) {
 	env := func(values map[string]string) func(string) string { return func(k string) string { return values[k] } }
 	good := map[string]string{"AGENT_VAULT_CURSOR_AUDIENCE": "gatehouse-broker", "AGENT_VAULT_CURSOR_TEAM_IDS": "123,456",
-		"AGENT_VAULT_CURSOR_PERSON_DOMAINS": "trmlabs.com"}
+		"AGENT_VAULT_CURSOR_PERSON_DOMAINS": "example.org"}
 	a, err := loadAuthorization(env(good))
-	if err != nil || a.cursor == nil || a.runner != nil || len(a.cursor.TeamIDs) != 2 || a.cursor.PersonDomains[0] != "trmlabs.com" ||
+	if err != nil || a.cursor == nil || a.runner != nil || len(a.cursor.TeamIDs) != 2 || a.cursor.PersonDomains[0] != "example.org" ||
 		a.cursor.JWKSURL != "https://api.cursor.com/keys" || a.cursor.Issuer != "https://api.cursor.com" || a.verifier() == nil {
 		t.Fatalf("set: %+v %v", a.cursor, err)
 	}
@@ -41,7 +41,7 @@ func TestCursorSettings(t *testing.T) {
 	bad := map[string]string{
 		"AGENT_VAULT_CURSOR_TEAM_IDS":       "",
 		"AGENT_VAULT_CURSOR_AUDIENCE":       "has space",
-		"AGENT_VAULT_CURSOR_PERSON_DOMAINS": "*.trmlabs.com",
+		"AGENT_VAULT_CURSOR_PERSON_DOMAINS": "*.example.org",
 		"AGENT_VAULT_CURSOR_JWKS_URL":       "http://api.cursor.com/keys",
 	}
 	for key, value := range bad {
@@ -70,7 +70,7 @@ func TestSandboxPersonDomains(t *testing.T) {
 	if err != nil || a.verifier() != nil {
 		t.Fatalf("unset: %v", err)
 	}
-	a, err = loadAuthorization(env(map[string]string{"AGENT_VAULT_SANDBOX_PERSON_DOMAINS": "trmlabs.com"}))
+	a, err = loadAuthorization(env(map[string]string{"AGENT_VAULT_SANDBOX_PERSON_DOMAINS": "example.org"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,10 +80,10 @@ func TestSandboxPersonDomains(t *testing.T) {
 	if !ok {
 		t.Fatal("verifier names no attested persons")
 	}
-	if person, err := persons.AttestedPerson("alice.smith@trmlabs.com"); err != nil || person != "alice.smith@trmlabs.com" {
+	if person, err := persons.AttestedPerson("alice.smith@example.org"); err != nil || person != "alice.smith@example.org" {
 		t.Fatalf("person %q %v", person, err)
 	}
-	if _, err := loadAuthorization(env(map[string]string{"AGENT_VAULT_SANDBOX_PERSON_DOMAINS": "*.trmlabs.com"})); err == nil {
+	if _, err := loadAuthorization(env(map[string]string{"AGENT_VAULT_SANDBOX_PERSON_DOMAINS": "*.example.org"})); err == nil {
 		t.Fatal("wildcard domain accepted")
 	}
 }
