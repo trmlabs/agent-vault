@@ -40,11 +40,13 @@ type Permissions struct {
 }
 
 // ContentsRead and ContentsWrite are the git fetch and push scopes;
-// PullRequestsWrite opens pull requests and comments on them.
+// PullRequestsWrite opens pull requests and comments on them. Opening one
+// also reads its head and base refs, which GitHub checks with contents read
+// ("not all refs are readable" without it), so that scope carries it.
 var (
 	ContentsRead      = Permissions{Contents: "read"}
 	ContentsWrite     = Permissions{Contents: "write"}
-	PullRequestsWrite = Permissions{PullRequests: "write"}
+	PullRequestsWrite = Permissions{Contents: "read", PullRequests: "write"}
 )
 
 func (p Permissions) valid() bool {
@@ -322,13 +324,21 @@ func (m *Minter) revoke(api string, client *http.Client, token string) {
 	}
 }
 
+// maxTokenBytes bounds an installation token. GitHub's stateless format,
+// ghs_<app id>_<JWT>, is about 520 characters and varies with its claims;
+// 4096 leaves room for growth and still fits any request header.
+const maxTokenBytes = 4096
+
+// tokenShape checks only what makes a token safe to put in a header: a
+// plausible length and URL-safe base64 characters, with the dots of the JWT
+// in the stateless format. GitHub asks clients to treat the value as opaque.
 func tokenShape(t string) bool {
-	if len(t) < 20 || len(t) > 255 {
+	if len(t) < 20 || len(t) > maxTokenBytes {
 		return false
 	}
 	for i := 0; i < len(t); i++ {
 		c := t[i]
-		if alnum := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'; !alnum && c != '_' && c != '-' {
+		if alnum := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'; !alnum && c != '_' && c != '-' && c != '.' {
 			return false
 		}
 	}

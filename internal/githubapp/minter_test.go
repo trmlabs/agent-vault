@@ -34,6 +34,7 @@ type fakeGitHub struct {
 	expires   time.Time
 	lastBody  map[string]any
 	seq       atomic.Int32
+	token     func(seq int32) string // the minted token; a classic 40-character style by default
 }
 
 func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
@@ -67,8 +68,12 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 			perms["administration"] = "write"
 		}
 		repo := body["repositories"].([]any)[0].(string)
+		token := fmt.Sprintf("ghs_synthetictoken%04d", g.seq.Add(1))
+		if g.token != nil {
+			token = g.token(g.seq.Load())
+		}
 		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(map[string]any{"token": fmt.Sprintf("ghs_synthetictoken%04d", g.seq.Add(1)), "expires_at": g.expires.Format(time.RFC3339),
+		_ = json.NewEncoder(w).Encode(map[string]any{"token": token, "expires_at": g.expires.Format(time.RFC3339),
 			"permissions": perms, "repositories": []map[string]string{{"full_name": "trmlabs/" + repo}}})
 	}))
 	t.Cleanup(srv.Close)
@@ -110,13 +115,71 @@ func newMinter(g *fakeGitHub, srv *httptest.Server, now *time.Time) *Minter {
 
 var app = App{AppID: 7, InstallationID: 42}
 
+// statelessToken is a synthetic token in GitHub's stateless installation
+// format, ghs_<app id>_<JWT>: tag, then three URL-safe base64 segments joined
+// by dots, n characters in all.
+func statelessToken(tag string, n int) string {
+	raw := make([]byte, n)
+	for i := range raw {
+		raw[i] = byte(i*37 + 251) // spreads across the alphabet, '-' and '_' included
+	}
+	body := base64.RawURLEncoding.EncodeToString(raw)
+	head := tag + "_7_"
+	rest := n - len(head) - 2
+	if rest < 3 {
+		panic("statelessToken: n too small")
+	}
+	a, b := rest/5, rest*2/5
+	return head + body[:a] + "." + body[a:a+b] + "." + body[a+b:rest]
+}
+
+func TestTokenShape(t *testing.T) {
+	for name, tc := range map[string]struct {
+		token string
+		ok    bool
+	}{
+		"classic":               {"ghs_" + strings.Repeat("A1b2", 9), true},
+		"stateless 390":         {statelessToken("ghs", 390), true},
+		"stateless 520":         {statelessToken("ghs", 520), true},
+		"at the bound":          {statelessToken("ghs", maxTokenBytes), true},
+		"over the bound":        {statelessToken("ghs", maxTokenBytes+1), false},
+		"too short":             {"ghs_short", false},
+		"empty":                 {"", false},
+		"space":                 {"ghs_" + strings.Repeat("a", 30) + " x", false},
+		"header injection":      {"ghs_" + strings.Repeat("a", 30) + "\r\nX-Injected: 1", false},
+		"standard base64 plus":  {"ghs_" + strings.Repeat("a", 30) + "+", false},
+		"standard base64 slash": {"ghs_" + strings.Repeat("a", 30) + "/", false},
+		"base64 padding":        {"ghs_" + strings.Repeat("a", 30) + "=", false},
+		"basic auth separator":  {"ghs_" + strings.Repeat("a", 30) + ":", false},
+	} {
+		if got := tokenShape(tc.token); got != tc.ok {
+			t.Errorf("%s (%d chars): tokenShape = %v, want %v", name, len(tc.token), got, tc.ok)
+		}
+	}
+}
+
+func TestMinterAcceptsStatelessTokens(t *testing.T) {
+	for _, n := range []int{390, 520} {
+		g, srv := newFakeGitHub(t)
+		g.token = func(seq int32) string { return statelessToken(fmt.Sprintf("ghs_stateless%04d", seq), n) }
+		m := newMinter(g, srv, nil)
+		token, err := m.Token(context.Background(), app, "trmlabs/trm-b2b", ContentsRead)
+		if err != nil {
+			t.Fatalf("%d-character token: %v", n, err)
+		}
+		if want := statelessToken("ghs_stateless0001", n); token.Value() != want || len(token.Value()) != n {
+			t.Fatalf("%d-character token: got %d characters, not the minted token", n, len(token.Value()))
+		}
+	}
+}
+
 func TestMinterRequestsOnlyOneRepoAndMinimumPermissions(t *testing.T) {
 	g, srv := newFakeGitHub(t)
 	m := newMinter(g, srv, nil)
 	for permissions, want := range map[Permissions]map[string]any{
 		ContentsRead:      {"contents": "read", "metadata": "read"},
 		ContentsWrite:     {"contents": "write", "metadata": "read"},
-		PullRequestsWrite: {"pull_requests": "write", "metadata": "read"},
+		PullRequestsWrite: {"contents": "read", "pull_requests": "write", "metadata": "read"},
 	} {
 		token, err := m.Token(context.Background(), app, "trmlabs/trm-b2b", permissions)
 		if err != nil || !strings.HasPrefix(token.Value(), "ghs_") {

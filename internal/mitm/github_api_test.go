@@ -24,7 +24,7 @@ import (
 
 // apiFixture fronts a fake api.github.com: it mints tokens and accepts a pull
 // request or comment only with a token minted for that repository with
-// pull_requests write.
+// contents read and pull_requests write, as GitHub needs to open one.
 type apiFixture struct {
 	client  *http.Client
 	port    int
@@ -63,7 +63,7 @@ func newAPIFixture(t *testing.T) *apiFixture {
 		f.mu.Lock()
 		scope := f.minted[token]
 		f.mu.Unlock()
-		if scope != `trmlabs/trm-b2b|{"metadata":"read","pull_requests":"write"}` {
+		if scope != `trmlabs/trm-b2b|{"contents":"read","metadata":"read","pull_requests":"write"}` {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
@@ -166,8 +166,8 @@ func TestGitHubAPIOpensPullRequestsAndComments(t *testing.T) {
 	}
 	f.mu.Lock()
 	for _, scope := range f.minted {
-		if !strings.HasSuffix(scope, `{"metadata":"read","pull_requests":"write"}`) {
-			t.Errorf("minted %s, want pull_requests write only", scope)
+		if !strings.HasSuffix(scope, `{"contents":"read","metadata":"read","pull_requests":"write"}`) {
+			t.Errorf("minted %s, want contents read and pull_requests write only", scope)
 		}
 	}
 	f.mu.Unlock()
