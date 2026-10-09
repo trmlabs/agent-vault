@@ -29,9 +29,10 @@ type scopeGitHub struct {
 	settingsErr int
 	wideMint    bool
 	listErr     int
-	settings    int // GET /app/installations/42 calls
-	listMints   int // metadata-only tokens
-	repoMints   int // one-repository tokens
+	stateless   bool // mint GitHub's longer ghs_<app id>_<JWT> tokens
+	settings    int  // GET /app/installations/42 calls
+	listMints   int  // metadata-only tokens
+	repoMints   int  // one-repository tokens
 	revoked     []string
 	pages       []string
 }
@@ -80,11 +81,19 @@ func newScopeGitHub(t *testing.T) (*scopeGitHub, *Minter) {
 					t.Errorf("listing token asked for %v", body.Permissions)
 				}
 				g.listMints++
-				_ = json.NewEncoder(w).Encode(map[string]any{"token": fmt.Sprintf("ghs_listingtoken%04d", g.listMints), "expires_at": expires, "permissions": body.Permissions})
+				token := fmt.Sprintf("ghs_listingtoken%04d", g.listMints)
+				if g.stateless {
+					token = statelessToken(token, 520)
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"token": token, "expires_at": expires, "permissions": body.Permissions})
 				return
 			}
 			g.repoMints++
-			_ = json.NewEncoder(w).Encode(map[string]any{"token": fmt.Sprintf("ghs_repositorytoken%04d", g.repoMints), "expires_at": expires,
+			token := fmt.Sprintf("ghs_repositorytoken%04d", g.repoMints)
+			if g.stateless {
+				token = statelessToken(token, 520)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"token": token, "expires_at": expires,
 				"permissions": body.Permissions, "repositories": func() []map[string]string {
 					out := []map[string]string{{"full_name": "trmlabs/" + body.Repositories[0]}}
 					if g.wideMint {
@@ -113,6 +122,24 @@ func newScopeGitHub(t *testing.T) (*scopeGitHub, *Minter) {
 			return Scope{Repos: []string{"trmlabs/trm-b2b", "trmlabs/docs"}}
 		}}
 	return g, m
+}
+
+func TestScopeAcceptsStatelessTokens(t *testing.T) {
+	g, m := newScopeGitHub(t)
+	g.stateless = true
+	token, err := m.Token(context.Background(), app, "trmlabs/trm-b2b", ContentsRead)
+	if err != nil || len(token.Value()) != 520 {
+		t.Fatalf("token of %d characters: %v", len(token.Value()), err)
+	}
+	settings, listMints, repoMints, revoked := g.counts()
+	if settings != 1 || listMints != 1 || repoMints != 1 || revoked != 1 {
+		t.Fatalf("settings=%d listMints=%d repoMints=%d revoked=%d", settings, listMints, repoMints, revoked)
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !strings.HasPrefix(g.revoked[0], "ghs_listingtoken0001_7_") || len(g.revoked[0]) != 520 {
+		t.Fatalf("revoked %d characters, not the listing token", len(g.revoked[0]))
+	}
 }
 
 func (g *scopeGitHub) counts() (settings, listMints, repoMints, revoked int) {

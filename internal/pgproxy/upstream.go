@@ -3,6 +3,9 @@ package pgproxy
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -268,7 +271,8 @@ func privatePeer(conn net.Conn) bool {
 //   - prefer (default): request TLS, use it if offered, else plaintext.
 //   - require: request TLS, fail if the server declines; encrypt without
 //     verifying the certificate (matching libpq).
-//   - verify-full: as require, but verify the certificate chain and hostname.
+//   - verify-full: as require, but verify the certificate chain and hostname,
+//     against the service's pinned CA alone when it has one.
 func negotiateUpstreamTLS(ctx context.Context, conn net.Conn, svc *DatabaseService) (net.Conn, bool, error) {
 	switch svc.SSLMode {
 	case "", "disable", "prefer", "require", "verify-full":
@@ -307,15 +311,86 @@ func negotiateUpstreamTLS(ctx context.Context, conn net.Conn, svc *DatabaseServi
 	if err != nil {
 		host = svc.Addr
 	}
+	if svc.ServerName != "" {
+		host = svc.ServerName
+	}
 	tlsConf := &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}
-	if mode != "verify-full" {
+	switch {
+	case mode != "verify-full":
 		// require encrypts without certificate verification, matching libpq's
 		// sslmode=require. verify-full performs full chain + hostname verification.
 		tlsConf.InsecureSkipVerify = true //nolint:gosec // intentional per sslmode=require
+	case svc.CA != "":
+		pins, err := parsePinnedCA(svc.CA)
+		if err != nil {
+			return nil, false, err
+		}
+		// VerifyConnection runs whatever InsecureSkipVerify says; it checks
+		// against the pinned certificates alone, never the system roots.
+		tlsConf.InsecureSkipVerify = true //nolint:gosec // verified by verifyPinned
+		tlsConf.VerifyConnection = verifyPinned(pins, host)
 	}
 	tlsConn := tls.Client(conn, tlsConf)
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		return nil, false, fmt.Errorf("upstream TLS handshake: %w", err)
 	}
 	return tlsConn, true, nil
+}
+
+// parsePinnedCA reads the PEM certificates of a database's pinned CA. The
+// catalog has already held them to CERTIFICATE blocks that are CAs or
+// self-signed.
+func parsePinnedCA(text string) ([]*x509.Certificate, error) {
+	var pins []*x509.Certificate
+	rest := []byte(text)
+	for {
+		block, next := pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		rest = next
+		if block.Type != "CERTIFICATE" {
+			return nil, errors.New("upstream pinned CA holds a PEM block that is not a CERTIFICATE")
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("upstream pinned CA: %w", err)
+		}
+		pins = append(pins, cert)
+	}
+	if len(pins) == 0 {
+		return nil, errors.New("upstream pinned CA has no certificate")
+	}
+	return pins, nil
+}
+
+// verifyPinned trusts a server certificate that chains to one of pins and
+// names serverName, or that is itself one of pins. The second covers a
+// self-signed certificate such as the one Citus generates, which has no
+// names and a zero validity period: the handshake proved the server holds
+// its key, which is all a pin of the certificate itself can ask.
+func verifyPinned(pins []*x509.Certificate, serverName string) func(tls.ConnectionState) error {
+	roots := x509.NewCertPool()
+	for _, pin := range pins {
+		roots.AddCert(pin)
+	}
+	return func(state tls.ConnectionState) error {
+		if len(state.PeerCertificates) == 0 {
+			return errors.New("upstream presented no certificate")
+		}
+		leaf := state.PeerCertificates[0]
+		for _, pin := range pins {
+			if leaf.Equal(pin) {
+				return nil
+			}
+		}
+		intermediates := x509.NewCertPool()
+		for _, cert := range state.PeerCertificates[1:] {
+			intermediates.AddCert(cert)
+		}
+		if _, err := leaf.Verify(x509.VerifyOptions{Roots: roots, Intermediates: intermediates, DNSName: serverName}); err != nil {
+			return fmt.Errorf("upstream certificate against the pinned CA: %w", err)
+		}
+		return nil
+	}
 }
