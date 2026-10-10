@@ -123,7 +123,7 @@ func (s *Server) handleDatabaseUpsert(w http.ResponseWriter, r *http.Request) {
 
 	// Serialize with the same per-vault lock the HTTP-service path uses so a
 	// concurrent add/remove of the same name cannot interleave.
-	unlock, err := s.lockVaultServices(ctx, ns.ID)
+	unlock, err := s.lockVault(ctx, ns.ID)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, "lock failed")
 		return
@@ -183,7 +183,7 @@ func (s *Server) handleDatabaseRemove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	unlock, err := s.lockVaultServices(ctx, ns.ID)
+	unlock, err := s.lockVault(ctx, ns.ID)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, "lock failed")
 		return

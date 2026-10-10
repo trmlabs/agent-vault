@@ -4,7 +4,7 @@
 
 For this TRM-maintained fork, report suspected vulnerabilities privately to security@trmlabs.com. Include the revision, affected configuration, impact and reproduction steps. Do not include real credentials or open a public issue containing exploit details.
 
-For the original Infisical project, follow its upstream security policy. If a finding affects both projects, coordinate disclosure with both maintainers.
+For the original Infisical project, follow its upstream security policy at <https://infisical.com/vulnerability-disclosure>. If a finding affects both projects, coordinate disclosure with both maintainers.
 
 ## Supported releases
 
