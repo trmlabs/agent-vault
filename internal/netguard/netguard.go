@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -119,8 +121,9 @@ var privateRanges = []net.IPNet{
 	parseCIDR("fe80::/10"),
 	// IPv6 unique local
 	parseCIDR("fc00::/7"),
-	// 0.0.0.0 (often routes to localhost)
+	// 0.0.0.0 and :: (unspecified; connecting to them reaches localhost)
 	parseCIDR("0.0.0.0/32"),
+	parseCIDR("::/128"),
 }
 
 func parseCIDR(s string) net.IPNet {
@@ -164,63 +167,91 @@ func isBlockedIP(ip net.IP, allowPrivate bool, allowed []net.IPNet) bool {
 // forbidden IP ranges. When allowPrivate is true, only IMDS endpoints are
 // blocked. When false, private/reserved ranges are also blocked unless
 // allowlisted via AGENT_VAULT_NETWORK_ALLOWLIST.
+//
+// Resolution and address selection are left to net.Dialer, which tries every
+// resolved address and races IPv6 against IPv4 (RFC 6555 Fast Fallback), so
+// one broken address family does not fail or stall the dial. The policy check
+// runs in the dialer's ControlContext hook on each address right before
+// connect, so blocked addresses are skipped and DNS rebinding cannot swap in
+// an unchecked IP between validation and connection.
 func SafeDialContext(allowPrivate bool) func(ctx context.Context, network, addr string) (net.Conn, error) {
-	dialer := &net.Dialer{
-		Timeout:   10 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}
-
 	var allowed []net.IPNet
 	if !allowPrivate {
 		allowed = AllowlistFromEnv()
 	}
-	// AGENT_VAULT_EGRESS_RANGES, when set, confines every destination, public
-	// or private, to the approved data-plane ranges: the broker's own
-	// least-privilege layer beneath the catalog's host allowlist.
-	egressSetting := os.Getenv("AGENT_VAULT_EGRESS_RANGES")
-	egress := ParseCIDRList(egressSetting, "AGENT_VAULT_EGRESS_RANGES")
-	if strings.TrimSpace(egressSetting) != "" && len(egress) == 0 {
-		// Set but unparseable: allow nothing rather than everything.
-		egress = []net.IPNet{{IP: net.IPv4zero, Mask: net.CIDRMask(32, 32)}}
-	}
+	return withEgressRanges(newSafeDialer(allowPrivate, allowed), os.Getenv("AGENT_VAULT_EGRESS_RANGES")).DialContext
+}
 
-	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		host, port, err := net.SplitHostPort(addr)
-		if err != nil {
-			return nil, fmt.Errorf("netguard: invalid address %q: %w", addr, err)
-		}
-
-		// Resolve the hostname to IP addresses.
-		ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-		if err != nil {
-			return nil, fmt.Errorf("netguard: DNS lookup failed for %q: %w", host, err)
-		}
-
-		// Check all resolved IPs before connecting.
-		for _, ipAddr := range ips {
-			if isBlockedIP(ipAddr.IP, allowPrivate, allowed) || !withinEgress(ipAddr.IP, egress) {
-				return nil, fmt.Errorf("netguard: connection to %s (%s) blocked by network policy",
-					host, ipAddr.IP.String())
+func newSafeDialer(allowPrivate bool, allowed []net.IPNet) *net.Dialer {
+	return &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+		ControlContext: func(_ context.Context, _, address string, _ syscall.RawConn) error {
+			err := checkDialAddress(address, allowPrivate, allowed)
+			if err != nil {
+				// A refused address may be skipped in favor of another one, in
+				// which case the request succeeds and this is the only trace.
+				slog.Warn("netguard: dial attempt refused", //nolint:gosec // G706: structured slog attrs, handlers quote control chars
+					slog.String("address", address), slog.String("error", err.Error()))
 			}
-		}
-
-		// All IPs are safe — connect directly to a validated IP to prevent
-		// DNS rebinding (TOCTOU: a second resolution could return a different IP).
-		return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+			return err
+		},
 	}
 }
 
-// withinEgress reports whether ip is inside one of the approved egress
-// ranges. With no ranges configured, every address not otherwise blocked is
-// allowed, as before.
-func withinEgress(ip net.IP, egress []net.IPNet) bool {
-	if len(egress) == 0 {
-		return true
+// checkDialAddress applies the network policy to the ip:port net.Dialer is
+// about to connect to. Anything that does not parse as an IP address is
+// rejected, so an unexpected address form cannot slip past the policy.
+func checkDialAddress(address string, allowPrivate bool, allowed []net.IPNet) error {
+	addrPort, err := netip.ParseAddrPort(address)
+	if err != nil {
+		return fmt.Errorf("netguard: cannot validate dial address %q: %w", address, err)
 	}
+	ip := addrPort.Addr().Unmap()
+	if isBlockedIP(ip.AsSlice(), allowPrivate, allowed) {
+		return fmt.Errorf("netguard: connection to %s blocked by network policy", ip)
+	}
+	return nil
+}
+
+// withEgressRanges confines d to the AGENT_VAULT_EGRESS_RANGES data-plane
+// ranges, every destination public or private: the broker's own
+// least-privilege layer beneath the catalog's host allowlist. The ranges are
+// checked in the same ControlContext hook as the network policy, on each
+// address right before connect. An empty setting leaves d unchanged; a set
+// but unparseable one allows nothing rather than everything.
+func withEgressRanges(d *net.Dialer, setting string) *net.Dialer {
+	if strings.TrimSpace(setting) == "" {
+		return d
+	}
+	egress := ParseCIDRList(setting, "AGENT_VAULT_EGRESS_RANGES")
+	policy := d.ControlContext
+	d.ControlContext = func(ctx context.Context, network, address string, c syscall.RawConn) error {
+		if err := policy(ctx, network, address, c); err != nil {
+			return err
+		}
+		err := checkEgressAddress(address, egress)
+		if err != nil {
+			slog.Warn("netguard: dial attempt outside egress ranges refused", //nolint:gosec // G706: structured slog attrs, handlers quote control chars
+				slog.String("address", address), slog.String("error", err.Error()))
+		}
+		return err
+	}
+	return d
+}
+
+// checkEgressAddress reports an error unless the ip:port the dialer is about
+// to connect to lies inside one of the egress ranges.
+func checkEgressAddress(address string, egress []net.IPNet) error {
+	addrPort, err := netip.ParseAddrPort(address)
+	if err != nil {
+		return fmt.Errorf("netguard: cannot validate dial address %q: %w", address, err)
+	}
+	ip := addrPort.Addr().Unmap()
 	for _, n := range egress {
-		if n.Contains(ip) {
-			return true
+		if n.Contains(ip.AsSlice()) {
+			return nil
 		}
 	}
-	return false
+	return fmt.Errorf("netguard: connection to %s blocked by network policy", ip)
 }

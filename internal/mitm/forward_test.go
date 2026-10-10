@@ -44,6 +44,26 @@ func (s *recordingSink) snapshot() []requestlog.Record {
 	return out
 }
 
+// waitForRows polls until the sink holds at least n records, then returns
+// them. forwardRequest emits its log row *after* the response body has been
+// flushed to the client, so a test that reads the sink the instant its
+// request returns races the server goroutine and can observe a short count.
+func (s *recordingSink) waitForRows(t *testing.T, n int) []requestlog.Record {
+	t.Helper()
+	const timeout = 2 * time.Second
+	deadline := time.Now().Add(timeout)
+	for {
+		rows := s.snapshot()
+		if len(rows) >= n {
+			return rows
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("got %d log rows after %s, want at least %d", len(rows), timeout, n)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // dialProxy opens a plain TCP connection to the proxy listener (no
 // CONNECT, no absolute-form request). Tests use it to write malformed
 // or hand-shaped request lines so we can exercise the dispatch
@@ -520,7 +540,7 @@ func TestMITMForwardEmitsRequestLogRow(t *testing.T) {
 		t.Fatalf("drain proxy handlers: %v", err)
 	}
 
-	rows := sink.snapshot()
+	rows := sink.waitForRows(t, 1)
 	if len(rows) != 1 {
 		t.Fatalf("got %d records, want 1", len(rows))
 	}
@@ -608,7 +628,7 @@ func TestMITMForwardKeepalivePersistsAcrossRequests(t *testing.T) {
 	if err := proxy.Shutdown(ctx); err != nil {
 		t.Fatalf("drain proxy handlers: %v", err)
 	}
-	if rows := sink.snapshot(); len(rows) != 2 {
+	if rows := sink.waitForRows(t, 2); len(rows) != 2 {
 		t.Fatalf("got %d log rows, want 2", len(rows))
 	}
 }

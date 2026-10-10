@@ -218,7 +218,7 @@ func (s *Server) SeedDatabaseServices(ctx context.Context, byVault map[string][]
 			continue
 		}
 		added, err := func() (int, error) {
-			unlock, err := s.lockVaultServices(ctx, vault.ID)
+			unlock, err := s.lockVault(ctx, vault.ID)
 			if err != nil {
 				return 0, err
 			}
