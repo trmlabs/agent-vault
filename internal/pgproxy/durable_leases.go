@@ -3,6 +3,7 @@ package pgproxy
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -26,6 +27,8 @@ type CleanupJournal interface {
 	LiveDatabaseCleanupOwners(context.Context) (int, error)
 	AddDatabaseCleanup(context.Context, string, store.DatabaseCleanup) error
 	SetDatabaseCleanupLease(context.Context, string, string, string) error
+	MarkDatabaseCleanupTokenRevoked(context.Context, string, string) error
+	SettledDatabaseCleanup(context.Context, string, time.Duration) ([]store.DatabaseCleanup, error)
 	QuarantineDatabaseCleanup(context.Context, string, string) error
 	DatabaseBindingQuarantined(context.Context, string) (bool, error)
 	ListDatabaseCleanup(context.Context) ([]store.DatabaseCleanup, error)
@@ -52,6 +55,20 @@ type DurableLeaseOptions struct {
 	Replica string
 	// Logger names a refused start or a duplicate-name fence. Default discard.
 	Logger *slog.Logger
+	// IssueTimeout bounds one issuance from child token to journaled lease.
+	// Neither its caller leaving nor a graceful Close cuts it short, only this
+	// bound or a fence: abandoned between the credential read and the lease
+	// write, it would leave an unknown issuance. Default 15s, the handshake's.
+	IssueTimeout time.Duration
+	// UnknownSettle is how long an unknown issuance's child token must have
+	// been dead, by the database clock, before Vault's lease list is read to
+	// clear it. It must exceed Vault's max_request_duration (90s by default)
+	// plus clock skew, so no request made with the token can still register a
+	// lease. Default 3 minutes.
+	UnknownSettle time.Duration
+	// UnknownRecheck spaces automatic checks of one unknown issuance that
+	// could not be cleared. Default 30s.
+	UnknownRecheck time.Duration
 }
 
 type durableLease struct {
@@ -62,10 +79,11 @@ type durableLease struct {
 
 // DurableLeaseMinter journals a child-token accessor before credential issuance.
 // Known leases are reconciled automatically. An interrupted response without a
-// lease ID quarantines its binding fleet-wide for explicit operator
-// reconciliation. Each replica owns the records it wrote; a survivor claims a
-// dead replica's records and revokes them. A replica that cannot renew fences
-// itself before its records become claimable.
+// lease ID quarantines its binding fleet-wide until Vault's lease list proves
+// no credential from it remains (clearUnknown) or an operator reconciles it.
+// Each replica owns the records it wrote; a survivor claims a dead replica's
+// records and revokes them. A replica that cannot renew fences itself before
+// its records become claimable.
 type DurableLeaseMinter struct {
 	client   *hashicorp.Client
 	journal  CleanupJournal
@@ -88,6 +106,9 @@ type DurableLeaseMinter struct {
 	fenced    atomic.Bool
 	live      atomic.Int64
 	kick      chan struct{}
+
+	draining atomic.Bool          // Close has begun: no new issuance starts
+	checked  map[string]time.Time // last automatic check per unknown issuance; under mu
 }
 
 func NewDurableLeaseMinter(ctx context.Context, client *hashicorp.Client, journal CleanupJournal, opts DurableLeaseOptions) (*DurableLeaseMinter, error) {
@@ -109,6 +130,15 @@ func NewDurableLeaseMinter(ctx context.Context, client *hashicorp.Client, journa
 	if opts.Heartbeat <= 0 {
 		opts.Heartbeat = opts.OwnerTTL / 6
 	}
+	if opts.IssueTimeout <= 0 {
+		opts.IssueTimeout = defaultHandshakeTimeout
+	}
+	if opts.UnknownSettle <= 0 {
+		opts.UnknownSettle = 3 * time.Minute
+	}
+	if opts.UnknownRecheck <= 0 {
+		opts.UnknownRecheck = 30 * time.Second
+	}
 	if opts.OwnerTTL < 3*time.Second || opts.TokenTTL < time.Second || opts.TokenTTL > 24*time.Hour ||
 		opts.Heartbeat >= opts.FenceAfter || opts.FenceAfter >= opts.OwnerTTL {
 		return nil, fmt.Errorf("invalid database lifecycle timing")
@@ -121,7 +151,7 @@ func NewDurableLeaseMinter(ctx context.Context, client *hashicorp.Client, journa
 	if opts.Replica != "" {
 		owner = opts.Replica + "/" + owner
 	}
-	m := &DurableLeaseMinter{client: client, journal: journal, opts: opts, owner: owner, done: make(chan struct{}), active: make(map[string]durableLease), kick: make(chan struct{}, 1)}
+	m := &DurableLeaseMinter{client: client, journal: journal, opts: opts, owner: owner, done: make(chan struct{}), active: make(map[string]durableLease), kick: make(chan struct{}, 1), checked: make(map[string]time.Time)}
 	m.ctx, m.cancel = context.WithCancel(ctx)
 	if opts.Logger == nil {
 		opts.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -185,7 +215,7 @@ func (m *DurableLeaseMinter) Fenced() bool { return m.fenced.Load() }
 // row, and a replica whose renewals are failing stops taking new sessions
 // before it fences.
 func (m *DurableLeaseMinter) Ready() bool {
-	return !m.fenced.Load() && m.ctx.Err() == nil && m.untilFence(time.Now()) > m.opts.FenceAfter/2
+	return !m.fenced.Load() && !m.draining.Load() && m.ctx.Err() == nil && m.untilFence(time.Now()) > m.opts.FenceAfter/2
 }
 
 // LiveReplicas is the number of live owner rows at the last heartbeat,
@@ -385,6 +415,9 @@ func (m *DurableLeaseMinter) reconcile(ctx context.Context, binding string) erro
 		if err := m.journal.CheckDatabaseCleanupOwner(ctx, m.owner); err != nil {
 			return err
 		}
+		if record.LeaseID == "" && m.clearUnknown(ctx, record) {
+			continue
+		}
 		cleanupCtx, cancel := context.WithTimeout(ctx, leaseRevokeTimeout)
 		var err error
 		// A record no live session holds belongs to a dead or retired session:
@@ -415,6 +448,90 @@ func (m *DurableLeaseMinter) reconcile(ctx context.Context, binding string) erro
 	return failure
 }
 
+// clearUnknown clears an unknown issuance without an operator when Vault shows
+// that no credential from it can remain:
+//
+//  1. its child token has been dead, revoked by this process or past its
+//     maximum lifetime, for UnknownSettle by the database clock, so no request
+//     made with it can still register a lease; and
+//  2. Vault's lease list for the record's credential path, read after that,
+//     holds no lease the fleet's journal does not account for.
+//
+// Vault deletes a lease only after the database engine has removed its user,
+// and keeps a failing or irrevocable revocation listed, so a credential from
+// this issuance that still exists would be listed and unaccounted. Vault
+// returns a credential only after registering its lease, so one that was never
+// registered was never handed to anyone. Token revocation success alone proves
+// nothing (Vault queues lease revocation) and neither does elapsed lifetime;
+// both only decide when the list is worth reading. Anything short of the
+// proof stays quarantined for the operator procedure: a record without its
+// mount and role, a refused or unrecognized list, or any unaccounted lease,
+// including another consumer's on a shared role. Requires m.mu.
+func (m *DurableLeaseMinter) clearUnknown(ctx context.Context, record store.DatabaseCleanup) bool {
+	if m.closed || record.Mount == "" || record.Role == "" {
+		return false
+	}
+	now := time.Now()
+	if last, ok := m.checked[record.Accessor]; ok && now.Sub(last) < m.opts.UnknownRecheck {
+		return false
+	}
+	settled, err := m.journal.SettledDatabaseCleanup(ctx, m.owner, m.opts.UnknownSettle)
+	if err != nil {
+		return false
+	}
+	ready := false
+	for _, candidate := range settled {
+		ready = ready || candidate.Accessor == record.Accessor && candidate.Mount == record.Mount && candidate.Role == record.Role
+	}
+	if !ready {
+		return false
+	}
+	m.checked[record.Accessor] = now
+	log := m.opts.Logger.With(slog.String("binding", record.Binding))
+	// The list comes before the journal read: a lease issued meanwhile by a
+	// live session is then either journaled or still unaccounted.
+	leases, err := m.client.ListDatabaseLeases(ctx, record.Mount, record.Role)
+	if err != nil {
+		log.Warn("pgproxy: unknown database issuance kept for the operator: Vault lease list unavailable", slog.String("error", err.Error()))
+		return false
+	}
+	fleet, err := m.journal.ListDatabaseCleanup(ctx)
+	if err != nil {
+		return false
+	}
+	known := make(map[string]bool, len(fleet))
+	for _, other := range fleet {
+		if other.LeaseID != "" {
+			known[other.LeaseID] = true
+		}
+	}
+	unaccounted := 0
+	for _, lease := range leases {
+		if !known[lease] {
+			unaccounted++
+		}
+	}
+	prefix, _ := hashicorp.DatabaseLeasePrefix(record.Mount, record.Role)
+	if unaccounted > 0 {
+		log.Warn("pgproxy: unknown database issuance kept for the operator: Vault holds leases the journal does not account for",
+			slog.String("lease_prefix", prefix), slog.Int("unaccounted", unaccounted))
+		return false
+	}
+	evidence, _ := json.Marshal(map[string]any{
+		"verification": "automated_vault_lease_absence", "checked_at": now.UTC().Format(time.RFC3339Nano),
+		"lease_prefix": prefix, "listed_leases": len(leases), "settle_seconds": int(m.opts.UnknownSettle / time.Second),
+	})
+	if err := m.journal.ConfirmDatabaseCleanup(ctx, m.owner, record.Accessor, string(evidence)); err != nil {
+		return false
+	}
+	delete(m.checked, record.Accessor)
+	log.Info("pgproxy: unknown database issuance cleared: Vault holds no unaccounted lease for it", slog.String("lease_prefix", prefix))
+	return true
+}
+
+// errDraining refuses an issuance once Close has begun.
+var errDraining = errors.New("database broker is stopping")
+
 func (m *DurableLeaseMinter) Mint(ctx context.Context, scope AgentScope, svc *DatabaseService) (*Lease, error) {
 	if svc == nil || scope.VaultID == "" || svc.Name == "" {
 		return nil, fmt.Errorf("database binding is required")
@@ -427,6 +544,9 @@ func (m *DurableLeaseMinter) Mint(ctx context.Context, scope AgentScope, svc *Da
 		return nil, err
 	}
 	defer m.mu.Unlock()
+	if m.draining.Load() {
+		return nil, errDraining
+	}
 	if m.ctx.Err() != nil || m.untilFence(time.Now()) <= 0 {
 		return nil, fmt.Errorf("database cleanup authority unavailable")
 	}
@@ -434,11 +554,26 @@ func (m *DurableLeaseMinter) Mint(ctx context.Context, scope AgentScope, svc *Da
 	if err := m.reconcile(ctx, binding); err != nil {
 		return nil, err
 	}
+	return m.issue(ctx, scope, svc, binding)
+}
+
+// issue runs one issuance, from child token to journaled lease, under its own
+// deadline. A caller that leaves partway, or a graceful Close, does not cut it
+// short: stopped between the credential read and the lease write, it would
+// leave an unknown issuance that closes the binding for everyone. Only
+// IssueTimeout or a fence ends it early. If the caller left in the meantime,
+// the credential it no longer wants is revoked here. Requires m.mu.
+func (m *DurableLeaseMinter) issue(caller context.Context, scope AgentScope, svc *DatabaseService, binding string) (*Lease, error) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(caller), m.opts.IssueTimeout)
+	defer cancel()
+	stop := context.AfterFunc(m.ctx, cancel)
+	defer stop()
 	session, err := m.client.NewDatabaseSession(ctx, svc.Mount, svc.Role, m.opts.TokenTTL)
 	if err != nil {
 		return nil, err
 	}
-	record := store.DatabaseCleanup{Accessor: session.Accessor, Binding: binding, ActorID: scope.ActorID, WorkloadID: scope.WorkloadID}
+	record := store.DatabaseCleanup{Accessor: session.Accessor, Binding: binding, ActorID: scope.ActorID, WorkloadID: scope.WorkloadID,
+		Mount: svc.Mount, Role: svc.Role, TokenTTL: m.opts.TokenTTL}
 	if err := m.journal.AddDatabaseCleanup(ctx, m.owner, record); err != nil {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
 		defer cleanupCancel()
@@ -451,11 +586,14 @@ func (m *DurableLeaseMinter) Mint(ctx context.Context, scope AgentScope, svc *Da
 		// Vault may have issued a credential whose response was lost. This
 		// process still holds the child token, and revoking it with its own
 		// token revokes every lease it issued, that one included. The durable
-		// record stays, so the binding is quarantined until database-backed
-		// reconciliation confirms that no issued role or session remains.
+		// record stays, so the binding is quarantined until Vault's lease list
+		// or an operator shows that no issued credential remains. A confirmed
+		// revocation starts the settle wait now rather than at token expiry.
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
 		defer cleanupCancel()
-		_ = session.Revoke(cleanupCtx)
+		if session.Revoke(cleanupCtx) == nil {
+			_ = m.journal.MarkDatabaseCleanupTokenRevoked(cleanupCtx, m.owner, session.Accessor)
+		}
 		_ = m.reconcile(cleanupCtx, binding)
 		return nil, err
 	}
@@ -465,6 +603,16 @@ func (m *DurableLeaseMinter) Mint(ctx context.Context, scope AgentScope, svc *Da
 		_ = m.client.RevokeDatabaseLeaseConfirmed(cleanupCtx, credential.LeaseID)
 		_ = session.Revoke(cleanupCtx)
 		return nil, fmt.Errorf("persist issued database lease: %w", err)
+	}
+	if err := caller.Err(); err != nil {
+		// The lease is journaled, so a failed revoke here is retried by path.
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), leaseRevokeTimeout)
+		defer cleanupCancel()
+		if m.client.RevokeDatabaseLeaseConfirmed(cleanupCtx, credential.LeaseID) == nil {
+			_ = session.Revoke(cleanupCtx)
+			_ = m.journal.DeleteDatabaseCleanup(cleanupCtx, session.Accessor)
+		}
+		return nil, err
 	}
 	expiry := credential.ExpiresAt(issued)
 	if expiry.After(session.ExpiresAt) {
@@ -532,6 +680,13 @@ func (m *DurableLeaseMinter) Revoke(ctx context.Context, id string) error {
 // once instead of waiting out the row; records still held become claimable.
 func (m *DurableLeaseMinter) Close(ctx context.Context) error {
 	defer func() { _ = m.release() }()
+	// Drain: no new issuance starts, and one under way finishes and journals
+	// its lease before authority ends. Canceling it mid-read is what leaves an
+	// unknown issuance behind.
+	m.draining.Store(true)
+	if err := m.lock(ctx); err == nil {
+		m.mu.Unlock()
+	}
 	m.cancel()
 	select {
 	case <-m.done:

@@ -373,7 +373,7 @@ func TestDatabaseCleanupFleetMigrationKeepsLiveRecords(t *testing.T) {
 			lease_id TEXT NOT NULL DEFAULT '', reconciliation_evidence TEXT NOT NULL DEFAULT '')`,
 		"INSERT INTO database_cleanup (accessor, binding, lease_id) VALUES ('legacy-known', 'vault/db', 'database/creds/r/1'), ('legacy-unknown', 'vault/db', '')",
 		"INSERT INTO database_cleanup_owner (id, owner, expires_ns) VALUES (1, 'old-binary', 0)",
-		"DELETE FROM schema_migrations WHERE name IN ('20261001120000_database_cleanup_actor', '20261001130000_database_cleanup_workload', '20261003120000_database_cleanup_fleet')",
+		"DELETE FROM schema_migrations WHERE name IN ('20261001120000_database_cleanup_actor', '20261001130000_database_cleanup_workload', '20261003120000_database_cleanup_fleet', '20261009120000_database_cleanup_issuance')",
 	} {
 		if _, err := s.db.Exec(statement); err != nil {
 			t.Fatalf("%s: %v", statement, err)
@@ -486,7 +486,7 @@ func checkDatabaseCleanupActorMigration(t *testing.T, open func() (*SQLStore, er
 			lease_id TEXT NOT NULL DEFAULT '', reconciliation_evidence TEXT NOT NULL DEFAULT '')`,
 		`INSERT INTO database_cleanup (accessor, binding, lease_id) VALUES ('legacy-known', 'vault/db', 'database/creds/reader/one'), ('legacy-unknown', 'vault/db', '')`,
 		`DELETE FROM schema_migrations WHERE name IN ('20261001120000_database_cleanup_actor', '20261001130000_database_cleanup_workload',
-			'20261003120000_database_cleanup_fleet')`,
+			'20261003120000_database_cleanup_fleet', '20261009120000_database_cleanup_issuance')`,
 	} {
 		if _, err := s.db.Exec(statement); err != nil {
 			t.Fatal(err)
@@ -606,3 +606,87 @@ func checkConcurrentReplicaClaims(t *testing.T, s *SQLStore) {
 }
 
 func TestConcurrentReplicaClaims(t *testing.T) { checkConcurrentReplicaClaims(t, openTestDB(t)) }
+
+func TestDatabaseCleanupSettledUnknownIssuance(t *testing.T) {
+	checkSettledUnknownIssuance(t, openTestDB(t))
+}
+
+// checkSettledUnknownIssuance: an unknown issuance qualifies for the automatic
+// check only once its child token has been dead for the settle time, by
+// revocation or expiry, and only when it names its credential path.
+func checkSettledUnknownIssuance(t *testing.T, s *SQLStore) {
+	t.Helper()
+	resetFleetTables(t, s)
+	t.Cleanup(func() { resetFleetTables(t, s) })
+	ctx := context.Background()
+	if err := s.ClaimDatabaseCleanupOwner(ctx, "owner-a", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimDatabaseCleanupOwner(ctx, "owner-b", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	add := func(accessor, mount, role string, ttl time.Duration) {
+		t.Helper()
+		record := DatabaseCleanup{Accessor: accessor, Binding: "vault/db", Mount: mount, Role: role, TokenTTL: ttl}
+		if err := s.AddDatabaseCleanup(ctx, "owner-a", record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add("expiring", "database", "reader", 300*time.Millisecond)
+	add("revoked", "database", "reader", time.Hour)
+	add("held", "database", "reader", time.Hour)
+	add("legacy", "", "", 300*time.Millisecond)
+	add("known", "database", "reader", 300*time.Millisecond)
+	if err := s.SetDatabaseCleanupLease(ctx, "owner-a", "known", "database/creds/reader/1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkDatabaseCleanupTokenRevoked(ctx, "owner-b", "revoked"); err == nil {
+		t.Fatal("another replica marked this replica's token revoked")
+	}
+	if err := s.MarkDatabaseCleanupTokenRevoked(ctx, "owner-a", "revoked"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkDatabaseCleanupTokenRevoked(ctx, "owner-a", "known"); err == nil {
+		t.Fatal("a known lease's token was marked as an unknown issuance's")
+	}
+	settled := func(owner string, settle time.Duration) []string {
+		t.Helper()
+		rows, err := s.SettledDatabaseCleanup(ctx, owner, settle)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var accessors []string
+		for _, row := range rows {
+			accessors = append(accessors, row.Accessor)
+		}
+		return accessors
+	}
+	if got := settled("owner-a", time.Minute); len(got) != 0 {
+		t.Fatalf("settled before the settle time: %v", got)
+	}
+	if got := settled("owner-a", 0); fmt.Sprint(got) != "[revoked]" {
+		t.Fatalf("settled at once %v, want only the revoked token", got)
+	}
+	if got := settled("owner-b", 0); len(got) != 0 {
+		t.Fatalf("another owner's records settled: %v", got)
+	}
+	time.Sleep(400 * time.Millisecond)
+	if got := settled("owner-a", 50*time.Millisecond); fmt.Sprint(got) != "[expiring revoked]" {
+		t.Fatalf("settled after expiry %v, want the expired and revoked tokens", got)
+	}
+	rows, err := s.ListDatabaseCleanup(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.Accessor == "expiring" && (row.Mount != "database" || row.Role != "reader") {
+			t.Fatalf("credential path not kept: %+v", row)
+		}
+	}
+	if err := s.ConfirmDatabaseCleanup(ctx, "owner-a", "revoked", "automated"); err != nil {
+		t.Fatal(err)
+	}
+	if got := settled("owner-a", 50*time.Millisecond); fmt.Sprint(got) != "[expiring]" {
+		t.Fatalf("a confirmed record still settled: %v", got)
+	}
+}

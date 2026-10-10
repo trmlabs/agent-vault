@@ -30,6 +30,20 @@ type durableVaultFixture struct {
 	journal      *store.SQLStore
 	mintStarted  chan struct{}
 	mintRelease  chan struct{}
+	// Vault's lease store as the lease list shows it: the lease each live
+	// child token issued, plus leases other Vault clients hold.
+	leases   map[string]string
+	foreign  []string
+	lists    int
+	denyList bool
+}
+
+// leaseRef is the child token a fixture lease ID belongs to.
+func leaseRef(leaseID string) string {
+	if i := strings.LastIndex(leaseID, "/lease-"); i >= 0 {
+		return leaseID[i+len("/lease-"):]
+	}
+	return leaseID
 }
 
 func durableFixture(t *testing.T) (*hashicorp.Client, *store.SQLStore, *durableVaultFixture) {
@@ -44,7 +58,7 @@ func durableFixture(t *testing.T) (*hashicorp.Client, *store.SQLStore, *durableV
 
 func durableFixtureOn(t *testing.T, st *store.SQLStore) (*hashicorp.Client, *store.SQLStore, *durableVaultFixture) {
 	t.Helper()
-	f := &durableVaultFixture{live: make(map[string]bool), journal: st}
+	f := &durableVaultFixture{live: make(map[string]bool), leases: make(map[string]string), journal: st}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -62,7 +76,7 @@ func durableFixtureOn(t *testing.T, st *store.SQLStore) (*hashicorp.Client, *sto
 			f.next++
 			ref := fmt.Sprintf("ref-%d", f.next)
 			write(map[string]any{"auth": map[string]any{"accessor": ref, "client_token": ref, "policies": body["policies"], "lease_duration": 60, "renewable": false}})
-		case strings.Contains(r.URL.Path, "/creds/"):
+		case strings.Contains(r.URL.Path, "/creds/") && !strings.HasPrefix(r.URL.Path, "/v1/sys/"):
 			ref := r.Header.Get("X-Vault-Token")
 			records, err := st.ListDatabaseCleanup(r.Context())
 			if err != nil {
@@ -79,6 +93,7 @@ func durableFixtureOn(t *testing.T, st *store.SQLStore) (*hashicorp.Client, *sto
 			}
 			f.issued++
 			f.live[ref] = true
+			f.leases[ref] = strings.TrimPrefix(r.URL.Path, "/v1/") + "/lease-" + ref
 			if f.mintStarted != nil {
 				close(f.mintStarted)
 				select {
@@ -91,7 +106,7 @@ func durableFixtureOn(t *testing.T, st *store.SQLStore) (*hashicorp.Client, *sto
 				_, _ = w.Write([]byte("interrupted-json"))
 				return
 			}
-			write(map[string]any{"lease_id": "lease-" + ref, "lease_duration": 30, "renewable": true, "data": map[string]any{"username": "user-" + ref, "password": "synthetic-private-password"}})
+			write(map[string]any{"lease_id": f.leases[ref], "lease_duration": 30, "renewable": true, "data": map[string]any{"username": "user-" + ref, "password": "synthetic-private-password"}})
 		case r.URL.Path == "/v1/auth/token/revoke-self":
 			if f.failRevoke {
 				w.WriteHeader(503)
@@ -123,8 +138,33 @@ func durableFixtureOn(t *testing.T, st *store.SQLStore) (*hashicorp.Client, *sto
 			if body["sync"] != true {
 				t.Error("database revoke was not synchronous")
 			}
-			delete(f.live, strings.TrimPrefix(r.URL.Path, "/v1/sys/leases/revoke/lease-"))
+			delete(f.live, leaseRef(strings.TrimPrefix(r.URL.Path, "/v1/sys/leases/revoke/")))
 			w.WriteHeader(204)
+		case strings.HasPrefix(r.URL.Path, "/v1/sys/leases/lookup/") && r.URL.Query().Get("list") == "true":
+			f.lists++
+			if f.denyList {
+				w.WriteHeader(http.StatusForbidden)
+				write(map[string]any{"errors": []string{"permission denied"}})
+				return
+			}
+			prefix := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/sys/leases/lookup/"), "/") + "/"
+			keys := []string{}
+			for ref, lease := range f.leases {
+				if f.live[ref] && strings.HasPrefix(lease, prefix) {
+					keys = append(keys, strings.TrimPrefix(lease, prefix))
+				}
+			}
+			for _, lease := range f.foreign {
+				if strings.HasPrefix(lease, prefix) {
+					keys = append(keys, strings.TrimPrefix(lease, prefix))
+				}
+			}
+			if len(keys) == 0 {
+				w.WriteHeader(http.StatusNotFound)
+				write(map[string]any{"errors": []string{}})
+				return
+			}
+			write(map[string]any{"data": map[string]any{"keys": keys}})
 		case r.URL.Path == "/v1/sys/leases/lookup":
 			w.WriteHeader(400)
 			write(map[string]any{"errors": []string{"invalid lease"}})

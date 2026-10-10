@@ -46,7 +46,7 @@ The admission controller sends `GET /v1/runtime/cleanup-status?agents=all`. Its 
 
 Unattributed work appears once at the top level and is not repeated in any entry. Treat any unattributed count as blocking every agent, and an entry with an empty `workloadUID` as blocking every Pod of its agent. A retired Pod is clean when it has no entry and nothing is unattributed. When the broker cannot account for every item by agent, the list fields are omitted and `status` is `unknown` with HTTP 503.
 
-The observation serializes with issuance/reconciliation, checks the existing cleanup-owner heartbeat without extending it and reads durable records. It neither issues nor revokes credentials, confirms unknown cleanup nor grants authority to modify records. Independent database-side checks remain necessary to establish release acceptance. Unknown issuance requires the existing operator reconciliation procedure.
+The observation serializes with issuance/reconciliation, checks the existing cleanup-owner heartbeat without extending it and reads durable records. It neither issues nor revokes credentials, confirms unknown cleanup nor grants authority to modify records. Independent database-side checks remain necessary to establish release acceptance. An unknown issuance that the broker cannot clear automatically requires the existing operator reconciliation procedure.
 
 ## Verification scope
 

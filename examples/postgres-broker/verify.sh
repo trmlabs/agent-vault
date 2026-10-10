@@ -68,6 +68,11 @@ path "sys/leases/renew" {
 }
 path "sys/leases/revoke/database/creds/readonly/*" { capabilities = ["update"] }
 path "sys/leases/revoke/database/creds/readonly2/*" { capabilities = ["update"] }
+# Listing its own roles' leases lets the broker clear an unknown issuance once
+# Vault shows no credential from it remains. Vault requires sudo to list leases;
+# on these exact paths it grants nothing else.
+path "sys/leases/lookup/database/creds/readonly/" { capabilities = ["list", "sudo"] }
+path "sys/leases/lookup/database/creds/readonly2/" { capabilities = ["list", "sudo"] }
 path "sys/leases/lookup" {
   capabilities = ["update"]
   required_parameters = ["lease_id"]

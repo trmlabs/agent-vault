@@ -171,8 +171,12 @@ func TestRealVault_DurableParentPolicyScope(t *testing.T) {
 			_, err := api.Logical().ReadWithContext(context.Background(), "database/creds/readonly2")
 			return err
 		}},
-		{"lease enumeration", func() error {
-			_, err := api.Logical().ListWithContext(context.Background(), "sys/leases/lookup/database/creds/readonly")
+		{"lease enumeration beyond the broker's roles", func() error {
+			_, err := api.Logical().ListWithContext(context.Background(), "sys/leases/lookup/database/creds")
+			return err
+		}},
+		{"lease enumeration of another mount", func() error {
+			_, err := api.Logical().ListWithContext(context.Background(), "sys/leases/lookup/other/creds/admin")
 			return err
 		}},
 		{"unrelated lease lookup", func() error {
@@ -188,6 +192,146 @@ func TestRealVault_DurableParentPolicyScope(t *testing.T) {
 			}
 		})
 	}
+	// The automatic check of an unknown issuance lists its own role's leases.
+	if _, err := client.ListDatabaseLeases(context.Background(), svc.Mount, svc.Role); err != nil {
+		t.Fatal("parent cannot list its own role's leases:", err)
+	}
+}
+
+// A lost credential response whose child token could not revoke itself: Vault
+// still lists the issued lease, so the binding stays closed. The child token
+// then expires, but a database dependency makes Vault's revocation fail: the
+// lease stays listed and the binding stays closed. Once the dependency is
+// gone Vault's retry drops the role, the list comes back empty, and the
+// broker reopens the binding without an operator.
+func TestRealVault_DurableUnknownIssuanceClearsWhenVaultListsNoLease(t *testing.T) {
+	_, admin, svc := realDurableInputs(t)
+	upstream, err := url.Parse(os.Getenv("VAULT_ADDR"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var interrupted atomic.Bool
+	var orphanName atomic.Value
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/auth/token/revoke-self" && interrupted.Load() {
+			http.Error(w, "revoke unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		request := r.Clone(r.Context())
+		request.RequestURI = ""
+		request.URL.Scheme = upstream.Scheme
+		request.URL.Host = upstream.Host
+		response, err := http.DefaultTransport.RoundTrip(request)
+		if err != nil {
+			http.Error(w, "upstream unavailable", http.StatusBadGateway)
+			return
+		}
+		defer response.Body.Close()
+		body, err := io.ReadAll(response.Body)
+		if err != nil {
+			http.Error(w, "response unavailable", http.StatusBadGateway)
+			return
+		}
+		if r.URL.Path == "/v1/"+svc.Mount+"/creds/"+svc.Role && response.StatusCode == 200 && interrupted.CompareAndSwap(false, true) {
+			var result struct {
+				Data struct {
+					Username string `json:"username"`
+				} `json:"data"`
+			}
+			_ = json.Unmarshal(body, &result)
+			orphanName.Store(result.Data.Username)
+			_, _ = w.Write([]byte("lost issuance response"))
+			return
+		}
+		w.WriteHeader(response.StatusCode)
+		_, _ = w.Write(body)
+	}))
+	defer proxy.Close()
+	t.Setenv("VAULT_ADDR", proxy.URL)
+	client, err := hashicorp.NewClient(context.Background(), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "cleanup.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	// The child token outlives the settle time but not the role's 8 s TTL, so
+	// it is the token's expiry that revokes the lost lease.
+	m, err := NewDurableLeaseMinter(context.Background(), client, st, DurableLeaseOptions{
+		TokenTTL: 3 * time.Second, UnknownSettle: time.Second, UnknownRecheck: 200 * time.Millisecond, RetryInterval: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close(context.Background())
+	ctx := context.Background()
+	if _, err = m.Mint(ctx, AgentScope{VaultID: "vault"}, svc); err == nil {
+		t.Fatal("lost issuance accepted")
+	}
+	orphan, _ := orphanName.Load().(string)
+	if orphan == "" {
+		t.Fatal("fixture did not observe the issued role")
+	}
+	var roles int
+	if err = admin.QueryRow(ctx, "SELECT count(*) FROM pg_roles WHERE rolname=$1", orphan).Scan(&roles); err != nil || roles != 1 {
+		t.Fatalf("lost credential's role not in the database: %d %v", roles, err)
+	}
+	leases, err := client.ListDatabaseLeases(ctx, svc.Mount, svc.Role)
+	if err != nil || len(leases) == 0 {
+		t.Fatalf("Vault did not list the lost credential's lease: %v %v", leases, err)
+	}
+	// A real dependency blocks DROP ROLE, so Vault's revocation at token expiry fails.
+	schema := fmt.Sprintf("unknown_fault_%d", time.Now().UnixNano())
+	if _, err = admin.Exec(ctx, "CREATE SCHEMA "+pgx.Identifier{schema}.Sanitize()+" AUTHORIZATION "+pgx.Identifier{orphan}.Sanitize()); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = admin.Exec(ctx, "DROP SCHEMA IF EXISTS "+pgx.Identifier{schema}.Sanitize()) }()
+	time.Sleep(2 * time.Second)
+	if _, err = m.Mint(ctx, AgentScope{VaultID: "vault"}, svc); err == nil {
+		t.Fatal("binding reopened while the lost credential's token was alive")
+	}
+	// Past token expiry plus the settle time: the check runs and finds the
+	// failed revocation's lease.
+	time.Sleep(5 * time.Second)
+	if leases, err = client.ListDatabaseLeases(ctx, svc.Mount, svc.Role); err != nil || len(leases) == 0 {
+		t.Fatalf("a lease whose revocation failed was not listed: %v %v", leases, err)
+	}
+	if _, err = m.Mint(ctx, AgentScope{VaultID: "vault"}, svc); err == nil {
+		t.Fatal("binding reopened while Vault's revocation was failing")
+	}
+	if records, err := st.ListDatabaseCleanup(ctx); err != nil || len(records) != 1 {
+		t.Fatalf("unknown issuance cleared while its revocation failed: %+v %v", records, err)
+	}
+	if _, err = admin.Exec(ctx, "DROP SCHEMA "+pgx.Identifier{schema}.Sanitize()); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	deadline := time.Now().Add(150 * time.Second)
+	for {
+		records, err := st.ListDatabaseCleanup(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(records) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("unknown issuance not cleared: %+v", records)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	assertDatabaseRemoved(t, admin, orphan)
+	lease, err := m.Mint(ctx, AgentScope{VaultID: "vault"}, svc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = m.Revoke(ctx, lease.ID); err != nil {
+		t.Fatal(err)
+	}
+	assertDatabaseRemoved(t, admin, lease.Username)
+	t.Logf("unknown issuance cleared %s after the dependency was removed; residual roles=0 sessions=0", time.Since(started).Round(time.Millisecond))
 }
 
 func TestRealVault_DurableInterruptedIssuance(t *testing.T) {

@@ -13,8 +13,16 @@ import (
 // ActorID names the actor whose connection minted the credential; an empty
 // ActorID is unattributed (legacy or unknown) and counts against every actor.
 // WorkloadID is that connection's verified runtime instance UID; an empty
-// WorkloadID counts against every instance of the actor.
-type DatabaseCleanup struct{ Accessor, Binding, LeaseID, ActorID, WorkloadID string }
+// WorkloadID counts against every instance of the actor. Mount and Role name
+// the Vault credential path the record's child token could read; they are
+// empty on records from before they were kept. TokenTTL is the child token's
+// maximum lifetime, written as an expiry by the database clock and not read
+// back.
+type DatabaseCleanup struct {
+	Accessor, Binding, LeaseID, ActorID, WorkloadID string
+	Mount, Role                                     string
+	TokenTTL                                        time.Duration
+}
 
 // ErrReplicaNameInUse means another broker process that is still renewing its
 // owner row uses the same replica name. Two processes under one name would
@@ -210,19 +218,44 @@ func (s *SQLStore) AddDatabaseCleanup(ctx context.Context, owner string, record 
 	if record.Accessor == "" || record.Binding == "" {
 		return fmt.Errorf("incomplete database cleanup record")
 	}
-	result, err := s.databaseCleanupExec(ctx, s.dialect.Rebind(`INSERT INTO database_cleanup (accessor, binding, actor_id, workload_id, owner)
-		SELECT ?, ?, ?, ?, ? WHERE `+s.liveOwner()), record.Accessor, record.Binding, record.ActorID, record.WorkloadID, owner, owner)
+	// The child token was created before this write, so the database clock
+	// now plus its lifetime is no earlier than its real expiry.
+	result, err := s.databaseCleanupExec(ctx, s.dialect.Rebind(`INSERT INTO database_cleanup (accessor, binding, actor_id, workload_id, owner, mount, role, token_expires_ms)
+		SELECT ?, ?, ?, ?, ?, ?, ?, CASE WHEN CAST(? AS BIGINT) > 0 THEN `+s.dbNowMs()+` + CAST(? AS BIGINT) ELSE 0 END WHERE `+s.liveOwner()),
+		record.Accessor, record.Binding, record.ActorID, record.WorkloadID, owner, record.Mount, record.Role,
+		record.TokenTTL.Milliseconds(), record.TokenTTL.Milliseconds(), owner)
 	return affectedOne(result, err, ErrDatabaseCleanupOwnershipLost)
+}
+
+// MarkDatabaseCleanupTokenRevoked records, by the database clock, that this
+// owner revoked an unknown issuance's child token with the token itself. It is
+// written after Vault confirmed the revocation, so the token was dead by then.
+func (s *SQLStore) MarkDatabaseCleanupTokenRevoked(ctx context.Context, owner, accessor string) error {
+	result, err := s.databaseCleanupExec(ctx, s.dialect.Rebind(`UPDATE database_cleanup SET token_revoked_ms = `+s.dbNowMs()+`
+		WHERE accessor = ? AND owner = ? AND lease_id = '' AND reconciliation_evidence = '' AND `+s.liveOwner()), accessor, owner, owner)
+	return affectedOne(result, err, ErrDatabaseCleanupOwnershipLost)
+}
+
+// SettledDatabaseCleanup returns this owner's unknown issuances whose child
+// token has been dead, by revocation or expiry, for at least settle by the
+// database clock. Only records that name their mount and role qualify.
+func (s *SQLStore) SettledDatabaseCleanup(ctx context.Context, owner string, settle time.Duration) ([]DatabaseCleanup, error) {
+	return s.listDatabaseCleanup(ctx, s.dialect.Rebind(`SELECT `+databaseCleanupColumns+` FROM database_cleanup
+		WHERE reconciliation_evidence = '' AND lease_id = '' AND owner = ? AND mount <> '' AND role <> '' AND token_expires_ms > 0
+		AND (CASE WHEN token_revoked_ms > 0 AND token_revoked_ms < token_expires_ms THEN token_revoked_ms ELSE token_expires_ms END) + CAST(? AS BIGINT) <= `+s.dbNowMs()+`
+		ORDER BY accessor`), owner, settle.Milliseconds())
 }
 
 // ListDatabaseCleanup returns the whole fleet's unresolved records.
 func (s *SQLStore) ListDatabaseCleanup(ctx context.Context) ([]DatabaseCleanup, error) {
-	return s.listDatabaseCleanup(ctx, `SELECT accessor, binding, lease_id, actor_id, workload_id FROM database_cleanup WHERE reconciliation_evidence = '' ORDER BY accessor`)
+	return s.listDatabaseCleanup(ctx, `SELECT `+databaseCleanupColumns+` FROM database_cleanup WHERE reconciliation_evidence = '' ORDER BY accessor`)
 }
+
+const databaseCleanupColumns = `accessor, binding, lease_id, actor_id, workload_id, mount, role`
 
 // ListOwnedDatabaseCleanup returns only the records one owner must resolve.
 func (s *SQLStore) ListOwnedDatabaseCleanup(ctx context.Context, owner string) ([]DatabaseCleanup, error) {
-	return s.listDatabaseCleanup(ctx, s.dialect.Rebind(`SELECT accessor, binding, lease_id, actor_id, workload_id FROM database_cleanup
+	return s.listDatabaseCleanup(ctx, s.dialect.Rebind(`SELECT `+databaseCleanupColumns+` FROM database_cleanup
 		WHERE reconciliation_evidence = '' AND owner = ? ORDER BY accessor`), owner)
 }
 
@@ -235,7 +268,7 @@ func (s *SQLStore) listDatabaseCleanup(ctx context.Context, query string, args .
 	var records []DatabaseCleanup
 	for rows.Next() {
 		var record DatabaseCleanup
-		if err := rows.Scan(&record.Accessor, &record.Binding, &record.LeaseID, &record.ActorID, &record.WorkloadID); err != nil {
+		if err := rows.Scan(&record.Accessor, &record.Binding, &record.LeaseID, &record.ActorID, &record.WorkloadID, &record.Mount, &record.Role); err != nil {
 			return nil, err
 		}
 		records = append(records, record)
@@ -253,8 +286,8 @@ func (s *SQLStore) SetDatabaseCleanupLease(ctx context.Context, owner, accessor,
 }
 
 // QuarantineDatabaseCleanup marks an issuance whose lease ID never arrived.
-// The mark is fleet-wide: no replica reopens the binding until an operator
-// confirms cleanup.
+// The mark is fleet-wide: no replica reopens the binding until the record is
+// confirmed, by an operator or by the broker's Vault lease check.
 func (s *SQLStore) QuarantineDatabaseCleanup(ctx context.Context, owner, accessor string) error {
 	_, err := s.databaseCleanupExec(ctx, s.dialect.Rebind(`UPDATE database_cleanup SET quarantined = 1
 		WHERE accessor = ? AND owner = ? AND lease_id = '' AND reconciliation_evidence = ''`), accessor, owner)
@@ -270,9 +303,10 @@ func (s *SQLStore) DatabaseBindingQuarantined(ctx context.Context, binding strin
 	return quarantined, err
 }
 
-// ConfirmDatabaseCleanup is an explicit operator attestation, not an automated
-// test result. Keep its evidence after removing the binding's quarantine. Any
-// live replica may record it, whichever replica owns the record.
+// ConfirmDatabaseCleanup records the evidence that resolved an unknown
+// issuance: an operator's attestation, or the broker's automated Vault lease
+// check, which the evidence names. Keep it after removing the binding's
+// quarantine. Any live replica may record it, whichever replica owns the record.
 func (s *SQLStore) ConfirmDatabaseCleanup(ctx context.Context, owner, accessor, evidence string) error {
 	if strings.TrimSpace(accessor) == "" || strings.TrimSpace(evidence) == "" {
 		return fmt.Errorf("accessor and database reconciliation evidence are required")

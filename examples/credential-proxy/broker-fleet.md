@@ -20,7 +20,8 @@ A single replica on SQLite works as before.
 
 - **Clock.** Expiry is written and compared with the database clock (`now()`), never a replica's clock. The fence uses the replica's own elapsed time since it sent the last successful renewal, counting both monotonic and wall time, so a suspended host still fences.
 - **Claim.** A claim is one SQL statement that moves each record only from the owner it read. When two survivors race, each record moves once. Revocation is idempotent anyway.
-- **Quarantine.** An issuance whose lease ID never arrived quarantines its binding for every replica until an operator confirms cleanup.
+- **Drain.** On SIGTERM a replica starts no new issuance and lets one under way finish and journal its lease before it gives up ownership, so a restart does not leave an unknown issuance.
+- **Quarantine.** An issuance whose lease ID never arrived quarantines its binding for every replica until Vault's lease list shows no credential from it remains (see [automatic reconciliation](database-recovery.md#automatic-reconciliation)) or an operator confirms cleanup.
 - **Budgets.** Pooled server-connection budgets divide by the live replica count. When a replica joins, the others close idle connections down to their new share.
 - **Sessions.** The `broker_sessions` table counts a Pod's sessions fleet-wide. A session counts only while its replica is live.
 
