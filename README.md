@@ -1,285 +1,150 @@
-> This is TRM's maintained fork of [Infisical Agent Vault](https://github.com/Infisical/agent-vault). The credential-proxy profile and its verification commands are documented in [examples/credential-proxy](examples/credential-proxy/README.md). Upstream installation commands and package names below refer to Infisical releases, not a published TRM release. Downstream release publishing is disabled until its destinations and approval controls are configured.
+# Gatehouse
 
-<p align="center">
-  <img src="assets/banner.png" alt="Agent Vault" />
-</p>
+Gatehouse lets AI agents use databases, APIs and code repositories without ever
+holding a password, key or token. An agent sends a placeholder where the
+credential would go. Gatehouse checks that the agent is allowed to reach that
+destination, adds the real credential on the way out, and records the request
+in a signed audit trail that names the person behind the agent when there is
+one. Anything not explicitly allowed is refused.
 
-<p align="center"><strong>HTTP credential proxy and vault</strong></p>
+> Gatehouse is a fork of Infisical's open-source
+> [Agent Vault](https://github.com/Infisical/agent-vault), MIT licensed. We're
+> grateful for their work and contribute generic fixes back. Gatehouse is
+> maintained by TRM Labs and is not an Infisical product; Infisical has not
+> reviewed or endorsed this fork.
 
-<p align="center">
-An open-source credential broker by <a href="https://infisical.com">Infisical</a> that sits between your agents and the APIs they call.<br>
-Agents should not possess destination credentials. Agent Vault brokers access on their behalf; protecting credentials also requires trusted destinations, isolated deployment and controls against bypass.
-</p>
+## Status
 
-<p align="center">
-<strong>New here? The <a href="https://infisical.com/blog/agent-vault-the-open-source-credential-proxy-and-vault-for-agents">launch blog post</a> has the full story behind Agent Vault.</strong>
-</p>
+| Part | State today |
+|---|---|
+| Broker support for every destination below | On `main`. There is no tagged release |
+| Staging | Running, with broker images built from `main` commits |
+| Production | Not live. No release has been designated as supported ([SECURITY.md](SECURITY.md)) |
 
-<p align="center">
-<a href="https://docs.agent-vault.dev">Documentation</a> | <a href="https://docs.agent-vault.dev/installation">Installation</a> | <a href="https://docs.agent-vault.dev/tutorial">Tutorial</a> | <a href="https://youtu.be/AkyMmDSX8b4">Video Demo</a> | <a href="https://infisical.com/slack">Slack</a>
-</p>
+## Why Gatehouse
 
-<p align="center">
-  <img src="assets/agent-vault.gif" alt="Agent Vault demo" />
-</p>
+An agent that holds a credential can leak it: through a prompt injection, a
+log line, a transcript or a commit. Gatehouse removes the credential from the
+agent entirely.
 
-## Why Agent Vault
+- **Agents never hold a credential.** The agent's environment contains only
+  placeholders and public connection settings. A compromised agent has no
+  credential to steal; it can use only what the catalog grants its pool, and
+  every use is recorded.
+- **Short-lived credentials, added on the way out.** Where a service supports
+  it, Gatehouse issues a credential that lives from minutes to an hour, for one
+  destination: a database login, a GitHub App token for one repository, a
+  narrowed Google Cloud token. API keys stay in HashiCorp Vault; the broker
+  re-reads them every minute, so a rotated or removed key takes effect within
+  a minute.
+- **One catalog decides access.** Every destination is one entry in one
+  reviewed catalog, granted to named agent pools. Gatehouse checks the agent's
+  workload identity, its pool and the entry's tier on every request.
+- **A signed audit trail that names the person.** Every request and database
+  session is recorded in a tamper-evident chain with signed checkpoints. When a
+  person started the agent, the record names them.
 
-Traditional secrets management involves returning credentials back to you applications and services. This breaks down with AI agents which can be tricked via [prompt injection](https://en.wikipedia.org/wiki/Prompt_injection) into leaking secrets. This is the problem of **credential exfiltration**.
+## What agents can reach
 
-Agent Vault brokers credentials for agents using supported proxy protocols. Instead of giving AI agents credentals directly, you store them in Agent Vault (e.g. `ANTHROPIC_API_KEY`, `GITHUB_PAT`, etc.) and force your agents to route HTTP requests through it. Agent Vault intercepts every request and attaches credentials onto it before forwarding the request to the target outbound API.
+| Destination | What the agent sends | What Gatehouse adds |
+|---|---|---|
+| PostgreSQL databases | A placeholder password | A temporary database login issued by HashiCorp Vault, revoked when no longer needed |
+| HTTP APIs | A placeholder in the key header, or no key | The real key, for the catalog's host, paths and methods only |
+| GitHub repositories (clone, push) | Nothing | A short-lived GitHub App token for that one repository; pushes can be limited to branch prefixes |
+| GitHub pull requests | A placeholder token, or none | The same App token, for the pull request API |
+| Google Cloud (Cloud Storage, BigQuery) | A placeholder token | A short-lived token narrowed to one bucket prefix or one service account |
+| Staging web apps as a test user | Nothing | A sign-in for the test user; the browser holds only placeholders |
 
-Features:
+HTTP responses are screened for the credential, so a service that echoes it
+back is cut off.
 
-- **Credential Brokering**: Broker AI agents access target services like LLM providers and GitHub without them holding any real credentials. Agent Vault is able to broker that access by substituting dummy values in headers like `__anthropic_api_key__` with real credentials or replacing auth headers entirely on outbound requests through it.
-- **[Pluggable Credential Stores](docs/learn/credential-stores.mdx)**: Back a vault with an external secrets store like [Infisical](https://infisical.com) or [HashiCorp Vault](https://developer.hashicorp.com/vault) instead of the local encrypted store. Set `INFISICAL_URL` and create vaults with `--credential-store=infisical` (which extends Agent Vault with features like [dynamic secrets](https://infisical.com/docs/documentation/platform/dynamic-secrets/overview) from Infisical), or set `VAULT_ADDR` and use `--credential-store=hashicorp`.
-- **Transparent Integration**: Let AI agents use existing tools like MCP, CLI, SDK, API with all underlying requests automatically routed through Agent Vault. Agent Vault takes an interface-agnostic, non-invasive approach to credential brokering by bootstrapping your agents' environment to use `HTTPS_PROXY` and be compatible with Agent Vault's MITM architecture.
-- **Purpose-Built Design**: Existing forward proxies like `mitmproxy` or `squid` require modification to perform credential brokering and integrate well with agents. Agent Vault is purpose-built to work with the ergonomics of all types of agent use-cases with a dedicated CLI, multi-tenancy, and agent-specific roadmap backed by [Infisical](https://github.com/Infisical/infisical).
-- **Egress Filtering**: Control which agents should have access to which services and API endpoints on them since authenticated requests flow through Agent Vault.
-- **Request Logging**: Inspect authenticated traffic to monitor and diagnose agent behavior.
+## How it's deployed
 
-By default, requests not matching any service forward as plain proxy traffic; flip a vault into strict deny mode (`unmatched_host_policy=deny`) to reject them with 403 instead.
+Gatehouse runs as a broker inside a Kubernetes cluster, separate from the
+agents. Agents reach it through a sidecar or relay that proves which workload
+is calling. A **harness** is one kind of agent runtime; each is declared in the
+catalog with how its agents prove who they are and how they reach the broker.
 
-Read the full backstory behind Agent Vault [here](https://infisical.com/blog/agent-vault-the-open-source-credential-proxy-and-vault-for-agents).
+| Harness | How agents connect | Who is named in the audit |
+|---|---|---|
+| Cursor self-hosted workers | A Gatehouse sidecar on each worker's loopback address | The worker pool. The staging Cursor pool does not name a person, so it reaches only entries open to the whole pool |
+| agent-sandbox | A shared relay that matches each connection to a live sandbox Pod and the images it runs | The person who started the sandbox, when the pool runs in person mode; otherwise the pool |
 
-## Agent Vault and Infisical Agent Proxy
+Entries can be limited to people in specific groups. Cursor pools never reach
+those entries.
 
-[Infisical](https://infisical.com) offers two ways to broker credentials to agents.
+## Try it
 
-- **Agent Vault** is the simpler, self-contained option: a single open-source binary that stores credentials itself and runs entirely on infrastructure you control, with no dependency on any other system.
-- **[Infisical Agent Proxy](https://infisical.com/blog/agent-proxy)** is the commercial-grade option, built directly into Infisical. Your secrets, the services they are brokered to, and access control all live in one place, and it comes with everything Infisical supports around secrets management, including dynamic secrets, secret rotation, versioning, and more.
+The local demonstration runs real HashiCorp Vault and PostgreSQL with
+synthetic credentials, no network and no host directories. From the root of
+this checkout, with Docker running:
 
-For production and enterprise use cases we recommend Agent Proxy. It is part of Infisical Secrets Management and available on every plan, including the free one.
-
-## Use Cases
-
-Agent Vault works with all kinds of AI Agent use-cases including secure remote coding agents, all-purpose agents, custom agents + harnesses, secure ephemeral sandboxes and more.
-
-- Secure remote coding agents: You can run a remote Claude Code session and configure it to proxy requests through Agent Vault. As part of this setup, you can set an `ANTHROPIC_API_KEY` and `GITHUB_PAT` in Agent Vault, allowing Claude Code to interact with the Anthropic and GitHub API to code, raise PRs, and more. The same principle applies to other coding agents.
-- Secure all-purpose agents: You can set up OpenClaw, Hermes, and other all-purpose agents to proxy outbound requests through Agent Vault.
-- Secure custom agents: You can build your own AI agents with custom harnesses and configure them to proxy outbound requests through Agent Vault.
-- Secure ephemeral sandboxes: You can configure an orchestrator (e.g. backend) to mint a temporary token to be passed into an agent sandbox to use to proxy requests through agent vault. You can even have the sandboxed agent loop back a request to the same backend that spun it up.
-
-## Basic Usage
-
-Agent Vault is both a vault and proxy service and ships as a single binary that acts as both a server and CLI client. It stores credentials and brokers them to your AI agents using a MITM proxy architecture. By design, Agent Vault is meant to be deployed on a separate machine from your AI agents to provide the security guarantee needed so your AI agents cannot directly access the credentials within Agent Vault.
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│ Public internet                                                 │
-│                                                                 │
-│   api.anthropic.com    api.github.com    api.stripe.com   ...   │
-│          ▲                   ▲                  ▲               │
-└──────────┼───────────────────┼──────────────────┼───────────────┘
-           │                   │                  │
-           └───────────────────┼──────────────────┘
-                               │ outbound HTTPS, Agent Vault
-                               │ injects credentials on the way out
-┌──────────────────────────────┼──────────────────────────────────┐
-│ Private network              │                                  │
-│                              │                                  │
-│  ┌───────────────────────────┴────┐     ┌────────────────────┐  │
-│  │ Agent Vault                    │     │ AI agent           │  │
-│  │ :14321  management UI / API    │◀────│ HTTPS_PROXY=       │  │
-│  │ :14322  MITM proxy             │     │ agent-vault:14322  │  │
-│  └────────────────▲───────────────┘     └────────────────────┘  │
-│                   │                                             │
-└───────────────────┼─────────────────────────────────────────────┘
-                    │ operator access: keep private, or front
-                    │ with TLS + auth (SSO reverse proxy, IP
-                    │ allowlist, or VPN) if you need remote admin
-                    │
-                Operator
+```sh
+docker build -f examples/credential-proxy/Dockerfile -t credential-proxy-verification .
+docker run --rm --network none credential-proxy-verification
 ```
 
-You can configure Agent Vault to broker credentials for an AI agents in just a few steps:
+A nonzero exit is a failed demonstration. To build and test from source:
 
-1. [Install](https://docs.agent-vault.dev/installation) and start an Agent Vault server. You can run the script below to Install Agent Vault, supporting macOS (Intel + Apple Silicon) and Linux (x86_64 + ARM64):
-
-```bash
-curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL https://get.agent-vault.dev | sh
+```sh
+make build      # Build the web UI and the Go binary
+make test       # Run the Go tests
 ```
 
-Start the Agent Vault server and set a master password for it (store it somewhere safe); the password is used as part of its [data encryption mechanism](https://docs.agent-vault.dev/learn/security) and is unset from the process after the initial read.
+Check a catalog file before proposing it:
 
-```bash
-export AGENT_VAULT_MASTER_PASSWORD=your-password
-agent-vault server -d
+```sh
+./agent-vault broker-catalog validate --require-pools --environment staging catalog.yaml
 ```
 
-You can also deploy Agent Vault with Docker:
+The binary, Go module path and environment variables still use the upstream
+`agent-vault` and `AGENT_VAULT_` names, so upstream fixes merge cleanly.
 
-```bash
-docker run -it -p 14321:14321 -p 14322:14322 \
-  -e AGENT_VAULT_MASTER_PASSWORD=your-password \
-  -v agent-vault-data:/data infisical/agent-vault
-```
+## Documentation
 
-The server starts the HTTP API on port `14321` and a transparent HTTP/HTTPS proxy on port `14322`; the same listener handles `CONNECT` for `https://` upstreams and absolute-form forward-proxy requests for `http://` upstreams.
+Gatehouse documentation lives in [examples/credential-proxy](examples/credential-proxy/):
 
-The web UI becomes available at `http://<host>:14321` and you'll be prompted to create the first user known as the instance **owner**.
+| Read this | To learn |
+|---|---|
+| [Building against Gatehouse](examples/credential-proxy/developer-guide.md) | How to add a destination, connect an agent and read refusals. Start here |
+| [Broker catalog](examples/credential-proxy/broker-catalog.md) | The catalog format, pools, tiers and harness profiles |
+| [HTTP header adapter](examples/credential-proxy/http-header-adapter.md) | API keys behind placeholders |
+| [Git adapter](examples/credential-proxy/git-adapter.md) | Clone and push with GitHub App tokens |
+| [Google Cloud tokens](examples/credential-proxy/gcp-tokens.md) | Narrowed tokens for Cloud Storage and BigQuery |
+| [Browser sessions](examples/credential-proxy/browser-session.md) | Staging web apps as a test user |
+| [Signed audit](examples/credential-proxy/signed-audit.md) | The audit chain, checkpoints and verification |
+| [Task relay](examples/credential-proxy/task-relay/README.md) | How sandboxes reach the broker without an identity token |
+| [Workload identity](examples/credential-proxy/kubernetes/README.md) | Kubernetes identity setup and fixtures |
+| [Running a fleet](examples/credential-proxy/broker-fleet.md) and [database recovery](examples/credential-proxy/database-recovery.md) | Operating several replicas and recovering interrupted credential requests |
+| [Credential proxy verification](examples/credential-proxy/README.md) | The strict profile and its deployment requirements |
+| [Upstream maintenance](docs/upstream-maintenance.md) | How upstream changes come in and generic fixes go back |
 
-2. Create a [vault](https://docs.agent-vault.dev/learn/vaults), input your [credentials](https://docs.agent-vault.dev/learn/credentials), and configure [service rules](https://docs.agent-vault.dev/learn/services) in Agent Vault either through the management UI or via CLI on the Agent Vault machine. For example, you can create a credential for `ANTHROPIC_API_KEY` and create a service rule for Agent Vault to substitute a dummy value `__anthropic_api_key__` for the real key.
-
-3. Create an [agent](https://docs.agent-vault.dev/agents/overview) to represent a long-running agent and obtain a **token** for it. Alternatively, if you're spinning up ephemeral sandboxed agents, you can use [agent](https://docs.agent-vault.dev/agents/overview) to represent an orchestrator backend and use it to mint a short-lived **token** to be passed into the sandbox for the agent to use and proxy requests through Agent Vault.
-
-4. Set the following environment variables in your AI agent's environment:
-
-```bash
-AGENT_VAULT_ADDR=http://<your-addr>:14321
-AGENT_VAULT_TOKEN=<agent-token-from-agent-vault>
-AGENT_VAULT_VAULT=<vault-in-agent-vault>
-...
-ANTHROPIC_API_KEY=__anthropic_api_key__ // dummy key that will be substituted by Agent Vault
-```
-
-5. [Install](https://docs.agent-vault.dev/installation) the Agent Vault CLI into your agent's environment and run the Agent Vault CLI with your agent to start proxying requests through Agent Vault.
-
-```bash
-curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL https://get.agent-vault.dev | sh
-```
-
-### Verifying downloaded release binaries
-
-Release archives published from this workflow ship with a build provenance attestation tied to the GitHub Actions run that produced them. Verify with the `gh` CLI (no extra tools, no key management):
-
-```bash
-gh attestation verify agent-vault_*.tar.gz --repo Infisical/agent-vault
-```
-
-`checksums.txt` is also covered by the same attestation, and its cosign signature continues to verify with `cosign verify-blob` for users who prefer that path.
-
-```bash
-agent-vault run -- claude
-agent-vault vault run -- agent
-agent-vault vault run -- codex
-agent-vault vault run -- opencode
-```
-
-Alternatively, if your agent is running with Docker, you can install the Agent Vault CLI via a Dockerfile by copying the binary into your own image and using it to start up your agent process:
-
-```dockerfile
-# Add this line to your existing Dockerfile alongside your agent or app setup.
-COPY --from=infisical/agent-vault:latest /usr/local/bin/agent-vault /usr/local/bin/agent-vault
-
-...
-
-ENTRYPOINT ["agent-vault", "run", "--", "claude"]
-```
-
-There are many ways to deploy Agent Vault and integrate your AI agents with it. We recommend consulting the fuller [documentation](https://docs.agent-vault.dev/installation).
-
-## See it in Action
-
-Watch how Agent Vault brokers credentials for AI agents: store your keys once, route every outbound request through the proxy, and let agents call real APIs without ever seeing a secret.
-
-<p align="center">
-  <a href="https://youtu.be/AkyMmDSX8b4">
-    <img src="assets/agent-vault-video-thumbnail.png" alt="Watch: agents shouldn't see your secrets" />
-  </a>
-</p>
-
-Want a full deployment walkthrough? See [Run Hermes on a VPS](https://docs.agent-vault.dev/guides/hermes-on-vps) for an end-to-end example with a brokered agent on a separate box.
-
-## Best Practices
-
-1. Security:
-
-- You should deploy Agent Vault as a separate service on a different host machine from your AI agents to prevent agents from exploiting a shared host to gain access to Agent Vault.
-- You should keep the proxy port (14322 by default), where credentials get injected into outbound requests, private to your agents' network. The management interface on 14321 is safer to expose if you need remote admin, but still harden it like any production web service (TLS, IP allowlist). Refer to [examples/nginx-public-ui-proxy/](examples/nginx-public-ui-proxy/) for a working example.
-
-2. Latency: You should co-locate Agent Vault alongside your AI agents within the same network to reduce request latency.
-
-3. Tokens: You should create an [agent](https://docs.agent-vault.dev/agents/overview) in Agent Vault to represent a long-lived agent. For ephemeral sandboxes, you may prefer to mint short-lived, vault-scoped tokens for sandboxed agents to use to proxy requests through Agent Vault.
-
-HTTP forwarding and requests inside an existing HTTPS CONNECT tunnel revalidate the original proxy session before each request. Revoking an agent token, reaching its expiry, or removing its vault grant prevents the next request from reaching upstream. This does not terminate a request or WebSocket already in progress, and scoped sessions retain their separate stored-role semantics.
-
-The [credential proxy release profile](examples/credential-proxy/README.md) uses request-time Vault reads, durable audit admission and [Kubernetes workload identity](examples/credential-proxy/kubernetes/README.md) shared by HTTP and PostgreSQL. Enable it with `AGENT_VAULT_CREDENTIAL_PROXY=true` and `AGENT_VAULT_WORKLOAD_IDENTITY_FILE`. Its read-only HTTP path supports header placeholders, including HTTP Basic with a placeholder username and empty password. Exact GET services can add an operator-configured non-secret query; caller queries and bodies remain forbidden. The task relay accepts standard single-value CONNECT `Connection: close` or `keep-alive` headers and strips them before broker authentication. Direct pod proof does not establish an individual Daytona or ToolHive session identity; deployed ingress and network isolation still require verification.
-
-For managed Kubernetes tasks, [the trusted task relay](examples/credential-proxy/task-relay/README.md) keeps identity proofs in a separate Pod. The sandbox sends public placeholders over verified TLS. The relay checks the actual socket IP against the operator-pinned live Pod UID and named running task container, with zero container restarts, then applies a fixed service policy. A surviving sidecar does not retain access after the task exits. Upgrades must pair the required `sandbox.containerName` configuration with the new relay image. Start it with `agent-vault task-relay --config FILE`; the guide includes a configuration example and deployment acceptance checks. Local tests establish protocol behavior, not deployed network isolation or identity for other hosted-agent runtimes.
-
-The [task relay](examples/credential-proxy/task-relay/README.md) preserves bounded PostgreSQL application names and positive statement timeouts for application clients while keeping the database and user fixed by the operator. One relay can serve up to eight fixed PostgreSQL bindings on separate listeners, sharing its task identity, deadline and connection limits. Reconnecting clients wait within the broker's bounded admission window for completed sessions to release capacity. The credential limit stays enforced, and the broker rechecks identity before issuing a credential.
-
-The disposable verification image runs real Vault and PostgreSQL with synthetic destinations and credentials. Build and run it using the [verification commands](examples/credential-proxy/README.md#run-the-local-demonstration). Its output identifies local checks separately from required deployed validation.
-
-`internal/actionref` adds a fixed-read handler for acceptance testing. It permits only `POST /actions/read` without parameters, uses a configured upstream through the proxy, returns selected JSON fields and cancels requests on permission loss or deadline. The real-Vault fixture observes cancellation at both plain and TLS upstreams. Its identity and policy callbacks are synthetic; the handler is not mounted in the deployed server. Production wiring must provide verified workload identity, persistent current policy, audit records and runtime isolation. To run locally with Go and Vault installed, use `bash examples/credential-proxy/verify.sh`.
-
-## PostgreSQL (Production)
-
-By default Agent Vault stores all state in a local SQLite database, which requires no setup. For production deployments, or when running multiple instances, set the `DATABASE_URL` environment variable (or `--database-url` flag) to a PostgreSQL connection string and Agent Vault switches to Postgres as its backend. Legacy instances can share that database. The strict credential-proxy profile currently requires a single active broker: its durable database cleanup owner is exclusive, so do not enable multiple replicas or overlapping rollouts.
-
-Migrate existing data with `agent-vault migrate-db --to postgres://...` before switching. See the [PostgreSQL guide](https://docs.agent-vault.dev/self-hosting/postgres) for deployment examples (Kubernetes, Docker Compose), architecture notes, and operational details.
-
-A dedicated trusted manager can opt into the [read-only cleanup observer](examples/credential-proxy/cleanup-observer.md). It reports broker reconciliation state without exposing lease identifiers or granting database access.
-
-## SDK
-
-Agent Vault offers a TypeScript SDK in the event you'd like an orchestrator to mint a short-lived token and pass proxy config into a sandboxed agent to have it proxy requests through Agent Vault that way.
-
-```bash
-npm install @infisical/agent-vault-sdk
-```
-
-```typescript
-import { AgentVault, buildProxyEnv } from "@infisical/agent-vault-sdk";
-
-const av = new AgentVault({
-  token: "YOUR_TOKEN", // agent token
-  address: "http://localhost:14321",
-});
-const session = await av
-  .vault("my-vault")
-  .sessions.create({ vaultRole: "proxy" });
-
-// certPath is where you'll mount the CA certificate inside the sandbox.
-const certPath = "/etc/ssl/agent-vault-ca.pem";
-
-// env: { HTTPS_PROXY, HTTP_PROXY, NO_PROXY, NODE_USE_ENV_PROXY,
-//         SSL_CERT_FILE, NODE_EXTRA_CA_CERTS, REQUESTS_CA_BUNDLE,
-//         CURL_CA_BUNDLE, GIT_SSL_CAINFO, DENO_CERT }
-const env = buildProxyEnv(session.containerConfig!, certPath);
-const caCert = session.containerConfig!.caCertificate;
-
-// Pass `env` as environment variables and mount `caCert` at `certPath`
-// in your sandbox — Docker, Daytona, E2B, Firecracker, or any other runtime.
-// Once configured, the agent inside just calls APIs normally:
-//   fetch("https://api.github.com/...") — no SDK, no credentials needed.
-```
-
-See the [TypeScript SDK README](sdks/sdk-typescript/README.md) for full documentation.
-
-## Development
-
-```bash
-make build      # Build frontend + Go binary
-make test       # Run tests
-make web-dev    # Vite dev server with hot reload (port 5173)
-make dev        # Go + Vite dev servers with hot reload
-make docker     # Build Docker image
-```
-
-## Open-source vs. paid
-
-This repo available under the [MIT expat license](LICENSE), with the exception of the `ee` directory which will contain premium enterprise features requiring a Infisical license.
-
-If you are interested in Infisical or exploring a more commercial path for Agent Vault, take a look at [our website](https://infisical.com/) or [book a meeting with us](https://infisical.cal.com/vlad/infisical-demo).
+The [docs](docs/) directory is Infisical's Agent Vault documentation site.
+It describes the features Gatehouse inherits, such as vaults, the management UI,
+the CLI and the TypeScript SDK.
 
 ## Contributing
 
-Whether it's big or small, we love contributions. Agent Vault follows the same contribution guidelines as Infisical.
+- Open a pull request against `main`.
+- Run `go test -race ./...` before you push. It includes a check that keeps
+  internal hostnames, cloud project names and similar identifiers out of this
+  public repository; use `example.com` style placeholders instead.
+- The required CI checks (`ci-summary`) and a maintainer review must pass
+  before merge. Fix or reply to every automated review comment.
+- Keep credentials, internal endpoints and deployment details out of code,
+  docs, commits and pull request descriptions.
+- When behavior changes, update the matching guide in
+  [examples/credential-proxy](examples/credential-proxy/) in the same pull
+  request.
+- Fixes that help any Agent Vault user are offered upstream, following
+  [upstream maintenance](docs/upstream-maintenance.md).
 
-Check out our guide to see how to [get started](https://infisical.com/docs/contributing/getting-started).
+## Security
 
-Not sure where to get started? You can:
+Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
+Do not open a public issue with exploit details.
 
-- Join our <a href="https://infisical.com/slack">Slack</a>, and ask us any questions there.
+## License
 
-## We are hiring!
-
-If you're reading this, there is a strong chance you like the products we created.
-
-You might also make a great addition to our team. We're growing fast and would love for you to [join us](https://infisical.com/careers).
-
----
-
-> **Preview.** Agent Vault is in active development and the API is subject to change. Please review the [security documentation](https://docs.agent-vault.dev/learn/security) before deploying.
+MIT, as in the upstream project. See [LICENSE](LICENSE), which keeps
+Infisical's copyright notice.
